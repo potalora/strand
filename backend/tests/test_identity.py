@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from app.services.ingestion.identity import Identity, extract_identity
+
 # Real extract location (gitignored). Skip when absent.
 _XDM_DOC = Path(__file__).resolve().parents[2] / (
     "HealthSummary_May_29_2026/IHE_XDM/Pedro1/DOC0001.XML"
@@ -41,9 +43,6 @@ def test_cda_renderer_preserves_source_id():
         "CcdaRenderer dropped source <id>; identity.py CDA branch needs a "
         "direct-XML fallback (parse act <id root extension>)."
     )
-
-
-from app.services.ingestion.identity import Identity, extract_identity
 
 
 def test_explicit_fields_take_precedence():

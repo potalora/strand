@@ -8,7 +8,6 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.ingestion.bulk_inserter import bulk_insert_records
 from app.services.ingestion.epic_mappers.base import EpicMapper
 from app.services.ingestion.epic_mappers.allergies import AllergyMapper
 from app.services.ingestion.epic_mappers.documents import DocInformationMapper

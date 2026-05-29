@@ -9,7 +9,6 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.ingestion.bulk_inserter import bulk_insert_records
 from app.services.ingestion.idempotent_inserter import idempotent_insert_records
 
 logger = logging.getLogger(__name__)
