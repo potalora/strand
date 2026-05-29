@@ -10,6 +10,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.ingestion.bulk_inserter import bulk_insert_records
+from app.services.ingestion.idempotent_inserter import idempotent_insert_records
 
 logger = logging.getLogger(__name__)
 
@@ -402,16 +403,20 @@ async def _parse_small_bundle(
             continue
 
         if len(batch) >= batch_size:
-            count = await bulk_insert_records(db, batch)
-            stats["records_inserted"] += count
+            result = await idempotent_insert_records(db, batch)
+            stats["records_inserted"] += result["inserted"]
+            stats["records_updated"] = stats.get("records_updated", 0) + result["updated"]
+            stats["records_unchanged"] = stats.get("records_unchanged", 0) + result["unchanged"]
             batch.clear()
             await db.commit()
             if progress_callback:
                 await progress_callback(i + 1, stats["total_entries"], stats["records_inserted"])
 
     if batch:
-        count = await bulk_insert_records(db, batch)
-        stats["records_inserted"] += count
+        result = await idempotent_insert_records(db, batch)
+        stats["records_inserted"] += result["inserted"]
+        stats["records_updated"] = stats.get("records_updated", 0) + result["updated"]
+        stats["records_unchanged"] = stats.get("records_unchanged", 0) + result["unchanged"]
         batch.clear()
         await db.commit()
 
@@ -461,8 +466,10 @@ async def _parse_large_bundle(
                 continue
 
             if len(batch) >= batch_size:
-                count = await bulk_insert_records(db, batch)
-                stats["records_inserted"] += count
+                result = await idempotent_insert_records(db, batch)
+                stats["records_inserted"] += result["inserted"]
+                stats["records_updated"] = stats.get("records_updated", 0) + result["updated"]
+                stats["records_unchanged"] = stats.get("records_unchanged", 0) + result["unchanged"]
                 batch.clear()
                 await db.commit()
                 if progress_callback:
@@ -473,8 +480,10 @@ async def _parse_large_bundle(
                     )
 
     if batch:
-        count = await bulk_insert_records(db, batch)
-        stats["records_inserted"] += count
+        result = await idempotent_insert_records(db, batch)
+        stats["records_inserted"] += result["inserted"]
+        stats["records_updated"] = stats.get("records_updated", 0) + result["updated"]
+        stats["records_unchanged"] = stats.get("records_unchanged", 0) + result["unchanged"]
         batch.clear()
         await db.commit()
 

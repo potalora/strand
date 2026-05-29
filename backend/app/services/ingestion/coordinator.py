@@ -20,6 +20,7 @@ from app.services.ingestion.cda_dedup import deduplicate_across_documents
 from app.services.ingestion.cda_parser import parse_cda_document
 from app.services.ingestion.epic_parser import parse_epic_export
 from app.services.ingestion.fhir_parser import parse_fhir_bundle
+from app.services.ingestion.idempotent_inserter import idempotent_insert_records
 from app.services.ingestion.xdm_parser import parse_xdm_metadata
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,8 @@ async def ingest_file(
             "total_entries": stats.get("total_entries", 0),
             "records_inserted": stats.get("records_inserted", 0),
             "records_skipped": stats.get("records_skipped", 0),
+            "records_updated": stats.get("records_updated", 0),
+            "records_unchanged": stats.get("records_unchanged", 0),
         }
 
         # Run dedup scan in background so the upload endpoint returns immediately
@@ -276,8 +279,6 @@ async def _ingest_cda_standalone(
     file_path: Path,
 ) -> dict:
     """Ingest a standalone CDA XML file (not inside an XDM package)."""
-    from app.services.ingestion.bulk_inserter import bulk_insert_records
-
     stats: dict = {
         "total_entries": 0,
         "records_inserted": 0,
@@ -304,8 +305,10 @@ async def _ingest_cda_standalone(
     batch_size = settings.ingestion_batch_size
     for i in range(0, len(records), batch_size):
         batch = records[i : i + batch_size]
-        count = await bulk_insert_records(db, batch)
-        stats["records_inserted"] += count
+        result = await idempotent_insert_records(db, batch)
+        stats["records_inserted"] += result["inserted"]
+        stats["records_updated"] = stats.get("records_updated", 0) + result["updated"]
+        stats["records_unchanged"] = stats.get("records_unchanged", 0) + result["unchanged"]
         await db.commit()
 
     logger.info(
@@ -325,8 +328,6 @@ async def _ingest_xdm(
     metadata_path: Path,
 ) -> dict:
     """Ingest an IHE XDM package containing CDA XML documents."""
-    from app.services.ingestion.bulk_inserter import bulk_insert_records
-
     stats: dict = {
         "total_entries": 0,
         "records_inserted": 0,
@@ -390,8 +391,10 @@ async def _ingest_xdm(
     batch_size = settings.ingestion_batch_size
     for i in range(0, len(unique_records), batch_size):
         batch = unique_records[i : i + batch_size]
-        count = await bulk_insert_records(db, batch)
-        stats["records_inserted"] += count
+        result = await idempotent_insert_records(db, batch)
+        stats["records_inserted"] += result["inserted"]
+        stats["records_updated"] = stats.get("records_updated", 0) + result["updated"]
+        stats["records_unchanged"] = stats.get("records_unchanged", 0) + result["unchanged"]
         await db.commit()
 
     logger.info(
