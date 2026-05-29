@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.models.user import User
 from app.models.patient import Patient
 from app.models.record import HealthRecord
+from app.models.record_version import RecordVersion
 from app.models.uploaded_file import UploadedFile
 from app.models.ai_summary import AISummaryPrompt
 from app.models.deduplication import DedupCandidate
@@ -15,6 +16,7 @@ __all__ = [
     "User",
     "Patient",
     "HealthRecord",
+    "RecordVersion",
     "UploadedFile",
     "AISummaryPrompt",
     "DedupCandidate",

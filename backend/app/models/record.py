@@ -57,6 +57,10 @@ class HealthRecord(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("health_records.id"), nullable=True
     )
     merge_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    external_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_system: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
