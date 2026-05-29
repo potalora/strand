@@ -8,7 +8,13 @@
 
 **Tech Stack:** Python 3.12, SQLAlchemy 2.x async, PostgreSQL 16 (JSONB, partial unique index), Alembic, pytest + pytest-asyncio. Design spec: `docs/superpowers/specs/2026-05-29-idempotent-incremental-ingestion-design.md`.
 
-**Conventions:** `from __future__ import annotations` at top of every new module. Type hints on all functions. No `print()` — use `logging`. Run tests from `backend/`. DB head revision is `f1a2b3c4d5e6`.
+**Conventions:** `from __future__ import annotations` at top of every new module. Type hints on all functions. No `print()` — use `logging`. DB head revision is `f1a2b3c4d5e6`.
+
+**Test runner (IMPORTANT):** run pytest with the project venv interpreter, not the global pyenv (which has a broken `langsmith` plugin that fails collection): `cd backend && .venv/bin/python -m pytest …`. All `Run:` commands below assume this.
+
+**Marker registration:** `pyproject.toml` registers only `slow` and `integration`. Before adding `@pytest.mark.fidelity` tests (Tasks 1, 12), register it in `[tool.pytest.ini_options] markers` to avoid `PytestUnknownMarkWarning`: add `"fidelity: marks tests requiring real user-provided data"`.
+
+**Task 1 findings (already verified against the real extract):** `CcdaRenderer` preserves the CDA act `<id>` in `resource.identifier` as `[{"system": "urn:oid:<root-OID>", "value": "<extension>"}]` — NOT in `resource.id` (which is a renderer-generated UUID; never match on it). Some resource types (AllergyIntolerance, Medication, Practitioner) have `identifier=None` and will fall through to content-dedup (acceptable for Phase 1). Some ids appear as `{"nullFlavor": "UNK"}` dicts — guard against non-string id values. The probe PASSED, so **Task 4 uses the `resource.identifier` path (no raw-XML fallback needed)**.
 
 ---
 
@@ -450,29 +456,32 @@ Implement `_from_cda` based on the probe. **If probe PASSED**, this task only ad
 
 - [ ] **Step 1: Write failing tests (append)**
 
+Real `CcdaRenderer` output (verified in Task 1): `system` is `urn:oid:<root>` (note the `urn:oid:` prefix), `value` is the extension; `resource.id` is a renderer UUID and must be ignored; some ids are `{"nullFlavor": "UNK"}` dicts. The filter must therefore strip `urn:oid:` before comparing roots, and guard non-string id values.
+
 ```python
-def test_cda_identifier_with_oid():
+def test_cda_identifier_with_urn_oid():
     rec = {
         "source_format": "cda_r2",
         "fhir_resource": {
             "resourceType": "Condition",
-            "identifier": [{"system": "1.2.840.114350.1.13.516.2.7.2.768076", "value": "ABC123"}],
+            "id": "881e0b55-1111-2222-3333-444455556666",  # renderer UUID, ignored
+            "identifier": [{"system": "urn:oid:1.2.840.114350.1.13.516.2.7.2.768076", "value": "26510156"}],
         },
     }
     ident = extract_identity(rec)
     assert ident == Identity(
-        source_system="1.2.840.114350.1.13.516.2.7.2.768076",
-        external_id="Condition/ABC123",
+        source_system="urn:oid:1.2.840.114350.1.13.516.2.7.2.768076",
+        external_id="Condition/26510156",
     )
 
 
 def test_cda_npi_root_is_not_used_as_identity():
-    """Provider NPI must not become the record identity."""
+    """Provider NPI (urn:oid:2.16.840.1.113883.4.6) must not become the record identity."""
     rec = {
         "source_format": "cda_r2",
         "fhir_resource": {
             "resourceType": "Practitioner",
-            "identifier": [{"system": "2.16.840.1.113883.4.6", "value": "1234567890"}],
+            "identifier": [{"system": "urn:oid:2.16.840.1.113883.4.6", "value": "1234567890"}],
         },
     }
     assert extract_identity(rec) is None
@@ -483,22 +492,36 @@ def test_cda_person_root_is_not_used_as_identity():
         "source_format": "cda_r2",
         "fhir_resource": {
             "resourceType": "Condition",
-            "identifier": [{"system": "2.16.840.1.113883.4.2", "value": "999"}],
+            "identifier": [{"system": "urn:oid:2.16.840.1.113883.4.2", "value": "999"}],
         },
     }
-    # Falls through to id; none present -> None
+    # Only non-act identifier present, and id absent -> None
+    assert extract_identity(rec) is None
+
+
+def test_cda_nullflavor_id_does_not_crash():
+    rec = {
+        "source_format": "cda_r2",
+        "fhir_resource": {"resourceType": "Practitioner", "id": {"nullFlavor": "UNK"}},
+    }
     assert extract_identity(rec) is None
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd backend && python -m pytest tests/test_identity.py -v -k "cda and not renderer"`
+Run: `cd backend && .venv/bin/python -m pytest tests/test_identity.py -v -k "cda and not renderer"`
 Expected: FAIL (`test_cda_npi_root_is_not_used_as_identity` returns an Identity instead of None)
 
-- [ ] **Step 3: Implement the non-act-root filter**
+- [ ] **Step 3: Implement the non-act-root filter (prefix-aware, id-shape-safe)**
 
 ```python
-# Replace _from_cda in identity.py
+# Replace _from_cda in identity.py. Probe PASSED -> identifier path only, no raw-XML fallback.
+def _strip_oid(system: str | None) -> str:
+    """Normalize a FHIR system to a bare OID for root comparison."""
+    s = system or ""
+    return s[len("urn:oid:"):] if s.startswith("urn:oid:") else s
+
+
 def _from_cda(resource: dict[str, Any]) -> Identity | None:
     rtype = resource.get("resourceType")
     if not rtype:
@@ -506,23 +529,24 @@ def _from_cda(resource: dict[str, Any]) -> Identity | None:
     identifiers = resource.get("identifier")
     if isinstance(identifiers, list):
         for ident in identifiers:
+            if not isinstance(ident, dict):
+                continue
             system = ident.get("system")
             value = ident.get("value")
-            if not value or system in CDA_NON_ACT_ROOTS:
+            if not value or _strip_oid(system) in CDA_NON_ACT_ROOTS:
                 continue
             return Identity(source_system=str(system or "cda"), external_id=f"{rtype}/{value}")
     rid = resource.get("id")
-    if rid and "-" not in str(rid):  # skip renderer-generated UUIDs
+    # Ignore renderer UUIDs and non-string ids (e.g. {"nullFlavor": "UNK"}).
+    if isinstance(rid, str) and rid and "-" not in rid:
         return Identity(source_system="cda", external_id=f"{rtype}/{rid}")
     return None
 ```
 
-> **Only if Task 1 probe FAILED:** also add `_extract_cda_id_from_xml(act_element)` to `cda_parser.py` that reads the first `<id>` child whose `root` is not in `CDA_NON_ACT_ROOTS`, and write it into `resource["identifier"]` during `parse_cda_document` before the record dict is appended (after line 114). Add a unit test using a small inline CDA `<entry>` XML string asserting the identifier is attached.
-
 - [ ] **Step 4: Run to verify pass**
 
-Run: `cd backend && python -m pytest tests/test_identity.py -v -k "cda and not renderer"`
-Expected: PASS (3 tests)
+Run: `cd backend && .venv/bin/python -m pytest tests/test_identity.py -v -k "cda and not renderer"`
+Expected: PASS (4 tests)
 
 - [ ] **Step 5: Commit**
 
