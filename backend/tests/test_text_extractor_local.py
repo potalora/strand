@@ -67,3 +67,46 @@ def test_local_extraction_empty_is_zero_confidence(tmp_path):
     with patch.object(text_extractor.pdfplumber, "open", return_value=_fake_pdf(pages)):
         text, conf = text_extractor.extract_text_from_pdf_local(f)
     assert conf == 0.0
+
+
+import pytest
+from unittest.mock import AsyncMock
+
+
+@pytest.mark.asyncio
+async def test_router_uses_local_when_confident(tmp_path):
+    from app.services.extraction import text_extractor
+    f = tmp_path / "n.pdf"; f.write_bytes(b"%PDF-1.4")
+    with patch.object(text_extractor, "extract_text_from_pdf_local",
+                      return_value=("good clinical text " * 50, 300.0)) as local, \
+         patch.object(text_extractor, "_extract_text_from_pdf_gemini",
+                      new=AsyncMock(return_value="gemini text")) as gem:
+        out = await text_extractor.extract_text_from_pdf(f, "key")
+    assert "good clinical text" in out
+    local.assert_called_once()
+    gem.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_router_falls_back_to_gemini_when_low_confidence(tmp_path):
+    from app.services.extraction import text_extractor
+    f = tmp_path / "scan.pdf"; f.write_bytes(b"%PDF-1.4")
+    with patch.object(text_extractor, "extract_text_from_pdf_local", return_value=("", 0.0)), \
+         patch.object(text_extractor, "_extract_text_from_pdf_gemini",
+                      new=AsyncMock(return_value="gemini ocr text")) as gem:
+        out = await text_extractor.extract_text_from_pdf(f, "key")
+    assert out == "gemini ocr text"
+    gem.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_router_falls_back_when_local_raises(tmp_path):
+    from app.services.extraction import text_extractor
+    f = tmp_path / "bad.pdf"; f.write_bytes(b"%PDF-1.4")
+    with patch.object(text_extractor, "extract_text_from_pdf_local",
+                      side_effect=ValueError("corrupt")), \
+         patch.object(text_extractor, "_extract_text_from_pdf_gemini",
+                      new=AsyncMock(return_value="gemini fallback")) as gem:
+        out = await text_extractor.extract_text_from_pdf(f, "key")
+    assert out == "gemini fallback"
+    gem.assert_called_once()
