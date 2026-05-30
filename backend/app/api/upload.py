@@ -15,28 +15,57 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import async_session_factory
 
-# Global semaphore to limit concurrent Gemini API calls across all uploads
-_gemini_semaphore: asyncio.Semaphore | None = None
+# Per-event-loop semaphore caches.
+#
+# An ``asyncio.Semaphore`` binds to the event loop that it first *blocks* on (it
+# registers waiter futures against the running loop). A single module-level
+# semaphore reused across loops therefore raises
+# ``RuntimeError: <Semaphore> is bound to a different event loop`` whenever a
+# task must wait on it under a different loop. In production this stays benign
+# because uvicorn runs one long-lived loop, but the test harness creates a fresh
+# loop per test (pytest-asyncio) and the persisting module global goes stale.
+# Keying by the running loop guarantees every loop gets a semaphore bound to it,
+# while still capping concurrency at the configured limits.
+_gemini_semaphores: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 
 # Extraction semaphore to limit concurrent file extractions (layer above Gemini semaphore)
-_extraction_semaphore: asyncio.Semaphore | None = None
+_extraction_semaphores: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 
 # Worker task reference
 _worker_task: asyncio.Task | None = None
 
 
+def _prune_closed_loops(cache: dict[asyncio.AbstractEventLoop, asyncio.Semaphore]) -> None:
+    """Drop semaphores keyed to event loops that have since closed.
+
+    Keeps the per-loop caches bounded so repeated short-lived loops (e.g. one
+    per test) do not accumulate dead entries.
+    """
+    stale = [loop for loop in cache if loop.is_closed()]
+    for loop in stale:
+        del cache[loop]
+
+
 def _get_gemini_semaphore() -> asyncio.Semaphore:
-    global _gemini_semaphore
-    if _gemini_semaphore is None:
-        _gemini_semaphore = asyncio.Semaphore(settings.gemini_concurrency_limit)
-    return _gemini_semaphore
+    """Return the Gemini-concurrency semaphore bound to the running event loop."""
+    loop = asyncio.get_running_loop()
+    sem = _gemini_semaphores.get(loop)
+    if sem is None:
+        _prune_closed_loops(_gemini_semaphores)
+        sem = asyncio.Semaphore(settings.gemini_concurrency_limit)
+        _gemini_semaphores[loop] = sem
+    return sem
 
 
 def _get_extraction_semaphore() -> asyncio.Semaphore:
-    global _extraction_semaphore
-    if _extraction_semaphore is None:
-        _extraction_semaphore = asyncio.Semaphore(settings.extraction_concurrency)
-    return _extraction_semaphore
+    """Return the file-extraction semaphore bound to the running event loop."""
+    loop = asyncio.get_running_loop()
+    sem = _extraction_semaphores.get(loop)
+    if sem is None:
+        _prune_closed_loops(_extraction_semaphores)
+        sem = asyncio.Semaphore(settings.extraction_concurrency)
+        _extraction_semaphores[loop] = sem
+    return sem
 
 
 async def _extraction_worker() -> None:
