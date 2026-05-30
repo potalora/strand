@@ -29,6 +29,17 @@ SUPPORTED_EXTENSIONS = {
 }
 
 
+def _render_tables(tables: list | None) -> str:
+    """Render pdfplumber extract_tables() output as pipe-delimited rows."""
+    if not tables:
+        return ""
+    lines: list[str] = []
+    for table in tables:
+        for row in table:
+            lines.append(" | ".join((cell or "") for cell in row))
+    return "\n".join(lines)
+
+
 def detect_file_type(file_path: Path) -> FileType:
     """Detect unstructured file type by extension."""
     ext = file_path.suffix.lower()
