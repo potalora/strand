@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Slow fidelity test: real clinical-note PDF upload → extraction → re-upload idempotency.
 
 Marks:
@@ -8,6 +6,7 @@ Marks:
 
 Skipped automatically when either the note PDF or the API key is absent.
 """
+from __future__ import annotations
 
 import uuid
 from pathlib import Path
