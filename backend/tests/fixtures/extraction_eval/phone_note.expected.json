@@ -1,0 +1,16 @@
+{
+  "expected": [
+    {"entity_class": "condition", "text": "hypertension"},
+    {"entity_class": "medication", "text": "lisinopril"},
+    {"entity_class": "condition", "text": "type 2 diabetes"},
+    {"entity_class": "medication", "text": "metformin"},
+    {"entity_class": "allergy", "text": "penicillin"}
+  ],
+  "must_not_extract": [
+    {"entity_class": "condition", "text": "chest pain", "reason": "negation"},
+    {"entity_class": "condition", "text": "breast cancer", "reason": "attribution"}
+  ],
+  "expected_family_history": [
+    {"text": "breast cancer"}
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "expected": [
+    {"entity_class": "vital", "text": "142/90"},
+    {"entity_class": "condition", "text": "hypertension"}
+  ],
+  "must_not_extract": [
+    {"entity_class": "condition", "text": "diabetes", "reason": "negation"},
+    {"entity_class": "condition", "text": "colon cancer", "reason": "attribution"},
+    {"entity_class": "condition", "text": "esophagitis", "reason": "educational"}
+  ],
+  "expected_family_history": [
+    {"text": "colon cancer"}
+  ]
+}

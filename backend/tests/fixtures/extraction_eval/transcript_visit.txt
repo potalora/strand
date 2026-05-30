@@ -1,0 +1,8 @@
+Dr. Lee: Good morning. What brings you in today?
+Patient: I've had this burning stomach pain since about last week.
+Dr. Lee: Are you taking anything for it?
+Patient: Just something over the counter for my stomach. I stopped taking my lisinopril though.
+Dr. Lee: Okay. Any history of diabetes?
+Patient: No, never had diabetes. But my father had colon cancer.
+Dr. Lee: Your blood pressure today is 142 over 90. I'm noting hypertension.
+Dr. Lee: Generally, untreated reflux can cause esophagitis, but let's not get ahead of ourselves.
