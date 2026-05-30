@@ -33,6 +33,7 @@ async def find_prior_extracted_upload(
         .where(
             UploadedFile.user_id == user_id,
             UploadedFile.file_hash == file_hash,
+            UploadedFile.file_category == "unstructured",
             UploadedFile.ingestion_status.in_(PRODUCED_RECORDS_STATUSES),
         )
         .order_by(UploadedFile.created_at)

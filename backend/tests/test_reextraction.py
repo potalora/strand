@@ -93,3 +93,19 @@ async def test_find_prior_extracted_upload_ignores_failed_and_unknown(db_session
     await db_session.commit()
     assert await find_prior_extracted_upload(db_session, uuid.UUID(uid), "HASH2") is None
     assert await find_prior_extracted_upload(db_session, uuid.UUID(uid), "NOPE") is None
+
+
+@pytest.mark.asyncio
+async def test_find_prior_extracted_upload_ignores_structured_uploads(db_session, client):
+    """A structured upload sharing a file_hash must NOT be treated as an unstructured duplicate."""
+    from app.services.ingestion.reextraction import find_prior_extracted_upload
+    from tests.conftest import auth_headers
+    _, uid = await auth_headers(client)
+    structured = UploadedFile(
+        id=uuid.uuid4(), user_id=uuid.UUID(uid), filename="bundle.json", file_hash="HASH3",
+        storage_path="/x", ingestion_status="completed", file_category="structured",
+        record_count=9, mime_type="application/json",
+    )
+    db_session.add(structured)
+    await db_session.commit()
+    assert await find_prior_extracted_upload(db_session, uuid.UUID(uid), "HASH3") is None
