@@ -244,6 +244,46 @@ def _safe_file_path(upload_dir: Path, user_id: UUID, original_filename: str) -> 
     return file_path
 
 
+def _collect_entities(results: list, total_chunks: int) -> tuple[list, int]:
+    """Collect entities from asyncio.gather() results; count failed chunks.
+
+    A chunk is considered failed when it raised an Exception OR when its
+    ExtractionResult carries a non-empty ``error`` field.  Successful entity
+    objects are tagged with ``_source_section`` before being returned.
+
+    Args:
+        results: Raw list returned by ``asyncio.gather(..., return_exceptions=True)``.
+            Each item is either ``(ExtractionResult, section_type)`` or an ``Exception``.
+        total_chunks: Total number of tasks that were submitted (used for logging).
+
+    Returns:
+        A 2-tuple ``(entities, failed_chunks)`` where ``entities`` is a flat list of
+        ``ExtractedEntity`` objects and ``failed_chunks`` is the count of chunks that
+        did not produce usable output.
+    """
+    from app.services.extraction.entity_extractor import ExtractionResult  # local to avoid circular import
+
+    entities: list = []
+    failed = 0
+    for r in results:
+        if isinstance(r, Exception):
+            failed += 1
+            logger.error("Section extraction raised: %s", r)
+            continue
+        extraction_result: ExtractionResult
+        extraction_result, section_type = r
+        if extraction_result.error:
+            failed += 1
+            logger.warning(
+                "Extraction error in section %s: %s", section_type, extraction_result.error
+            )
+            continue
+        for entity in extraction_result.entities:
+            entity.attributes["_source_section"] = section_type
+            entities.append(entity)
+    return entities, failed
+
+
 # --- Endpoints ---
 
 
@@ -674,17 +714,23 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
             tasks = [extract_chunk(chunk, stype) for chunk, stype in extraction_tasks]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for r in results:
-                if isinstance(r, Exception):
-                    logger.error("Section extraction failed: %s", r)
-                    continue
-                extraction_result, section_type = r
-                if extraction_result.error:
-                    logger.warning("Extraction error in section %s: %s", section_type, extraction_result.error)
-                    continue
-                for entity in extraction_result.entities:
-                    entity.attributes["_source_section"] = section_type
-                    all_entities.append(entity)
+            collected, failed_chunks = _collect_entities(results, len(extraction_tasks))
+            all_entities.extend(collected)
+            if failed_chunks:
+                errs = list(upload.ingestion_errors or [])
+                errs.append({
+                    "stage": "entity_extraction",
+                    "failed_chunks": failed_chunks,
+                    "total_chunks": len(extraction_tasks),
+                    "error_type": "ExtractionChunkFailure",
+                })
+                upload.ingestion_errors = errs
+                logger.warning(
+                    "Extraction for %s: %d/%d chunks failed",
+                    upload.id,
+                    failed_chunks,
+                    len(extraction_tasks),
+                )
 
             # Deduplicate entities within the same document (same text + same type)
             seen = set()
