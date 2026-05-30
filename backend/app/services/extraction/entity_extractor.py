@@ -60,7 +60,7 @@ def extract_entities(text: str, source_file: str, api_key: str) -> ExtractionRes
                     model_id=settings.gemini_extraction_model,
                     api_key=api_key,
                     max_char_buffer=2000,
-                    max_workers=1,
+                    max_workers=settings.gemini_concurrency_limit,
                 )
                 break
             except Exception as e:
