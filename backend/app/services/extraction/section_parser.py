@@ -79,6 +79,56 @@ Rules:
 """
 
 
+def resolve_sections(text: str, raw_sections: list[dict]) -> list[ParsedSection]:
+    """Locate each section's anchor in `text` and slice locally (boundaries-only).
+
+    Each raw section is {"type": <str>, "anchor": <verbatim snippet from the doc>}.
+    Anchors are located in document order via forward search; an anchor not found is
+    dropped. Full-coverage invariant: any text before the first anchor becomes a
+    leading OTHER section, and each section runs to the next section's start, so the
+    concatenation of section texts reconstructs `text` exactly. If no anchor resolves,
+    the whole document is returned as a single OTHER section.
+    """
+    located: list[tuple[int, SectionType, str]] = []  # (position, type, anchor)
+    search_from = 0
+    for s in raw_sections:
+        if not isinstance(s, dict):
+            continue
+        anchor = s.get("anchor") or ""
+        if not anchor:
+            continue
+        pos = text.find(anchor, search_from)
+        if pos == -1:
+            pos = text.find(anchor)  # model may have returned slightly out of order
+        if pos == -1:
+            logger.debug("section anchor not found (type=%s); dropping", s.get("type"))
+            continue
+        try:
+            stype = SectionType(s.get("type"))
+        except (ValueError, KeyError):
+            stype = SectionType.OTHER
+        located.append((pos, stype, anchor))
+        search_from = pos + len(anchor)
+
+    if not located:
+        return [ParsedSection(SectionType.OTHER, "Full Document", text, (0, len(text)))]
+
+    located.sort(key=lambda t: t[0])
+    sections: list[ParsedSection] = []
+
+    first_pos = located[0][0]
+    if first_pos > 0:
+        sections.append(
+            ParsedSection(SectionType.OTHER, "Preamble", text[0:first_pos], (0, first_pos))
+        )
+
+    for i, (pos, stype, anchor) in enumerate(located):
+        end = located[i + 1][0] if i + 1 < len(located) else len(text)
+        sections.append(ParsedSection(stype, anchor, text[pos:end], (pos, end)))
+
+    return sections
+
+
 async def parse_sections(text: str, api_key: str) -> ParsedDocument:
     """Parse a clinical document into logical sections using Gemini.
 
