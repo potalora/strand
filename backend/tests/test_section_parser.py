@@ -6,40 +6,12 @@ import pytest
 
 from app.services.extraction.section_parser import (
     ParsedDocument,
-    ParsedSection,
     SectionType,
     parse_sections,
     split_large_section,
 )
 
 MOCK_API_KEY = "test-api-key"
-
-MOCK_LLM_RESPONSE = {
-    "document_type": "clinical_note",
-    "primary_visit_date": "2025-03-15",
-    "provider": "Dr. Smith",
-    "facility": "General Hospital",
-    "sections": [
-        {
-            "type": "history",
-            "title": "History of Present Illness",
-            "text": "Patient is a 55-year-old male presenting with chest pain for 3 days.",
-            "char_range": [0, 72],
-        },
-        {
-            "type": "medications",
-            "title": "Current Medications",
-            "text": "1. Lisinopril 10mg daily\n2. Metformin 500mg BID\n3. Aspirin 81mg daily",
-            "char_range": [73, 142],
-        },
-        {
-            "type": "assessment_plan",
-            "title": "Assessment and Plan",
-            "text": "1. Chest pain - likely musculoskeletal. Order EKG and troponin.\n2. Continue current medications.",
-            "char_range": [143, 237],
-        },
-    ],
-}
 
 CLINICAL_NOTE_TEXT = (
     "History of Present Illness\n"
@@ -50,6 +22,21 @@ CLINICAL_NOTE_TEXT = (
     "1. Chest pain - likely musculoskeletal. Order EKG and troponin.\n"
     "2. Continue current medications."
 )
+
+# Anchor-based contract: the LLM returns only {type, anchor} where each anchor is a
+# verbatim substring of the document marking that section's start. parse_sections then
+# slices the original text locally via resolve_sections.
+MOCK_LLM_RESPONSE = {
+    "document_type": "clinical_note",
+    "primary_visit_date": "2025-03-15",
+    "provider": "Dr. Smith",
+    "facility": "General Hospital",
+    "sections": [
+        {"type": "history", "anchor": "History of Present Illness"},
+        {"type": "medications", "anchor": "Current Medications"},
+        {"type": "assessment_plan", "anchor": "Assessment and Plan"},
+    ],
+}
 
 
 @pytest.mark.asyncio
@@ -87,7 +74,7 @@ async def test_parse_sections_maps_section_types():
 
 @pytest.mark.asyncio
 async def test_parse_sections_preserves_text():
-    """Verify section text is preserved from LLM response."""
+    """Verify section text is sliced locally from the original document with full coverage."""
     with patch(
         "app.services.extraction.section_parser._call_gemini_for_sections",
         new_callable=AsyncMock,
@@ -95,17 +82,24 @@ async def test_parse_sections_preserves_text():
     ):
         result = await parse_sections(CLINICAL_NOTE_TEXT, MOCK_API_KEY)
 
-    assert result.sections[0].text == (
+    # Each section's text is the slice starting at its anchor up to the next anchor.
+    assert result.sections[0].text.startswith("History of Present Illness")
+    assert (
         "Patient is a 55-year-old male presenting with chest pain for 3 days."
+        in result.sections[0].text
     )
     assert "Lisinopril 10mg daily" in result.sections[1].text
+    assert "Order EKG and troponin." in result.sections[2].text
     assert result.sections[0].title == "History of Present Illness"
-    assert result.sections[0].char_range == (0, 72)
+    # Anchor begins the document, so no leading preamble section is inserted.
+    assert result.sections[0].char_range == (0, result.sections[1].char_range[0])
+    # Full-coverage invariant: the slices reconstruct the original document exactly.
+    assert "".join(s.text for s in result.sections) == CLINICAL_NOTE_TEXT
 
 
 @pytest.mark.asyncio
 async def test_parse_sections_unknown_type_falls_back_to_other():
-    """Unknown section types map to SectionType.OTHER."""
+    """Unknown section types map to SectionType.OTHER; the anchor becomes the title."""
     response = {
         "document_type": "clinical_note",
         "primary_visit_date": None,
@@ -114,8 +108,7 @@ async def test_parse_sections_unknown_type_falls_back_to_other():
         "sections": [
             {
                 "type": "nonexistent_section_type",
-                "title": "Unknown Section",
-                "text": "Some content here.",
+                "anchor": "History of Present Illness",
             },
         ],
     }
@@ -126,9 +119,11 @@ async def test_parse_sections_unknown_type_falls_back_to_other():
     ):
         result = await parse_sections(CLINICAL_NOTE_TEXT, MOCK_API_KEY)
 
+    # A single resolved anchor at position 0 yields one OTHER section covering the doc.
     assert len(result.sections) == 1
     assert result.sections[0].section_type == SectionType.OTHER
-    assert result.sections[0].title == "Unknown Section"
+    assert result.sections[0].title == "History of Present Illness"
+    assert result.sections[0].text == CLINICAL_NOTE_TEXT
 
 
 @pytest.mark.asyncio
