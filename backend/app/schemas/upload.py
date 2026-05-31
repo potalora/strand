@@ -33,6 +33,8 @@ class UploadHistoryItem(BaseModel):
     record_count: int
     file_size_bytes: int | None = None
     created_at: str | None = None
+    ingestion_progress: dict = {}
+    ingestion_errors: list[Any] = []
 
 
 class UploadHistoryResponse(BaseModel):

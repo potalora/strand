@@ -62,6 +62,46 @@ interface UploadHistoryItem {
   records_inserted?: number;
   created_at: string;
   file_category?: string;
+  record_count?: number;
+  ingestion_progress?: {
+    records_inserted?: number;
+    records_updated?: number;
+    records_unchanged?: number;
+    records_skipped?: number;
+    duplicate_of?: string;
+    record_count?: number;
+    total_entries?: number;
+  };
+  ingestion_errors?: Array<Record<string, unknown>>;
+}
+
+function statusLabel(status: string): string {
+  if (status === "duplicate_file") return "Duplicate";
+  if (status === "pending_extraction") return "pending";
+  return status;
+}
+
+function recordSummary(u: UploadHistoryItem): string {
+  const p = u.ingestion_progress ?? {};
+  const parts: string[] = [];
+  if (p.records_inserted) parts.push(`${p.records_inserted} new`);
+  if (p.records_updated) parts.push(`${p.records_updated} updated`);
+  if (p.records_unchanged) parts.push(`${p.records_unchanged} unchanged`);
+  if (parts.length) return parts.join(" · ");
+  const n = u.record_count ?? u.records_inserted;
+  return n != null ? String(n) : "--";
+}
+
+function formatUploadError(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    if (e.stage === "entity_extraction") {
+      return `Entity extraction: ${e.failed_chunks} of ${e.total_chunks} sections failed — some records may be incomplete`;
+    }
+    if (typeof e.error === "string") return e.error;
+  }
+  return JSON.stringify(err);
 }
 
 /* ==========================================
@@ -861,7 +901,7 @@ export default function UploadPage() {
                             borderRadius: "4px",
                           }}
                         >
-                          {typeof err === "string" ? err : JSON.stringify(err)}
+                          {formatUploadError(err)}
                         </p>
                       ))}
                     </div>
@@ -1291,6 +1331,11 @@ export default function UploadPage() {
                         >
                           {upload.original_filename}
                         </span>
+                        {upload.ingestion_status === "duplicate_file" && (
+                          <div style={{ fontSize: "0.65rem", color: "var(--theme-ochre)", fontFamily: "var(--font-body)", marginTop: "0.15rem" }}>
+                            Already extracted{upload.ingestion_progress?.record_count != null ? ` · ${upload.ingestion_progress.record_count} records` : ""} (duplicate of an earlier upload)
+                          </div>
+                        )}
                       </RetroTableCell>
                       <RetroTableCell>
                         <span
@@ -1300,7 +1345,7 @@ export default function UploadPage() {
                             color: "var(--theme-text-dim)",
                           }}
                         >
-                          {upload.records_inserted ?? "--"}
+                          {recordSummary(upload)}
                         </span>
                       </RetroTableCell>
                       <RetroTableCell>
@@ -1324,11 +1369,14 @@ export default function UploadPage() {
                                       : upload.ingestion_status ===
                                           "pending_extraction"
                                         ? "var(--theme-ochre)"
-                                        : "var(--theme-text-muted)",
+                                        : upload.ingestion_status ===
+                                            "duplicate_file"
+                                          ? "var(--theme-ochre)"
+                                          : "var(--theme-text-muted)",
                             color: "var(--theme-bg-deep)",
                           }}
                         >
-                          {upload.ingestion_status}
+                          {statusLabel(upload.ingestion_status)}
                         </span>
                       </RetroTableCell>
                       <RetroTableCell>

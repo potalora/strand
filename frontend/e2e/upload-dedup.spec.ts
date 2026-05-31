@@ -2,13 +2,13 @@ import { test, expect } from "@playwright/test";
 import * as fs from "fs";
 import * as path from "path";
 import { ApiClient } from "./helpers/api-client";
-import { PATHS, hasTestData, testEmail, TEST_PASSWORD } from "./helpers/test-data";
+import { PATHS, hasTestData, uniqueEmail, TEST_PASSWORD } from "./helpers/test-data";
 
 test.describe.serial("Cross-upload dedup detection", () => {
   test.setTimeout(180_000);
 
   const api = new ApiClient();
-  const email = testEmail("dedup");
+  const email = uniqueEmail("dedup");
   let upload1Id: string;
   let upload2Id: string;
   let initialRecordCount: number;
@@ -33,7 +33,11 @@ test.describe.serial("Cross-upload dedup detection", () => {
     expect(initialRecordCount).toBeGreaterThan(0);
   });
 
-  test("second upload of same bundle triggers dedup", async () => {
+  test("second upload of same bundle is idempotent (no duplicate records)", async () => {
+    // Phase 1 stable-id idempotency: re-uploading the IDENTICAL bundle inserts no new
+    // records (each resource matches an existing one by source id + content hash), so it
+    // no longer creates duplicates to dedup. This asserts the new, correct behavior —
+    // genuine cross-source dedup is covered by the "Cross-format dedup" describe below.
     const result = await api.uploadStructured(
       PATHS.fhirBundle,
       "sample_fhir_bundle.json"
@@ -41,22 +45,15 @@ test.describe.serial("Cross-upload dedup detection", () => {
     upload2Id = result.upload_id;
     expect(upload2Id).toBeTruthy();
 
-    // Wait for dedup to finish (exclude dedup_scanning from terminal statuses)
-    await api.pollUploadStatus(upload2Id, 120_000, ["dedup_scanning"]);
+    // Identical content → zero new inserts.
+    expect(result.records_inserted).toBe(0);
 
-    const review = await api.getUploadReview(upload2Id);
-    expect(review).toBeTruthy();
-    expect(review.upload).toBeTruthy();
+    await api.pollUploadStatus(upload2Id, 120_000);
 
-    const autoMerged = review.auto_merged?.length ?? 0;
-    const needsReviewCount = Object.values(review.needs_review ?? {}).reduce(
-      (sum: number, arr: unknown) => sum + (arr as unknown[]).length,
-      0
-    );
-    const totalCandidates = autoMerged + needsReviewCount;
-
-    // At least some duplicates should be detected from uploading the same bundle
-    expect(totalCandidates).toBeGreaterThan(0);
+    // Total record count is unchanged — the re-upload created no duplicate records.
+    const records = await api.getRecords();
+    const finalCount = records.total ?? records.items?.length ?? 0;
+    expect(finalCount).toBe(initialRecordCount);
   });
 
   test("total record count did not double", async () => {
@@ -113,7 +110,7 @@ test.describe("Cross-format dedup", () => {
     );
 
     const api = new ApiClient();
-    const email = testEmail("dedup-cross");
+    const email = uniqueEmail("dedup-cross");
     await api.register(email, TEST_PASSWORD);
     await api.login(email, TEST_PASSWORD);
 

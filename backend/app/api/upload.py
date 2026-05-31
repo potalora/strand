@@ -628,6 +628,8 @@ async def get_upload_history(
             "record_count": u.record_count,
             "file_size_bytes": u.file_size_bytes,
             "created_at": u.created_at.isoformat() if u.created_at else None,
+            "ingestion_progress": u.ingestion_progress or {},
+            "ingestion_errors": u.ingestion_errors or [],
         })
 
     return UploadHistoryResponse(items=items, total=len(items))

@@ -40,6 +40,13 @@ export interface IngestionStatus {
     total_files?: number;
     records_ingested?: number;
     records_failed?: number;
+    records_inserted?: number;
+    records_updated?: number;
+    records_unchanged?: number;
+    records_skipped?: number;
+    duplicate_of?: string;
+    record_count?: number;
+    total_entries?: number;
   };
   ingestion_errors: Array<{
     file?: string;

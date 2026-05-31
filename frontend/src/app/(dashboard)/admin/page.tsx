@@ -317,11 +317,17 @@ function ExtractionsTab() {
                             ? "var(--theme-amber)"
                             : status === "failed"
                               ? "var(--theme-terracotta)"
-                              : "var(--theme-ochre)",
+                              : status === "duplicate_file"
+                                ? "var(--theme-ochre)"
+                                : "var(--theme-ochre)",
                         color: "var(--theme-bg-deep)",
                       }}
                     >
-                      {status === "pending_extraction" ? "pending" : status}
+                      {status === "duplicate_file"
+                        ? "Duplicate"
+                        : status === "pending_extraction"
+                          ? "pending"
+                          : status}
                     </span>
                   </RetroTableCell>
                   <RetroTableCell>

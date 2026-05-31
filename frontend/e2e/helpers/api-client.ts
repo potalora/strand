@@ -118,6 +118,7 @@ export class ApiClient {
       "awaiting_confirmation",
       "awaiting_review",
       "dedup_scanning",
+      "duplicate_file", // idempotent re-upload of identical content (Phase 2a)
     ].filter((s) => !excludeTerminal.includes(s));
 
     while (Date.now() - start < timeoutMs) {
