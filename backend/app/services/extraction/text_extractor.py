@@ -4,6 +4,7 @@ import logging
 from enum import Enum
 from pathlib import Path
 
+import pdfplumber
 from google import genai
 from google.genai import types
 from PIL import Image
@@ -28,6 +29,42 @@ SUPPORTED_EXTENSIONS = {
     ".tiff": FileType.TIFF,
 }
 
+LOCAL_TEXT_MIN_CHARS_PER_PAGE = 50
+
+
+def _render_tables(tables: list | None) -> str:
+    """Render pdfplumber extract_tables() output as pipe-delimited rows."""
+    if not tables:
+        return ""
+    lines: list[str] = []
+    for table in tables:
+        for row in table:
+            lines.append(" | ".join((cell or "") for cell in row))
+    return "\n".join(lines)
+
+
+def extract_text_from_pdf_local(file_path: Path) -> tuple[str, float]:
+    """Extract text + tables from a PDF's embedded text layer via pdfplumber.
+
+    Returns (text, confidence) where confidence is average characters per page.
+    A scanned/image-only PDF yields ~0 confidence because it has no text layer.
+    """
+    page_texts: list[str] = []
+    total_chars = 0
+    with pdfplumber.open(file_path) as pdf:
+        page_count = len(pdf.pages) or 1
+        for page in pdf.pages:
+            parts = [page.extract_text() or ""]
+            table_text = _render_tables(page.extract_tables())
+            if table_text:
+                parts.append(table_text)
+            page_text = "\n".join(p for p in parts if p)
+            total_chars += len(page_text)
+            page_texts.append(page_text)
+    text = "\n\n".join(page_texts)
+    confidence = total_chars / page_count
+    return text, confidence
+
 
 def detect_file_type(file_path: Path) -> FileType:
     """Detect unstructured file type by extension."""
@@ -41,7 +78,7 @@ def extract_text_from_rtf(file_path: Path) -> str:
     return rtf_to_text(raw)
 
 
-async def extract_text_from_pdf(file_path: Path, api_key: str) -> str:
+async def _extract_text_from_pdf_gemini(file_path: Path, api_key: str) -> str:
     """Extract text from PDF by sending bytes to Gemini 3 Flash."""
     client = genai.Client(api_key=api_key)
     with open(file_path, "rb") as f:
@@ -55,6 +92,23 @@ async def extract_text_from_pdf(file_path: Path, api_key: str) -> str:
         ],
     )
     return response.text or ""
+
+
+async def extract_text_from_pdf(file_path: Path, api_key: str) -> str:
+    """Local-first PDF text extraction; fall back to Gemini vision when untrustworthy."""
+    try:
+        text, confidence = extract_text_from_pdf_local(file_path)
+        if confidence >= LOCAL_TEXT_MIN_CHARS_PER_PAGE and text.strip():
+            logger.info("PDF %s: used local text layer (%.0f chars/page)", file_path.name, confidence)
+            return text
+        logger.info(
+            "PDF %s: low local confidence (%.0f chars/page) — using Gemini vision",
+            file_path.name,
+            confidence,
+        )
+    except Exception:
+        logger.exception("Local PDF extraction failed for %s — using Gemini vision", file_path.name)
+    return await _extract_text_from_pdf_gemini(file_path, api_key)
 
 
 async def extract_text_from_tiff(file_path: Path, api_key: str) -> str:

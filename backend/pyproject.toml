@@ -27,6 +27,7 @@ dependencies = [
     "langextract>=1.0.7",
     "striprtf>=0.0.28",
     "Pillow>=11.0.0",
+    "pdfplumber>=0.11",
     "python-fhir-converter>=0.3.0",
 ]
 
