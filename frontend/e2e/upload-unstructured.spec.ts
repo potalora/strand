@@ -7,12 +7,10 @@ import {
   PATHS,
   hasTestData,
   getRtfFiles,
-  testEmail,
+  uniqueEmail,
   TEST_PASSWORD,
   TEST_DATA_DIR,
 } from "./helpers/test-data";
-
-const EMAIL = testEmail("unstructured");
 
 /**
  * Find a PDF file in test_data directories for PDF upload test.
@@ -62,11 +60,16 @@ function mimeForExt(filePath: string): string {
 
 test.describe("Unstructured Upload", () => {
   let api: ApiClient;
+  let email: string;
 
-  test.beforeAll(async () => {
+  // Fresh user per test: the backend now skips re-ingesting identical file content
+  // for the same user (duplicate_file). A unique user per test ensures each upload is
+  // genuinely extracted rather than detected as a duplicate of an earlier test/run.
+  test.beforeEach(async () => {
     api = new ApiClient();
-    await api.register(EMAIL, TEST_PASSWORD);
-    await api.login(EMAIL, TEST_PASSWORD);
+    email = uniqueEmail("unstructured");
+    await api.register(email, TEST_PASSWORD);
+    await api.login(email, TEST_PASSWORD);
   });
 
   test("upload single RTF via API", async () => {
@@ -102,7 +105,7 @@ test.describe("Unstructured Upload", () => {
     test.setTimeout(300_000);
 
     // Login via UI (with rate-limit retry)
-    await browserLogin(page, EMAIL, TEST_PASSWORD);
+    await browserLogin(page, email, TEST_PASSWORD);
 
     // Navigate to upload page
     await page.goto("/upload");
