@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import base64
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from uuid import UUID, uuid4
 
 from app.services.extraction.entity_extractor import ExtractedEntity
+from app.services.ingestion.content_hash import content_hash
 from app.utils.date_utils import parse_datetime
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ def entity_to_health_record_dict(
         "record_type": record_type,
         "fhir_resource_type": fhir_resource_type,
         "fhir_resource": fhir_resource,
+        "content_hash": content_hash(fhir_resource),
         "source_format": "ai_extracted",
         "source_file_id": source_file_id,
         "effective_date": effective_date,

@@ -719,6 +719,11 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
             patient = patient_result.scalar_one_or_none()
 
             if patient:
+                from app.services.ingestion.reextraction import soft_delete_prior_extracted
+                replaced = await soft_delete_prior_extracted(db, upload_id)
+                if replaced:
+                    logger.info("Re-extraction replaced %d prior records for %s", replaced, upload_id)
+
                 encounter_id = None
                 created_records = []
 
@@ -841,6 +846,9 @@ async def upload_unstructured(
 
     file_hash = hashlib.sha256(content).hexdigest()
 
+    from app.services.ingestion.reextraction import find_prior_extracted_upload
+    prior = await find_prior_extracted_upload(db, user_id, file_hash)
+
     upload_record = UploadedFile(
         id=uuid4(),
         user_id=user_id,
@@ -849,9 +857,14 @@ async def upload_unstructured(
         file_size_bytes=len(content),
         file_hash=file_hash,
         storage_path=str(file_path),
-        ingestion_status="pending_extraction",
+        ingestion_status="duplicate_file" if prior else "pending_extraction",
         file_category="unstructured",
     )
+    if prior:
+        upload_record.ingestion_progress = {
+            "duplicate_of": str(prior.id),
+            "record_count": prior.record_count or 0,
+        }
     db.add(upload_record)
     await db.commit()
     await db.refresh(upload_record)
@@ -865,14 +878,14 @@ async def upload_unstructured(
         details={"filename": file.filename, "file_type": ext},
     )
 
-    # Worker will pick up the file automatically via DB polling
+    # Worker will pick up the file automatically via DB polling (duplicate_file rows are skipped)
 
     from app.services.extraction.text_extractor import detect_file_type
     file_type = detect_file_type(file_path)
 
     return UnstructuredUploadResponse(
         upload_id=str(upload_record.id),
-        status="pending_extraction",
+        status=upload_record.ingestion_status,
         file_type=file_type.value,
     )
 
@@ -889,6 +902,7 @@ async def upload_unstructured_batch(
 ) -> BatchUploadResponse:
     """Upload multiple unstructured files for concurrent processing."""
     from app.services.extraction.text_extractor import detect_file_type
+    from app.services.ingestion.reextraction import find_prior_extracted_upload
 
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -914,6 +928,7 @@ async def upload_unstructured_batch(
             f.write(content)
 
         file_hash = hashlib.sha256(content).hexdigest()
+        prior = await find_prior_extracted_upload(db, user_id, file_hash)
 
         upload_record = UploadedFile(
             id=uuid4(),
@@ -923,9 +938,14 @@ async def upload_unstructured_batch(
             file_size_bytes=len(content),
             file_hash=file_hash,
             storage_path=str(file_path),
-            ingestion_status="pending_extraction",
+            ingestion_status="duplicate_file" if prior else "pending_extraction",
             file_category="unstructured",
         )
+        if prior:
+            upload_record.ingestion_progress = {
+                "duplicate_of": str(prior.id),
+                "record_count": prior.record_count or 0,
+            }
         db.add(upload_record)
         await db.flush()
 
@@ -941,13 +961,13 @@ async def upload_unstructured_batch(
         file_type = detect_file_type(file_path)
         results.append(UnstructuredUploadResponse(
             upload_id=str(upload_record.id),
-            status="pending_extraction",
+            status=upload_record.ingestion_status,
             file_type=file_type.value,
         ))
 
     await db.commit()
 
-    # Worker will pick up files automatically via DB polling
+    # Worker will pick up files automatically via DB polling (duplicate_file rows are skipped)
 
     return BatchUploadResponse(uploads=results, total=len(results))
 
@@ -1021,6 +1041,11 @@ async def confirm_extraction(
 
     patient_uuid = UUID(body.patient_id)
     created_count = 0
+
+    from app.services.ingestion.reextraction import soft_delete_prior_extracted
+    replaced = await soft_delete_prior_extracted(db, upload_id)
+    if replaced:
+        logger.info("Manual re-confirm replaced %d prior records for %s", replaced, upload_id)
 
     for entity_data in body.confirmed_entities:
         entity = ExtractedEntity(
