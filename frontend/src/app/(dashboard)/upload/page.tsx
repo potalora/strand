@@ -57,7 +57,7 @@ function formatFileSize(bytes: number): string {
 
 interface UploadHistoryItem {
   id: string;
-  original_filename: string;
+  filename: string;
   ingestion_status: string;
   records_inserted?: number;
   created_at: string;
@@ -201,6 +201,10 @@ export default function UploadPage() {
             clearInterval(progressPollRef.current);
             progressPollRef.current = null;
           }
+          // Extraction finished — refresh upload history so rows show their
+          // final status/record counts instead of the stale pending snapshot
+          // captured right after upload.
+          setHistoryLoaded(false);
         }
       } catch {
         /* continue polling */
@@ -436,9 +440,13 @@ export default function UploadPage() {
   const progressPercent = extractionProgress && extractionProgress.total > 0
     ? Math.round(((extractionProgress.completed + extractionProgress.failed) / extractionProgress.total) * 100)
     : 0;
-  const showProgress = extractionProgress && extractionProgress.total > 0 && (
-    extractionProgress.processing > 0 || extractionTriggered
-  );
+  // Show the progress card whenever we have extraction data with files, and
+  // keep it visible through completion (processing 0 → "Extraction complete")
+  // until the user dismisses it (Dismiss nulls extractionProgress). Gating on
+  // `processing > 0` alone made the card vanish on completion for directly
+  // uploaded files, so the "Extraction complete · N records created" summary
+  // was never shown.
+  const showProgress = !!extractionProgress && extractionProgress.total > 0;
   const allDone = extractionProgress && extractionProgress.processing === 0 && extractionProgress.total > 0;
 
   // --- Render ---
@@ -514,7 +522,14 @@ export default function UploadPage() {
                 const input = document.querySelector(
                   'input[type="file"]:not([webkitdirectory])'
                 ) as HTMLInputElement | null;
-                input?.click();
+                if (input) {
+                  // Reset value so re-selecting the SAME file still fires a
+                  // change event (browsers suppress it when the value is
+                  // unchanged) — otherwise re-picking a just-uploaded file is
+                  // a silent no-op with no preview.
+                  input.value = "";
+                  input.click();
+                }
               }}
             >
               <FileText size={14} style={{ marginRight: "0.5rem" }} />
@@ -843,15 +858,18 @@ export default function UploadPage() {
                       inserted
                     </span>
                   ) : (
+                    // Upload accepted; live extraction status is shown in the
+                    // dedicated progress card below (this label is static, so
+                    // don't imply ongoing progress here).
                     <span
                       style={{
                         fontSize: "0.7rem",
                         fontWeight: 600,
-                        color: "var(--theme-amber)",
+                        color: "var(--theme-sage)",
                         fontFamily: "var(--font-body)",
                       }}
                     >
-                      Extracting...
+                      Uploaded
                     </span>
                   )}
                 </div>
@@ -1329,7 +1347,7 @@ export default function UploadPage() {
                             display: "inline-block",
                           }}
                         >
-                          {upload.original_filename}
+                          {upload.filename}
                         </span>
                         {upload.ingestion_status === "duplicate_file" && (
                           <div style={{ fontSize: "0.65rem", color: "var(--theme-ochre)", fontFamily: "var(--font-body)", marginTop: "0.15rem" }}>
