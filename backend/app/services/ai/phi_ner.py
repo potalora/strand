@@ -53,7 +53,12 @@ CLINICAL_SUFFIXES: tuple[str, ...] = (
     "osis", "iasis", "algia", "ostosis", "plegia", "trophy",
 )
 
-_REDACTION = "[NAME]"
+_NAME = "[NAME]"
+
+# NOTE on locations: the general-purpose model mislabels DRUG names as GPE/ORG
+# (e.g. "Rifaximin" -> GPE), so redacting GPE/LOC/FAC here destroys clinical
+# content. Street addresses are handled by a regex in phi_scrubber instead;
+# safely redacting cities/facilities would need a clinical-aware NER model.
 
 _nlp = None
 _load_failed = False
@@ -97,18 +102,26 @@ def _is_name_token(token) -> bool:
     return True
 
 
-def redact_person_names(text: str) -> tuple[str, int]:
+def redact_named_entities(text: str) -> tuple[str, dict[str, int]]:
     """Redact free-text PERSON names, preserving clinical content.
 
-    Returns (redacted_text, number_of_redacted_spans). Returns the input
-    unchanged when there is nothing to redact or the model is unavailable.
+    Token-level: only proper-noun / Title-Case name tokens inside a PERSON span
+    are redacted to ``[NAME]``, so verbs spaCy swallows into a span ("Pedro
+    Otalora prescribed") survive, and clinical eponyms/specialties are protected.
+
+    Locations are intentionally NOT redacted here — the general model mislabels
+    drugs as GPE (see module note). Street addresses are handled by a regex in
+    phi_scrubber.
+
+    Returns ``(redacted_text, {"names": n})``; the input unchanged with an empty
+    report when nothing matches or the model is unavailable.
     """
     if not text or not text.strip():
-        return text, 0
+        return text, {}
 
     nlp = _get_nlp()
     if nlp is None:
-        return text, 0
+        return text, {}
 
     doc = nlp(text)
 
@@ -122,7 +135,7 @@ def redact_person_names(text: str) -> tuple[str, int]:
                 spans.append((token.idx, token.idx + len(token.text)))
 
     if not spans:
-        return text, 0
+        return text, {}
 
     # Merge spans separated only by whitespace so "Pedro Otalora" -> one [NAME].
     spans.sort()
@@ -133,9 +146,8 @@ def redact_person_names(text: str) -> tuple[str, int]:
         else:
             merged.append((start, end))
 
-    # Replace right-to-left to keep earlier offsets valid.
     redacted = text
     for start, end in reversed(merged):
-        redacted = redacted[:start] + _REDACTION + redacted[end:]
+        redacted = redacted[:start] + _NAME + redacted[end:]
 
-    return redacted, len(merged)
+    return redacted, {"names": len(merged)}

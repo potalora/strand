@@ -19,11 +19,30 @@ PATTERNS = {
     "ip_address": (re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"), "[IP]"),
     "url": (re.compile(r"https?://[^\s<>\"]+"), "[URL]"),
     "zip_code": (re.compile(r"\b\d{5}(?:-\d{4})?\b"), "[ZIP]"),
+    # Street addresses: <number> <name words> <street-type> [direction] [unit].
+    # spaCy fragments these (e.g. "275 Post Rd E" -> CARDINAL + PERSON), so a
+    # regex is more reliable than NER for the street line. Requires a street-type
+    # keyword after a leading number, keeping false positives on clinical text low.
+    "street_address": (
+        re.compile(
+            r"\b\d{1,6}\s+(?:[A-Za-z0-9'.\-]+\s+){0,4}"
+            r"(?:Street|St|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Drive|Dr|"
+            r"Court|Ct|Place|Pl|Way|Circle|Cir|Terrace|Ter|Parkway|Pkwy|"
+            r"Highway|Hwy|Square|Sq|Trail|Trl)\b\.?"
+            r"(?:\s+[NSEW]{1,2}\b)?"
+            r"(?:\s*,?\s*(?:Ste|Suite|Unit|Apt|Apartment|Fl|Floor|Rm|Room|Bldg|Building)"
+            r"\.?\s*#?\s*[\w\-]+)*",
+            re.IGNORECASE,
+        ),
+        "[LOCATION]",
+    ),
     # Slash dates (MM/DD/YYYY) are generalized to MM/YYYY below (not a fixed
     # token), so they are handled separately from these replacement patterns.
     "account": (
         re.compile(
-            r"\b(?:account|acct|accession)\s*(?:no\.?|number|num|#|id)?[:\s#]*\d+\b",
+            # The trailing [:\s#*]* tolerates markdown the OCR sometimes emits
+            # ("**Account No:** 235410324") between the label and the number.
+            r"\b(?:account|acct|accession)\s*(?:no\.?|number|num|#|id)?[:\s#*]*\d+\b",
             re.IGNORECASE,
         ),
         "[ACCOUNT]",
@@ -151,13 +170,15 @@ def scrub_phi(
 
     # NER pass: redact free-text person names the patterns/known-identifier
     # passes can't catch (providers, family members). Runs last, after known
-    # patient names are already replaced. Fails open if the model is missing.
+    # patient names are replaced. Fails open if the model is missing. (Street
+    # addresses are handled by the regex above; location NER is unsafe with the
+    # general model — it mislabels drugs as places.)
     use_ner = settings.phi_ner_enabled if enable_ner is None else enable_ner
     if use_ner:
-        from app.services.ai.phi_ner import redact_person_names
+        from app.services.ai.phi_ner import redact_named_entities
 
-        scrubbed, ner_count = redact_person_names(scrubbed)
-        if ner_count:
-            report["ner_names_scrubbed"] = ner_count
+        scrubbed, ner_report = redact_named_entities(scrubbed)
+        if ner_report.get("names"):
+            report["ner_names_scrubbed"] = ner_report["names"]
 
     return scrubbed, report

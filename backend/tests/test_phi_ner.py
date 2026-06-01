@@ -80,30 +80,42 @@ EVAL_CASES = [
     ids=[c[0] for c in EVAL_CASES],
 )
 def test_person_name_redaction(case_id, text, redact, survive):
-    from app.services.ai.phi_ner import redact_person_names
+    from app.services.ai.phi_ner import redact_named_entities
 
-    redacted, count = redact_person_names(text)
+    redacted, report = redact_named_entities(text)
 
     for name in redact:
         assert name not in redacted, f"[{case_id}] name {name!r} not redacted: {redacted!r}"
     for term in survive:
         assert term in redacted, f"[{case_id}] clinical term {term!r} was destroyed: {redacted!r}"
     if redact:
-        assert count >= 1
+        assert report.get("names", 0) >= 1
 
 
 def test_redaction_token_is_generic():
-    from app.services.ai.phi_ner import redact_person_names
+    from app.services.ai.phi_ner import redact_named_entities
 
-    redacted, _ = redact_person_names("Seen by Dr. Jennifer Lee today.")
+    redacted, _ = redact_named_entities("Seen by Dr. Jennifer Lee today.")
     assert "Jennifer" not in redacted
     assert "[NAME]" in redacted
 
 
 def test_empty_and_nameless_text_unchanged():
-    from app.services.ai.phi_ner import redact_person_names
+    from app.services.ai.phi_ner import redact_named_entities
 
-    assert redact_person_names("")[0] == ""
-    out, count = redact_person_names("Metformin 500mg twice daily.")
+    assert redact_named_entities("")[0] == ""
+    out, report = redact_named_entities("Metformin 500mg twice daily.")
     assert out == "Metformin 500mg twice daily."
-    assert count == 0
+    assert report == {}
+
+
+def test_drug_names_are_not_redacted_as_locations():
+    """Regression: the general NER model mislabels drugs as GPE (e.g. 'Rifaximin'
+    -> GPE). Location redaction is therefore disabled here — drug names must
+    survive the NER pass."""
+    from app.services.ai.phi_ner import redact_named_entities
+
+    redacted, report = redact_named_entities("Please try Rifaximin and Metformin.")
+    assert "Rifaximin" in redacted
+    assert "Metformin" in redacted
+    assert report.get("locations", 0) == 0

@@ -355,7 +355,12 @@ def test_phi_scrubber_redacts_account_and_accession_numbers():
     """Account and lab-accession numbers (e.g. 'Account No: 235410324',
     'Lab Accession: 87414853') are identifiers and must be redacted."""
     from app.services.ai.phi_scrubber import scrub_phi
-    text = "Account No: 235410324\nLab Accession: 87414853\nAcct #998877"
+    # Plain, markdown-bold (as OCR sometimes emits), and shorthand variants.
+    text = (
+        "Account No: 235410324\n"
+        "**Lab Accession:** 87414853\n"
+        "Acct #998877"
+    )
     scrubbed, _ = scrub_phi(text, enable_ner=False)
     assert "235410324" not in scrubbed
     assert "87414853" not in scrubbed
@@ -372,6 +377,28 @@ def test_phi_scrubber_preserves_clinical_numbers():
     assert "0.00 - 1.55" in scrubbed
     assert "96% - 100%" in scrubbed
     assert "IBS-D" in scrubbed
+
+
+def test_phi_scrubber_redacts_street_address():
+    """Street addresses (incl. suite/unit continuation) are geographic PHI.
+    (enable_ner=False isolates the regex layer.)"""
+    from app.services.ai.phi_scrubber import scrub_phi
+    text = "Address: 275 Post Rd E, Ste. 10, Unit 310; also 1234 Elm Street, Apt 5B"
+    scrubbed, _ = scrub_phi(text, enable_ner=False)
+    assert "275 Post Rd" not in scrubbed
+    assert "1234 Elm Street" not in scrubbed
+    assert "[LOCATION]" in scrubbed
+
+
+def test_phi_scrubber_street_regex_preserves_clinical_text():
+    """The street-address regex must not eat dosing / vitals / lab lines."""
+    from app.services.ai.phi_scrubber import scrub_phi
+    text = "Take 2 tablets by mouth daily; 5 mg PO; BP 120/80; 3 episodes per week"
+    scrubbed, _ = scrub_phi(text, enable_ner=False)
+    assert "2 tablets" in scrubbed
+    assert "5 mg" in scrubbed
+    assert "120/80" in scrubbed
+    assert "3 episodes" in scrubbed
 
 
 # ===========================================================================
