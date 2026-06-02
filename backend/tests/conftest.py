@@ -24,6 +24,25 @@ import app.models  # noqa: F401
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
+
+# Slow/fidelity tests drive real Gemini calls over real data and legitimately
+# take minutes (e.g. the section-parsing wall-clock test runs the full pipeline
+# and asserts <450s itself). The fast-suite ``timeout = 120`` would falsely kill
+# them, so they get a generous BUT BOUNDED override — enough headroom for real
+# API latency, while still backstopping a genuine hang (a frozen await never
+# returns; the internal perf assertions can't fire until it does).
+_SLOW_TEST_TIMEOUT_S = 900
+
+
+def pytest_collection_modifyitems(config, items):
+    """Give slow/fidelity tests a generous bounded timeout instead of the 120s
+    fast-suite default. Never disable the timeout entirely (timeout=0) — that
+    reintroduces the infinite-hang failure mode this whole change exists to
+    prevent."""
+    for item in items:
+        if item.get_closest_marker("slow") or item.get_closest_marker("fidelity"):
+            item.add_marker(pytest.mark.timeout(_SLOW_TEST_TIMEOUT_S))
+
 # Use a dedicated test database to avoid destroying production data.
 # Derive from the production URL by appending "_test" to the database name.
 _prod_url = settings.database_url
@@ -110,6 +129,37 @@ def clear_rate_limiters():
     yield
     login_limiter._requests.clear()
     register_limiter._requests.clear()
+
+
+@pytest.fixture(autouse=True)
+def reset_extraction_worker():
+    """Stop the DB-polling extraction worker from leaking across tests.
+
+    ``upload._worker_task`` is a module global. A worker started in one test is
+    bound to that test's event loop; once pytest-asyncio closes that loop the
+    task is dead but still referenced, so the *next* test's
+    ``start_extraction_worker`` sees a "not done" task and refuses to spawn a
+    fresh one. Extraction then never runs and any test that waits on it hangs
+    forever (the whole-suite hang). Nulling the global before each test — and
+    clearing the per-loop semaphore caches — guarantees each test gets a worker
+    bound to its own loop.
+    """
+    import app.api.upload as upload_module
+
+    def _reset() -> None:
+        task = getattr(upload_module, "_worker_task", None)
+        if task is not None:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        upload_module._worker_task = None
+        upload_module._extraction_semaphores.clear()
+        upload_module._gemini_semaphores.clear()
+
+    _reset()
+    yield
+    _reset()
 
 
 # ---------------------------------------------------------------------------
