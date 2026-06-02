@@ -1,64 +1,34 @@
 # MedTimeline
 
-Local-first personal health records app. Ingests structured clinical data (FHIR, Epic EHI, CDA XML) and unstructured documents (PDF, RTF, TIFF), normalizes everything into FHIR R4 in PostgreSQL, and displays it on a timeline. AI features are optional — works fine without an API key.
+Your medical records come scattered across formats and portals: a FHIR bundle from one system, an Epic EHI export from another, a CDA document from the hospital, a scanned PDF from the specialist who still faxes. MedTimeline ingests all of it, normalizes everything to FHIR R4 in a local PostgreSQL database, and lays it out on one timeline.
+
+It's local-first: your data stays on your machine. AI summaries are optional — prompt-only mode sends nothing anywhere, and live mode de-identifies every record before it reaches the API.
 
 ## How data flows
 
 ```mermaid
 flowchart LR
-    subgraph Upload
-        JSON[".json"]
-        ZIP[".zip"]
-        XML[".xml"]
-        PDF[".pdf / .rtf / .tiff"]
-    end
-
-    subgraph Parse
-        FHIR["FHIR R4 parser<br/><small>18 resource types</small>"]
-        EPIC["Epic EHI parser<br/><small>14 TSV mappers</small>"]
-        XDM["IHE XDM parser<br/><small>METADATA.XML → CDA → FHIR</small>"]
-        CDA["CDA parser<br/><small>python-fhir-converter</small>"]
-        TXT["Text extraction<br/><small>Gemini vision</small>"]
-        ENT["Entity extraction<br/><small>LangExtract · 7 types</small>"]
-        PHI["PHI scrubber<br/><small>18 HIPAA identifiers</small>"]
-    end
-
-    subgraph Store
-        DB[("health_records<br/><small>FHIR R4 JSONB<br/>AES-256 at rest<br/>dedup engine<br/>audit log</small>")]
-    end
-
-    JSON --> FHIR --> DB
-    ZIP -->|extract| EPIC --> DB
-    ZIP -->|"METADATA.XML<br/>detected"| XDM -->|"cross-doc<br/>dedup"| DB
-    XML --> CDA --> DB
-    PDF --> TXT --> PHI --> ENT --> DB
+    U["Upload<br/><small>FHIR · Epic EHI · CDA · PDF</small>"]
+    P["Normalize<br/><small>parse → FHIR R4, scrub PHI</small>"]
+    S["Store<br/><small>encrypted Postgres, deduped</small>"]
+    V["Explore<br/><small>timeline · summaries</small>"]
+    U --> P --> S --> V
 ```
+
+The formats and parsers behind that "Normalize" step are in [Ingestion formats](#ingestion-formats) below.
 
 ## Dedup pipeline
 
-Every upload triggers a two-tier dedup scan against existing records.
+Records overlap. The same hypertension diagnosis shows up in an Epic export and again in a CDA document with slightly different wording. So every upload runs a two-tier dedup scan against what's already stored: a cheap heuristic scorer first, then a Gemini judge only for the ambiguous middle.
 
 ```mermaid
 flowchart TD
-    NEW["New records from upload"] --> BUCKET["Bucket by<br/>(record_type, code_value)"]
-
-    BUCKET --> HEUR["Heuristic scorer"]
-
-    HEUR -->|"score ≥ 0.95"| AUTO_MERGE["Auto-merge<br/><small>mark secondary as duplicate</small>"]
-    HEUR -->|"0.50 — 0.94"| LLM["Gemini LLM judge"]
-    HEUR -->|"score < 0.50"| SKIP["No match"]
-
-    LLM -->|"duplicate<br/>confidence ≥ 0.8"| AUTO_MERGE
-    LLM -->|"distinct<br/>confidence ≥ 0.8"| AUTO_DISMISS["Auto-dismiss"]
-    LLM -->|"update / related"| PENDING["Pending review"]
-
-    PENDING --> USER["User resolves in Admin Console<br/><small>merge · dismiss · field cherry-pick · undo</small>"]
-
-    style AUTO_MERGE fill:#2d6a4f,color:#fff
-    style AUTO_DISMISS fill:#6c757d,color:#fff
-    style SKIP fill:#6c757d,color:#fff
-    style LLM fill:#4a7a6a,color:#fff
-    style HEUR fill:#4a7a6a,color:#fff
+    N["New records"] --> H{"Heuristic<br/>score"}
+    H -->|high| M["Merge automatically"]
+    H -->|borderline| J{"Gemini<br/>judge"}
+    H -->|low| K["Keep both"]
+    J -->|confident| M
+    J -->|unsure| R["You decide in Admin<br/><small>merge · dismiss · cherry-pick · undo</small>"]
 ```
 
 **Heuristic scoring weights:**
@@ -71,6 +41,8 @@ flowchart TD
 | `status` match | 0.10 |
 | Cross-source bonus | 0.10 |
 | `source_section` match | 0.15 |
+
+Score ≥ 0.95 merges automatically; 0.50–0.94 goes to the Gemini judge (which auto-resolves at ≥ 0.8 confidence); below 0.50 is left alone.
 
 ## Ingestion formats
 
@@ -85,58 +57,21 @@ flowchart TD
 <details>
 <summary>Epic EHI table mappers (14)</summary>
 
-```mermaid
-flowchart LR
-    subgraph Epic TSV Tables
-        PL[PROBLEM_LIST]
-        PLA[PROBLEM_LIST_ALL]
-        MH[MEDICAL_HX]
-        OM[ORDER_MED]
-        OR[ORDER_RESULTS]
-        PE[PAT_ENC]
-        DI[DOC_INFORMATION]
-        AL[ALLERGY]
-        IM[IMMUNE]
-        OP[ORDER_PROC]
-        VI[IP_FLWSHT_MEAS]
-        RF[REFERRAL]
-        PD[PAT_ENC_DX]
-        SH[SOCIAL_HX]
-        FH[FAMILY_HX]
-    end
-
-    subgraph FHIR Resources
-        Cond[Condition]
-        MedReq[MedicationRequest]
-        Obs[Observation]
-        Enc[Encounter]
-        DocRef[DocumentReference]
-        Allergy[AllergyIntolerance]
-        Immun[Immunization]
-        Proc[Procedure]
-        Vital["Observation<br/><small>(vital-signs)</small>"]
-        SvcReq[ServiceRequest]
-        EncDx["Condition<br/><small>(encounter-dx)</small>"]
-        Social["Observation<br/><small>(social-history)</small>"]
-        FamHx[FamilyMemberHistory]
-    end
-
-    PL --> Cond
-    PLA --> Cond
-    MH --> Cond
-    OM --> MedReq
-    OR --> Obs
-    PE --> Enc
-    DI --> DocRef
-    AL --> Allergy
-    IM --> Immun
-    OP --> Proc
-    VI --> Vital
-    RF --> SvcReq
-    PD --> EncDx
-    SH --> Social
-    FH --> FamHx
-```
+| Epic TSV table(s) | FHIR resource |
+|-------------------|---------------|
+| PROBLEM_LIST, PROBLEM_LIST_ALL, MEDICAL_HX | Condition |
+| PAT_ENC_DX | Condition (encounter diagnosis) |
+| ORDER_MED | MedicationRequest |
+| ORDER_RESULTS | Observation |
+| IP_FLWSHT_MEAS | Observation (vital signs) |
+| SOCIAL_HX | Observation (social history) |
+| PAT_ENC | Encounter |
+| DOC_INFORMATION | DocumentReference |
+| ALLERGY | AllergyIntolerance |
+| IMMUNE | Immunization |
+| ORDER_PROC | Procedure |
+| REFERRAL | ServiceRequest |
+| FAMILY_HX | FamilyMemberHistory |
 
 </details>
 
@@ -149,30 +84,19 @@ Condition, Observation, MedicationRequest, MedicationStatement, AllergyIntoleran
 
 ## AI modes
 
+MedTimeline organizes records and produces summaries. It never diagnoses, recommends treatment, or gives medical advice — and either way, records are de-identified before any model sees them. There are two ways to run it:
+
 ```mermaid
 flowchart TD
-    subgraph "Mode 1: Prompt-only · no API key"
-        R1["health_records"] --> S1["PHI scrubber<br/><small>strips 18 HIPAA IDs</small>"]
-        S1 --> P1["Build prompt<br/><small>system + user</small>"]
-        P1 --> U1["Return copyable text"]
-        U1 --> EXT["User pastes into any LLM"]
-        EXT -.->|optional| PASTE["Paste response back for storage"]
-    end
-
-    subgraph "Mode 2: Live API · needs GEMINI_API_KEY"
-        R2["health_records"] --> S2["PHI scrubber"]
-        S2 --> P2["Build prompt"]
-        P2 --> G["Gemini API"]
-        G --> OUT["Return summary<br/><small>text / JSON / both</small>"]
-    end
-
-    style S1 fill:#c25550,color:#fff
-    style S2 fill:#c25550,color:#fff
-    style G fill:#4a7a6a,color:#fff
+    R["Records"] --> D["De-identify<br/><small>strip 18 HIPAA identifiers</small>"]
+    D --> M1["Mode 1 — copy a prompt<br/><small>paste into any LLM, no key needed</small>"]
+    D --> M2["Mode 2 — Gemini summary<br/><small>needs GEMINI_API_KEY</small>"]
 ```
 
-**Summary types:** full, category, date-range, single-record
-**Models:** `gemini-3-flash-preview` (summary + OCR), `gemini-2.5-flash` (entity extraction)
+The scrubber runs in three layers: regex patterns for the structured identifiers (SSN, MRN, phone, dates, addresses), a known-patient pass that redacts the record owner's own name and DOB, and spaCy NER to catch provider and family names the patterns miss.
+
+**Summary types:** full, category, date range, single record
+**Model:** `gemini-3.5-flash` (summaries, OCR, and entity extraction)
 
 ## Database
 
@@ -184,67 +108,10 @@ erDiagram
     patients ||--o{ health_records : has
     uploaded_files ||--o{ health_records : produces
     health_records ||--o{ dedup_candidates : "compared in"
-    health_records ||--o{ provenance : tracks
-
-    users {
-        uuid id PK
-        text email "AES-256 encrypted"
-        text password_hash "bcrypt cost 12+"
-        int failed_login_attempts
-        timestamp locked_until
-    }
-
-    health_records {
-        uuid id PK
-        uuid patient_id FK
-        text record_type
-        jsonb fhir_resource "FHIR R4"
-        timestamp effective_date
-        text code_system
-        text code_value
-        text display_text
-        boolean is_duplicate
-        boolean ai_extracted
-        timestamp deleted_at "soft delete only"
-    }
-
-    dedup_candidates {
-        uuid id PK
-        uuid record_a_id FK
-        uuid record_b_id FK
-        float similarity_score
-        text status "pending/merged/dismissed"
-        text llm_classification
-        float llm_confidence
-    }
-
-    uploaded_files {
-        uuid id PK
-        text filename
-        text ingestion_status
-        jsonb ingestion_progress
-        text extracted_text
-        jsonb extraction_entities
-    }
-
-    provenance {
-        uuid id PK
-        uuid record_id FK
-        text action
-        text agent
-        uuid source_file_id
-    }
-
-    audit_log {
-        uuid id PK
-        uuid user_id FK
-        text action
-        text resource_type
-        inet ip_address
-    }
+    health_records ||--o{ provenance : "tracked by"
 ```
 
-All tables use UUID PKs and `created_at`/`updated_at` timestamps. PII encrypted at rest via AES-256/pgcrypto.
+`health_records` is the core table — every clinical fact, stored as FHIR R4 JSONB. Every table uses UUID primary keys and `created_at`/`updated_at` timestamps; PII is encrypted at rest with AES-256/pgcrypto. Nothing is ever hard-deleted: `deleted_at` marks a row gone, and deleting an upload cascades that soft-delete to the records it produced. Full column-level schema lives in the Alembic migrations.
 
 ## HIPAA controls
 
@@ -259,9 +126,9 @@ All tables use UUID PKs and `created_at`/`updated_at` timestamps. PII encrypted 
 
 ## Tech stack
 
-**Backend**: Python 3.12 / FastAPI / SQLAlchemy 2 async / PostgreSQL 16 / Alembic / Gemini API / LangExtract / python-fhir-converter
+**Backend**: Python 3.12 / FastAPI / SQLAlchemy 2 async / PostgreSQL 16 / Alembic / Gemini API / LangExtract / spaCy (PHI NER) / python-fhir-converter
 
-**Frontend**: Next.js 15 / TypeScript / Tailwind CSS 4 / shadcn/ui / TanStack Query / Zustand / NextAuth.js
+**Frontend**: Next.js 15 / TypeScript / Tailwind CSS 4 / shadcn/ui / TanStack Query / Zustand. Auth is custom JWT — access + rotated refresh tokens in a Zustand store, with transparent 401 refresh in `lib/api.ts` (no auth framework).
 
 **Infra**: PostgreSQL 16 + Redis 7 via Homebrew, macOS. No Docker.
 
@@ -273,21 +140,23 @@ backend/
 │   ├── main.py, config.py, database.py
 │   ├── middleware/          # auth, audit, encryption, security headers, rate limit
 │   ├── models/              # user, patient, record, uploaded_file, ai_summary, dedup, provenance, audit
-│   ├── api/                 # auth, records, timeline, upload, summary, dedup, review, dashboard
+│   ├── api/                 # auth, records, timeline, upload, summary, dedup, review, dashboard, audit
 │   └── services/
 │       ├── ingestion/       # coordinator, fhir_parser, epic_parser, cda_parser, xdm_parser,
 │       │                    # cda_dedup, bulk_inserter, epic_mappers/ (14)
-│       ├── ai/              # prompt_builder, summarizer, phi_scrubber
+│       ├── ai/              # prompt_builder, summarizer, phi_scrubber, patient_phi, phi_ner
 │       ├── extraction/      # text_extractor, entity_extractor, section_parser, entity_to_fhir
 │       └── dedup/           # detector, orchestrator, llm_judge, field_merger
-├── tests/                   # 26 test files, 517 tests
+├── tests/                   # ~57 files, ~697 tests
 └── alembic/                 # migrations
 
 frontend/src/
-├── app/(dashboard)/         # home, timeline, upload (+review), summaries, admin (4-tab), records/[id]
-├── components/retro/        # 16 custom components (Mature Zen theme)
+├── app/(dashboard)/         # overview, timeline, upload (+review), summaries, admin (4-tab), records/[id]
+├── components/retro/        # 18 components — Reimagined theme (Bloom / Prussian / Editorial)
 └── lib/                     # api.ts, utils.ts, constants.ts
 ```
+
+The frontend theme is "Reimagined": warm paper, a deep ink-blue (Prussian) accent, and an italic serif display face (Source Serif 4 × Source Sans 3 × IBM Plex Mono). It reads as a records organizer, not a dashboard — values are shown neutrally, with no good/bad coloring.
 
 ## Setup
 
@@ -318,25 +187,13 @@ cd frontend && npm install && npm run dev
 
 ```bash
 cd backend
-python -m pytest -x -v                            # ~440 fast tests
-python -m pytest -x -v --run-slow                  # all 517 (needs GEMINI_API_KEY for 7 slow)
-python -m pytest tests/test_hipaa_compliance.py -v # HIPAA suite (28 tests)
-python -m pytest tests/fidelity/ -v                # fidelity checks (Epic + FHIR + CDA)
+python -m pytest -m "not slow"        # 681 fast tests
+python -m pytest --run-slow            # all 697 (16 slow need GEMINI_API_KEY + real data)
+python -m pytest tests/test_hipaa_compliance.py
+python -m pytest tests/fidelity/       # Epic / FHIR / CDA fidelity (skip without real fixtures)
 ```
 
-| Area | Tests | | Area | Tests |
-|------|------:|-|------|------:|
-| auth | 10 | | ingestion | 59 |
-| records | 15 | | pipeline integration | 21 |
-| dashboard | 10 | | xdm parser | 8 |
-| timeline | 8 | | cda parser + dedup | 16 |
-| upload | 10 | | text extraction | 12 |
-| summary | 10 | | entity extraction | 39 |
-| summarization | 9 | | section parser | 11 |
-| unstructured upload | 22 | | dedup (all) | 43 |
-| hipaa compliance | 28 | | fidelity (epic/fhir/cda) | 181 |
-
-Tests hit `medtimeline_test` (auto-derived from `DATABASE_URL`). Fidelity tests skip when real-data fixtures are absent.
+697 tests across 57 files. They run against `medtimeline_test`, auto-derived from `DATABASE_URL`. The slow ones call the real Gemini API; fidelity tests need real-data fixtures and skip when those are absent. A 120s per-test timeout backstops hangs in the fast suite; slow tests get a longer bound.
 
 ## API
 
@@ -345,14 +202,15 @@ Full contract: [`docs/backend-handoff.md`](docs/backend-handoff.md)
 | Group | Endpoints |
 |-------|-----------|
 | **Auth** | `POST /auth/register` `/login` `/refresh` `/logout` `GET /auth/me` |
-| **Records** | `GET /records` `/records/:id` `/records/search` `DELETE /records/:id` |
+| **Records** | `GET /records` (`?status=` `?sort=` `?order=`) `/records/:id` `/records/search` `/records/series` `/records/export` `DELETE /records/:id` |
 | **Timeline** | `GET /timeline` |
-| **Dashboard** | `GET /dashboard/overview` `/labs` `/patients` |
-| **Upload** | `POST /upload` `/upload/unstructured` `/unstructured-batch` `/trigger-extraction` |
+| **Dashboard** | `GET /dashboard/overview` `/labs` `/patients` `/sources` |
+| **Upload** | `POST /upload` `/upload/unstructured` `/unstructured-batch` `/trigger-extraction` `DELETE /upload/:id` |
 | **Upload status** | `GET /upload/:id/status` `/errors` `/extraction` `/history` `/pending-extraction` `/extraction-progress` |
 | **Upload review** | `POST /upload/:id/confirm-extraction` `GET /upload/:id/review` `POST /review/resolve` `/undo-merge` |
 | **Dedup** | `GET /dedup/candidates` `POST /dedup/merge` `/dismiss` |
 | **AI Summary** | `POST /summary/build-prompt` `/generate` `/paste-response` `GET /summary/prompts` `/prompts/:id` `/responses` |
+| **Audit** | `GET /audit-log` |
 
 ## License
 
