@@ -46,10 +46,10 @@ function ConfidenceBadge({ confidence }: { confidence: number }) {
   let label = "Low";
 
   if (confidence >= 0.8) {
-    bg = "#4a7a6a";
+    bg = "var(--primary)";
     label = "High";
   } else if (confidence >= 0.5) {
-    bg = "#8a7a5a";
+    bg = "var(--theme-ochre)";
     label = "Med";
   }
 
@@ -69,12 +69,12 @@ function ConfidenceBadge({ confidence }: { confidence: number }) {
 
 function ClassificationBadge({ classification }: { classification: string }) {
   const colorMap: Record<string, string> = {
-    duplicate: "#4a7a6a",
-    update: "#8a7a5a",
-    related: "#5a8070",
+    duplicate: "var(--primary)",
+    update: "var(--theme-ochre)",
+    related: "var(--success)",
     distinct: "var(--theme-terracotta)",
   };
-  const bg = colorMap[classification] ?? "#5a8070";
+  const bg = colorMap[classification] ?? "var(--text-dim)";
 
   return (
     <span
@@ -230,7 +230,7 @@ function CandidateRow({
                     </span>
                     <span style={{ color: "var(--theme-terracotta)" }}>{diff.old}</span>
                     <ArrowRight className="h-3 w-3 flex-shrink-0" style={{ color: "var(--theme-text-dim)" }} />
-                    <span style={{ color: "#4a7a6a" }}>{diff.new}</span>
+                    <span style={{ color: "var(--success)" }}>{diff.new}</span>
                   </div>
                 ))}
               </div>

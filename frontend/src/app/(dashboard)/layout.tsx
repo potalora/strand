@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { RetroNav } from "@/components/retro/RetroNav";
+import { FloatingDock } from "@/components/retro/FloatingDock";
 import { useAuthStore, useHasHydrated } from "@/stores/useAuthStore";
 
 export default function DashboardLayout({
@@ -25,9 +26,10 @@ export default function DashboardLayout({
   }
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden">
+    <div className="min-h-screen">
       <RetroNav />
-      <main className="flex-1 overflow-auto p-6">{children}</main>
+      <main className="main-narrow">{children}</main>
+      <FloatingDock />
     </div>
   );
 }

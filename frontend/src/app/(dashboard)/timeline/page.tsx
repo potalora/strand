@@ -1,29 +1,45 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Lock } from "lucide-react";
 import { api } from "@/lib/api";
-import type { TimelineResponse, TimelineEvent } from "@/types/api";
-import { RECORD_TYPE_COLORS, RECORD_TYPE_SHORT, DEFAULT_RECORD_COLOR } from "@/lib/constants";
-import { GlowText } from "@/components/retro/GlowText";
+import type { TimelineResponse, TimelineEvent, UserResponse } from "@/types/api";
+import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
 import { RetroBadge } from "@/components/retro/RetroBadge";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
 
-const FILTER_TYPES = [
-  { value: "", label: "ALL" },
-  { value: "condition", label: "COND" },
-  { value: "observation", label: "OBS" },
-  { value: "medication", label: "MED" },
-  { value: "encounter", label: "ENC" },
-  { value: "immunization", label: "IMMUN" },
-  { value: "procedure", label: "PROC" },
-  { value: "document", label: "DOC" },
-  { value: "imaging", label: "IMG" },
-  { value: "allergy", label: "ALRG" },
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+const fmtShort = (s: string | null) => {
+  if (!s) return "";
+  const d = new Date(s);
+  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+};
+
+const FILTERS: { v: string; label: string }[] = [
+  { v: "", label: "All" },
+  { v: "condition", label: "Conditions" },
+  { v: "observation", label: "Labs & vitals" },
+  { v: "medication", label: "Medications" },
+  { v: "encounter", label: "Visits" },
+  { v: "immunization", label: "Vaccines" },
+  { v: "procedure", label: "Procedures" },
+  { v: "imaging", label: "Imaging" },
+  { v: "allergy", label: "Allergies" },
+  { v: "document", label: "Documents" },
 ];
 
+function SecureChip() {
+  return (
+    <span className="secure">
+      <Lock size={13} strokeWidth={1.9} /> End-to-end encrypted
+    </span>
+  );
+}
+
 function groupByMonth(events: TimelineEvent[]): { label: string; events: TimelineEvent[] }[] {
-  const groups: Map<string, TimelineEvent[]> = new Map();
+  const groups = new Map<string, TimelineEvent[]>();
   for (const event of events) {
     const key = event.effective_date
       ? (() => {
@@ -39,11 +55,10 @@ function groupByMonth(events: TimelineEvent[]): { label: string; events: Timelin
     if (b[0] === "undated") return -1;
     return b[0].localeCompare(a[0]);
   });
-  return sorted.map(([key, events]) => {
-    if (key === "undated") return { label: "Undated", events };
+  return sorted.map(([key, evs]) => {
+    if (key === "undated") return { label: "Undated", events: evs };
     const [y, m] = key.split("-");
-    const months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
-    return { label: `${months[parseInt(m) - 1]} ${y}`, events };
+    return { label: `${MONTHS[parseInt(m, 10) - 1]} ${y}`, events: evs };
   });
 }
 
@@ -52,200 +67,114 @@ export default function TimelinePage() {
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("");
   const [selectedRecord, setSelectedRecord] = useState<string | null>(null);
+  const [me, setMe] = useState<UserResponse | null>(null);
+  const [shown, setShown] = useState(false);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  useEffect(() => {
+    // Optional masthead kicker — falls back to "Your health story" when unavailable.
+    api
+      .get<UserResponse>("/auth/me")
+      .then(setMe)
+      .catch(() => setMe(null));
+  }, []);
 
   useEffect(() => {
     setLoading(true);
-    let endpoint = "/timeline?limit=200";
-    if (filter) endpoint += `&record_type=${filter}`;
-
     api
-      .get<TimelineResponse>(endpoint)
+      .get<TimelineResponse>("/timeline?limit=200" + (filter ? `&record_type=${filter}` : ""))
       .then(setData)
       .catch(() => setData(null))
       .finally(() => setLoading(false));
   }, [filter]);
 
-  const events: TimelineEvent[] = data?.events || [];
-  const sortedEvents = [...events].sort((a, b) => {
-    if (!a.effective_date && !b.effective_date) return 0;
-    if (!a.effective_date) return 1;
-    if (!b.effective_date) return -1;
-    return new Date(b.effective_date).getTime() - new Date(a.effective_date).getTime();
-  });
+  const events: TimelineEvent[] = useMemo(() => data?.events ?? [], [data]);
 
-  const groups = groupByMonth(sortedEvents);
+  const sortedEvents = useMemo(
+    () =>
+      [...events].sort((a, b) => {
+        if (!a.effective_date && !b.effective_date) return 0;
+        if (!a.effective_date) return 1;
+        if (!b.effective_date) return -1;
+        return new Date(b.effective_date).getTime() - new Date(a.effective_date).getTime();
+      }),
+    [events],
+  );
+
+  const groups = useMemo(() => groupByMonth(sortedEvents), [sortedEvents]);
+
+  const kicker = me?.display_name?.trim() || "Your health story";
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-baseline justify-between gap-4">
-        <GlowText as="h1">Timeline</GlowText>
-        {data && (
-          <span
-            className="text-xs"
-            style={{ color: "var(--theme-text-dim)" }}
-          >
-            {data.total} events
-          </span>
-        )}
+    <div className={`screen ${shown ? "on" : ""}`}>
+      <div className="page-top">
+        <div>
+          <p className="kicker">{kicker}</p>
+          <h1 className="h1 display">Timeline</h1>
+        </div>
+        <SecureChip />
       </div>
 
-      {/* Filter bar */}
-      <div className="flex flex-wrap gap-1">
-        {FILTER_TYPES.map((ft) => {
-          const active = filter === ft.value;
-          return (
-            <button
-              key={ft.value}
-              onClick={() => setFilter(ft.value)}
-              className="px-3 py-1.5 text-xs font-medium transition-colors cursor-pointer rounded-md"
-              style={{
-                backgroundColor: active ? "var(--theme-amber)" : "var(--theme-bg-card)",
-                color: active ? "var(--theme-bg-deep)" : "var(--theme-text-dim)",
-                border: `1px solid ${active ? "var(--theme-amber)" : "var(--theme-border)"}`,
-                fontFamily: "var(--font-body)",
-              }}
-              onMouseEnter={(e) => {
-                if (!active) {
-                  e.currentTarget.style.borderColor = "var(--theme-border-active)";
-                  e.currentTarget.style.color = "var(--theme-text)";
-                }
-              }}
-              onMouseLeave={(e) => {
-                if (!active) {
-                  e.currentTarget.style.borderColor = "var(--theme-border)";
-                  e.currentTarget.style.color = "var(--theme-text-dim)";
-                }
-              }}
-            >
-              {ft.label}
-            </button>
-          );
-        })}
+      <div className="filters">
+        {FILTERS.map((f) => (
+          <button
+            key={f.v}
+            className="filt"
+            aria-pressed={filter === f.v}
+            onClick={() => setFilter(f.v)}
+          >
+            {f.label}
+          </button>
+        ))}
       </div>
 
       {loading ? (
         <RetroLoadingState text="Loading timeline" />
       ) : sortedEvents.length === 0 ? (
-        <div className="py-16 text-center">
-          <p
-            className="text-sm"
-            style={{
-              color: "var(--theme-text-muted)",
-            }}
-          >
-            No events found
-          </p>
-          {filter && (
-            <button
-              onClick={() => setFilter("")}
-              className="mt-3 text-xs cursor-pointer font-medium"
-              style={{ color: "var(--theme-amber-dim)" }}
-            >
-              Clear filter
-            </button>
-          )}
+        <div className="muted" style={{ padding: "60px 0", textAlign: "center" }}>
+          No events.
         </div>
       ) : (
-        <div className="relative pl-6">
-          {/* Vertical line */}
-          <div
-            className="absolute left-2 top-0 bottom-0 w-px"
-            style={{ backgroundColor: "var(--theme-amber-dim)" }}
-          />
-
-          {groups.map((group) => (
-            <div key={group.label} className="mb-6">
-              {/* Month/Year divider */}
-              <div className="relative flex items-center gap-3 mb-3 -ml-6">
-                <div
-                  className="w-5 h-px"
-                  style={{ backgroundColor: "var(--theme-amber-dim)" }}
-                />
-                <span
-                  className="text-xs font-semibold"
-                  style={{
-                    color: "var(--theme-amber)",
-                    fontFamily: "var(--font-body)",
-                  }}
-                >
-                  {group.label}
-                </span>
-                <div
-                  className="flex-1 h-px"
-                  style={{ backgroundColor: "var(--theme-border)" }}
-                />
+        <div className="tl">
+          {groups.map((g) => (
+            <div className="tl-grp" key={g.label}>
+              <div className="tl-grp-h">
+                <span className="tl-grp-label">{g.label}</span>
+                <span className="tl-grp-rule" />
+                <span className="tl-grp-n">{g.events.length}</span>
               </div>
-
-              {/* Events */}
-              <div className="space-y-2">
-                {group.events.map((event) => {
-                  const colors = RECORD_TYPE_COLORS[event.record_type] || DEFAULT_RECORD_COLOR;
+              <div className="tl-list">
+                {g.events.map((r) => {
+                  const colors = RECORD_TYPE_COLORS[r.record_type] || DEFAULT_RECORD_COLOR;
+                  const category = r.category?.length ? r.category.join(", ") : null;
                   return (
-                    <div
-                      key={event.id}
-                      className="relative flex items-start gap-3 cursor-pointer transition-colors"
-                      onClick={() => setSelectedRecord(event.id)}
-                      style={{ paddingLeft: "0.5rem" }}
-                      onMouseEnter={(e) => {
-                        const card = e.currentTarget.querySelector("[data-card]") as HTMLElement;
-                        if (card) card.style.borderColor = "var(--theme-border-active)";
-                      }}
-                      onMouseLeave={(e) => {
-                        const card = e.currentTarget.querySelector("[data-card]") as HTMLElement;
-                        if (card) card.style.borderColor = "var(--theme-border)";
-                      }}
+                    <button
+                      key={r.id}
+                      className="tl-card"
+                      onClick={() => setSelectedRecord(r.id)}
                     >
-                      {/* Dot on timeline */}
-                      <div
-                        className="absolute -left-[1.15rem] top-3 h-2 w-2 shrink-0"
-                        style={{
-                          backgroundColor: colors.dot,
-                          borderRadius: "1px",
-                          boxShadow: `0 0 4px ${colors.dot}40`,
-                        }}
-                      />
-
-                      {/* Event card */}
-                      <div
-                        data-card
-                        className="flex-1 border px-3 py-2 transition-colors"
-                        style={{
-                          backgroundColor: "var(--theme-bg-card)",
-                          borderColor: "var(--theme-border)",
-                          borderRadius: "4px",
-                        }}
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="space-y-0.5 min-w-0">
-                            <div className="flex items-center gap-2">
-                              <RetroBadge recordType={event.record_type} short />
-                              <span
-                                className="text-sm truncate"
-                                style={{ color: "var(--theme-text)" }}
-                              >
-                                {event.display_text}
-                              </span>
-                            </div>
-                            {event.code_display && (
-                              <p
-                                className="text-xs"
-                                style={{ color: "var(--theme-text-dim)" }}
-                              >
-                                {event.code_display}
-                              </p>
-                            )}
-                          </div>
-                          <span
-                            className="text-xs whitespace-nowrap shrink-0"
-                            style={{ color: "var(--theme-text-muted)" }}
-                          >
-                            {event.effective_date
-                              ? new Date(event.effective_date).toLocaleDateString()
-                              : ""}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
+                      <span className="tl-rail" style={{ background: colors.dot }} />
+                      <span className="tl-main">
+                        <span className="tl-top">
+                          <RetroBadge recordType={r.record_type} />
+                          <span className="tl-title">{r.display_text}</span>
+                        </span>
+                        {r.code_display && <span className="tl-sub">{r.code_display}</span>}
+                      </span>
+                      <span className="tl-date">
+                        {fmtShort(r.effective_date)}
+                        {category && (
+                          <>
+                            <br />
+                            <span className="muted">{category}</span>
+                          </>
+                        )}
+                      </span>
+                    </button>
                   );
                 })}
               </div>

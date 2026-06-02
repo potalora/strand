@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +16,16 @@ from app.schemas.records import HealthRecordResponse, RecordListResponse
 router = APIRouter(prefix="/records", tags=["records"])
 
 
+# Server-side sort: maps the ?sort= key to a column. Anything else falls back
+# to effective_date so the default ordering is unchanged.
+_SORT_COLUMNS = {
+    "date": HealthRecord.effective_date,
+    "type": HealthRecord.record_type,
+    "display_text": HealthRecord.display_text,
+    "created": HealthRecord.created_at,
+}
+
+
 @router.get("", response_model=RecordListResponse)
 async def list_records(
     request: Request,
@@ -23,10 +34,13 @@ async def list_records(
     record_type: str | None = None,
     category: str | None = None,
     search: str | None = None,
+    status: str | None = None,
+    sort: str | None = None,
+    order: str = Query("desc", pattern="^(asc|desc)$"),
     user_id: UUID = Depends(get_authenticated_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> RecordListResponse:
-    """List health records with pagination and filtering."""
+    """List health records with pagination, filtering, and sorting."""
     query = select(HealthRecord).where(
         HealthRecord.user_id == user_id,
         HealthRecord.deleted_at.is_(None),
@@ -35,6 +49,8 @@ async def list_records(
 
     if record_type:
         query = query.where(HealthRecord.record_type == record_type)
+    if status:
+        query = query.where(HealthRecord.status == status)
     if search:
         query = query.where(
             or_(
@@ -48,8 +64,13 @@ async def list_records(
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
 
-    # Fetch page
-    query = query.order_by(HealthRecord.effective_date.desc().nullslast())
+    # Fetch page — server-side sort with sensible nulls handling; default is
+    # newest-first by effective date.
+    sort_col = _SORT_COLUMNS.get(sort or "", HealthRecord.effective_date)
+    direction = sort_col.asc() if order == "asc" else sort_col.desc()
+    if sort_col is HealthRecord.effective_date:
+        direction = direction.nullsfirst() if order == "asc" else direction.nullslast()
+    query = query.order_by(direction)
     query = query.offset((page - 1) * page_size).limit(page_size)
     result = await db.execute(query)
     records = result.scalars().all()
@@ -108,6 +129,104 @@ async def search_records(
         "items": [HealthRecordResponse.model_validate(r) for r in records],
         "total": len(records),
     }
+
+
+@router.get("/series")
+async def record_series(
+    request: Request,
+    code_value: str = Query(..., min_length=1),
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Time-series of one observation code (ascending by date) for trend charts.
+
+    Declared before /{record_id} so the literal path isn't captured as a UUID.
+    Only numeric valueQuantity points are returned.
+    """
+    result = await db.execute(
+        select(HealthRecord)
+        .where(
+            HealthRecord.user_id == user_id,
+            HealthRecord.deleted_at.is_(None),
+            HealthRecord.is_duplicate.is_(False),
+            HealthRecord.code_value == code_value,
+        )
+        .order_by(HealthRecord.effective_date.asc().nullslast())
+    )
+    records = result.scalars().all()
+
+    items = []
+    for r in records:
+        value_qty = (r.fhir_resource or {}).get("valueQuantity") or {}
+        value = value_qty.get("value")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        items.append(
+            {
+                "id": str(r.id),
+                "effective_date": r.effective_date.isoformat() if r.effective_date else None,
+                "value": value,
+                "unit": value_qty.get("unit", ""),
+            }
+        )
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="records.series",
+        resource_type="health_record",
+        ip_address=request.client.host if request.client else None,
+        details={"code_value": code_value, "points": len(items)},
+    )
+
+    return {"code_value": code_value, "items": items, "total": len(items)}
+
+
+@router.get("/export")
+async def export_records(
+    request: Request,
+    format: str = Query("fhir-bundle"),
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk-export all of the user's records as a single FHIR R4 collection Bundle.
+
+    Declared before /{record_id} so the literal path isn't captured as a UUID.
+    """
+    if format != "fhir-bundle":
+        raise HTTPException(status_code=400, detail=f"Unsupported export format: {format}")
+
+    result = await db.execute(
+        select(HealthRecord)
+        .where(
+            HealthRecord.user_id == user_id,
+            HealthRecord.deleted_at.is_(None),
+            HealthRecord.is_duplicate.is_(False),
+        )
+        .order_by(HealthRecord.effective_date.desc().nullslast())
+    )
+    records = result.scalars().all()
+
+    bundle = {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "total": len(records),
+        "entry": [{"resource": r.fhir_resource} for r in records],
+    }
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="records.export",
+        resource_type="health_record",
+        ip_address=request.client.host if request.client else None,
+        details={"format": format, "count": len(records)},
+    )
+
+    return JSONResponse(
+        content=bundle,
+        headers={"Content-Disposition": 'attachment; filename="medtimeline-fhir-bundle.json"'},
+    )
 
 
 @router.get("/{record_id}", response_model=HealthRecordResponse)

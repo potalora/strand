@@ -1,25 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { Lock, Copy, ChevronRight } from "lucide-react";
 import { api } from "@/lib/api";
 import type {
   PatientInfo,
   GenerateSummaryResponse,
   PromptResponse,
 } from "@/types/api";
-import { GlowText } from "@/components/retro/GlowText";
-import {
-  RetroCard,
-  RetroCardHeader,
-  RetroCardContent,
-} from "@/components/retro/RetroCard";
-import { RetroButton } from "@/components/retro/RetroButton";
-import { RetroTabs } from "@/components/retro/RetroTabs";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 
 const SUMMARY_TYPES = [
-  { key: "full", label: "Full" },
-  { key: "category", label: "Category" },
+  { key: "full", label: "Full record" },
+  { key: "category", label: "By category" },
   { key: "date_range", label: "Date range" },
 ];
 
@@ -32,12 +25,33 @@ const CATEGORIES = [
   { value: "procedure", label: "Procedures" },
 ];
 
-const OUTPUT_TABS = [
-  { key: "nl", label: "Natural language" },
+const OUTPUT_FORMATS = [
+  { value: "natural_language", label: "Natural language" },
+  { value: "json", label: "JSON data" },
+  { value: "both", label: "Both" },
+];
+
+const RESULT_TABS = [
+  { key: "nl", label: "Narrative" },
   { key: "json", label: "JSON data" },
 ];
 
+function SecureChip() {
+  return (
+    <span className="secure">
+      <Lock size={13} strokeWidth={1.9} /> End-to-end encrypted
+    </span>
+  );
+}
+
 export default function SummariesPage() {
+  // Entrance
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
   // Patient selector
   const [patients, setPatients] = useState<PatientInfo[]>([]);
   const [selectedPatient, setSelectedPatient] = useState("");
@@ -56,6 +70,7 @@ export default function SummariesPage() {
   const [result, setResult] = useState<GenerateSummaryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [resultTab, setResultTab] = useState("nl");
+  const [copied, setCopied] = useState(false);
 
   // History
   const [showHistory, setShowHistory] = useState(false);
@@ -183,520 +198,395 @@ export default function SummariesPage() {
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
   };
 
   return (
-    <div className="space-y-6 max-w-4xl mx-auto">
-      <GlowText as="h1">AI Health Summary</GlowText>
+    <div className={`screen s24 ${shown ? "on" : ""}`}>
+      {/* Header */}
+      <div className="page-top">
+        <div>
+          <p className="kicker">Private &amp; de-identified</p>
+          <h1 className="h1 display">Summaries</h1>
+          <p className="h-sub">
+            Generate a private, PHI-scrubbed summary of this record to share with a
+            provider, family member, advocate, or AI assistant. Personal identifiers
+            are removed before anything leaves your device.
+          </p>
+        </div>
+        <SecureChip />
+      </div>
 
-      {/* Patient Selector */}
-      <RetroCard>
-        <RetroCardContent>
-          <label
-            className="text-xs font-medium block mb-2"
-            style={{
-              color: "var(--theme-text-dim)",
-              fontFamily: "var(--font-body)",
-            }}
-          >
-            Select patient
-          </label>
-          <select
-            value={selectedPatient}
-            onChange={(e) => setSelectedPatient(e.target.value)}
-            className="w-full px-3 py-2 text-sm border"
-            style={{
-              backgroundColor: "var(--theme-bg-deep)",
-              borderColor: "var(--theme-border)",
-              color: "var(--theme-text)",
-              fontFamily: "var(--font-mono)",
-              borderRadius: "4px",
-            }}
-          >
-            {patients.length === 0 && (
-              <option value="">No patients found</option>
-            )}
-            {patients.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.fhir_id || p.id.slice(0, 8)} ({p.gender || "unknown"})
-              </option>
-            ))}
-          </select>
-        </RetroCardContent>
-      </RetroCard>
+      {/* Patient selector */}
+      <div className="card-surface pad">
+        <div className="field-l" style={{ marginBottom: 8 }}>
+          Record subject
+        </div>
+        <select
+          className="selectbox"
+          style={{ width: "100%" }}
+          value={selectedPatient}
+          onChange={(e) => setSelectedPatient(e.target.value)}
+        >
+          {patients.length === 0 && <option value="">No record found</option>}
+          {patients.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.fhir_id || p.id.slice(0, 8)} ({p.gender || "unknown"})
+            </option>
+          ))}
+        </select>
+      </div>
 
-      {/* Duplicate Warning */}
+      {/* Duplicate notice */}
       {result?.duplicate_warning &&
         result.duplicate_warning.duplicates_excluded > 0 && (
-          <RetroCard>
-            <RetroCardContent>
-              <div className="flex items-start gap-3">
+          <div className="card-surface pad">
+            <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+              <span className="tag" style={{ flexShrink: 0 }}>
                 <span
-                  className="text-xs font-bold shrink-0 px-2 py-0.5"
-                  style={{
-                    backgroundColor: "var(--theme-ochre)",
-                    color: "var(--theme-bg-deep)",
-                    borderRadius: "4px",
-                    fontFamily: "var(--font-body)",
-                  }}
-                >
-                  Dedup
-                </span>
-                <p
-                  className="text-xs leading-relaxed"
-                  style={{ color: "var(--theme-text-dim)" }}
-                >
-                  {result.duplicate_warning.message} Review in Admin &gt; DEDUP
-                  tab.
-                </p>
-              </div>
-            </RetroCardContent>
-          </RetroCard>
-        )}
-
-      {/* Summary Configuration */}
-      <RetroCard accentTop>
-        <RetroCardHeader>
-          <GlowText as="h3" glow={false}>
-            Configuration
-          </GlowText>
-        </RetroCardHeader>
-        <RetroCardContent>
-          <div className="space-y-4">
-            {/* Summary Type */}
-            <div>
-              <label
-                className="text-xs font-medium block mb-2"
-                style={{
-                  color: "var(--theme-text-dim)",
-                  fontFamily: "var(--font-body)",
-                }}
-              >
-                Summary type
-              </label>
-              <RetroTabs
-                tabs={SUMMARY_TYPES}
-                active={summaryType}
-                onChange={setSummaryType}
-              />
-            </div>
-
-            {/* Category selector (conditional) */}
-            {summaryType === "category" && (
-              <div>
-                <label
-                  className="text-xs font-medium block mb-2"
-                  style={{
-                    color: "var(--theme-text-dim)",
-                    fontFamily: "var(--font-body)",
-                  }}
-                >
-                  Category
-                </label>
-                <select
-                  value={category}
-                  onChange={(e) => setCategory(e.target.value)}
-                  className="w-full px-3 py-2 text-sm border"
-                  style={{
-                    backgroundColor: "var(--theme-bg-deep)",
-                    borderColor: "var(--theme-border)",
-                    color: "var(--theme-text)",
-                    fontFamily: "var(--font-mono)",
-                    borderRadius: "4px",
-                  }}
-                >
-                  {CATEGORIES.map((c) => (
-                    <option key={c.value} value={c.value}>
-                      {c.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-
-            {/* Date range (conditional) */}
-            {summaryType === "date_range" && (
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label
-                    className="text-xs font-medium block mb-2"
-                    style={{
-                      color: "var(--theme-text-dim)",
-                      fontFamily: "var(--font-body)",
-                    }}
-                  >
-                    From
-                  </label>
-                  <input
-                    type="date"
-                    value={dateFrom}
-                    onChange={(e) => setDateFrom(e.target.value)}
-                    className="w-full px-3 py-2 text-sm border"
-                    style={{
-                      backgroundColor: "var(--theme-bg-deep)",
-                      borderColor: "var(--theme-border)",
-                      color: "var(--theme-text)",
-                      fontFamily: "var(--font-mono)",
-                      borderRadius: "4px",
-                    }}
-                  />
-                </div>
-                <div>
-                  <label
-                    className="text-xs font-medium block mb-2"
-                    style={{
-                      color: "var(--theme-text-dim)",
-                      fontFamily: "var(--font-body)",
-                    }}
-                  >
-                    To
-                  </label>
-                  <input
-                    type="date"
-                    value={dateTo}
-                    onChange={(e) => setDateTo(e.target.value)}
-                    className="w-full px-3 py-2 text-sm border"
-                    style={{
-                      backgroundColor: "var(--theme-bg-deep)",
-                      borderColor: "var(--theme-border)",
-                      color: "var(--theme-text)",
-                      fontFamily: "var(--font-mono)",
-                      borderRadius: "4px",
-                    }}
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* Output Format */}
-            <div>
-              <label
-                className="text-xs font-medium block mb-2"
-                style={{
-                  color: "var(--theme-text-dim)",
-                  fontFamily: "var(--font-body)",
-                }}
-              >
-                Output format
-              </label>
-              <div className="flex gap-4">
-                {[
-                  { value: "natural_language", label: "Natural Language" },
-                  { value: "json", label: "JSON" },
-                  { value: "both", label: "Both" },
-                ].map((opt) => (
-                  <label key={opt.value} className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="outputFormat"
-                      value={opt.value}
-                      checked={outputFormat === opt.value}
-                      onChange={(e) => setOutputFormat(e.target.value)}
-                      className="accent-amber-500"
-                    />
-                    <span
-                      className="text-xs"
-                      style={{
-                        color: "var(--theme-text-dim)",
-                        fontFamily: "var(--font-body)",
-                      }}
-                    >
-                      {opt.label}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            {/* Customize Prompt (expandable) */}
-            <div>
-              <button
-                onClick={() => setShowCustomize(!showCustomize)}
-                className="text-xs cursor-pointer font-medium"
-                style={{
-                  color: "var(--theme-amber-dim)",
-                  fontFamily: "var(--font-body)",
-                }}
-              >
-                {showCustomize ? "Hide prompt options" : "Customize prompt"}
-              </button>
-              {showCustomize && (
-                <div className="mt-2">
-                  <textarea
-                    value={customSystemPrompt}
-                    onChange={(e) => setCustomSystemPrompt(e.target.value)}
-                    placeholder="Override system prompt (leave empty for default)..."
-                    rows={6}
-                    className="w-full px-3 py-2 text-xs border resize-y"
-                    style={{
-                      backgroundColor: "var(--theme-bg-deep)",
-                      borderColor: "var(--theme-border)",
-                      color: "var(--theme-text)",
-                      fontFamily: "var(--font-mono)",
-                      borderRadius: "4px",
-                    }}
-                  />
-                </div>
-              )}
+                  className="tdot"
+                  style={{ background: "var(--theme-ochre)" }}
+                />
+                Deduped
+              </span>
+              <p className="dim" style={{ fontSize: 13, lineHeight: 1.5, margin: 0 }}>
+                {result.duplicate_warning.message} Review in Admin &gt; Dedup tab.
+              </p>
             </div>
           </div>
-        </RetroCardContent>
-      </RetroCard>
+        )}
 
-      {/* Generate Button */}
-      <div className="flex justify-center">
-        <RetroButton
-          variant="large"
+      {/* Configuration */}
+      <div className="card-surface pad">
+        <div className="card-h">
+          <h3 className="sec-title">Configuration</h3>
+        </div>
+
+        {/* Summary type */}
+        <div className="field-l" style={{ marginBottom: 10 }}>
+          What to summarize
+        </div>
+        <div className="tabs" style={{ marginBottom: 20 }}>
+          {SUMMARY_TYPES.map((t) => (
+            <button
+              key={t.key}
+              type="button"
+              className="tab"
+              aria-selected={summaryType === t.key}
+              onClick={() => setSummaryType(t.key)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Category (conditional) */}
+        {summaryType === "category" && (
+          <div style={{ marginBottom: 20 }}>
+            <div className="field-l" style={{ marginBottom: 8 }}>
+              Category
+            </div>
+            <select
+              className="selectbox"
+              style={{ width: "100%" }}
+              value={category}
+              onChange={(e) => setCategory(e.target.value)}
+            >
+              {CATEGORIES.map((c) => (
+                <option key={c.value} value={c.value}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {/* Date range (conditional) */}
+        {summaryType === "date_range" && (
+          <div className="grid-2" style={{ marginBottom: 20 }}>
+            <div>
+              <div className="field-l" style={{ marginBottom: 8 }}>
+                From
+              </div>
+              <input
+                type="date"
+                className="selectbox"
+                style={{ width: "100%" }}
+                value={dateFrom}
+                onChange={(e) => setDateFrom(e.target.value)}
+              />
+            </div>
+            <div>
+              <div className="field-l" style={{ marginBottom: 8 }}>
+                To
+              </div>
+              <input
+                type="date"
+                className="selectbox"
+                style={{ width: "100%" }}
+                value={dateTo}
+                onChange={(e) => setDateTo(e.target.value)}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Output format */}
+        <div className="field-l" style={{ marginBottom: 10 }}>
+          Output format
+        </div>
+        <div className="filters" style={{ marginBottom: 18 }}>
+          {OUTPUT_FORMATS.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              className="filt"
+              aria-pressed={outputFormat === opt.value}
+              onClick={() => setOutputFormat(opt.value)}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Customize prompt (expandable) */}
+        <button
+          type="button"
+          className="btn ghost sm"
+          onClick={() => setShowCustomize(!showCustomize)}
+        >
+          {showCustomize ? "Hide prompt options" : "Customize prompt"}
+        </button>
+        {showCustomize && (
+          <textarea
+            value={customSystemPrompt}
+            onChange={(e) => setCustomSystemPrompt(e.target.value)}
+            placeholder="Override the system prompt (leave empty for the default)…"
+            rows={6}
+            className="search"
+            style={{
+              display: "block",
+              width: "100%",
+              marginTop: 12,
+              fontFamily: "var(--font-mono), monospace",
+              fontSize: 13,
+              lineHeight: 1.5,
+              resize: "vertical",
+            }}
+          />
+        )}
+      </div>
+
+      {/* Generate */}
+      <div style={{ display: "flex", justifyContent: "center" }}>
+        <button
+          className="btn"
           onClick={handleGenerate}
           disabled={loading || !selectedPatient}
         >
-          {loading ? "Generating..." : "Generate summary"}
-        </RetroButton>
+          {loading ? "Generating…" : "Generate summary"}
+        </button>
       </div>
 
-      {/* Loading State */}
-      {loading && (
-        <RetroLoadingState text="Generating summary" />
-      )}
+      {/* Loading */}
+      {loading && <RetroLoadingState text="Generating summary" />}
 
       {/* Error */}
       {error && (
-        <RetroCard>
-          <RetroCardContent>
-            <div className="flex items-start gap-3">
+        <div className="card-surface pad">
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+            <span className="tag" style={{ flexShrink: 0 }}>
               <span
-                className="text-xs font-bold shrink-0 px-2 py-0.5"
-                style={{
-                  backgroundColor: "var(--theme-terracotta)",
-                  color: "var(--theme-text)",
-                  borderRadius: "4px",
-                  fontFamily: "var(--font-body)",
-                }}
-              >
-                ERROR
-              </span>
-              <p className="text-xs" style={{ color: "var(--theme-text-dim)" }}>
-                {error}
-              </p>
-            </div>
-          </RetroCardContent>
-        </RetroCard>
+                className="tdot"
+                style={{ background: "var(--danger)" }}
+              />
+              Error
+            </span>
+            <p className="dim" style={{ fontSize: 13, lineHeight: 1.5, margin: 0 }}>
+              {error}
+            </p>
+          </div>
+        </div>
       )}
 
       {/* Results */}
       {result && (
-        <RetroCard accentTop>
-          <RetroCardHeader>
-            <div className="flex items-center justify-between">
-              <GlowText as="h3" glow={false}>
-                Summary results
-              </GlowText>
-              <div className="flex items-center gap-4">
-                <span
-                  className="text-xs"
-                  style={{ color: "var(--theme-text-dim)" }}
-                >
-                  {result.record_count} records | {result.model_used}
-                </span>
-              </div>
+        <div className="card-surface pad">
+          <div className="card-h">
+            <h3 className="sec-title">Summary</h3>
+            <span className="muted mono" style={{ fontSize: 11 }}>
+              {result.record_count} record{result.record_count === 1 ? "" : "s"}
+              {result.model_used ? ` · ${result.model_used}` : ""}
+            </span>
+          </div>
+
+          {/* Output tabs */}
+          {(result.natural_language || result.json_data) && (
+            <div className="tabs">
+              {RESULT_TABS.map((t) => {
+                const disabled =
+                  (t.key === "nl" && !result.natural_language) ||
+                  (t.key === "json" && !result.json_data);
+                if (disabled) return null;
+                return (
+                  <button
+                    key={t.key}
+                    type="button"
+                    className="tab"
+                    aria-selected={resultTab === t.key}
+                    onClick={() => setResultTab(t.key)}
+                  >
+                    {t.label}
+                  </button>
+                );
+              })}
             </div>
-          </RetroCardHeader>
-          <RetroCardContent>
-            <div className="space-y-4">
-              {/* Output tabs */}
-              {(result.natural_language || result.json_data) && (
-                <RetroTabs
-                  tabs={OUTPUT_TABS}
-                  active={resultTab}
-                  onChange={setResultTab}
-                />
-              )}
+          )}
 
-              {/* NL tab */}
-              {resultTab === "nl" && result.natural_language && (
-                <div
-                  className="p-4 text-xs leading-relaxed whitespace-pre-wrap overflow-auto max-h-[600px]"
-                  style={{
-                    backgroundColor: "var(--theme-bg-deep)",
-                    color: "var(--theme-text-dim)",
-                    fontFamily: "var(--font-mono)",
-                    borderRadius: "4px",
-                    border: "1px solid var(--theme-border)",
-                  }}
-                >
-                  {result.natural_language}
-                </div>
-              )}
-
-              {/* JSON tab */}
-              {resultTab === "json" && result.json_data && (
-                <div className="relative">
-                  <RetroButton
-                    variant="ghost"
-                    className="absolute top-2 right-2 z-10"
-                    onClick={() =>
-                      copyToClipboard(
-                        JSON.stringify(result.json_data, null, 2)
-                      )
-                    }
-                  >
-                    Copy
-                  </RetroButton>
-                  <pre
-                    className="p-4 text-xs overflow-auto max-h-[600px]"
-                    style={{
-                      backgroundColor: "var(--theme-bg-deep)",
-                      color: "var(--theme-sage)",
-                      fontFamily: "var(--font-mono)",
-                      borderRadius: "4px",
-                      border: "1px solid var(--theme-border)",
-                    }}
-                  >
-                    {JSON.stringify(result.json_data, null, 2)}
-                  </pre>
-                </div>
-              )}
-
-              {/* De-identification Report */}
-              {result.de_identification_report &&
-                Object.keys(result.de_identification_report).length > 0 && (
-                  <div
-                    className="border-t pt-3 mt-3"
-                    style={{ borderColor: "var(--theme-border)" }}
-                  >
-                    <p
-                      className="text-xs font-medium mb-2"
-                      style={{
-                        color: "var(--theme-text-muted)",
-                        fontFamily: "var(--font-body)",
-                      }}
-                    >
-                      De-identification report
-                    </p>
-                    <div className="grid grid-cols-2 gap-2">
-                      {Object.entries(result.de_identification_report).map(
-                        ([key, val]) => (
-                          <div
-                            key={key}
-                            className="flex justify-between py-1 px-2"
-                            style={{
-                              backgroundColor: "var(--theme-bg-deep)",
-                              borderRadius: "4px",
-                            }}
-                          >
-                            <span
-                              className="text-xs"
-                              style={{ color: "var(--theme-text-muted)" }}
-                            >
-                              {key.replace(/_/g, " ").toUpperCase()}
-                            </span>
-                            <span
-                              className="text-xs font-medium"
-                              style={{ color: "var(--theme-amber)" }}
-                            >
-                              {val}
-                            </span>
-                          </div>
-                        )
-                      )}
-                    </div>
-                  </div>
-                )}
-            </div>
-          </RetroCardContent>
-        </RetroCard>
-      )}
-
-      {/* AI Disclaimer */}
-      <RetroCard>
-        <RetroCardContent>
-          <div className="flex items-start gap-3">
-            <span
-              className="text-xs font-bold shrink-0 px-2 py-0.5"
+          {/* Narrative tab */}
+          {resultTab === "nl" && result.natural_language && (
+            <div
+              className="panel"
               style={{
-                backgroundColor: "var(--theme-terracotta)",
-                color: "var(--theme-text)",
-                borderRadius: "4px",
-                fontFamily: "var(--font-body)",
+                whiteSpace: "pre-wrap",
+                fontSize: 14.5,
+                lineHeight: 1.6,
+                color: "var(--text-dim)",
+                maxHeight: 600,
+                overflow: "auto",
               }}
             >
-              Notice
-            </span>
-            <p
-              className="text-xs leading-relaxed"
-              style={{ color: "var(--theme-text-dim)" }}
-            >
-              AI summaries are for personal reference only and do not constitute
-              medical advice, diagnoses, or treatment recommendations. All health
-              data is de-identified before being sent to the AI model. Summaries
-              are generated by Gemini 3 Flash and may contain inaccuracies.
-            </p>
-          </div>
-        </RetroCardContent>
-      </RetroCard>
+              {result.natural_language}
+            </div>
+          )}
+
+          {/* JSON tab */}
+          {resultTab === "json" && result.json_data && (
+            <div style={{ position: "relative" }}>
+              <button
+                type="button"
+                className="btn ghost sm"
+                style={{ position: "absolute", top: 10, right: 10, zIndex: 10 }}
+                onClick={() =>
+                  copyToClipboard(JSON.stringify(result.json_data, null, 2))
+                }
+              >
+                <Copy size={13} /> {copied ? "Copied" : "Copy"}
+              </button>
+              <pre
+                className="panel mono"
+                style={{
+                  fontSize: 12.5,
+                  lineHeight: 1.5,
+                  color: "var(--success)",
+                  maxHeight: 600,
+                  overflow: "auto",
+                  margin: 0,
+                }}
+              >
+                {JSON.stringify(result.json_data, null, 2)}
+              </pre>
+            </div>
+          )}
+
+          {/* De-identification report */}
+          {result.de_identification_report &&
+            Object.keys(result.de_identification_report).length > 0 && (
+              <div
+                style={{
+                  marginTop: 18,
+                  paddingTop: 16,
+                  borderTop: "1px solid var(--border)",
+                }}
+              >
+                <div className="field-l" style={{ marginBottom: 10 }}>
+                  De-identification report
+                </div>
+                <div className="reasons">
+                  {Object.entries(result.de_identification_report).map(
+                    ([key, val]) => (
+                      <span key={key} className="reason">
+                        {key.replace(/_/g, " ")} · {val}
+                      </span>
+                    )
+                  )}
+                </div>
+              </div>
+            )}
+        </div>
+      )}
+
+      {/* AI disclaimer — legally required wherever AI prompts/responses are shown. */}
+      <div className="card-surface pad">
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+          <span className="tag" style={{ flexShrink: 0 }}>
+            <span className="tdot" style={{ background: "var(--theme-ochre)" }} />
+            Notice
+          </span>
+          <p className="dim" style={{ fontSize: 13, lineHeight: 1.55, margin: 0 }}>
+            AI summaries are for personal reference only and do not constitute
+            medical advice, diagnoses, or treatment recommendations. All health
+            data is de-identified before being sent to the AI model. Summaries are
+            generated by Gemini 3 Flash and may contain inaccuracies; verify
+            anything important against your original records.
+          </p>
+        </div>
+      </div>
 
       {/* History */}
-      <div>
-        <button
-          onClick={() => setShowHistory(!showHistory)}
-          className="text-xs cursor-pointer font-medium"
-          style={{
-            color: "var(--theme-text-dim)",
-            fontFamily: "var(--font-body)",
-          }}
-        >
-          {showHistory ? "Hide history" : "Summary history"} ({history.length})
-        </button>
-        {showHistory && history.length > 0 && (
-          <div className="mt-3 space-y-2">
-            {history.map((h) => (
-              <button
-                key={h.id}
-                type="button"
-                onClick={() => handleViewSaved(h.id)}
-                className="block w-full text-left cursor-pointer transition-transform hover:-translate-y-px focus:outline-none focus-visible:ring-1 focus-visible:ring-[var(--theme-primary)] rounded"
-                title="View this saved summary"
-              >
-                <RetroCard className="transition-colors hover:border-[var(--theme-primary)]">
-                  <RetroCardContent>
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <span
-                          className="text-xs font-medium"
-                          style={{ color: "var(--theme-text)" }}
-                        >
-                          {h.summary_type} summary
-                        </span>
-                        <span
-                          className="text-xs ml-3"
-                          style={{ color: "var(--theme-text-muted)" }}
-                        >
-                          {h.record_count} records
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-3">
-                        <span
-                          className="text-xs"
-                          style={{ color: "var(--theme-text-muted)" }}
-                        >
-                          {h.generated_at
-                            ? new Date(h.generated_at).toLocaleDateString()
-                            : ""}
-                        </span>
-                        <span
-                          className="text-xs font-mono"
-                          style={{ color: "var(--theme-primary)" }}
-                        >
-                          View →
-                        </span>
-                      </div>
-                    </div>
-                  </RetroCardContent>
-                </RetroCard>
-              </button>
-            ))}
-          </div>
-        )}
+      <div className="card-surface pad">
+        <div className="card-h">
+          <h3 className="sec-title">Summary history</h3>
+          <button
+            type="button"
+            className="btn ghost sm"
+            onClick={() => setShowHistory(!showHistory)}
+          >
+            {showHistory ? "Hide" : "Show"} ({history.length})
+          </button>
+        </div>
+        {showHistory &&
+          (history.length === 0 ? (
+            <p className="muted" style={{ fontSize: 13, margin: 0 }}>
+              No saved summaries yet.
+            </p>
+          ) : (
+            <div>
+              {history.map((h) => (
+                <button
+                  key={h.id}
+                  type="button"
+                  className="lrow"
+                  onClick={() => handleViewSaved(h.id)}
+                  title="Open this saved summary"
+                  style={{
+                    width: "100%",
+                    background: "transparent",
+                    border: 0,
+                    borderBottom: "1px solid var(--border)",
+                    cursor: "pointer",
+                    textAlign: "left",
+                  }}
+                >
+                  <span className="lrow-main">
+                    <span className="lrow-title" style={{ textTransform: "capitalize" }}>
+                      {h.summary_type.replace(/_/g, " ")} summary
+                    </span>
+                    <span className="lrow-sub">
+                      {h.record_count} record{h.record_count === 1 ? "" : "s"}
+                    </span>
+                  </span>
+                  <span className="lrow-meta tnum">
+                    {h.generated_at
+                      ? new Date(h.generated_at).toLocaleDateString()
+                      : ""}
+                  </span>
+                  <ChevronRight size={15} style={{ color: "var(--text-muted)" }} />
+                </button>
+              ))}
+            </div>
+          ))}
       </div>
     </div>
   );

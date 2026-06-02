@@ -2,7 +2,16 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
-import { FolderUp, FileText, FileArchive, ChevronDown, ChevronUp } from "lucide-react";
+import {
+  FolderUp,
+  FileText,
+  FileArchive,
+  ChevronDown,
+  ChevronUp,
+  Lock,
+  RotateCcw,
+  Trash2,
+} from "lucide-react";
 import { useDirectoryUpload } from "@/hooks/useDirectoryUpload";
 import { getFilesFromDrop } from "@/lib/getFilesFromDrop";
 import { api } from "@/lib/api";
@@ -12,18 +21,8 @@ import type {
   TriggerExtractionResponse,
   ExtractionProgressResponse,
 } from "@/types/api";
-import { GlowText } from "@/components/retro/GlowText";
-import { RetroCard, RetroCardHeader, RetroCardContent } from "@/components/retro/RetroCard";
-import { RetroButton } from "@/components/retro/RetroButton";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
-import {
-  RetroTable,
-  RetroTableHeader,
-  RetroTableHead,
-  RetroTableBody,
-  RetroTableRow,
-  RetroTableCell,
-} from "@/components/retro/RetroTable";
+import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
 
 /* ==========================================
    FILE CLASSIFICATION HELPERS
@@ -49,6 +48,32 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/* ==========================================
+   STATUS PILL HELPERS — neutral editorial hues
+   ========================================== */
+
+// Map a status to a tdot color drawn from the design tokens. We keep the pill
+// neutral (.tag) and only color the dot, matching the Overview/admin treatment.
+function statusDotColor(status: string): string {
+  switch (status) {
+    case "completed":
+    case "parsed":
+      return "var(--success)";
+    case "processing":
+    case "pending_extraction":
+    case "awaiting_confirmation":
+    case "pending":
+      return "var(--primary)";
+    case "failed":
+      return "var(--danger)";
+    case "duplicate_file":
+    case "duplicate":
+      return "var(--text-muted)";
+    default:
+      return "var(--text-muted)";
+  }
 }
 
 /* ==========================================
@@ -115,11 +140,26 @@ interface UploadResult {
   error?: string;
 }
 
+function SecureChip() {
+  return (
+    <span className="secure">
+      <Lock size={13} strokeWidth={1.9} /> End-to-end encrypted
+    </span>
+  );
+}
+
 /* ==========================================
    MAIN UPLOAD PAGE
    ========================================== */
 
 export default function UploadPage() {
+  // --- Mount transition ---
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
   // --- File selection state ---
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
 
@@ -133,6 +173,11 @@ export default function UploadPage() {
   const [history, setHistory] = useState<UploadHistoryItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+
+  // --- Upload deletion state ---
+  const [deleteTarget, setDeleteTarget] = useState<UploadHistoryItem | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // --- Extraction trigger state (for unstructured files from ZIP uploads) ---
   const [pendingExtractions, setPendingExtractions] = useState<
@@ -169,19 +214,49 @@ export default function UploadPage() {
     onError: (message) => setUploadError(message),
   });
 
+  // --- Load history (reusable so delete can refetch immediately) ---
+  const fetchHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    try {
+      const data = await api.get<{ items: UploadHistoryItem[]; total: number }>(
+        "/upload/history"
+      );
+      setHistory(data.items || []);
+      setHistoryLoaded(true);
+    } catch {
+      setHistory([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
   // --- Load history when section is opened ---
   useEffect(() => {
     if (!historyOpen || historyLoaded) return;
-    setHistoryLoading(true);
-    api
-      .get<{ items: UploadHistoryItem[]; total: number }>("/upload/history")
-      .then((data) => {
-        setHistory(data.items || []);
-        setHistoryLoaded(true);
-      })
-      .catch(() => setHistory([]))
-      .finally(() => setHistoryLoading(false));
-  }, [historyOpen, historyLoaded]);
+    void fetchHistory();
+  }, [historyOpen, historyLoaded, fetchHistory]);
+
+  // --- Delete an upload (cascade soft-deletes its records server-side) ---
+  const performDeleteUpload = useCallback(
+    async (id: string) => {
+      setDeletingId(id);
+      setDeleteError(null);
+      try {
+        await api.delete<void>(`/upload/${id}`);
+        // Refetch so the cascade-deleted upload disappears and record counts
+        // reflect the server state.
+        await fetchHistory();
+      } catch (err) {
+        setDeleteError(
+          err instanceof Error ? err.message : "Failed to delete upload"
+        );
+      } finally {
+        setDeletingId(null);
+        setDeleteTarget(null);
+      }
+    },
+    [fetchHistory]
+  );
 
   // --- Poll for extraction progress ---
   const startProgressPolling = useCallback(() => {
@@ -451,722 +526,457 @@ export default function UploadPage() {
 
   // --- Render ---
   return (
-    <div className="space-y-6 retro-stagger">
-      <GlowText as="h1">Upload</GlowText>
+    <div className={`screen s24 ${shown ? "on" : ""}`}>
+      {/* ==========================================
+          HEADER
+          ========================================== */}
+      <div className="page-top">
+        <div>
+          <p className="kicker">Add to your record</p>
+          <h1 className="h1 display">Uploads</h1>
+        </div>
+        <SecureChip />
+      </div>
 
       {/* ==========================================
           HERO DROPZONE
           ========================================== */}
-      <RetroCard accentTop>
-        <RetroCardContent>
-          <div
-            {...getRootProps()}
-            onDropCapture={handleDropCapture}
-            className="border-2 border-dashed transition-all duration-200 cursor-pointer"
-            style={{
-              borderColor: isDragActive
-                ? "var(--theme-amber)"
-                : "var(--theme-border)",
-              backgroundColor: isDragActive
-                ? "var(--theme-bg-card-hover)"
-                : "transparent",
-              borderRadius: "6px",
-              minHeight: "200px",
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              justifyContent: "center",
-              padding: "2rem",
+      <div
+        {...getRootProps()}
+        onDropCapture={handleDropCapture}
+        className={`dropzone ${isDragActive ? "drag" : ""}`}
+        style={{ cursor: "pointer" }}
+      >
+        <input {...getInputProps()} />
+        <div className="dz-ic">
+          <FolderUp size={24} strokeWidth={1.8} />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <p style={{ fontSize: 15, fontWeight: 700, color: "var(--text)", margin: 0 }}>
+            Drop files or a folder to add to the record
+          </p>
+          <p className="dim" style={{ fontSize: 13, margin: "4px 0 0" }}>
+            FHIR R4 · Epic EHI (.zip) · C-CDA (.xml) · PDF / RTF / TIFF — encrypted on arrival.
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 10, flexShrink: 0 }}>
+          <button
+            className="btn ghost"
+            onClick={(e) => {
+              e.stopPropagation();
+              const input = document.querySelector(
+                'input[type="file"]:not([webkitdirectory])'
+              ) as HTMLInputElement | null;
+              if (input) {
+                // Reset value so re-selecting the SAME file still fires a
+                // change event (browsers suppress it when the value is
+                // unchanged) — otherwise re-picking a just-uploaded file is
+                // a silent no-op with no preview.
+                input.value = "";
+                input.click();
+              }
             }}
           >
-            <input {...getInputProps()} />
-            <FolderUp
-              size={48}
-              style={{ color: "var(--theme-text-muted)", marginBottom: "1rem" }}
-            />
-            <p
-              style={{
-                color: "var(--theme-text)",
-                fontFamily: "var(--font-body)",
-                fontWeight: 600,
-                fontSize: "1rem",
-                marginBottom: "0.25rem",
-              }}
-            >
-              Drop files or folders
-            </p>
-            <p
-              style={{
-                color: "var(--theme-text-dim)",
-                fontFamily: "var(--font-body)",
-                fontSize: "0.8rem",
-              }}
-            >
-              JSON, ZIP, PDF, RTF, TIFF, or Epic export directories
-            </p>
-          </div>
-
-          {/* Buttons below dropzone */}
-          <div
-            style={{
-              display: "flex",
-              gap: "0.75rem",
-              justifyContent: "center",
-              marginTop: "1rem",
+            <FileText size={14} />
+            Browse files
+          </button>
+          <button
+            className="btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              selectFolder();
             }}
+            disabled={isZipping}
           >
-            <RetroButton
-              variant="ghost"
-              onClick={(e) => {
-                e.stopPropagation();
-                const input = document.querySelector(
-                  'input[type="file"]:not([webkitdirectory])'
-                ) as HTMLInputElement | null;
-                if (input) {
-                  // Reset value so re-selecting the SAME file still fires a
-                  // change event (browsers suppress it when the value is
-                  // unchanged) — otherwise re-picking a just-uploaded file is
-                  // a silent no-op with no preview.
-                  input.value = "";
-                  input.click();
-                }
-              }}
-            >
-              <FileText size={14} style={{ marginRight: "0.5rem" }} />
-              Select Files
-            </RetroButton>
-            <RetroButton
-              onClick={(e) => {
-                e.stopPropagation();
-                selectFolder();
-              }}
-              disabled={isZipping}
-            >
-              <FileArchive size={14} style={{ marginRight: "0.5rem" }} />
-              Select Folder
-            </RetroButton>
-            <input
-              ref={folderInputRef}
-              type="file"
-              webkitdirectory=""
-              directory=""
-              multiple
-              onChange={handleFolderSelect}
-              style={{ display: "none" }}
-            />
-          </div>
-        </RetroCardContent>
-      </RetroCard>
+            <FileArchive size={14} />
+            Select folder
+          </button>
+          <input
+            ref={folderInputRef}
+            type="file"
+            webkitdirectory=""
+            directory=""
+            multiple
+            onChange={handleFolderSelect}
+            style={{ display: "none" }}
+          />
+        </div>
+      </div>
 
       {/* ==========================================
           ZIPPING PROGRESS
           ========================================== */}
       {isZipping && folderInfo && (
-        <RetroCard>
-          <RetroCardContent>
-            <span
-              className="animate-pulse"
-              style={{
-                fontFamily: "var(--font-mono)",
-                fontSize: "1rem",
-                color: "var(--theme-amber)",
-                display: "block",
-                marginBottom: "0.5rem",
-              }}
-            >
-              Preparing upload...
-            </span>
-            <p
-              style={{
-                fontSize: "0.8rem",
-                color: "var(--theme-text-dim)",
-                fontFamily: "var(--font-body)",
-                marginBottom: "0.75rem",
-              }}
-            >
-              {folderInfo.name} &mdash; {folderInfo.fileCount.toLocaleString()} files ({formatFileSize(folderInfo.totalSize)})
-            </p>
-            <div
-              style={{
-                height: "6px",
-                backgroundColor: "var(--theme-bg-deep)",
-                borderRadius: "3px",
-                overflow: "hidden",
-              }}
-            >
-              <div
-                style={{
-                  height: "100%",
-                  width: `${zipProgress}%`,
-                  backgroundColor: "var(--theme-amber)",
-                  borderRadius: "3px",
-                  transition: "width 0.2s ease",
-                }}
-              />
-            </div>
-            <span
-              style={{
-                fontFamily: "var(--font-mono)",
-                fontSize: "0.95rem",
-                color: "var(--theme-amber)",
-                display: "block",
-                textAlign: "right",
-                marginTop: "0.25rem",
-              }}
-            >
+        <div className="card-surface pad">
+          <div className="card-h">
+            <h3 className="sec-title">Preparing upload</h3>
+            <span className="muted mono" style={{ fontSize: 12 }}>
               {zipProgress.toFixed(0)}%
             </span>
-          </RetroCardContent>
-        </RetroCard>
+          </div>
+          <p className="dim" style={{ fontSize: 13, marginBottom: 12 }}>
+            {folderInfo.name} &mdash; {folderInfo.fileCount.toLocaleString()} files (
+            {formatFileSize(folderInfo.totalSize)})
+          </p>
+          <div className="bar">
+            <i style={{ width: `${zipProgress}%` }} />
+          </div>
+        </div>
       )}
 
       {/* ==========================================
           SELECTED FILES DISPLAY
           ========================================== */}
       {selectedFiles.length > 0 && (
-        <RetroCard>
-          <RetroCardContent>
-            {/* Status bar */}
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                marginBottom: "1rem",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-                <span
-                  style={{
-                    fontFamily: "var(--font-mono)",
-                    fontSize: "1rem",
-                    color: "var(--theme-amber)",
-                  }}
-                >
-                  {selectedFiles.length} file{selectedFiles.length !== 1 ? "s" : ""}{" "}
-                  selected
+        <div className="card-surface pad">
+          <div className="card-h">
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              <h3 className="sec-title">
+                {selectedFiles.length} file{selectedFiles.length !== 1 ? "s" : ""} ready
+              </h3>
+              {structuredCount > 0 && (
+                <span className="tag">
+                  <span className="tdot" style={{ background: "var(--success)" }} />
+                  {structuredCount} structured · import
                 </span>
+              )}
+              {unstructuredCount > 0 && (
+                <span className="tag">
+                  <span className="tdot" style={{ background: "var(--primary)" }} />
+                  {unstructuredCount} document{unstructuredCount !== 1 ? "s" : ""} · AI extraction
+                </span>
+              )}
+            </div>
+            <button className="btn ghost sm" onClick={clearFiles}>
+              Clear
+            </button>
+          </div>
 
-                {structuredCount > 0 && (
-                  <span
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: "0.25rem",
-                      padding: "0.15rem 0.5rem",
-                      borderRadius: "4px",
-                      fontSize: "0.7rem",
-                      fontFamily: "var(--font-body)",
-                      fontWeight: 600,
-                      backgroundColor: "var(--theme-sage)",
-                      color: "var(--theme-bg-deep)",
-                    }}
-                  >
-                    {structuredCount} structured &rarr; Import
-                  </span>
-                )}
-
-                {unstructuredCount > 0 && (
-                  <span
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: "0.25rem",
-                      padding: "0.15rem 0.5rem",
-                      borderRadius: "4px",
-                      fontSize: "0.7rem",
-                      fontFamily: "var(--font-body)",
-                      fontWeight: 600,
-                      backgroundColor: "var(--theme-amber)",
-                      color: "var(--theme-bg-deep)",
-                    }}
-                  >
-                    {unstructuredCount} document{unstructuredCount !== 1 ? "s" : ""}{" "}
-                    &rarr; AI extraction
-                  </span>
-                )}
+          {/* File list */}
+          <div
+            style={{
+              maxHeight: 200,
+              overflowY: "auto",
+              borderRadius: "var(--radius-sm)",
+              background: "var(--card-2)",
+              border: "1px solid var(--border)",
+            }}
+          >
+            {selectedFiles.map((file, i) => (
+              <div
+                key={`${file.name}-${i}`}
+                className="between"
+                style={{
+                  padding: "10px 14px",
+                  borderBottom:
+                    i < selectedFiles.length - 1
+                      ? "1px solid var(--border)"
+                      : "none",
+                }}
+              >
+                <span style={{ fontSize: 13.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {file.name}
+                </span>
+                <span className="muted mono" style={{ fontSize: 12, flexShrink: 0 }}>
+                  {formatFileSize(file.size)}
+                </span>
               </div>
+            ))}
+          </div>
 
-              <RetroButton variant="ghost" onClick={clearFiles}>
-                Clear
-              </RetroButton>
-            </div>
-
-            {/* File list */}
-            <div
-              style={{
-                maxHeight: "180px",
-                overflowY: "auto",
-                borderRadius: "4px",
-                backgroundColor: "var(--theme-bg-deep)",
-                padding: "0.5rem",
-              }}
-            >
-              {selectedFiles.map((file, i) => (
-                <div
-                  key={`${file.name}-${i}`}
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    padding: "0.35rem 0.5rem",
-                    borderBottom:
-                      i < selectedFiles.length - 1
-                        ? "1px solid var(--theme-border)"
-                        : "none",
-                  }}
-                >
-                  <span
-                    style={{
-                      fontFamily: "var(--font-mono)",
-                      fontSize: "0.95rem",
-                      color: "var(--theme-text)",
-                    }}
-                  >
-                    {file.name}
-                  </span>
-                  <span
-                    style={{
-                      fontFamily: "var(--font-mono)",
-                      fontSize: "0.85rem",
-                      color: "var(--theme-text-muted)",
-                    }}
-                  >
-                    {formatFileSize(file.size)}
-                  </span>
-                </div>
-              ))}
-            </div>
-
-            {/* Upload All button */}
-            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "1rem" }}>
-              <RetroButton onClick={handleUploadAll} disabled={uploading}>
-                {uploading ? "Uploading..." : "Upload All"}
-              </RetroButton>
-            </div>
-          </RetroCardContent>
-        </RetroCard>
+          {/* Upload All button */}
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
+            <button className="btn" onClick={handleUploadAll} disabled={uploading}>
+              {uploading ? "Uploading…" : "Upload all"}
+            </button>
+          </div>
+        </div>
       )}
 
       {/* ==========================================
           UPLOAD PROGRESS / RESULTS
           ========================================== */}
       {uploading && (
-        <RetroCard>
-          <RetroCardContent>
-            <span
-              className="animate-pulse"
-              style={{
-                fontFamily: "var(--font-mono)",
-                fontSize: "1rem",
-                color: "var(--theme-amber)",
-              }}
-            >
-              Uploading files...
-            </span>
-          </RetroCardContent>
-        </RetroCard>
+        <div className="card-surface pad">
+          <span className="mono dim" style={{ fontSize: 13 }}>
+            Uploading files…
+          </span>
+        </div>
       )}
 
       {uploadError && (
-        <RetroCard>
-          <RetroCardContent>
-            <div style={{ display: "flex", alignItems: "flex-start", gap: "0.75rem" }}>
-              <span
-                style={{
-                  fontSize: "0.7rem",
-                  fontWeight: 700,
-                  padding: "0.15rem 0.5rem",
-                  borderRadius: "4px",
-                  backgroundColor: "var(--theme-terracotta)",
-                  color: "var(--theme-text)",
-                  flexShrink: 0,
-                  fontFamily: "var(--font-body)",
-                }}
-              >
-                ERROR
-              </span>
-              <p
-                style={{
-                  fontSize: "0.8rem",
-                  color: "var(--theme-text-dim)",
-                  fontFamily: "var(--font-body)",
-                }}
-              >
-                {uploadError}
-              </p>
-            </div>
-          </RetroCardContent>
-        </RetroCard>
+        <div className="card-surface pad">
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+            <span className="tag" style={{ color: "var(--danger)" }}>
+              <span className="tdot" style={{ background: "var(--danger)" }} />
+              Error
+            </span>
+            <p className="dim" style={{ fontSize: 13, margin: 0 }}>
+              {uploadError}
+            </p>
+          </div>
+        </div>
       )}
 
       {uploadResults.length > 0 && !uploading && (
-        <RetroCard accentTop>
-          <RetroCardHeader>
-            <GlowText as="h4" glow={false}>
-              Upload complete
-            </GlowText>
-          </RetroCardHeader>
-          <RetroCardContent>
-            <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-              {uploadResults.map((result, i) => (
-                <div
-                  key={i}
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    padding: "0.5rem 0",
-                    borderBottom:
-                      i < uploadResults.length - 1
-                        ? "1px solid var(--theme-border)"
-                        : "none",
-                  }}
-                >
-                  <span
+        <div className="card-surface pad">
+          <div className="card-h">
+            <h3 className="sec-title">Upload complete</h3>
+          </div>
+          <div>
+            {uploadResults.map((result, i) => (
+              <div
+                key={i}
+                className="between"
+                style={{
+                  padding: "10px 0",
+                  borderBottom:
+                    i < uploadResults.length - 1
+                      ? "1px solid var(--border)"
+                      : "none",
+                }}
+              >
+                <span style={{ fontSize: 13.5, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {result.filename}
+                </span>
+                {result.error ? (
+                  <span className="tag" style={{ color: "var(--danger)", flexShrink: 0 }}>
+                    <span className="tdot" style={{ background: "var(--danger)" }} />
+                    {result.error}
+                  </span>
+                ) : result.type === "structured" &&
+                  result.response &&
+                  "records_inserted" in result.response ? (
+                  <span className="tag" style={{ flexShrink: 0 }}>
+                    <span className="tdot" style={{ background: "var(--success)" }} />
+                    {(result.response as UploadResponse).records_inserted} records inserted
+                  </span>
+                ) : (
+                  // Upload accepted; live extraction status is shown in the
+                  // dedicated progress card below (this label is static, so
+                  // don't imply ongoing progress here).
+                  <span className="tag" style={{ flexShrink: 0 }}>
+                    <span className="tdot" style={{ background: "var(--success)" }} />
+                    Uploaded
+                  </span>
+                )}
+              </div>
+            ))}
+
+            {/* Show structured upload errors if any */}
+            {uploadResults
+              .filter(
+                (r) =>
+                  r.type === "structured" &&
+                  r.response &&
+                  "errors" in r.response &&
+                  Array.isArray((r.response as UploadResponse).errors) &&
+                  (r.response as UploadResponse).errors.length > 0
+              )
+              .map((r, i) => (
+                <div key={`errs-${i}`} style={{ marginTop: 12 }}>
+                  <p className="field-l" style={{ color: "var(--danger)", marginBottom: 6 }}>
+                    Errors in {r.filename}
+                  </p>
+                  <div
                     style={{
-                      fontFamily: "var(--font-mono)",
-                      fontSize: "0.95rem",
-                      color: "var(--theme-text)",
+                      maxHeight: 140,
+                      overflowY: "auto",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 4,
                     }}
                   >
-                    {result.filename}
-                  </span>
-                  {result.error ? (
-                    <span
-                      style={{
-                        fontSize: "0.7rem",
-                        fontWeight: 600,
-                        color: "var(--theme-terracotta)",
-                        fontFamily: "var(--font-body)",
-                      }}
-                    >
-                      {result.error}
-                    </span>
-                  ) : result.type === "structured" &&
-                    result.response &&
-                    "records_inserted" in result.response ? (
-                    <span
-                      style={{
-                        fontSize: "0.7rem",
-                        fontWeight: 600,
-                        color: "var(--theme-sage)",
-                        fontFamily: "var(--font-body)",
-                      }}
-                    >
-                      {(result.response as UploadResponse).records_inserted} records
-                      inserted
-                    </span>
-                  ) : (
-                    // Upload accepted; live extraction status is shown in the
-                    // dedicated progress card below (this label is static, so
-                    // don't imply ongoing progress here).
-                    <span
-                      style={{
-                        fontSize: "0.7rem",
-                        fontWeight: 600,
-                        color: "var(--theme-sage)",
-                        fontFamily: "var(--font-body)",
-                      }}
-                    >
-                      Uploaded
-                    </span>
-                  )}
+                    {(r.response as UploadResponse).errors.map((err, j) => (
+                      <p
+                        key={j}
+                        className="mono dim"
+                        style={{
+                          fontSize: 12,
+                          padding: "6px 8px",
+                          background: "var(--card-2)",
+                          border: "1px solid var(--border)",
+                          borderRadius: "var(--radius-sm)",
+                          margin: 0,
+                        }}
+                      >
+                        {formatUploadError(err)}
+                      </p>
+                    ))}
+                  </div>
                 </div>
               ))}
-
-              {/* Show structured upload errors if any */}
-              {uploadResults
-                .filter(
-                  (r) =>
-                    r.type === "structured" &&
-                    r.response &&
-                    "errors" in r.response &&
-                    Array.isArray((r.response as UploadResponse).errors) &&
-                    (r.response as UploadResponse).errors.length > 0
-                )
-                .map((r, i) => (
-                  <div key={`errs-${i}`} style={{ marginTop: "0.5rem" }}>
-                    <p
-                      style={{
-                        fontSize: "0.75rem",
-                        fontWeight: 600,
-                        color: "var(--theme-terracotta)",
-                        fontFamily: "var(--font-body)",
-                        marginBottom: "0.25rem",
-                      }}
-                    >
-                      Errors in {r.filename}
-                    </p>
-                    <div
-                      style={{
-                        maxHeight: "120px",
-                        overflowY: "auto",
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: "0.25rem",
-                      }}
-                    >
-                      {(r.response as UploadResponse).errors.map((err, j) => (
-                        <p
-                          key={j}
-                          style={{
-                            fontFamily: "var(--font-mono)",
-                            fontSize: "0.85rem",
-                            padding: "0.35rem 0.5rem",
-                            backgroundColor: "var(--theme-bg-deep)",
-                            color: "var(--theme-text-dim)",
-                            borderRadius: "4px",
-                          }}
-                        >
-                          {formatUploadError(err)}
-                        </p>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-            </div>
-          </RetroCardContent>
-        </RetroCard>
+          </div>
+        </div>
       )}
 
       {/* ==========================================
           EXTRACTION PROGRESS BAR
           ========================================== */}
       {showProgress && extractionProgress && (
-        <RetroCard accentTop>
-          <RetroCardHeader>
-            <GlowText as="h4" glow={false}>
+        <div className="card-surface pad">
+          <div className="card-h">
+            <h3 className="sec-title">
               {extractionProgress.processing > 0
-                ? "Extracting clinical entities..."
+                ? "Extracting clinical entities"
                 : "Extraction complete"}
-            </GlowText>
-          </RetroCardHeader>
-          <RetroCardContent>
-            <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-              {/* Progress text */}
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span
-                  style={{
-                    fontFamily: "var(--font-mono)",
-                    fontSize: "1rem",
-                    color: extractionProgress.processing > 0
-                      ? "var(--theme-amber)"
-                      : "var(--theme-sage)",
-                  }}
-                  className={extractionProgress.processing > 0 ? "animate-pulse" : ""}
-                >
-                  {extractionProgress.completed + extractionProgress.failed} of {extractionProgress.total} files processed
-                </span>
-                <span
-                  style={{
-                    fontFamily: "var(--font-mono)",
-                    fontSize: "1rem",
-                    color: "var(--theme-sage)",
-                  }}
-                >
-                  {extractionProgress.records_created} records created
-                </span>
-              </div>
+            </h3>
+            <span className="muted mono" style={{ fontSize: 12 }}>
+              {extractionProgress.records_created} records created
+            </span>
+          </div>
 
-              {/* Progress bar */}
-              <div
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {/* Progress text */}
+            <div className="between">
+              <span
+                className="mono"
                 style={{
-                  height: "8px",
-                  backgroundColor: "var(--theme-bg-deep)",
-                  borderRadius: "4px",
-                  overflow: "hidden",
+                  fontSize: 13,
+                  color:
+                    extractionProgress.processing > 0
+                      ? "var(--primary)"
+                      : "var(--success)",
                 }}
               >
-                <div
-                  style={{
-                    height: "100%",
-                    width: `${progressPercent}%`,
-                    backgroundColor: allDone && extractionProgress.failed === 0
-                      ? "var(--theme-sage)"
-                      : "var(--theme-amber)",
-                    borderRadius: "4px",
-                    transition: "width 0.3s ease",
-                  }}
-                />
-              </div>
+                {extractionProgress.completed + extractionProgress.failed} of{" "}
+                {extractionProgress.total} files processed
+              </span>
+            </div>
 
-              {/* Status breakdown */}
-              <div
+            {/* Progress bar */}
+            <div className="bar">
+              <i
                 style={{
-                  display: "flex",
-                  gap: "1rem",
-                  flexWrap: "wrap",
+                  width: `${progressPercent}%`,
+                  background:
+                    allDone && extractionProgress.failed === 0
+                      ? "var(--success)"
+                      : "var(--primary)",
                 }}
-              >
-                {extractionProgress.completed > 0 && (
-                  <span
-                    style={{
-                      fontSize: "0.7rem",
-                      fontFamily: "var(--font-body)",
-                      fontWeight: 600,
-                      padding: "0.15rem 0.5rem",
-                      borderRadius: "4px",
-                      backgroundColor: "var(--theme-sage)",
-                      color: "var(--theme-bg-deep)",
-                    }}
-                  >
-                    {extractionProgress.completed} completed
-                  </span>
-                )}
-                {extractionProgress.processing > 0 && (
-                  <span
-                    style={{
-                      fontSize: "0.7rem",
-                      fontFamily: "var(--font-body)",
-                      fontWeight: 600,
-                      padding: "0.15rem 0.5rem",
-                      borderRadius: "4px",
-                      backgroundColor: "var(--theme-amber)",
-                      color: "var(--theme-bg-deep)",
-                    }}
-                  >
-                    {extractionProgress.processing} processing
-                  </span>
-                )}
-                {extractionProgress.failed > 0 && (
-                  <span
-                    style={{
-                      fontSize: "0.7rem",
-                      fontFamily: "var(--font-body)",
-                      fontWeight: 600,
-                      padding: "0.15rem 0.5rem",
-                      borderRadius: "4px",
-                      backgroundColor: "var(--theme-terracotta)",
-                      color: "var(--theme-bg-deep)",
-                    }}
-                  >
-                    {extractionProgress.failed} failed
-                  </span>
-                )}
-                {extractionProgress.pending > 0 && (
-                  <span
-                    style={{
-                      fontSize: "0.7rem",
-                      fontFamily: "var(--font-body)",
-                      fontWeight: 600,
-                      padding: "0.15rem 0.5rem",
-                      borderRadius: "4px",
-                      backgroundColor: "var(--theme-text-muted)",
-                      color: "var(--theme-bg-deep)",
-                    }}
-                  >
-                    {extractionProgress.pending} pending
-                  </span>
-                )}
-              </div>
+              />
+            </div>
 
-              {/* Retry button when there are failed files and nothing processing */}
-              {allDone && extractionProgress.failed > 0 && (
-                <div style={{ display: "flex", justifyContent: "flex-end", gap: "0.5rem" }}>
-                  <RetroButton
-                    variant="ghost"
-                    onClick={() => {
-                      setExtractionProgress(null);
-                      setExtractionTriggered(false);
-                    }}
-                  >
-                    Dismiss
-                  </RetroButton>
-                  <RetroButton onClick={handleRetryFailed}>
-                    Retry {extractionProgress.failed} Failed
-                  </RetroButton>
-                </div>
+            {/* Status breakdown */}
+            <div className="reasons">
+              {extractionProgress.completed > 0 && (
+                <span className="tag">
+                  <span className="tdot" style={{ background: "var(--success)" }} />
+                  {extractionProgress.completed} completed
+                </span>
               )}
-
-              {/* Dismiss when all done with no failures */}
-              {allDone && extractionProgress.failed === 0 && (
-                <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                  <RetroButton
-                    variant="ghost"
-                    onClick={() => {
-                      setExtractionProgress(null);
-                      setExtractionTriggered(false);
-                    }}
-                  >
-                    Dismiss
-                  </RetroButton>
-                </div>
+              {extractionProgress.processing > 0 && (
+                <span className="tag">
+                  <span className="tdot" style={{ background: "var(--primary)" }} />
+                  {extractionProgress.processing} processing
+                </span>
+              )}
+              {extractionProgress.failed > 0 && (
+                <span className="tag">
+                  <span className="tdot" style={{ background: "var(--danger)" }} />
+                  {extractionProgress.failed} failed
+                </span>
+              )}
+              {extractionProgress.pending > 0 && (
+                <span className="tag">
+                  <span className="tdot" style={{ background: "var(--text-muted)" }} />
+                  {extractionProgress.pending} pending
+                </span>
               )}
             </div>
-          </RetroCardContent>
-        </RetroCard>
+
+            {/* Retry button when there are failed files and nothing processing */}
+            {allDone && extractionProgress.failed > 0 && (
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+                <button
+                  className="btn ghost sm"
+                  onClick={() => {
+                    setExtractionProgress(null);
+                    setExtractionTriggered(false);
+                  }}
+                >
+                  Dismiss
+                </button>
+                <button className="btn sm" onClick={handleRetryFailed}>
+                  Retry {extractionProgress.failed} failed
+                </button>
+              </div>
+            )}
+
+            {/* Dismiss when all done with no failures */}
+            {allDone && extractionProgress.failed === 0 && (
+              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                <button
+                  className="btn ghost sm"
+                  onClick={() => {
+                    setExtractionProgress(null);
+                    setExtractionTriggered(false);
+                  }}
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
       )}
 
       {/* ==========================================
           EXTRACTION TRIGGER PANEL
           ========================================== */}
       {pendingExtractions.length > 0 && (
-        <RetroCard>
-          <RetroCardHeader>
-            <GlowText as="h3" className="text-base">
-              {pendingExtractions.length} Unstructured File
-              {pendingExtractions.length !== 1 ? "s" : ""} Detected
-            </GlowText>
-            <p
-              style={{
-                fontSize: "0.7rem",
-                color: "var(--theme-text-muted)",
-                fontFamily: "var(--font-body)",
-                marginTop: "0.25rem",
-              }}
-            >
-              Text extraction required for clinical entity recognition
+        <div className="card-surface pad">
+          <div style={{ marginBottom: 16 }}>
+            <h3 className="sec-title">
+              {pendingExtractions.length} unstructured file
+              {pendingExtractions.length !== 1 ? "s" : ""} detected
+            </h3>
+            <p className="muted" style={{ fontSize: 12.5, margin: "4px 0 0" }}>
+              Text extraction is required before clinical entities can be added to the record.
             </p>
-          </RetroCardHeader>
-          <RetroCardContent>
-            <RetroTable>
-              <RetroTableHeader>
-                <RetroTableHead className="w-8">
-                  <input
-                    type="checkbox"
-                    checked={
-                      selectedForExtraction.size === pendingExtractions.length &&
-                      pendingExtractions.length > 0
-                    }
-                    onChange={toggleSelectAllExtraction}
-                    disabled={extractionTriggered}
-                    style={{ accentColor: "var(--theme-amber)" }}
-                  />
-                </RetroTableHead>
-                <RetroTableHead>File</RetroTableHead>
-                <RetroTableHead>Type</RetroTableHead>
-                <RetroTableHead>Status</RetroTableHead>
-              </RetroTableHeader>
-              <RetroTableBody>
+          </div>
+
+          <div className="tablewrap">
+            <table className="rtable">
+              <thead>
+                <tr>
+                  <th style={{ width: 32 }}>
+                    <input
+                      type="checkbox"
+                      checked={
+                        selectedForExtraction.size === pendingExtractions.length &&
+                        pendingExtractions.length > 0
+                      }
+                      onChange={toggleSelectAllExtraction}
+                      disabled={extractionTriggered}
+                      style={{ accentColor: "var(--primary)" }}
+                    />
+                  </th>
+                  <th>File</th>
+                  <th>Format</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
                 {pendingExtractions.map((file) => {
                   const ext = file.filename.split(".").pop()?.toLowerCase() || "";
-                  const badgeColor =
-                    ext === "pdf"
-                      ? "var(--theme-terracotta)"
-                      : ext === "rtf"
-                        ? "var(--theme-sage)"
-                        : "var(--theme-ochre)";
                   const currentStatus =
                     extractionStatuses[file.upload_id] || file.status;
                   return (
-                    <RetroTableRow key={file.upload_id}>
-                      <RetroTableCell>
+                    <tr key={file.upload_id}>
+                      <td>
                         <input
                           type="checkbox"
                           checked={selectedForExtraction.has(file.upload_id)}
                           onChange={() => toggleExtractionSelection(file.upload_id)}
                           disabled={extractionTriggered}
-                          style={{ accentColor: "var(--theme-amber)" }}
+                          style={{ accentColor: "var(--primary)" }}
                         />
-                      </RetroTableCell>
-                      <RetroTableCell>
+                      </td>
+                      <td className="desc">
                         <span
                           style={{
-                            fontSize: "0.75rem",
-                            fontFamily: "var(--font-body)",
-                            color: "var(--theme-text)",
-                            maxWidth: "250px",
+                            maxWidth: 280,
                             overflow: "hidden",
                             textOverflow: "ellipsis",
                             whiteSpace: "nowrap",
@@ -1175,260 +985,240 @@ export default function UploadPage() {
                         >
                           {file.filename}
                         </span>
-                      </RetroTableCell>
-                      <RetroTableCell>
-                        <span
-                          style={{
-                            fontSize: "0.6rem",
-                            fontWeight: 700,
-                            padding: "0.1rem 0.4rem",
-                            borderRadius: "3px",
-                            backgroundColor: badgeColor,
-                            color: "var(--theme-bg-deep)",
-                            fontFamily: "var(--font-body)",
-                            textTransform: "uppercase",
-                          }}
-                        >
+                      </td>
+                      <td>
+                        <span className="tag" style={{ textTransform: "uppercase" }}>
                           {ext}
                         </span>
-                      </RetroTableCell>
-                      <RetroTableCell>
-                        <span
-                          style={{
-                            fontSize: "0.65rem",
-                            fontWeight: 600,
-                            padding: "0.15rem 0.5rem",
-                            borderRadius: "4px",
-                            fontFamily: "var(--font-body)",
-                            backgroundColor:
-                              currentStatus === "processing"
-                                ? "var(--theme-amber)"
-                                : currentStatus === "completed"
-                                  ? "var(--theme-sage)"
-                                  : currentStatus === "failed"
-                                    ? "var(--theme-terracotta)"
-                                    : "var(--theme-text-muted)",
-                            color: "var(--theme-bg-deep)",
-                          }}
-                        >
+                      </td>
+                      <td>
+                        <span className="tag">
+                          <span
+                            className="tdot"
+                            style={{ background: statusDotColor(currentStatus) }}
+                          />
                           {currentStatus}
                         </span>
-                      </RetroTableCell>
-                    </RetroTableRow>
+                      </td>
+                    </tr>
                   );
                 })}
-              </RetroTableBody>
-            </RetroTable>
+              </tbody>
+            </table>
+          </div>
 
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                padding: "0.75rem 0 0",
-                borderTop: "1px solid var(--theme-border)",
-                marginTop: "0.5rem",
-              }}
-            >
-              <span
-                style={{
-                  fontSize: "0.7rem",
-                  color: "var(--theme-text-muted)",
-                  fontFamily: "var(--font-body)",
-                }}
+          <div
+            className="between"
+            style={{
+              padding: "14px 0 0",
+              borderTop: "1px solid var(--border)",
+              marginTop: 12,
+            }}
+          >
+            <span className="muted" style={{ fontSize: 12.5 }}>
+              {selectedForExtraction.size} of {pendingExtractions.length} selected
+            </span>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn ghost sm" onClick={handleDismissExtractionPanel}>
+                Do later
+              </button>
+              <button
+                className="btn sm"
+                onClick={handleTriggerExtraction}
+                disabled={selectedForExtraction.size === 0 || extractionTriggered}
               >
-                {selectedForExtraction.size} of {pendingExtractions.length} selected
-              </span>
-              <div style={{ display: "flex", gap: "0.5rem" }}>
-                <RetroButton
-                  variant="ghost"
-                  onClick={handleDismissExtractionPanel}
-                >
-                  Do Later
-                </RetroButton>
-                <RetroButton
-                  onClick={handleTriggerExtraction}
-                  disabled={
-                    selectedForExtraction.size === 0 || extractionTriggered
-                  }
-                >
-                  {extractionTriggered
-                    ? "Extracting..."
-                    : `Extract ${selectedForExtraction.size} File${selectedForExtraction.size !== 1 ? "s" : ""}`}
-                </RetroButton>
-              </div>
+                {extractionTriggered
+                  ? "Extracting…"
+                  : `Extract ${selectedForExtraction.size} file${selectedForExtraction.size !== 1 ? "s" : ""}`}
+              </button>
             </div>
-          </RetroCardContent>
-        </RetroCard>
+          </div>
+        </div>
       )}
 
       {/* ==========================================
           UPLOAD HISTORY (COLLAPSIBLE)
           ========================================== */}
-      <RetroCard>
-        <div
+      <div className="card-surface">
+        <button
           onClick={() => setHistoryOpen((prev) => !prev)}
+          className="between"
           style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "0.75rem 1rem",
+            width: "100%",
+            padding: "16px 22px",
             cursor: "pointer",
+            background: "transparent",
+            border: 0,
+            textAlign: "left",
           }}
         >
-          <span
-            style={{
-              fontSize: "0.8rem",
-              fontWeight: 600,
-              color: "var(--theme-text-dim)",
-              fontFamily: "var(--font-body)",
-            }}
-          >
-            Upload history
-          </span>
+          <span className="sec-title">Upload history</span>
           {historyOpen ? (
-            <ChevronUp size={16} style={{ color: "var(--theme-text-muted)" }} />
+            <ChevronUp size={16} style={{ color: "var(--text-muted)" }} />
           ) : (
-            <ChevronDown size={16} style={{ color: "var(--theme-text-muted)" }} />
+            <ChevronDown size={16} style={{ color: "var(--text-muted)" }} />
           )}
-        </div>
+        </button>
 
         {historyOpen && (
-          <RetroCardContent>
+          <div style={{ padding: "0 22px 22px" }}>
+            {deleteError && (
+              <div
+                className="tag"
+                style={{ color: "var(--danger)", marginBottom: 12 }}
+              >
+                <span className="tdot" style={{ background: "var(--danger)" }} />
+                {deleteError}
+              </div>
+            )}
             {historyLoading ? (
               <RetroLoadingState text="Loading upload history" />
             ) : history.length === 0 ? (
-              <p
-                style={{
-                  textAlign: "center",
-                  padding: "1rem 0",
-                  fontSize: "0.75rem",
-                  color: "var(--theme-text-muted)",
-                  fontFamily: "var(--font-body)",
-                }}
-              >
-                No uploads yet
+              <p className="muted" style={{ textAlign: "center", padding: "16px 0", fontSize: 13 }}>
+                No uploads yet.
               </p>
             ) : (
-              <RetroTable>
-                <RetroTableHeader>
-                  <RetroTableHead>Date</RetroTableHead>
-                  <RetroTableHead>Source</RetroTableHead>
-                  <RetroTableHead>Records</RetroTableHead>
-                  <RetroTableHead>Status</RetroTableHead>
-                  <RetroTableHead>Actions</RetroTableHead>
-                </RetroTableHeader>
-                <RetroTableBody>
-                  {history.map((upload) => (
-                    <RetroTableRow key={upload.id}>
-                      <RetroTableCell>
-                        <span
-                          style={{
-                            fontFamily: "var(--font-mono)",
-                            fontSize: "0.9rem",
-                            color: "var(--theme-text-dim)",
-                          }}
-                        >
-                          {upload.created_at
-                            ? new Date(upload.created_at).toLocaleDateString()
-                            : "--"}
-                        </span>
-                      </RetroTableCell>
-                      <RetroTableCell>
-                        <span
-                          style={{
-                            fontSize: "0.75rem",
-                            color: "var(--theme-text)",
-                            fontFamily: "var(--font-body)",
-                            maxWidth: "200px",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                            display: "inline-block",
-                          }}
-                        >
-                          {upload.filename}
-                        </span>
-                        {upload.ingestion_status === "duplicate_file" && (
-                          <div style={{ fontSize: "0.65rem", color: "var(--theme-ochre)", fontFamily: "var(--font-body)", marginTop: "0.15rem" }}>
-                            Already extracted{upload.ingestion_progress?.record_count != null ? ` · ${upload.ingestion_progress.record_count} records` : ""} (duplicate of an earlier upload)
-                          </div>
-                        )}
-                      </RetroTableCell>
-                      <RetroTableCell>
-                        <span
-                          style={{
-                            fontFamily: "var(--font-mono)",
-                            fontSize: "0.9rem",
-                            color: "var(--theme-text-dim)",
-                          }}
-                        >
-                          {recordSummary(upload)}
-                        </span>
-                      </RetroTableCell>
-                      <RetroTableCell>
-                        <span
-                          style={{
-                            fontSize: "0.65rem",
-                            fontWeight: 600,
-                            padding: "0.15rem 0.5rem",
-                            borderRadius: "4px",
-                            fontFamily: "var(--font-body)",
-                            backgroundColor:
-                              upload.ingestion_status === "completed"
-                                ? "var(--theme-sage)"
-                                : upload.ingestion_status === "processing"
-                                  ? "var(--theme-amber)"
-                                  : upload.ingestion_status === "failed"
-                                    ? "var(--theme-terracotta)"
-                                    : upload.ingestion_status ===
-                                        "awaiting_confirmation"
-                                      ? "var(--record-procedure-text)"
-                                      : upload.ingestion_status ===
-                                          "pending_extraction"
-                                        ? "var(--theme-ochre)"
-                                        : upload.ingestion_status ===
-                                            "duplicate_file"
-                                          ? "var(--theme-ochre)"
-                                          : "var(--theme-text-muted)",
-                            color: "var(--theme-bg-deep)",
-                          }}
-                        >
-                          {statusLabel(upload.ingestion_status)}
-                        </span>
-                      </RetroTableCell>
-                      <RetroTableCell>
-                        {(upload.ingestion_status === "pending_extraction" ||
-                          upload.ingestion_status === "failed" ||
-                          upload.ingestion_status === "processing") && (
-                          <RetroButton
-                            variant="ghost"
-                            onClick={async (e: React.MouseEvent) => {
-                              e.stopPropagation();
-                              try {
-                                await api.post<TriggerExtractionResponse>(
-                                  "/upload/trigger-extraction",
-                                  { upload_ids: [upload.id] }
-                                );
-                                setHistoryLoaded(false);
-                              } catch {
-                                // Silently fail
-                              }
-                            }}
-                            style={{ fontSize: "0.65rem", padding: "0.15rem 0.4rem" }}
-                          >
-                            {upload.ingestion_status === "failed" ? "Retry" : "Extract"}
-                          </RetroButton>
-                        )}
-                      </RetroTableCell>
-                    </RetroTableRow>
-                  ))}
-                </RetroTableBody>
-              </RetroTable>
+              <div className="tablewrap">
+                <table className="rtable">
+                  <thead>
+                    <tr>
+                      <th>File</th>
+                      <th>Format</th>
+                      <th>Status</th>
+                      <th>Records</th>
+                      <th>Uploaded</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {history.map((upload) => {
+                      const ext =
+                        upload.filename.split(".").pop()?.toLowerCase() || "—";
+                      return (
+                        <tr key={upload.id}>
+                          <td className="desc">
+                            <span
+                              style={{
+                                maxWidth: 220,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                                display: "inline-block",
+                              }}
+                            >
+                              {upload.filename}
+                            </span>
+                            {upload.ingestion_status === "duplicate_file" && (
+                              <div className="muted" style={{ fontSize: 11.5, fontWeight: 400, marginTop: 3 }}>
+                                Already added
+                                {upload.ingestion_progress?.record_count != null
+                                  ? ` · ${upload.ingestion_progress.record_count} records`
+                                  : ""}{" "}
+                                (duplicate of an earlier upload)
+                              </div>
+                            )}
+                          </td>
+                          <td>
+                            <span className="tag" style={{ textTransform: "uppercase" }}>
+                              {ext}
+                            </span>
+                          </td>
+                          <td>
+                            <span className="tag">
+                              <span
+                                className="tdot"
+                                style={{ background: statusDotColor(upload.ingestion_status) }}
+                              />
+                              {statusLabel(upload.ingestion_status)}
+                            </span>
+                          </td>
+                          <td className="num">{recordSummary(upload)}</td>
+                          <td className="num">
+                            {upload.created_at
+                              ? new Date(upload.created_at).toLocaleDateString()
+                              : "--"}
+                          </td>
+                          <td>
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "flex-end",
+                                gap: 8,
+                              }}
+                            >
+                              {(upload.ingestion_status === "pending_extraction" ||
+                                upload.ingestion_status === "failed" ||
+                                upload.ingestion_status === "processing") && (
+                                <button
+                                  className="btn ghost sm"
+                                  onClick={async (e: React.MouseEvent) => {
+                                    e.stopPropagation();
+                                    try {
+                                      await api.post<TriggerExtractionResponse>(
+                                        "/upload/trigger-extraction",
+                                        { upload_ids: [upload.id] }
+                                      );
+                                      setHistoryLoaded(false);
+                                    } catch {
+                                      // Silently fail
+                                    }
+                                  }}
+                                >
+                                  <RotateCcw size={13} />
+                                  {upload.ingestion_status === "failed" ? "Retry" : "Extract"}
+                                </button>
+                              )}
+                              <button
+                                className="row-del"
+                                title="Delete upload"
+                                aria-label={`Delete ${upload.filename}`}
+                                disabled={deletingId === upload.id}
+                                style={
+                                  deletingId === upload.id
+                                    ? { opacity: 0.5, cursor: "wait" }
+                                    : undefined
+                                }
+                                onClick={(e: React.MouseEvent) => {
+                                  e.stopPropagation();
+                                  setDeleteError(null);
+                                  setDeleteTarget(upload);
+                                }}
+                              >
+                                <Trash2 size={16} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             )}
-          </RetroCardContent>
+          </div>
         )}
-      </RetroCard>
+      </div>
+
+      {/* ==========================================
+          DELETE UPLOAD CONFIRMATION
+          ========================================== */}
+      <ConfirmDialog
+        open={!!deleteTarget}
+        title="Delete upload?"
+        description={
+          deleteTarget
+            ? `"${deleteTarget.filename}" and all records ingested from it will be soft-deleted. This cannot be undone from here.`
+            : ""
+        }
+        confirmLabel="Delete"
+        cancelLabel="Cancel"
+        variant="destructive"
+        onConfirm={() => {
+          if (deleteTarget) void performDeleteUpload(deleteTarget.id);
+        }}
+        onCancel={() => setDeleteTarget(null)}
+      />
     </div>
   );
 }

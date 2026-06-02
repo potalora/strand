@@ -2,11 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { ChevronDown, ChevronRight, ArrowLeft, CheckCircle, RotateCcw } from "lucide-react";
+import { ChevronDown, ChevronRight, ArrowLeft, CheckCircle, RotateCcw, Lock } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
-import { GlowText } from "@/components/retro/GlowText";
-import { RetroCard, RetroCardHeader, RetroCardContent } from "@/components/retro/RetroCard";
-import { RetroButton } from "@/components/retro/RetroButton";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { DedupReviewCard, type ReviewCandidate } from "@/components/retro/DedupReviewCard";
 
@@ -74,20 +71,33 @@ function formatDate(iso: string): string {
   }
 }
 
-function StatusBadge({ status }: { status: string }) {
-  const colorMap: Record<string, string> = {
-    awaiting_review: "#8a7a5a",
-    complete: "#4a7a6a",
-    processing: "#5a8070",
-    failed: "var(--theme-terracotta)",
-  };
-  const bg = colorMap[status] ?? "#5a8070";
+function statusDotColor(status: string): string {
+  switch (status) {
+    case "complete":
+      return "var(--success)";
+    case "awaiting_review":
+    case "processing":
+      return "var(--primary)";
+    case "failed":
+      return "var(--danger)";
+    default:
+      return "var(--text-muted)";
+  }
+}
+
+function StatusTag({ status }: { status: string }) {
   return (
-    <span
-      className="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-md capitalize"
-      style={{ backgroundColor: bg, color: "#ffffff", fontFamily: "var(--font-mono)" }}
-    >
+    <span className="tag" style={{ textTransform: "capitalize" }}>
+      <span className="tdot" style={{ background: statusDotColor(status) }} />
       {status.replace(/_/g, " ")}
+    </span>
+  );
+}
+
+function SecureChip() {
+  return (
+    <span className="secure">
+      <Lock size={13} strokeWidth={1.9} /> End-to-end encrypted
     </span>
   );
 }
@@ -108,84 +118,88 @@ function AutoMergedSection({
   if (entries.length === 0) return null;
 
   return (
-    <RetroCard>
-      <RetroCardHeader>
-        <button
-          className="flex items-center gap-2 w-full text-left"
-          onClick={() => setOpen((v) => !v)}
-        >
+    <div className="card-surface">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="between"
+        style={{
+          width: "100%",
+          padding: "16px 22px",
+          cursor: "pointer",
+          background: "transparent",
+          border: 0,
+          textAlign: "left",
+        }}
+      >
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
           {open ? (
-            <ChevronDown className="h-4 w-4 flex-shrink-0" style={{ color: "var(--theme-text-dim)" }} />
+            <ChevronDown size={16} style={{ color: "var(--text-muted)" }} />
           ) : (
-            <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: "var(--theme-text-dim)" }} />
+            <ChevronRight size={16} style={{ color: "var(--text-muted)" }} />
           )}
-          <span
-            className="text-sm font-medium"
-            style={{ color: "var(--theme-text)", fontFamily: "var(--font-body)" }}
-          >
-            Auto-Merged
-          </span>
-          <span
-            className="inline-flex items-center px-2 py-0.5 text-xs rounded-full"
-            style={{
-              backgroundColor: "#4a7a6a",
-              color: "#ffffff",
-              fontFamily: "var(--font-mono)",
-            }}
-          >
+          <span className="sec-title">Auto-merged</span>
+          <span className="tag">
+            <span className="tdot" style={{ background: "var(--success)" }} />
             {entries.length}
           </span>
-          <span
-            className="text-xs ml-auto"
-            style={{ color: "var(--theme-text-dim)" }}
-          >
-            {open ? "collapse" : "expand to undo"}
-          </span>
-        </button>
-      </RetroCardHeader>
+        </span>
+        <span className="muted mono" style={{ fontSize: 11 }}>
+          {open ? "collapse" : "expand to undo"}
+        </span>
+      </button>
 
       {open && (
-        <div>
+        <div style={{ padding: "0 18px 18px" }}>
           {entries.map((entry) => (
-            <div
-              key={entry.candidate_id}
-              className="flex items-center gap-3 px-4 py-3 border-b last:border-b-0"
-              style={{ borderColor: "var(--theme-border)" }}
-            >
-              <div className="flex-1 min-w-0">
-                <p
-                  className="text-sm truncate"
-                  style={{ color: "var(--theme-text)", fontFamily: "var(--font-body)" }}
-                  title={`${entry.primary.display_text} + ${entry.secondary.display_text}`}
+            <div key={entry.candidate_id} className="dedup-card">
+              <div className="between">
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                  <span className="tag" style={{ textTransform: "capitalize" }}>
+                    {entry.primary.record_type.replace(/_/g, " ")}
+                  </span>
+                  <span className="muted mono" style={{ fontSize: 11 }}>
+                    merged {formatDate(entry.merged_at)}
+                  </span>
+                </span>
+                <button
+                  className="btn ghost sm"
+                  onClick={() => onUndo(entry.candidate_id)}
                 >
-                  {entry.primary.display_text}
-                </p>
-                <p
-                  className="text-xs"
-                  style={{ color: "var(--theme-text-dim)", fontFamily: "var(--font-mono)" }}
-                >
-                  {entry.primary.record_type} &middot; merged {formatDate(entry.merged_at)} &middot; similarity {Math.round(entry.similarity_score * 100)}%
-                </p>
+                  <RotateCcw size={13} />
+                  Undo
+                </button>
               </div>
-              <button
-                onClick={() => onUndo(entry.candidate_id)}
-                className="flex items-center gap-1 text-xs transition-colors duration-150"
-                style={{ color: "var(--theme-text-dim)", fontFamily: "var(--font-body)" }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.color = "var(--theme-amber)";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.color = "var(--theme-text-dim)";
-                }}
-              >
-                <RotateCcw className="h-3 w-3" />
-                Undo
-              </button>
+
+              <div className="dedup-pair">
+                <div className="dedup-rec">
+                  <div className="field-l">Kept</div>
+                  <div className="field-v" style={{ fontSize: 13.5 }}>
+                    {entry.primary.display_text}
+                  </div>
+                </div>
+                <div className="dedup-vs">+</div>
+                <div className="dedup-rec">
+                  <div className="field-l">Merged in</div>
+                  <div className="field-v" style={{ fontSize: 13.5 }}>
+                    {entry.secondary.display_text}
+                  </div>
+                </div>
+              </div>
+
+              <div className="reasons" style={{ marginTop: 12 }}>
+                <span className="reason">similarity {Math.round(entry.similarity_score * 100)}%</span>
+                {entry.llm_classification && (
+                  <span className="reason">{entry.llm_classification}</span>
+                )}
+                {entry.llm_confidence != null && (
+                  <span className="reason">confidence {Math.round(entry.llm_confidence * 100)}%</span>
+                )}
+              </div>
             </div>
           ))}
         </div>
       )}
-    </RetroCard>
+    </div>
   );
 }
 
@@ -195,24 +209,18 @@ function AutoMergedSection({
 
 function AllResolvedState({ onBack }: { onBack: () => void }) {
   return (
-    <div className="flex flex-col items-center justify-center py-20 gap-4">
-      <CheckCircle className="h-12 w-12" style={{ color: "#4a7a6a" }} />
-      <h2
-        className="text-xl font-medium"
-        style={{ color: "var(--theme-text)", fontFamily: "var(--font-display)" }}
-      >
+    <div className="screen on" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "80px 0", gap: 16 }}>
+      <CheckCircle size={48} style={{ color: "var(--success)" }} />
+      <h2 className="sec-title" style={{ fontSize: 22 }}>
         All candidates resolved
       </h2>
-      <p
-        className="text-sm"
-        style={{ color: "var(--theme-text-dim)", fontFamily: "var(--font-body)" }}
-      >
+      <p className="dim" style={{ fontSize: 14 }}>
         No remaining deduplication decisions for this upload.
       </p>
-      <RetroButton variant="ghost" onClick={onBack}>
-        <ArrowLeft className="h-4 w-4 mr-2" />
+      <button className="btn ghost" onClick={onBack}>
+        <ArrowLeft size={15} />
         Back to Uploads
-      </RetroButton>
+      </button>
     </div>
   );
 }
@@ -225,6 +233,12 @@ export default function ReviewPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const uploadId = params.id;
+
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -349,7 +363,7 @@ export default function ReviewPage() {
   /* ---- Render ---- */
   if (loading) {
     return (
-      <div className="space-y-6">
+      <div className="screen on">
         <RetroLoadingState text="Loading review data" />
       </div>
     );
@@ -357,18 +371,14 @@ export default function ReviewPage() {
 
   if (error) {
     return (
-      <div className="space-y-4">
-        <RetroButton variant="ghost" onClick={() => router.push("/upload")}>
-          <ArrowLeft className="h-4 w-4 mr-2" />
+      <div className="screen on s24">
+        <button className="btn ghost" onClick={() => router.push("/upload")}>
+          <ArrowLeft size={15} />
           Back to Uploads
-        </RetroButton>
-        <RetroCard>
-          <RetroCardContent>
-            <p className="text-sm" style={{ color: "var(--theme-terracotta)" }}>
-              {error}
-            </p>
-          </RetroCardContent>
-        </RetroCard>
+        </button>
+        <div className="card-surface pad">
+          <p style={{ fontSize: 13.5, color: "var(--danger)", margin: 0 }}>{error}</p>
+        </div>
       </div>
     );
   }
@@ -381,123 +391,77 @@ export default function ReviewPage() {
 
   const { upload, auto_merged } = data;
 
+  const metaStats = [
+    { label: "Uploaded", value: formatDate(upload.uploaded_at), color: "var(--text)" },
+    { label: "Records", value: upload.record_count.toLocaleString(), color: "var(--text)" },
+    { label: "Total candidates", value: String(upload.dedup_summary.total_candidates), color: "var(--text)" },
+    { label: "Auto-merged", value: String(upload.dedup_summary.auto_merged), color: "var(--success)" },
+    { label: "Needs review", value: String(upload.dedup_summary.needs_review), color: "var(--primary)" },
+  ];
+
   return (
-    <div className="space-y-6 pb-24">
+    <div className={`screen s24 ${shown ? "on" : ""}`} style={{ paddingBottom: 96 }}>
       {/* Back nav */}
       <button
         onClick={() => router.push("/upload")}
-        className="flex items-center gap-2 text-xs transition-colors duration-150"
-        style={{ color: "var(--theme-text-dim)", fontFamily: "var(--font-body)" }}
-        onMouseEnter={(e) => { e.currentTarget.style.color = "var(--theme-amber)"; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = "var(--theme-text-dim)"; }}
+        className="btn ghost sm"
+        style={{ alignSelf: "flex-start" }}
       >
-        <ArrowLeft className="h-3 w-3" />
+        <ArrowLeft size={14} />
         Back to Uploads
       </button>
 
       {/* Header */}
-      <div className="flex items-start justify-between gap-4">
+      <div className="page-top" style={{ marginBottom: 0 }}>
         <div>
-          <GlowText as="h1">
-            Dedup Review
-          </GlowText>
-          <p
-            className="mt-1 text-sm"
-            style={{ color: "var(--theme-text-dim)", fontFamily: "var(--font-body)" }}
-          >
-            {upload.filename}
-          </p>
+          <p className="kicker">Review duplicates</p>
+          <h1 className="h1 display">Dedup review</h1>
+          <p className="h-sub">{upload.filename}</p>
         </div>
-        <StatusBadge status={upload.status} />
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 12 }}>
+          <SecureChip />
+          <StatusTag status={upload.status} />
+        </div>
       </div>
 
       {/* Upload metadata */}
-      <RetroCard>
-        <RetroCardContent className="py-3">
-          <div className="flex items-center gap-6 flex-wrap">
-            <div>
-              <p className="text-xs" style={{ color: "var(--theme-text-dim)" }}>
-                Uploaded
-              </p>
-              <p
-                className="text-sm font-medium"
-                style={{ color: "var(--theme-text)", fontFamily: "var(--font-mono)" }}
-              >
-                {formatDate(upload.uploaded_at)}
-              </p>
+      <div className="card-surface pad">
+        <div style={{ display: "flex", gap: 32, flexWrap: "wrap" }}>
+          {metaStats.map((s) => (
+            <div key={s.label}>
+              <div className="field-l">{s.label}</div>
+              <div className="mono" style={{ fontSize: 16, fontWeight: 600, color: s.color }}>
+                {s.value}
+              </div>
             </div>
-            <div>
-              <p className="text-xs" style={{ color: "var(--theme-text-dim)" }}>
-                Records
-              </p>
-              <p
-                className="text-sm font-medium"
-                style={{ color: "var(--theme-text)", fontFamily: "var(--font-mono)" }}
-              >
-                {upload.record_count.toLocaleString()}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs" style={{ color: "var(--theme-text-dim)" }}>
-                Total Candidates
-              </p>
-              <p
-                className="text-sm font-medium"
-                style={{ color: "var(--theme-text)", fontFamily: "var(--font-mono)" }}
-              >
-                {upload.dedup_summary.total_candidates}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs" style={{ color: "var(--theme-text-dim)" }}>
-                Auto-Merged
-              </p>
-              <p
-                className="text-sm font-medium"
-                style={{ color: "#4a7a6a", fontFamily: "var(--font-mono)" }}
-              >
-                {upload.dedup_summary.auto_merged}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs" style={{ color: "var(--theme-text-dim)" }}>
-                Needs Review
-              </p>
-              <p
-                className="text-sm font-medium"
-                style={{ color: "#8a7a5a", fontFamily: "var(--font-mono)" }}
-              >
-                {upload.dedup_summary.needs_review}
-              </p>
-            </div>
-          </div>
-        </RetroCardContent>
-      </RetroCard>
+          ))}
+        </div>
+      </div>
 
       {/* Summary bar */}
       <div
-        className="flex items-center gap-4 px-4 py-2 rounded-md text-xs"
+        className="between mono"
         style={{
-          backgroundColor: "var(--theme-bg-card)",
-          borderColor: "var(--theme-border)",
-          border: "1px solid",
-          fontFamily: "var(--font-mono)",
-          color: "var(--theme-text-dim)",
+          padding: "10px 16px",
+          borderRadius: "var(--radius-sm)",
+          background: "var(--card-2)",
+          border: "1px solid var(--border)",
+          fontSize: 12.5,
+          color: "var(--text-dim)",
+          justifyContent: "flex-start",
+          gap: 16,
         }}
       >
         <span>
-          <span style={{ color: "#4a7a6a" }}>{upload.dedup_summary.auto_merged}</span>
-          {" "}auto-merged
+          <span style={{ color: "var(--success)" }}>{upload.dedup_summary.auto_merged}</span> auto-merged
         </span>
-        <span style={{ color: "var(--theme-border)" }}>/</span>
+        <span style={{ color: "var(--border-strong)" }}>/</span>
         <span>
-          <span style={{ color: "#8a7a5a" }}>{totalNeedsReview}</span>
-          {" "}remaining
+          <span style={{ color: "var(--primary)" }}>{totalNeedsReview}</span> remaining
         </span>
-        <span style={{ color: "var(--theme-border)" }}>/</span>
+        <span style={{ color: "var(--border-strong)" }}>/</span>
         <span>
-          <span style={{ color: "var(--theme-text)" }}>{resolvedCount}</span>
-          {" "}resolved this session
+          <span style={{ color: "var(--text)" }}>{resolvedCount}</span> resolved this session
         </span>
       </div>
 
@@ -506,13 +470,8 @@ export default function ReviewPage() {
 
       {/* Needs review section */}
       {Object.keys(needsReviewByType).length > 0 && (
-        <div className="space-y-4">
-          <h2
-            className="text-sm font-medium"
-            style={{ color: "var(--theme-text-dim)", fontFamily: "var(--font-body)" }}
-          >
-            Needs Review
-          </h2>
+        <div className="s16">
+          <h2 className="sec-title">Needs review</h2>
           {Object.entries(needsReviewByType).map(([recordType, candidates]) => {
             const visible = candidates.filter((c) => !resolved.has(c.candidate_id));
             if (visible.length === 0) return null;
@@ -533,47 +492,36 @@ export default function ReviewPage() {
       {/* Sticky bulk action bar */}
       {selected.size > 0 && (
         <div
-          className="fixed bottom-0 left-0 right-0 z-50 flex items-center justify-between gap-4 px-6 py-4 border-t"
+          className="between"
           style={{
-            backgroundColor: "var(--theme-bg-card)",
-            borderColor: "var(--theme-border)",
+            position: "fixed",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            zIndex: 50,
+            padding: "16px 24px",
+            background: "var(--card)",
+            borderTop: "1px solid var(--border-strong)",
+            boxShadow: "var(--shadow-lg)",
           }}
         >
-          <span
-            className="text-sm"
-            style={{ color: "var(--theme-text-dim)", fontFamily: "var(--font-body)" }}
-          >
-            <span style={{ color: "var(--theme-text)", fontFamily: "var(--font-mono)" }}>
-              {selected.size}
-            </span>
-            {" "}selected &middot;{" "}
-            <span style={{ color: "var(--theme-text)" }}>
+          <span className="dim" style={{ fontSize: 13.5 }}>
+            <span className="mono" style={{ color: "var(--text)" }}>{selected.size}</span> selected ·{" "}
+            <span style={{ color: "var(--text)" }}>
               {resolvedCount}/{totalCandidates}
-            </span>
-            {" "}resolved
+            </span>{" "}
+            resolved
           </span>
-          <div className="flex items-center gap-3">
-            <RetroButton
-              variant="ghost"
-              onClick={() => setSelected(new Set())}
-              className="text-xs"
-            >
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <button className="btn ghost sm" onClick={() => setSelected(new Set())}>
               Clear
-            </RetroButton>
-            <RetroButton
-              variant="ghost"
-              onClick={() => handleBulkResolve("decline")}
-              className="text-xs"
-            >
-              Decline Selected ({selected.size})
-            </RetroButton>
-            <RetroButton
-              variant="primary"
-              onClick={() => handleBulkResolve("accept")}
-              className="text-xs"
-            >
-              Accept Selected ({selected.size})
-            </RetroButton>
+            </button>
+            <button className="btn ghost sm" onClick={() => handleBulkResolve("decline")}>
+              Keep both ({selected.size})
+            </button>
+            <button className="btn sm" onClick={() => handleBulkResolve("accept")}>
+              Merge selected ({selected.size})
+            </button>
           </div>
         </div>
       )}

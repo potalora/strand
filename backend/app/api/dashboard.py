@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.dependencies import get_authenticated_user_id
 from app.middleware.audit import log_audit_event
+from app.middleware.encryption import decrypt_field
 from app.models.patient import Patient
 from app.models.record import HealthRecord
 from app.models.uploaded_file import UploadedFile
@@ -174,6 +175,40 @@ async def get_labs_dashboard(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+@router.get("/sources")
+async def get_sources(
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Provenance breakdown: how many records came from each source.
+
+    Powers the Overview "Where records come from" bars and the data-sources stat.
+    """
+    base_filter = [
+        HealthRecord.user_id == user_id,
+        HealthRecord.deleted_at.is_(None),
+        HealthRecord.is_duplicate.is_(False),
+    ]
+    result = await db.execute(
+        select(HealthRecord.source_format, func.count())
+        .where(*base_filter)
+        .group_by(HealthRecord.source_format)
+        .order_by(func.count().desc())
+    )
+    items = [{"source": row[0], "count": row[1]} for row in result.all()]
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="dashboard.sources",
+        resource_type="dashboard",
+        ip_address=request.client.host if request.client else None,
+    )
+
+    return {"items": items, "total": len(items)}
+
+
 @router.get("/patients")
 async def get_patients(
     request: Request,
@@ -200,8 +235,24 @@ async def get_patients(
                 "id": str(p.id),
                 "fhir_id": p.fhir_id,
                 "gender": p.gender,
+                "name": _safe_decrypt(p.name_encrypted),
+                "birth_date": _safe_decrypt(p.birth_date_encrypted),
             }
             for p in patients
         ],
         "total": len(patients),
     }
+
+
+def _safe_decrypt(value: bytes | None) -> str | None:
+    """Decrypt an encrypted PII field, returning None if absent or undecryptable.
+
+    The record subject's own identity (name/DOB) powers the masthead + account
+    card. It is user-scoped data the owner is entitled to see.
+    """
+    if not value:
+        return None
+    try:
+        return decrypt_field(value)
+    except Exception:
+        return None

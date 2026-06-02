@@ -3,14 +3,6 @@
 import React from "react";
 import { DetailRow, str, obj, arr, nested, formatDate } from "./shared";
 
-const SEVERITY_BORDERS: Record<string, string> = {
-  severe: "var(--theme-terracotta)",
-  high: "var(--theme-terracotta)",
-  moderate: "var(--theme-ochre)",
-  mild: "var(--theme-sage)",
-  low: "var(--theme-sage)",
-};
-
 export function AllergyRenderer({ r }: { r: Record<string, unknown> }) {
   const allergen =
     str(nested(r, "code", "text")) ||
@@ -37,30 +29,30 @@ export function AllergyRenderer({ r }: { r: Record<string, unknown> }) {
     }
   }
 
-  const severityLower = severity.toLowerCase();
-  const borderColor = SEVERITY_BORDERS[severityLower] ?? "var(--record-allergy-dot)";
+  // Record-TYPE accent (allergy hue) — neutral, not a severity good/bad judgement.
+  const accentColor = "var(--record-allergy-dot)";
 
   return (
     <div
       className="space-y-3 record-accent-left"
-      style={{ "--accent-color": borderColor } as React.CSSProperties}
+      style={{ "--accent-color": accentColor } as React.CSSProperties}
     >
       {allergen && (
         <p
           className="text-base font-semibold"
-          style={{ color: "var(--theme-terracotta)", fontFamily: "var(--font-body)" }}
+          style={{ color: "var(--record-allergy-text)", fontFamily: "var(--font-body)" }}
         >
           {allergen}
         </p>
       )}
 
-      {/* Severity badge */}
+      {/* Severity flag — presented as neutral text, not color-coded good/bad */}
       {severity && (
         <span
           className="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-md"
           style={{
-            backgroundColor: borderColor,
-            color: severityLower === "mild" || severityLower === "low" ? "var(--theme-bg-deep)" : "var(--theme-text)",
+            backgroundColor: "var(--theme-bg-deep)",
+            color: "var(--theme-text-muted)",
           }}
         >
           {severity}

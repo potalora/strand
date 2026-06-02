@@ -43,3 +43,6 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     document_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     dedup_summary: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

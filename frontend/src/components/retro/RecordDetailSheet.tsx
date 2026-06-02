@@ -1,16 +1,18 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Trash2 } from "lucide-react";
+import { Trash2, Sparkles } from "lucide-react";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { api } from "@/lib/api";
-import type { HealthRecord } from "@/types/api";
+import type { HealthRecord, SeriesResponse, SeriesPoint } from "@/types/api";
 import { usePreferencesStore } from "@/stores/usePreferencesStore";
+import { useUIStore } from "@/stores/useUIStore";
 import { RECORD_TYPE_ICONS, getObservationIcon } from "@/lib/record-icons";
-import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR, RECORD_TYPE_LABELS } from "@/lib/constants";
+import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
 import { RetroBadge } from "./RetroBadge";
 import { RetroLoadingState } from "./RetroLoadingState";
 import { FhirResourceRenderer } from "./FhirResourceRenderer";
+import { Sparkline } from "./DataViz";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { AIExtractionBadge, AdvancedSection } from "./renderers/shared";
 
@@ -23,12 +25,20 @@ interface RecordDetailSheetProps {
 
 export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordDetailSheetProps) {
   const [record, setRecord] = useState<HealthRecord | null>(null);
+  const [trend, setTrend] = useState<SeriesPoint[]>([]);
   const [loading, setLoading] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [dontAskChecked, setDontAskChecked] = useState(false);
 
   const { skipDeleteConfirm, setSkipDeleteConfirm } = usePreferencesStore();
+  const setDetailOpen = useUIStore((s) => s.setDetailOpen);
+
+  // Tuck the floating dock away while the sheet is open.
+  useEffect(() => {
+    setDetailOpen(open);
+    return () => setDetailOpen(false);
+  }, [open, setDetailOpen]);
 
   useEffect(() => {
     if (!recordId || !open) {
@@ -37,9 +47,19 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
     }
 
     setLoading(true);
+    setTrend([]);
     api
       .get<HealthRecord>(`/records/${recordId}`)
-      .then(setRecord)
+      .then((rec) => {
+        setRecord(rec);
+        // For recurring observations, pull the recorded series for a neutral trend line.
+        if (rec.record_type === "observation" && rec.code_value) {
+          api
+            .get<SeriesResponse>(`/records/series?code_value=${encodeURIComponent(rec.code_value)}`)
+            .then((s) => setTrend(s.items ?? []))
+            .catch(() => setTrend([]));
+        }
+      })
       .catch(() => setRecord(null))
       .finally(() => setLoading(false));
   }, [recordId, open]);
@@ -71,73 +91,57 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
       });
   }
 
-  // Resolve icon and colors for header
+  // Resolve icon + colors for the header chip
   const type = record?.record_type?.toLowerCase() ?? "";
-  const IconComponent = type === "observation" && record
-    ? getObservationIcon(record.fhir_resource)
-    : RECORD_TYPE_ICONS[type];
+  const IconComponent =
+    type === "observation" && record ? getObservationIcon(record.fhir_resource) : RECORD_TYPE_ICONS[type];
   const colors = RECORD_TYPE_COLORS[type] ?? DEFAULT_RECORD_COLOR;
-  const typeLabel = RECORD_TYPE_LABELS[type] ?? type;
 
   return (
     <>
       <Sheet open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
         <SheetContent
-          className="w-full sm:max-w-xl overflow-auto border-l"
-          style={{
-            backgroundColor: "var(--theme-bg-surface)",
-            borderColor: "var(--theme-border)",
-          }}
+          className="w-full sm:max-w-xl overflow-auto border-l p-0"
+          style={{ background: "var(--card)", borderColor: "var(--border)" }}
         >
-          <SheetHeader>
-            <SheetTitle
-              className="text-[11px] font-medium uppercase tracking-widest"
-              style={{
-                color: "var(--theme-amber)",
-                fontFamily: "var(--font-body)",
-              }}
-            >
-              Record Details
+          <SheetHeader className="px-6 pt-6 pb-5 border-b" style={{ borderColor: "var(--border)" }}>
+            <SheetTitle asChild>
+              <p className="kicker" style={{ margin: 0 }}>
+                Record detail
+              </p>
             </SheetTitle>
           </SheetHeader>
 
           {loading ? (
             <RetroLoadingState text="Loading record" />
           ) : !record ? (
-            <div className="py-8 text-center">
-              <span
-                className="text-sm"
-                style={{ color: "var(--theme-text-muted)" }}
-              >
-                Record not found
-              </span>
+            <div className="py-10 text-center">
+              <span className="muted text-sm">Record not found</span>
             </div>
           ) : (
-            <div className="space-y-5 mt-4 px-4">
-              {/* 1. Header: icon + title + badge + status */}
+            <div className="px-6 py-6 space-y-5">
+              {/* 1. Header: icon chip + serif title + badge + status */}
               <div className="flex items-start gap-3">
                 {IconComponent && (
                   <div
-                    className="flex items-center justify-center w-10 h-10 rounded-md shrink-0 mt-0.5"
-                    style={{ backgroundColor: colors.bg, color: colors.text }}
+                    className="flex items-center justify-center w-10 h-10 shrink-0 mt-1"
+                    style={{
+                      background: colors.bg,
+                      color: colors.text,
+                      borderRadius: "var(--radius-sm)",
+                    }}
                   >
                     <IconComponent size={20} />
                   </div>
                 )}
                 <div className="min-w-0 flex-1">
-                  <p
-                    className="text-base font-bold leading-snug"
-                    style={{ color: "var(--theme-text)" }}
-                  >
+                  <h2 className="display" style={{ fontSize: 24, margin: 0, color: "var(--text)" }}>
                     {record.display_text}
-                  </p>
-                  <div className="flex items-center gap-2 mt-2">
+                  </h2>
+                  <div className="flex items-center gap-2 mt-2.5">
                     <RetroBadge recordType={record.record_type} />
                     {record.status && (
-                      <span
-                        className="text-xs"
-                        style={{ color: "var(--theme-text-dim)" }}
-                      >
+                      <span className="text-xs" style={{ color: "var(--text-dim)" }}>
                         {record.status}
                       </span>
                     )}
@@ -146,98 +150,71 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
               </div>
 
               {/* 2. Primary content: rich type-specific renderer */}
-              <div
-                className="pt-4"
-              >
-                <FhirResourceRenderer
-                  recordType={record.record_type}
-                  fhirResource={record.fhir_resource}
-                />
+              <div className="panel">
+                <FhirResourceRenderer recordType={record.record_type} fhirResource={record.fhir_resource} />
               </div>
 
-              {/* 3. AI extraction info (conditional) */}
-              {record.ai_extracted && (
-                <div
-                  className="border-t pt-4"
-                  style={{ borderColor: "var(--theme-border)" }}
-                >
-                  <AIExtractionBadge
-                    aiExtracted={record.ai_extracted}
-                    confidenceScore={record.confidence_score}
-                  />
+              {/* 2b. Recorded trend for recurring observations (neutral, descriptive). */}
+              {trend.length >= 2 && (
+                <div className="panel">
+                  <div className="field-l" style={{ marginBottom: 4 }}>
+                    Recorded results · {trend.length} on file
+                  </div>
+                  <Sparkline points={trend} />
+                  <div className="between mono muted" style={{ fontSize: 11, marginTop: 4 }}>
+                    <span>
+                      {fmtShort(trend[0].effective_date)} · {trend[0].value}
+                      {trend[0].unit ? ` ${trend[0].unit}` : ""}
+                    </span>
+                    <span>
+                      {fmtShort(trend[trend.length - 1].effective_date)} · {trend[trend.length - 1].value}
+                      {trend[trend.length - 1].unit ? ` ${trend[trend.length - 1].unit}` : ""}
+                    </span>
+                  </div>
                 </div>
               )}
 
-              {/* 4. Compact metadata */}
-              <div
-                className="border-t pt-4 space-y-1"
-                style={{ borderColor: "var(--theme-border)" }}
-              >
-                <p
-                  className="text-[11px] uppercase tracking-widest font-medium pb-1"
-                  style={{ color: "var(--theme-text-muted)" }}
-                >
-                  Metadata
-                </p>
-                <CompactRow
-                  label="Date"
-                  value={
-                    record.effective_date
-                      ? new Date(record.effective_date).toLocaleDateString("en-US", {
-                          year: "numeric",
-                          month: "short",
-                          day: "numeric",
-                        })
-                      : "Not specified"
-                  }
-                />
-                <CompactRow label="Source" value={record.source_format} />
+              {/* 3. AI extraction info (conditional) */}
+              {record.ai_extracted && (
+                <AIExtractionBadge aiExtracted={record.ai_extracted} confidenceScore={record.confidence_score} />
+              )}
+
+              {/* 4. Metadata fields */}
+              <div>
+                <Field label="Date" value={fmtDate(record.effective_date)} />
+                <Field label="Source" value={record.source_format} />
                 {record.code_value && (
-                  <CompactRow label="Code" value={`${record.code_value}${record.code_system ? ` (${record.code_system})` : ""}`} mono />
+                  <Field
+                    label="Code"
+                    value={`${record.code_value}${record.code_system ? ` · ${record.code_system}` : ""}`}
+                    mono
+                  />
                 )}
                 {record.category && record.category.length > 0 && (
-                  <CompactRow label="Categories" value={record.category.join(", ")} />
+                  <Field label="Categories" value={record.category.join(", ")} />
                 )}
-                <CompactRow
-                  label="Created"
-                  value={new Date(record.created_at).toLocaleDateString("en-US", {
-                    year: "numeric",
-                    month: "short",
-                    day: "numeric",
-                  })}
-                />
+                <Field label="Added" value={fmtDate(record.created_at)} />
               </div>
 
               {/* 5. Advanced section: collapsible FHIR JSON */}
-              <div
-                className="border-t pt-5"
-                style={{ borderColor: "var(--theme-border)" }}
-              >
+              <div className="field" style={{ borderBottom: 0, paddingBottom: 0 }}>
+                <div className="field-l">FHIR resource</div>
                 <AdvancedSection fhirResource={record.fhir_resource} />
               </div>
 
-              {/* 6. Delete button */}
-              <div
-                className="border-t pt-5 flex justify-end"
-                style={{ borderColor: "var(--theme-border)" }}
-              >
+              {/* 6. Actions */}
+              <div className="flex items-center gap-3 pt-1">
+                <button className="btn" style={{ flex: 1 }} onClick={() => api.get(`/records/${record.id}`)}>
+                  <Sparkles size={15} /> Add to summary
+                </button>
                 <button
                   onClick={handleDeleteClick}
                   disabled={deleting}
-                  className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  style={{
-                    color: "var(--theme-text-dim)",
-                    fontFamily: "var(--font-body)",
-                  }}
-                  onMouseEnter={(e) => {
-                    if (!deleting) e.currentTarget.style.color = "var(--theme-terracotta)";
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!deleting) e.currentTarget.style.color = "var(--theme-text-dim)";
-                  }}
+                  className="row-del"
+                  title="Delete record"
+                  aria-label="Delete record"
                 >
-                  <Trash2 size={12} />
-                  {deleting ? "Deleting..." : "Delete"}
+                  <Trash2 size={16} />
                 </button>
               </div>
             </div>
@@ -264,29 +241,23 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
   );
 }
 
-function CompactRow({
-  label,
-  value,
-  mono,
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-}) {
+function fmtDate(value: string | null): string {
+  if (!value) return "Not specified";
+  return new Date(value).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+}
+
+function fmtShort(value: string | null | undefined): string {
+  if (!value) return "";
+  return new Date(value).toLocaleDateString("en-US", { year: "2-digit", month: "short" });
+}
+
+function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
-    <div className="flex items-baseline justify-between gap-3 py-1">
-      <span
-        className="text-[11px] font-medium shrink-0"
-        style={{ color: "var(--theme-text-muted)" }}
-      >
-        {label}
-      </span>
-      <span
-        className={`text-xs text-right max-w-[65%] break-all ${mono ? "font-mono" : ""}`}
-        style={{ color: "var(--theme-text-dim)" }}
-      >
+    <div className="field">
+      <div className="field-l">{label}</div>
+      <div className={`field-v ${mono ? "mono" : ""}`} style={mono ? { fontSize: 13 } : undefined}>
         {value}
-      </span>
+      </div>
     </div>
   );
 }

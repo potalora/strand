@@ -9,6 +9,7 @@ export interface UserResponse {
   email: string;
   display_name: string | null;
   is_active: boolean;
+  created_at: string;
 }
 
 export interface RegisterRequest {
@@ -204,6 +205,48 @@ export interface PatientInfo {
   id: string;
   fhir_id: string | null;
   gender: string | null;
+  name: string | null;
+  birth_date: string | null;
+}
+
+export interface SourceBreakdown {
+  source: string;
+  count: number;
+}
+
+export interface SourcesResponse {
+  items: SourceBreakdown[];
+  total: number;
+}
+
+export interface AuditLogEntry {
+  id: string;
+  action: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  ip_address: string | null;
+  details: Record<string, unknown> | null;
+  created_at: string | null;
+}
+
+export interface AuditLogResponse {
+  items: AuditLogEntry[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface SeriesPoint {
+  id: string;
+  effective_date: string | null;
+  value: number;
+  unit: string;
+}
+
+export interface SeriesResponse {
+  code_value: string;
+  items: SeriesPoint[];
+  total: number;
 }
 
 export interface DedupCandidate {

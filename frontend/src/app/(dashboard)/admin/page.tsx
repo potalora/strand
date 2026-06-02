@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
-import { ChevronRight, Trash2 } from "lucide-react";
+import { Search, Trash2, Upload, FileStack, Copy, Settings, Check } from "lucide-react";
 import { api } from "@/lib/api";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { usePreferencesStore } from "@/stores/usePreferencesStore";
@@ -12,30 +12,28 @@ import type {
   DedupCandidate,
   UserResponse,
   DashboardOverview,
+  AuditLogResponse,
+  AuditLogEntry,
 } from "@/types/api";
-import { RECORD_TYPE_COLORS, RECORD_TYPE_LABELS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
-import { GlowText } from "@/components/retro/GlowText";
-import { RetroTabs } from "@/components/retro/RetroTabs";
-import { RetroCard, RetroCardHeader, RetroCardContent } from "@/components/retro/RetroCard";
-import { RetroButton } from "@/components/retro/RetroButton";
+import { RECORD_TYPE_LABELS } from "@/lib/constants";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { RetroBadge } from "@/components/retro/RetroBadge";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
 import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
-import {
-  RetroTable,
-  RetroTableHeader,
-  RetroTableHead,
-  RetroTableBody,
-  RetroTableRow,
-  RetroTableCell,
-} from "@/components/retro/RetroTable";
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const fmtDate = (s: string | null | undefined) => {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return "—";
+  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+};
 
 const TABS = [
-  { key: "records", label: "Records" },
-  { key: "extractions", label: "Extractions" },
-  { key: "dedup", label: "Dedup" },
-  { key: "sys", label: "System" },
+  { key: "records", label: "Records", icon: FileStack },
+  { key: "extractions", label: "Extractions", icon: Upload },
+  { key: "dedup", label: "Duplicates", icon: Copy },
+  { key: "sys", label: "System", icon: Settings },
 ];
 
 export default function AdminPage() {
@@ -43,6 +41,12 @@ export default function AdminPage() {
   const router = useRouter();
   const initialTab = searchParams.get("tab") || "records";
   const [activeTab, setActiveTab] = useState(initialTab);
+  const [shown, setShown] = useState(false);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
 
   useEffect(() => {
     const tab = searchParams.get("tab") || "records";
@@ -55,15 +59,36 @@ export default function AdminPage() {
   };
 
   return (
-    <div className="space-y-6">
-      <GlowText as="h1">Admin Console</GlowText>
-      <RetroTabs tabs={TABS} active={activeTab} onChange={handleTabChange} />
-      <div className="mt-4">
-        {activeTab === "records" && <RecordsTab />}
-        {activeTab === "extractions" && <ExtractionsTab />}
-        {activeTab === "dedup" && <DedupTab />}
-        {activeTab === "sys" && <SystemTab />}
+    <div className={`screen ${shown ? "on" : ""}`}>
+      <div className="page-top">
+        <div>
+          <p className="kicker">Data &amp; settings</p>
+          <h1 className="h1 display">Admin</h1>
+        </div>
       </div>
+
+      <div className="tabs" role="tablist">
+        {TABS.map((t) => {
+          const TabIcon = t.icon;
+          return (
+            <button
+              key={t.key}
+              className="tab"
+              role="tab"
+              aria-selected={activeTab === t.key}
+              onClick={() => handleTabChange(t.key)}
+            >
+              <TabIcon size={16} />
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {activeTab === "records" && <RecordsTab />}
+      {activeTab === "extractions" && <ExtractionsTab />}
+      {activeTab === "dedup" && <DedupTab />}
+      {activeTab === "sys" && <SystemTab />}
     </div>
   );
 }
@@ -72,17 +97,31 @@ export default function AdminPage() {
    EXTRACTIONS TAB — Pending extraction management
    ========================================== */
 
-function ExtractionsTab() {
-  interface ExtractionFile {
-    id: string;
-    filename: string;
-    mime_type: string;
-    file_category: string;
-    file_size_bytes: number | null;
-    created_at: string | null;
-    ingestion_status?: string;
-  }
+interface ExtractionFile {
+  id: string;
+  filename: string;
+  mime_type: string;
+  file_category: string;
+  file_size_bytes: number | null;
+  created_at: string | null;
+  ingestion_status?: string;
+}
 
+const EXTRACTION_STATUS_HUE: Record<string, string> = {
+  processing: "var(--primary)",
+  failed: "var(--danger)",
+  duplicate_file: "var(--ochre, var(--primary))",
+  pending_extraction: "var(--text-muted)",
+};
+
+function fmtSize(bytes: number | null): string {
+  if (!bytes) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function ExtractionsTab() {
   const [files, setFiles] = useState<ExtractionFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -135,133 +174,102 @@ function ExtractionsTab() {
 
   if (files.length === 0) {
     return (
-      <RetroCard>
-        <RetroCardContent>
-          <p
-            style={{
-              textAlign: "center",
-              padding: "2rem 0",
-              fontSize: "0.8rem",
-              color: "var(--theme-text-muted)",
-              fontFamily: "var(--font-body)",
-            }}
-          >
-            No files pending extraction, processing, or failed
-          </p>
-        </RetroCardContent>
-      </RetroCard>
+      <div>
+        <p className="h-sub" style={{ margin: "0 0 18px" }}>
+          Documents waiting for text + entity extraction. Structured formats parse instantly; PDF,
+          RTF, and TIFF files are read with OCR + entity extraction once you trigger them.
+        </p>
+        <div className="card-surface pad" style={{ textAlign: "center", padding: "56px 24px" }}>
+          <span className="dz-ic" style={{ margin: "0 auto 14px" }}>
+            <Check size={22} />
+          </span>
+          <div className="muted" style={{ fontSize: 14.5 }}>
+            Nothing waiting — no files pending extraction, processing, or failed.
+          </div>
+        </div>
+      </div>
     );
   }
 
-  const pendingCount = files.filter((f) => f.ingestion_status === "pending_extraction" || !f.ingestion_status).length;
+  const pendingCount = files.filter(
+    (f) => f.ingestion_status === "pending_extraction" || !f.ingestion_status
+  ).length;
   const processingCount = files.filter((f) => f.ingestion_status === "processing").length;
   const failedCount = files.filter((f) => f.ingestion_status === "failed").length;
 
+  const allSelected = selected.size === files.length && files.length > 0;
+
   return (
-    <RetroCard>
-      <RetroCardHeader>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-          }}
-        >
-          <div>
-            <GlowText as="h3" className="text-sm">
-              {files.length} File{files.length !== 1 ? "s" : ""}
-            </GlowText>
-            <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.35rem" }}>
-              {pendingCount > 0 && (
-                <span
-                  style={{
-                    fontSize: "0.6rem",
-                    fontWeight: 600,
-                    padding: "0.1rem 0.4rem",
-                    borderRadius: "3px",
-                    backgroundColor: "var(--theme-ochre)",
-                    color: "var(--theme-bg-deep)",
-                    fontFamily: "var(--font-body)",
-                  }}
-                >
-                  {pendingCount} pending
-                </span>
-              )}
-              {processingCount > 0 && (
-                <span
-                  style={{
-                    fontSize: "0.6rem",
-                    fontWeight: 600,
-                    padding: "0.1rem 0.4rem",
-                    borderRadius: "3px",
-                    backgroundColor: "var(--theme-amber)",
-                    color: "var(--theme-bg-deep)",
-                    fontFamily: "var(--font-body)",
-                  }}
-                >
-                  {processingCount} processing
-                </span>
-              )}
-              {failedCount > 0 && (
-                <span
-                  style={{
-                    fontSize: "0.6rem",
-                    fontWeight: 600,
-                    padding: "0.1rem 0.4rem",
-                    borderRadius: "3px",
-                    backgroundColor: "var(--theme-terracotta)",
-                    color: "var(--theme-bg-deep)",
-                    fontFamily: "var(--font-body)",
-                  }}
-                >
-                  {failedCount} failed
-                </span>
-              )}
-            </div>
-          </div>
-          <div style={{ display: "flex", gap: "0.5rem" }}>
-            <RetroButton
-              onClick={handleTrigger}
-              disabled={selected.size === 0 || triggering}
-            >
-              {triggering
-                ? "Triggering..."
-                : `Extract ${selected.size || "Selected"}`}
-            </RetroButton>
-          </div>
+    <div>
+      <p className="h-sub" style={{ margin: "0 0 18px" }}>
+        Documents waiting for text + entity extraction. Select files and extract — each is read with
+        OCR + entity extraction, then confirmed into the record.
+      </p>
+
+      <div className="toolbar" style={{ justifyContent: "space-between" }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          {pendingCount > 0 && (
+            <span className="tag">
+              <span className="tdot" style={{ background: "var(--text-muted)" }} />
+              {pendingCount} pending
+            </span>
+          )}
+          {processingCount > 0 && (
+            <span className="tag">
+              <span className="tdot" style={{ background: "var(--primary)" }} />
+              {processingCount} processing
+            </span>
+          )}
+          {failedCount > 0 && (
+            <span className="tag">
+              <span className="tdot" style={{ background: "var(--danger)" }} />
+              {failedCount} failed
+            </span>
+          )}
         </div>
-      </RetroCardHeader>
-      <RetroCardContent>
-        <RetroTable>
-          <RetroTableHeader>
-            <RetroTableHead className="w-8">
-              <input
-                type="checkbox"
-                checked={selected.size === files.length && files.length > 0}
-                onChange={toggleAll}
-                disabled={triggering}
-                style={{ accentColor: "var(--theme-amber)" }}
-              />
-            </RetroTableHead>
-            <RetroTableHead>File</RetroTableHead>
-            <RetroTableHead>Type</RetroTableHead>
-            <RetroTableHead>Status</RetroTableHead>
-            <RetroTableHead>Size</RetroTableHead>
-            <RetroTableHead>Uploaded</RetroTableHead>
-          </RetroTableHeader>
-          <RetroTableBody>
+        <button
+          className="btn"
+          onClick={handleTrigger}
+          disabled={selected.size === 0 || triggering}
+        >
+          {triggering ? "Triggering…" : `Extract ${selected.size || "selected"}`}
+        </button>
+      </div>
+
+      <div className="tablewrap">
+        <table className="rtable">
+          <thead>
+            <tr>
+              <th style={{ width: 1 }}>
+                <input
+                  type="checkbox"
+                  checked={allSelected}
+                  onChange={toggleAll}
+                  disabled={triggering}
+                  style={{ accentColor: "var(--primary)" }}
+                  aria-label="Select all files"
+                />
+              </th>
+              <th>File</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>Size</th>
+              <th>Uploaded</th>
+            </tr>
+          </thead>
+          <tbody>
             {files.map((file) => {
               const ext = file.filename.split(".").pop()?.toLowerCase() || "";
-              const badgeColor =
-                ext === "pdf"
-                  ? "var(--theme-terracotta)"
-                  : ext === "rtf"
-                    ? "var(--theme-sage)"
-                    : "var(--theme-ochre)";
               const status = file.ingestion_status || "pending_extraction";
+              const statusLabel =
+                status === "duplicate_file"
+                  ? "Duplicate"
+                  : status === "pending_extraction"
+                    ? "Pending"
+                    : status.charAt(0).toUpperCase() + status.slice(1);
               return (
-                <RetroTableRow key={file.id}>
-                  <RetroTableCell>
+                <tr key={file.id} style={{ cursor: "default" }}>
+                  <td style={{ width: 1 }}>
                     <input
                       type="checkbox"
                       checked={selected.has(file.id)}
@@ -274,166 +282,113 @@ function ExtractionsTab() {
                         });
                       }}
                       disabled={triggering}
-                      style={{ accentColor: "var(--theme-amber)" }}
+                      style={{ accentColor: "var(--primary)" }}
+                      aria-label={`Select ${file.filename}`}
                     />
-                  </RetroTableCell>
-                  <RetroTableCell>
-                    <span
-                      style={{
-                        fontSize: "0.75rem",
-                        fontFamily: "var(--font-body)",
-                        color: "var(--theme-text)",
-                      }}
-                    >
-                      {file.filename}
+                  </td>
+                  <td className="desc">{file.filename}</td>
+                  <td className="num" style={{ textTransform: "uppercase" }}>
+                    {ext || "—"}
+                  </td>
+                  <td>
+                    <span className="tag">
+                      <span
+                        className="tdot"
+                        style={{ background: EXTRACTION_STATUS_HUE[status] || "var(--text-muted)" }}
+                      />
+                      {statusLabel}
                     </span>
-                  </RetroTableCell>
-                  <RetroTableCell>
-                    <span
-                      style={{
-                        fontSize: "0.6rem",
-                        fontWeight: 700,
-                        padding: "0.1rem 0.4rem",
-                        borderRadius: "3px",
-                        backgroundColor: badgeColor,
-                        color: "var(--theme-bg-deep)",
-                        fontFamily: "var(--font-body)",
-                        textTransform: "uppercase",
-                      }}
-                    >
-                      {ext}
-                    </span>
-                  </RetroTableCell>
-                  <RetroTableCell>
-                    <span
-                      style={{
-                        fontSize: "0.6rem",
-                        fontWeight: 600,
-                        padding: "0.1rem 0.4rem",
-                        borderRadius: "3px",
-                        fontFamily: "var(--font-body)",
-                        backgroundColor:
-                          status === "processing"
-                            ? "var(--theme-amber)"
-                            : status === "failed"
-                              ? "var(--theme-terracotta)"
-                              : status === "duplicate_file"
-                                ? "var(--theme-ochre)"
-                                : "var(--theme-ochre)",
-                        color: "var(--theme-bg-deep)",
-                      }}
-                    >
-                      {status === "duplicate_file"
-                        ? "Duplicate"
-                        : status === "pending_extraction"
-                          ? "pending"
-                          : status}
-                    </span>
-                  </RetroTableCell>
-                  <RetroTableCell>
-                    <span
-                      style={{
-                        fontFamily: "var(--font-mono)",
-                        fontSize: "0.9rem",
-                        color: "var(--theme-text-dim)",
-                      }}
-                    >
-                      {file.file_size_bytes
-                        ? file.file_size_bytes < 1024
-                          ? `${file.file_size_bytes} B`
-                          : file.file_size_bytes < 1024 * 1024
-                            ? `${(file.file_size_bytes / 1024).toFixed(1)} KB`
-                            : `${(file.file_size_bytes / (1024 * 1024)).toFixed(1)} MB`
-                        : "--"}
-                    </span>
-                  </RetroTableCell>
-                  <RetroTableCell>
-                    <span
-                      style={{
-                        fontFamily: "var(--font-mono)",
-                        fontSize: "0.9rem",
-                        color: "var(--theme-text-dim)",
-                      }}
-                    >
-                      {file.created_at
-                        ? new Date(file.created_at).toLocaleDateString()
-                        : "--"}
-                    </span>
-                  </RetroTableCell>
-                </RetroTableRow>
+                  </td>
+                  <td className="num">{fmtSize(file.file_size_bytes)}</td>
+                  <td className="num">{fmtDate(file.created_at)}</td>
+                </tr>
               );
             })}
-          </RetroTableBody>
-        </RetroTable>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            padding: "0.5rem 0 0",
-            fontSize: "0.7rem",
-            color: "var(--theme-text-muted)",
-            fontFamily: "var(--font-body)",
-          }}
-        >
-          <span>
-            {selected.size} of {files.length} selected
-          </span>
-          <RetroButton variant="ghost" onClick={fetchFiles}>
-            Refresh
-          </RetroButton>
-        </div>
-      </RetroCardContent>
-    </RetroCard>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="between" style={{ marginTop: 14 }}>
+        <span className="h-sub" style={{ margin: 0 }}>
+          {selected.size} of {files.length} selected
+        </span>
+        <button className="btn ghost sm" onClick={fetchFiles}>
+          Refresh
+        </button>
+      </div>
+    </div>
   );
 }
 
 /* ==========================================
-   RECORDS TAB — Tree-based records view
+   RECORDS TAB — Flat searchable/sortable table
    ========================================== */
 
-type ViewMode = "byType" | "byUpload";
-
-interface TreeNodeData {
-  key: string;
-  label: string;
-  count: number;
-  recordType?: string;
-  uploadId?: string;
-  uploadDate?: string;
+type SortKey = "type" | "desc" | "date";
+interface SortState {
+  key: SortKey;
+  dir: 1 | -1;
 }
 
-function RecordsTab() {
-  const [viewMode, setViewMode] = useState<ViewMode>("byType");
-  const [selectedRecord, setSelectedRecord] = useState<string | null>(null);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [bulkConfirmOpen, setBulkConfirmOpen] = useState(false);
-  const [bulkDeleting, setBulkDeleting] = useState(false);
-  const [dontAskChecked, setDontAskChecked] = useState(false);
+// Map sortable header keys → the API's `sort` query values (server-sorted).
+const SORT_API_KEY: Record<SortKey, string> = {
+  type: "type",
+  desc: "display_text",
+  date: "date",
+};
 
-  const { skipDeleteConfirm, setSkipDeleteConfirm } = usePreferencesStore();
+function RecordsTab() {
+  const [records, setRecords] = useState<HealthRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const [q, setQ] = useState("");
+  const [typeFilter, setTypeFilter] = useState("");
+  const [sort, setSort] = useState<SortState>({ key: "date", dir: -1 });
+
+  const [selectedRecord, setSelectedRecord] = useState<string | null>(null);
 
   // Single delete state
+  const { skipDeleteConfirm, setSkipDeleteConfirm } = usePreferencesStore();
   const [singleDeleteId, setSingleDeleteId] = useState<string | null>(null);
   const [singleConfirmOpen, setSingleConfirmOpen] = useState(false);
   const [singleDontAskChecked, setSingleDontAskChecked] = useState(false);
 
-  // Refresh counter to trigger data re-fetches after deletes
-  const [refreshKey, setRefreshKey] = useState(0);
+  const triggerRefresh = useCallback(() => setRefreshKey((k) => k + 1), []);
 
-  const triggerRefresh = useCallback(() => {
-    setRefreshKey((k) => k + 1);
-    setSelectedIds(new Set());
-  }, []);
+  // API → GET /records (paginated, server-sorted). Search + type filter stay
+  // client-side over the loaded page; column sort is sent to the server via
+  // ?sort=&order= and refetches.
+  useEffect(() => {
+    setLoading(true);
+    const order = sort.dir === 1 ? "asc" : "desc";
+    api
+      .get<RecordListResponse>(
+        `/records?page=1&page_size=500&sort=${SORT_API_KEY[sort.key]}&order=${order}`
+      )
+      .then((data) => setRecords(data.items || []))
+      .catch(() => setRecords([]))
+      .finally(() => setLoading(false));
+  }, [refreshKey, sort]);
 
-  const toggleSelection = (id: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
+  const types = useMemo(
+    () => Array.from(new Set(records.map((r) => r.record_type))).sort((a, b) => a.localeCompare(b)),
+    [records]
+  );
+
+  // Records arrive server-sorted; search + type filter narrow the loaded page.
+  const rows = useMemo(() => {
+    return records.filter((r) => {
+      if (typeFilter && r.record_type !== typeFilter) return false;
+      if (q) {
+        const s = `${r.display_text} ${r.code_display || ""} ${r.source_format} ${
+          r.code_value || ""
+        }`.toLowerCase();
+        if (!s.includes(q.toLowerCase())) return false;
+      }
+      return true;
     });
-  };
+  }, [records, q, typeFilter]);
 
   const handleSingleDelete = (id: string) => {
     if (skipDeleteConfirm) {
@@ -448,9 +403,7 @@ function RecordsTab() {
   const performSingleDelete = async (id: string) => {
     try {
       await api.delete(`/records/${id}`);
-      if (singleDontAskChecked) {
-        setSkipDeleteConfirm(true);
-      }
+      if (singleDontAskChecked) setSkipDeleteConfirm(true);
       setSingleConfirmOpen(false);
       setSingleDeleteId(null);
       triggerRefresh();
@@ -459,128 +412,100 @@ function RecordsTab() {
     }
   };
 
-  const handleBulkDelete = () => {
-    if (selectedIds.size === 0) return;
-    if (skipDeleteConfirm) {
-      performBulkDelete();
-    } else {
-      setDontAskChecked(false);
-      setBulkConfirmOpen(true);
-    }
-  };
-
-  const performBulkDelete = async () => {
-    setBulkDeleting(true);
-    try {
-      const promises = Array.from(selectedIds).map((id) =>
-        api.delete(`/records/${id}`)
-      );
-      await Promise.all(promises);
-      if (dontAskChecked) {
-        setSkipDeleteConfirm(true);
+  const th = (key: SortKey, label: string) => (
+    <th
+      className="sortable"
+      onClick={() =>
+        setSort((s) => ({
+          key,
+          dir: s.key === key ? ((-s.dir) as 1 | -1) : key === "date" ? -1 : 1,
+        }))
       }
-      setBulkConfirmOpen(false);
-      triggerRefresh();
-    } catch {
-      // silently fail
-    } finally {
-      setBulkDeleting(false);
-    }
-  };
+    >
+      {label}
+      {sort.key === key ? (sort.dir === 1 ? " ↑" : " ↓") : ""}
+    </th>
+  );
+
+  if (loading) return <RetroLoadingState text="Loading records" />;
 
   return (
-    <div style={{ position: "relative", minHeight: "200px" }}>
-      {/* View toggle */}
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "flex-end",
-          marginBottom: "16px",
-          gap: "0px",
-        }}
-      >
-        <RetroButton
-          variant="ghost"
-          onClick={() => setViewMode("byType")}
-          style={{
-            color: viewMode === "byType" ? "var(--theme-amber)" : "var(--theme-text-dim)",
-            borderBottom: viewMode === "byType" ? "2px solid var(--theme-amber)" : "2px solid transparent",
-            borderRadius: 0,
-            fontFamily: "var(--font-body)",
-            fontSize: "0.75rem",
-          }}
+    <div>
+      <p className="h-sub" style={{ margin: "0 0 18px" }}>
+        Every resource in the record, as structured data — search, sort, and open any row. (The
+        Timeline is the same data, told as a story.)
+      </p>
+
+      <div className="toolbar">
+        <div className="search">
+          <Search size={16} />
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search descriptions, codes, sources…"
+          />
+        </div>
+        <select
+          className="selectbox"
+          value={typeFilter}
+          onChange={(e) => setTypeFilter(e.target.value)}
         >
-          By Type
-        </RetroButton>
-        <RetroButton
-          variant="ghost"
-          onClick={() => setViewMode("byUpload")}
-          style={{
-            color: viewMode === "byUpload" ? "var(--theme-amber)" : "var(--theme-text-dim)",
-            borderBottom: viewMode === "byUpload" ? "2px solid var(--theme-amber)" : "2px solid transparent",
-            borderRadius: 0,
-            fontFamily: "var(--font-body)",
-            fontSize: "0.75rem",
-          }}
-        >
-          By Upload
-        </RetroButton>
+          <option value="">All types ({records.length})</option>
+          {types.map((t) => (
+            <option key={t} value={t}>
+              {RECORD_TYPE_LABELS[t] || t}
+            </option>
+          ))}
+        </select>
       </div>
 
-      {/* Tree content */}
-      {viewMode === "byType" ? (
-        <ByTypeTree
-          refreshKey={refreshKey}
-          selectedIds={selectedIds}
-          onToggleSelection={toggleSelection}
-          onDeleteRecord={handleSingleDelete}
-          onSelectRecord={setSelectedRecord}
-        />
-      ) : (
-        <ByUploadTree
-          refreshKey={refreshKey}
-          selectedIds={selectedIds}
-          onToggleSelection={toggleSelection}
-          onDeleteRecord={handleSingleDelete}
-          onSelectRecord={setSelectedRecord}
-        />
-      )}
+      <div className="tablewrap">
+        <table className="rtable">
+          <thead>
+            <tr>
+              {th("type", "Type")}
+              {th("desc", "Description")}
+              {th("date", "Date")}
+              <th>Source</th>
+              <th>Code</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id} className="clickable" onClick={() => setSelectedRecord(r.id)}>
+                <td>
+                  <RetroBadge recordType={r.record_type} short />
+                </td>
+                <td className="desc">{r.display_text}</td>
+                <td className="num">{fmtDate(r.effective_date)}</td>
+                <td className="num">{r.source_format}</td>
+                <td className="num">
+                  {[r.code_system, r.code_value].filter(Boolean).join(" ") || "—"}
+                </td>
+                <td style={{ width: 1 }}>
+                  <button
+                    className="row-del"
+                    title="Delete record"
+                    aria-label={`Delete ${r.display_text}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleSingleDelete(r.id);
+                    }}
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
 
-      {/* Floating bulk action bar */}
-      {selectedIds.size > 0 && (
-        <div
-          style={{
-            position: "fixed",
-            bottom: 0,
-            left: 0,
-            right: 0,
-            height: "48px",
-            backgroundColor: "var(--theme-bg-surface)",
-            borderTop: "1px solid var(--theme-border)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: "16px",
-            zIndex: 40,
-            padding: "0 24px",
-          }}
-        >
-          <span
-            style={{
-              fontFamily: "var(--font-mono)",
-              fontSize: "1rem",
-              color: "var(--theme-text)",
-            }}
-          >
-            {selectedIds.size} selected
-          </span>
-          <RetroButton variant="destructive" onClick={handleBulkDelete}>
-            Delete selected
-          </RetroButton>
-        </div>
-      )}
+      <p className="h-sub" style={{ marginTop: 14 }}>
+        {rows.length} of {records.length} records
+      </p>
 
-      {/* Record detail sheet */}
       <RecordDetailSheet
         recordId={selectedRecord}
         open={!!selectedRecord}
@@ -588,7 +513,6 @@ function RecordsTab() {
         onDelete={triggerRefresh}
       />
 
-      {/* Single delete confirm dialog */}
       <ConfirmDialog
         open={singleConfirmOpen}
         title="Delete record?"
@@ -607,663 +531,13 @@ function RecordsTab() {
         dontAskAgainChecked={singleDontAskChecked}
         onDontAskAgainChange={setSingleDontAskChecked}
       />
-
-      {/* Bulk delete confirm dialog */}
-      <ConfirmDialog
-        open={bulkConfirmOpen}
-        title={`Delete ${selectedIds.size} records?`}
-        description={`This will soft-delete ${selectedIds.size} selected records. This action cannot be easily undone.`}
-        confirmLabel="Delete all"
-        cancelLabel="Cancel"
-        variant="destructive"
-        onConfirm={performBulkDelete}
-        onCancel={() => setBulkConfirmOpen(false)}
-        showDontAskAgain
-        dontAskAgainChecked={dontAskChecked}
-        onDontAskAgainChange={setDontAskChecked}
-      />
-    </div>
-  );
-}
-
-/* ------------------------------------------
-   BY TYPE TREE
-   ------------------------------------------ */
-
-function ByTypeTree({
-  refreshKey,
-  selectedIds,
-  onToggleSelection,
-  onDeleteRecord,
-  onSelectRecord,
-}: {
-  refreshKey: number;
-  selectedIds: Set<string>;
-  onToggleSelection: (id: string) => void;
-  onDeleteRecord: (id: string) => void;
-  onSelectRecord: (id: string) => void;
-}) {
-  const [overview, setOverview] = useState<DashboardOverview | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    setLoading(true);
-    api
-      .get<DashboardOverview>("/dashboard/overview")
-      .then(setOverview)
-      .catch(() => setOverview(null))
-      .finally(() => setLoading(false));
-  }, [refreshKey]);
-
-  if (loading) return <RetroLoadingState text="Loading records" />;
-
-  if (!overview || Object.keys(overview.records_by_type).length === 0) {
-    return (
-      <div style={{ textAlign: "center", padding: "48px 0" }}>
-        <p
-          style={{
-            fontSize: "0.875rem",
-            color: "var(--theme-text-muted)",
-          }}
-        >
-          No records found
-        </p>
-      </div>
-    );
-  }
-
-  const sortedTypes = Object.entries(overview.records_by_type)
-    .filter(([, count]) => count > 0)
-    .sort(([a], [b]) => a.localeCompare(b));
-
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
-      {sortedTypes.map(([recordType, count]) => (
-        <TypeTreeNode
-          key={recordType}
-          recordType={recordType}
-          count={count}
-          refreshKey={refreshKey}
-          selectedIds={selectedIds}
-          onToggleSelection={onToggleSelection}
-          onDeleteRecord={onDeleteRecord}
-          onSelectRecord={onSelectRecord}
-        />
-      ))}
-    </div>
-  );
-}
-
-function TypeTreeNode({
-  recordType,
-  count,
-  refreshKey,
-  selectedIds,
-  onToggleSelection,
-  onDeleteRecord,
-  onSelectRecord,
-}: {
-  recordType: string;
-  count: number;
-  refreshKey: number;
-  selectedIds: Set<string>;
-  onToggleSelection: (id: string) => void;
-  onDeleteRecord: (id: string) => void;
-  onSelectRecord: (id: string) => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [records, setRecords] = useState<HealthRecord[]>([]);
-  const [loadingRecords, setLoadingRecords] = useState(false);
-  const [page, setPage] = useState(1);
-  const [total, setTotal] = useState(0);
-  const pageSize = 25;
-
-  const colors = RECORD_TYPE_COLORS[recordType] || DEFAULT_RECORD_COLOR;
-  const label = RECORD_TYPE_LABELS[recordType] || recordType;
-
-  useEffect(() => {
-    if (!expanded) return;
-    setLoadingRecords(true);
-    api
-      .get<RecordListResponse>(
-        `/records?record_type=${recordType}&page=${page}&page_size=${pageSize}`
-      )
-      .then((data) => {
-        setRecords(data.items || []);
-        setTotal(data.total || 0);
-      })
-      .catch(() => {
-        setRecords([]);
-        setTotal(0);
-      })
-      .finally(() => setLoadingRecords(false));
-  }, [expanded, page, recordType, refreshKey]);
-
-  const handleToggle = () => {
-    if (!expanded) {
-      setPage(1);
-    }
-    setExpanded(!expanded);
-  };
-
-  const hasMore = page * pageSize < total;
-
-  return (
-    <div>
-      {/* Group header row */}
-      <div
-        onClick={handleToggle}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "8px",
-          padding: "8px 12px",
-          cursor: "pointer",
-          transition: "background-color 150ms",
-          borderRadius: "4px",
-        }}
-        onMouseEnter={(e) => {
-          e.currentTarget.style.backgroundColor = "var(--theme-bg-card-hover)";
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.backgroundColor = "transparent";
-        }}
-      >
-        <ChevronRight
-          size={16}
-          style={{
-            color: "var(--theme-amber)",
-            transition: "transform 200ms",
-            transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
-            flexShrink: 0,
-          }}
-        />
-        {/* Color dot */}
-        <span
-          style={{
-            width: "8px",
-            height: "8px",
-            borderRadius: "50%",
-            backgroundColor: colors.dot,
-            flexShrink: 0,
-          }}
-        />
-        <span
-          style={{
-            fontFamily: "var(--font-body)",
-            fontSize: "0.8125rem",
-            color: "var(--theme-text)",
-            flex: 1,
-          }}
-        >
-          {label}
-        </span>
-        <span
-          style={{
-            fontFamily: "var(--font-mono)",
-            fontSize: "0.875rem",
-            color: "var(--theme-text-muted)",
-          }}
-        >
-          {count}
-        </span>
-      </div>
-
-      {/* Expanded children */}
-      {expanded && (
-        <div
-          style={{
-            overflow: "hidden",
-            transition: "max-height 300ms ease-in-out",
-            paddingLeft: "36px",
-          }}
-        >
-          {loadingRecords ? (
-            <div style={{ padding: "12px 0" }}>
-              <RetroLoadingState text="Loading" />
-            </div>
-          ) : records.length === 0 ? (
-            <div style={{ padding: "12px 0" }}>
-              <span
-                style={{
-                  fontSize: "0.75rem",
-                  color: "var(--theme-text-muted)",
-                }}
-              >
-                No records
-              </span>
-            </div>
-          ) : (
-            <>
-              {records.map((record) => (
-                <RecordLeafNode
-                  key={record.id}
-                  record={record}
-                  isSelected={selectedIds.has(record.id)}
-                  onToggleSelection={() => onToggleSelection(record.id)}
-                  onDelete={() => onDeleteRecord(record.id)}
-                  onSelect={() => onSelectRecord(record.id)}
-                />
-              ))}
-              {hasMore && (
-                <div style={{ padding: "8px 12px" }}>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setPage((p) => p + 1);
-                    }}
-                    style={{
-                      background: "none",
-                      border: "none",
-                      cursor: "pointer",
-                      fontSize: "0.75rem",
-                      fontFamily: "var(--font-body)",
-                      color: "var(--theme-amber)",
-                      padding: 0,
-                    }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.textDecoration = "underline";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.textDecoration = "none";
-                    }}
-                  >
-                    Load more ({total - page * pageSize} remaining)
-                  </button>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ------------------------------------------
-   BY UPLOAD TREE
-   ------------------------------------------ */
-
-interface UploadHistoryItem {
-  id: string;
-  original_filename: string;
-  ingestion_status: string;
-  records_inserted?: number;
-  created_at: string;
-  file_category?: string;
-}
-
-function ByUploadTree({
-  refreshKey,
-  selectedIds,
-  onToggleSelection,
-  onDeleteRecord,
-  onSelectRecord,
-}: {
-  refreshKey: number;
-  selectedIds: Set<string>;
-  onToggleSelection: (id: string) => void;
-  onDeleteRecord: (id: string) => void;
-  onSelectRecord: (id: string) => void;
-}) {
-  const [uploads, setUploads] = useState<UploadHistoryItem[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    setLoading(true);
-    api
-      .get<{ items: UploadHistoryItem[]; total: number }>("/upload/history")
-      .then((data) => setUploads(data.items || []))
-      .catch(() => setUploads([]))
-      .finally(() => setLoading(false));
-  }, [refreshKey]);
-
-  if (loading) return <RetroLoadingState text="Loading uploads" />;
-
-  if (uploads.length === 0) {
-    return (
-      <div style={{ textAlign: "center", padding: "48px 0" }}>
-        <p
-          style={{
-            fontSize: "0.875rem",
-            color: "var(--theme-text-muted)",
-          }}
-        >
-          No uploads found
-        </p>
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
-      {uploads.map((upload) => (
-        <UploadTreeNode
-          key={upload.id}
-          upload={upload}
-          refreshKey={refreshKey}
-          selectedIds={selectedIds}
-          onToggleSelection={onToggleSelection}
-          onDeleteRecord={onDeleteRecord}
-          onSelectRecord={onSelectRecord}
-        />
-      ))}
-    </div>
-  );
-}
-
-function UploadTreeNode({
-  upload,
-  refreshKey,
-  selectedIds,
-  onToggleSelection,
-  onDeleteRecord,
-  onSelectRecord,
-}: {
-  upload: UploadHistoryItem;
-  refreshKey: number;
-  selectedIds: Set<string>;
-  onToggleSelection: (id: string) => void;
-  onDeleteRecord: (id: string) => void;
-  onSelectRecord: (id: string) => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [records, setRecords] = useState<HealthRecord[]>([]);
-  const [loadingRecords, setLoadingRecords] = useState(false);
-  const [page, setPage] = useState(1);
-  const [total, setTotal] = useState(0);
-  const pageSize = 25;
-
-  useEffect(() => {
-    if (!expanded) return;
-    setLoadingRecords(true);
-    api
-      .get<RecordListResponse>(
-        `/records?source_upload_id=${upload.id}&page=${page}&page_size=${pageSize}`
-      )
-      .then((data) => {
-        setRecords(data.items || []);
-        setTotal(data.total || 0);
-      })
-      .catch(() => {
-        setRecords([]);
-        setTotal(0);
-      })
-      .finally(() => setLoadingRecords(false));
-  }, [expanded, page, upload.id, refreshKey]);
-
-  const handleToggle = () => {
-    if (!expanded) {
-      setPage(1);
-    }
-    setExpanded(!expanded);
-  };
-
-  const hasMore = page * pageSize < total;
-  const uploadDate = upload.created_at
-    ? new Date(upload.created_at).toLocaleDateString()
-    : "--";
-  const recordCount = upload.records_inserted ?? 0;
-
-  return (
-    <div>
-      {/* Upload header row */}
-      <div
-        onClick={handleToggle}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "8px",
-          padding: "8px 12px",
-          cursor: "pointer",
-          transition: "background-color 150ms",
-          borderRadius: "4px",
-        }}
-        onMouseEnter={(e) => {
-          e.currentTarget.style.backgroundColor = "var(--theme-bg-card-hover)";
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.backgroundColor = "transparent";
-        }}
-      >
-        <ChevronRight
-          size={16}
-          style={{
-            color: "var(--theme-amber)",
-            transition: "transform 200ms",
-            transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
-            flexShrink: 0,
-          }}
-        />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <span
-            style={{
-              fontFamily: "var(--font-body)",
-              fontSize: "0.8125rem",
-              color: "var(--theme-text)",
-              display: "block",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
-          >
-            {upload.original_filename}
-          </span>
-          <span
-            style={{
-              fontFamily: "var(--font-body)",
-              fontSize: "0.6875rem",
-              color: "var(--theme-text-muted)",
-            }}
-          >
-            {uploadDate}
-          </span>
-        </div>
-        <span
-          style={{
-            fontFamily: "var(--font-mono)",
-            fontSize: "0.875rem",
-            color: "var(--theme-text-muted)",
-            flexShrink: 0,
-          }}
-        >
-          {recordCount}
-        </span>
-      </div>
-
-      {/* Expanded children */}
-      {expanded && (
-        <div
-          style={{
-            overflow: "hidden",
-            transition: "max-height 300ms ease-in-out",
-            paddingLeft: "36px",
-          }}
-        >
-          {loadingRecords ? (
-            <div style={{ padding: "12px 0" }}>
-              <RetroLoadingState text="Loading" />
-            </div>
-          ) : records.length === 0 ? (
-            <div style={{ padding: "12px 0" }}>
-              <span
-                style={{
-                  fontSize: "0.75rem",
-                  color: "var(--theme-text-muted)",
-                }}
-              >
-                No records from this upload
-              </span>
-            </div>
-          ) : (
-            <>
-              {records.map((record) => (
-                <RecordLeafNode
-                  key={record.id}
-                  record={record}
-                  isSelected={selectedIds.has(record.id)}
-                  onToggleSelection={() => onToggleSelection(record.id)}
-                  onDelete={() => onDeleteRecord(record.id)}
-                  onSelect={() => onSelectRecord(record.id)}
-                />
-              ))}
-              {hasMore && (
-                <div style={{ padding: "8px 12px" }}>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setPage((p) => p + 1);
-                    }}
-                    style={{
-                      background: "none",
-                      border: "none",
-                      cursor: "pointer",
-                      fontSize: "0.75rem",
-                      fontFamily: "var(--font-body)",
-                      color: "var(--theme-amber)",
-                      padding: 0,
-                    }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.textDecoration = "underline";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.textDecoration = "none";
-                    }}
-                  >
-                    Load more ({total - page * pageSize} remaining)
-                  </button>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ------------------------------------------
-   RECORD LEAF NODE (shared by both tree views)
-   ------------------------------------------ */
-
-function RecordLeafNode({
-  record,
-  isSelected,
-  onToggleSelection,
-  onDelete,
-  onSelect,
-}: {
-  record: HealthRecord;
-  isSelected: boolean;
-  onToggleSelection: () => void;
-  onDelete: () => void;
-  onSelect: () => void;
-}) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: "8px",
-        padding: "6px 12px",
-        transition: "background-color 150ms",
-        borderRadius: "4px",
-      }}
-      onMouseEnter={(e) => {
-        e.currentTarget.style.backgroundColor = "var(--theme-bg-card-hover)";
-      }}
-      onMouseLeave={(e) => {
-        e.currentTarget.style.backgroundColor = "transparent";
-      }}
-    >
-      {/* Checkbox */}
-      <input
-        type="checkbox"
-        checked={isSelected}
-        onChange={(e) => {
-          e.stopPropagation();
-          onToggleSelection();
-        }}
-        style={{
-          accentColor: "var(--theme-amber)",
-          cursor: "pointer",
-          flexShrink: 0,
-        }}
-      />
-
-      {/* Record text — clickable to open detail sheet */}
-      <span
-        onClick={onSelect}
-        style={{
-          flex: 1,
-          fontFamily: "var(--font-body)",
-          fontSize: "0.75rem",
-          color: "var(--theme-text)",
-          cursor: "pointer",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-        }}
-        onMouseEnter={(e) => {
-          e.currentTarget.style.color = "var(--theme-amber)";
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.color = "var(--theme-text)";
-        }}
-      >
-        {record.display_text}
-      </span>
-
-      {/* Date */}
-      <span
-        style={{
-          fontFamily: "var(--font-body)",
-          fontSize: "0.6875rem",
-          color: "var(--theme-text-muted)",
-          flexShrink: 0,
-          whiteSpace: "nowrap",
-        }}
-      >
-        {record.effective_date
-          ? new Date(record.effective_date).toLocaleDateString()
-          : "--"}
-      </span>
-
-      {/* Trash icon */}
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onDelete();
-        }}
-        style={{
-          background: "none",
-          border: "none",
-          cursor: "pointer",
-          padding: "2px",
-          display: "flex",
-          alignItems: "center",
-          color: "var(--theme-text-muted)",
-          flexShrink: 0,
-          transition: "color 150ms",
-        }}
-        onMouseEnter={(e) => {
-          e.currentTarget.style.color = "var(--theme-terracotta)";
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.color = "var(--theme-text-muted)";
-        }}
-      >
-        <Trash2 size={14} />
-      </button>
     </div>
   );
 }
 
 /* ==========================================
-   DEDUP TAB
+   DEDUP / DUPLICATES TAB
    ========================================== */
-
-// TODO: Improve dedup UX — current detection works but resolution UI needs redesign
 
 function DedupTab() {
   const [candidates, setCandidates] = useState<DedupCandidate[]>([]);
@@ -1276,19 +550,29 @@ function DedupTab() {
   const [scanResult, setScanResult] = useState<string | null>(null);
   const pageSize = 20;
 
-  const fetchCandidates = (p = page) => {
-    setLoading(true);
-    api
-      .get<{ items: DedupCandidate[]; total: number }>(`/dedup/candidates?page=${p}&limit=${pageSize}`)
-      .then((data) => {
-        setCandidates(data.items || []);
-        setTotal(data.total || 0);
-      })
-      .catch(() => { setCandidates([]); setTotal(0); })
-      .finally(() => setLoading(false));
-  };
+  const fetchCandidates = useCallback(
+    (p: number) => {
+      setLoading(true);
+      api
+        .get<{ items: DedupCandidate[]; total: number }>(
+          `/dedup/candidates?page=${p}&limit=${pageSize}`
+        )
+        .then((data) => {
+          setCandidates(data.items || []);
+          setTotal(data.total || 0);
+        })
+        .catch(() => {
+          setCandidates([]);
+          setTotal(0);
+        })
+        .finally(() => setLoading(false));
+    },
+    [pageSize]
+  );
 
-  useEffect(() => { fetchCandidates(page); }, [page]);
+  useEffect(() => {
+    fetchCandidates(page);
+  }, [page, fetchCandidates]);
 
   const handleScan = async () => {
     setScanning(true);
@@ -1311,6 +595,7 @@ function DedupTab() {
     try {
       await api.post("/dedup/merge", { candidate_id: candidateId });
       setCandidates((prev) => prev.filter((c) => c.id !== candidateId));
+      setTotal((t) => Math.max(0, t - 1));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Merge failed");
     } finally {
@@ -1323,6 +608,7 @@ function DedupTab() {
     try {
       await api.post("/dedup/dismiss", { candidate_id: candidateId });
       setCandidates((prev) => prev.filter((c) => c.id !== candidateId));
+      setTotal((t) => Math.max(0, t - 1));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Dismiss failed");
     } finally {
@@ -1331,125 +617,83 @@ function DedupTab() {
   };
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center gap-4">
-        <RetroButton onClick={handleScan} disabled={scanning}>
-          {scanning ? "Scanning..." : "Scan for duplicates"}
-        </RetroButton>
+    <div>
+      <p className="h-sub" style={{ margin: "0 0 18px" }}>
+        Potential duplicates found across sources. Each is scored, then auto-merged, auto-dismissed,
+        or sent here for your review.
+      </p>
+
+      <div className="toolbar">
+        <button className="btn" onClick={handleScan} disabled={scanning}>
+          {scanning ? "Scanning…" : "Scan for duplicates"}
+        </button>
         {scanResult && (
-          <span className="text-xs" style={{ color: "var(--theme-text-dim)" }}>
+          <span className="h-sub" style={{ margin: 0 }}>
             {scanResult}
           </span>
         )}
       </div>
 
       {error && (
-        <RetroCard>
-          <RetroCardContent>
-            <div className="flex items-start gap-3">
-              <span
-                className="text-xs font-bold shrink-0 px-2 py-0.5"
-                style={{
-                  backgroundColor: "var(--theme-terracotta)",
-                  color: "var(--theme-text)",
-                  borderRadius: "4px",
-                }}
-              >
-                ERROR
-              </span>
-              <p className="text-xs" style={{ color: "var(--theme-text-dim)" }}>{error}</p>
-            </div>
-          </RetroCardContent>
-        </RetroCard>
+        <div className="card-surface pad" style={{ marginBottom: 14 }}>
+          <div className="between" style={{ justifyContent: "flex-start", gap: 12 }}>
+            <span className="tag" style={{ background: "var(--danger)", color: "var(--on-primary)" }}>
+              ERROR
+            </span>
+            <p className="muted" style={{ fontSize: 13.5, margin: 0 }}>
+              {error}
+            </p>
+          </div>
+        </div>
       )}
 
       {loading ? (
         <RetroLoadingState text="Loading candidates" />
-      ) : candidates.length === 0 && total === 0 ? (
-        <div className="py-12 text-center">
-          <p
-            className="text-sm"
-            style={{ color: "var(--theme-text-muted)" }}
-          >
-            No duplicate candidates
-          </p>
-          <p
-            className="text-xs mt-1"
-            style={{ color: "var(--theme-text-muted)" }}
-          >
+      ) : candidates.length === 0 ? (
+        <div className="card-surface pad" style={{ textAlign: "center", padding: "56px 24px" }}>
+          <span className="dz-ic" style={{ margin: "0 auto 14px" }}>
+            <Check size={22} />
+          </span>
+          <div className="muted" style={{ fontSize: 14.5 }}>
+            All clear — no duplicates waiting for review.
+          </div>
+          <p className="h-sub" style={{ marginTop: 6 }}>
             Run the scanner to check for potential duplicates.
           </p>
         </div>
       ) : (
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <span className="text-xs" style={{ color: "var(--theme-text-dim)" }}>
-              {total.toLocaleString()} pending candidates — showing {(page - 1) * pageSize + 1}–{Math.min(page * pageSize, total)}
+        <div>
+          <div className="between" style={{ marginBottom: 14 }}>
+            <span className="h-sub" style={{ margin: 0 }}>
+              {total.toLocaleString()} pending candidates — showing {(page - 1) * pageSize + 1}–
+              {Math.min(page * pageSize, total)}
             </span>
-            <div className="flex gap-2">
-              <RetroButton variant="ghost" disabled={page <= 1} onClick={() => setPage(p => p - 1)}>Prev</RetroButton>
-              <RetroButton variant="ghost" disabled={page * pageSize >= total} onClick={() => setPage(p => p + 1)}>Next</RetroButton>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                className="btn ghost sm"
+                disabled={page <= 1}
+                onClick={() => setPage((p) => p - 1)}
+              >
+                Prev
+              </button>
+              <button
+                className="btn ghost sm"
+                disabled={page * pageSize >= total}
+                onClick={() => setPage((p) => p + 1)}
+              >
+                Next
+              </button>
             </div>
           </div>
-          {candidates.map((candidate) => (
-            <RetroCard key={candidate.id}>
-              <RetroCardContent>
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <span
-                        className="text-sm font-medium"
-                        style={{ color: "var(--theme-amber)" }}
-                      >
-                        {Math.round(candidate.similarity_score * 100)}% match
-                      </span>
-                      <div className="flex gap-1">
-                        {Object.entries(candidate.match_reasons)
-                          .filter(([, matched]) => matched)
-                          .map(([reason]) => (
-                            <span
-                              key={reason}
-                              className="px-2 py-0.5 text-xs rounded"
-                              style={{
-                                backgroundColor: "var(--theme-bg-surface)",
-                                color: "var(--theme-text-dim)",
-                                borderRadius: "4px",
-                                border: "1px solid var(--theme-border)",
-                              }}
-                            >
-                              {reason}
-                            </span>
-                          ))}
-                      </div>
-                    </div>
-                    <div className="flex gap-2">
-                      <RetroButton
-                        onClick={() => handleMerge(candidate.id)}
-                        disabled={actionLoading === candidate.id}
-                      >
-                        {actionLoading === candidate.id ? "..." : "Merge"}
-                      </RetroButton>
-                      <RetroButton
-                        variant="ghost"
-                        onClick={() => handleDismiss(candidate.id)}
-                        disabled={actionLoading === candidate.id}
-                      >
-                        Dismiss
-                      </RetroButton>
-                    </div>
-                  </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {candidate.record_a && (
-                      <DedupRecordCard label="RECORD A" record={candidate.record_a} />
-                    )}
-                    {candidate.record_b && (
-                      <DedupRecordCard label="RECORD B" record={candidate.record_b} />
-                    )}
-                  </div>
-                </div>
-              </RetroCardContent>
-            </RetroCard>
+          {candidates.map((candidate) => (
+            <DedupCandidateCard
+              key={candidate.id}
+              candidate={candidate}
+              busy={actionLoading === candidate.id}
+              onMerge={() => handleMerge(candidate.id)}
+              onKeepBoth={() => handleDismiss(candidate.id)}
+            />
           ))}
         </div>
       )}
@@ -1457,40 +701,97 @@ function DedupTab() {
   );
 }
 
-function DedupRecordCard({
-  label,
-  record,
+export function DedupCandidateCard({
+  candidate,
+  busy,
+  onMerge,
+  onKeepBoth,
 }: {
-  label: string;
-  record: NonNullable<DedupCandidate["record_a"]>;
+  candidate: DedupCandidate;
+  busy: boolean;
+  onMerge: () => void;
+  onKeepBoth: () => void;
 }) {
+  const reasons = Object.entries(candidate.match_reasons)
+    .filter(([, matched]) => matched)
+    .map(([reason]) => reason);
+
+  const records = [
+    { label: "RECORD A", rec: candidate.record_a },
+    { label: "RECORD B", rec: candidate.record_b },
+  ];
+
   return (
-    <div
-      className="border p-3 space-y-2"
-      style={{
-        backgroundColor: "var(--theme-bg-surface)",
-        borderColor: "var(--theme-border)",
-        borderRadius: "4px",
-      }}
-    >
-      <div className="flex items-center gap-2">
-        <span className="text-xs" style={{ color: "var(--theme-text-muted)" }}>
-          {label}
+    <div className="dedup-card">
+      <div className="between" style={{ gap: 12 }}>
+        <span
+          className="display"
+          style={{ fontSize: 22, color: "var(--primary)", whiteSpace: "nowrap" }}
+        >
+          {Math.round(candidate.similarity_score * 100)}% match
         </span>
-        <RetroBadge recordType={record.record_type} short />
+        <div style={{ display: "flex", gap: 9 }}>
+          <button className="btn sm" onClick={onMerge} disabled={busy}>
+            {busy ? "…" : "Merge"}
+          </button>
+          <button className="btn ghost sm" onClick={onKeepBoth} disabled={busy}>
+            Keep both
+          </button>
+        </div>
       </div>
-      <p className="text-sm" style={{ color: "var(--theme-text)" }}>
-        {record.display_text}
-      </p>
-      <div className="flex items-center gap-3 text-xs" style={{ color: "var(--theme-text-muted)" }}>
-        <span>{record.source_format}</span>
-        <span>
-          {record.effective_date
-            ? new Date(record.effective_date).toLocaleDateString()
-            : "--"}
-        </span>
+
+      {reasons.length > 0 && (
+        <div className="reasons" style={{ marginTop: 11 }}>
+          {reasons.map((r) => (
+            <span className="reason" key={r}>
+              {r}
+            </span>
+          ))}
+        </div>
+      )}
+
+      <div className="dedup-pair">
+        {records.map(({ label, rec }, i) => (
+          <DedupRecPair key={label} label={label} rec={rec} showVs={i === 1} />
+        ))}
       </div>
     </div>
+  );
+}
+
+function DedupRecPair({
+  label,
+  rec,
+  showVs,
+}: {
+  label: string;
+  rec: DedupCandidate["record_a"];
+  showVs: boolean;
+}) {
+  return (
+    <>
+      {showVs && <div className="dedup-vs">VS</div>}
+      <div className="dedup-rec">
+        {rec ? (
+          <>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <RetroBadge recordType={rec.record_type} short />
+              <span className="num" style={{ fontSize: 11 }}>
+                {label}
+              </span>
+            </div>
+            <div style={{ fontWeight: 600, fontSize: 14.5 }}>{rec.display_text}</div>
+            <div className="num" style={{ fontSize: 12, marginTop: 6 }}>
+              {rec.source_format} · {fmtDate(rec.effective_date)}
+            </div>
+          </>
+        ) : (
+          <span className="muted" style={{ fontSize: 13 }}>
+            {label} unavailable
+          </span>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -1498,39 +799,21 @@ function DedupRecordCard({
    SYSTEM TAB
    ========================================== */
 
-function interpretationStyle(interpretation: string): { color: string } {
-  const code = interpretation?.toUpperCase();
-  if (code === "H" || code === "HH") return { color: "var(--theme-terracotta)" };
-  if (code === "L" || code === "LL") return { color: "var(--record-procedure-text)" };
-  if (code === "A" || code === "AA") return { color: "var(--theme-ochre)" };
-  return { color: "var(--theme-text-dim)" };
-}
-
-function interpretationLabel(interpretation: string): string {
-  const code = interpretation?.toUpperCase();
-  if (code === "H") return "HIGH";
-  if (code === "HH") return "CRIT HIGH";
-  if (code === "L") return "LOW";
-  if (code === "LL") return "CRIT LOW";
-  if (code === "A") return "ABNORMAL";
-  if (code === "AA") return "CRIT ABNORM";
-  if (code === "N") return "NORMAL";
-  return interpretation || "--";
-}
-
-function statusColor(status: string | null): string {
-  if (!status) return "var(--theme-text-dim)";
-  const s = status.toLowerCase();
-  if (s === "active" || s === "in-progress") return "var(--theme-ochre)";
-  if (s === "completed" || s === "resolved" || s === "finished") return "var(--theme-sage)";
-  if (s === "stopped" || s === "cancelled" || s === "not-done") return "var(--theme-terracotta)";
-  return "var(--theme-text-dim)";
+function maskEmail(email: string | undefined | null): string {
+  if (!email) return "—";
+  const [local, domain] = email.split("@");
+  if (!domain) return email;
+  const head = local.slice(0, 1);
+  return `${head}${"•".repeat(Math.max(3, local.length - 1))}@${domain}`;
 }
 
 function SystemTab() {
   const [user, setUser] = useState<UserResponse | null>(null);
   const [overview, setOverview] = useState<DashboardOverview | null>(null);
+  const [auditLog, setAuditLog] = useState<AuditLogEntry[]>([]);
+  const [auditLoading, setAuditLoading] = useState(true);
   const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
   const { clearTokens } = useAuthStore();
 
   useEffect(() => {
@@ -1545,130 +828,172 @@ function SystemTab() {
       .finally(() => setLoading(false));
   }, []);
 
+  useEffect(() => {
+    setAuditLoading(true);
+    api
+      .get<AuditLogResponse>("/audit-log?limit=50")
+      .then((data) => setAuditLog(data.items || []))
+      .catch(() => setAuditLog([]))
+      .finally(() => setAuditLoading(false));
+  }, []);
+
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      const bundle = await api.get<unknown>("/records/export?format=fhir-bundle");
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], {
+        type: "application/fhir+json",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "medtimeline-fhir-bundle.json";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      // Best-effort: surface nothing on failure beyond resetting state.
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    // API → POST /auth/logout (revokes the refresh token server-side), then clear local tokens.
+    try {
+      await api.post("/auth/logout");
+    } catch {
+      // Best-effort: still clear locally even if the call fails.
+    }
+    clearTokens();
+    window.location.href = "/login";
+  };
+
   if (loading) return <RetroLoadingState text="Loading system info" />;
 
-  const dateRange =
+  const span =
     overview?.date_range_start && overview?.date_range_end
-      ? `${new Date(overview.date_range_start).toLocaleDateString()} – ${new Date(overview.date_range_end).toLocaleDateString()}`
-      : "N/A";
+      ? (() => {
+          const s = new Date(overview.date_range_start).getFullYear();
+          const e = new Date(overview.date_range_end).getFullYear();
+          return s === e ? `${s}` : `${s}–${e}`;
+        })()
+      : "—";
+
+  const recordTypeCount = overview ? Object.keys(overview.records_by_type).length : 0;
 
   return (
-    <div className="space-y-4">
-      {/* Account Info */}
-      <RetroCard accentTop>
-        <RetroCardHeader>
-          <GlowText as="h4" glow={false}>Account information</GlowText>
-        </RetroCardHeader>
-        <RetroCardContent>
-          {user ? (
-            <div className="space-y-2">
-              <SysRow label="Email" value={user.email} />
-              <SysRow label="Display name" value={user.display_name || "Not set"} />
-              <SysRow
-                label="Status"
-                value={user.is_active ? "Active" : "Inactive"}
-                valueColor={user.is_active ? "var(--theme-sage)" : "var(--theme-terracotta)"}
-              />
-              <SysRow label="User ID" value={user.id} mono />
-            </div>
-          ) : (
-            <p className="text-xs" style={{ color: "var(--theme-text-muted)" }}>
-              Unable to load account information.
-            </p>
-          )}
-        </RetroCardContent>
-      </RetroCard>
-
-      {/* Data Stats */}
-      <RetroCard>
-        <RetroCardHeader>
-          <GlowText as="h4" glow={false}>Data statistics</GlowText>
-        </RetroCardHeader>
-        <RetroCardContent>
-          {overview ? (
-            <div className="space-y-2">
-              <SysRow label="Total records" value={String(overview.total_records)} />
-              <SysRow label="Total patients" value={String(overview.total_patients)} />
-              <SysRow label="Total uploads" value={String(overview.total_uploads)} />
-              <SysRow label="Date range" value={dateRange} />
-            </div>
-          ) : (
-            <p className="text-xs" style={{ color: "var(--theme-text-muted)" }}>
-              No data available.
-            </p>
-          )}
-        </RetroCardContent>
-      </RetroCard>
-
-      {/* Sign Out */}
-      <RetroButton
-        variant="destructive"
-        onClick={() => {
-          clearTokens();
-          window.location.href = "/login";
-        }}
-      >
-        Sign out
-      </RetroButton>
-
-      {/* Privacy Notice */}
-      <RetroCard>
-        <RetroCardContent>
-          <div className="flex items-start gap-3">
-            <span
-              className="text-xs font-bold shrink-0 px-2 py-0.5"
-              style={{
-                backgroundColor: "var(--theme-sienna)",
-                color: "var(--theme-text)",
-                borderRadius: "4px",
-              }}
-            >
-              NOTICE
-            </span>
-            <p
-              className="text-xs leading-relaxed"
-              style={{ color: "var(--theme-text-dim)" }}
-            >
-              All health data is stored locally and encrypted at rest. Data only
-              leaves your device when you explicitly request an AI summary or
-              document extraction, and only after de-identification (PHI scrubbing
-              + name redaction) — never automatically, and never as raw PHI.
-            </p>
+    <div>
+      <div className="grid-2" style={{ alignItems: "start", marginBottom: 18 }}>
+        {/* Account */}
+        <div className="card-surface pad">
+          <h3 className="sec-title" style={{ marginBottom: 14 }}>
+            Account
+          </h3>
+          <div className="s12">
+            <Field l="Name" v={user?.display_name?.trim() || "Not set"} />
+            <Field l="Email" v={maskEmail(user?.email)} />
+            <Field l="Record owner" v="You" />
+            {/* TODO(backend): created_at not on /auth/me yet */}
+            <Field l="Member since" v="—" />
           </div>
-        </RetroCardContent>
-      </RetroCard>
+        </div>
+
+        {/* This record */}
+        <div className="card-surface pad">
+          <h3 className="sec-title" style={{ marginBottom: 14 }}>
+            This record
+          </h3>
+          <div className="s12">
+            <Field
+              l="Records"
+              v={`${overview?.total_records ?? 0} across ${recordTypeCount} ${
+                recordTypeCount === 1 ? "type" : "types"
+              }`}
+            />
+            <Field l="Sources" v={String(overview?.total_uploads ?? 0)} />
+            <Field l="Span" v={span} />
+          </div>
+        </div>
+      </div>
+
+      {/* Your data, your control */}
+      <div className="card-surface pad" style={{ marginBottom: 18 }}>
+        <h3 className="sec-title" style={{ marginBottom: 6 }}>
+          Your data, your control
+        </h3>
+        <p className="h-sub" style={{ margin: "0 0 16px" }}>
+          Export everything in an open format, or sign out of this device. All health data is stored
+          locally and encrypted at rest; it only leaves your device when you explicitly request an AI
+          summary or document extraction, and only after de-identification.
+        </p>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button className="btn" onClick={handleExport} disabled={exporting}>
+            <Upload size={15} style={{ transform: "rotate(180deg)" }} />{" "}
+            {exporting ? "Exporting…" : "Export all (FHIR)"}
+          </button>
+          <button className="btn ghost" onClick={handleSignOut}>
+            Sign out
+          </button>
+        </div>
+      </div>
+
+      {/* Audit log */}
+      <div className="card-surface pad">
+        <div className="card-h">
+          <h3 className="sec-title">Audit log</h3>
+          <span className="num" style={{ fontSize: 11 }}>
+            recent events
+          </span>
+        </div>
+        {auditLoading ? (
+          <RetroLoadingState text="Loading audit log" />
+        ) : auditLog.length === 0 ? (
+          <div className="muted" style={{ fontSize: 13.5, padding: "20px 0" }}>
+            No audit events recorded yet.
+          </div>
+        ) : (
+          <div className="tablewrap" style={{ boxShadow: "none", border: 0, padding: 0 }}>
+            <table className="rtable">
+              <thead>
+                <tr>
+                  <th>Action</th>
+                  <th>Resource</th>
+                  <th>When</th>
+                  <th>IP</th>
+                </tr>
+              </thead>
+              <tbody>
+                {auditLog.map((e) => {
+                  const resource = e.resource_type
+                    ? e.resource_id
+                      ? `${e.resource_type} · ${e.resource_id.slice(0, 8)}`
+                      : e.resource_type
+                    : "—";
+                  return (
+                    <tr key={e.id} style={{ cursor: "default" }}>
+                      <td className="desc">{e.action}</td>
+                      <td className="num">{resource}</td>
+                      <td className="num">
+                        {e.created_at ? new Date(e.created_at).toLocaleString() : "—"}
+                      </td>
+                      <td className="num">{e.ip_address || "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
-function SysRow({
-  label,
-  value,
-  mono,
-  valueColor,
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-  valueColor?: string;
-}) {
+function Field({ l, v }: { l: string; v: string }) {
   return (
-    <div
-      className="flex items-baseline justify-between py-1.5 border-b"
-      style={{ borderColor: "var(--theme-border)" }}
-    >
-      <span
-        className="text-xs font-medium"
-        style={{ color: "var(--theme-text-muted)" }}
-      >
-        {label}
-      </span>
-      <span
-        className={`text-xs ${mono ? "font-mono" : "font-medium"}`}
-        style={{ color: valueColor || "var(--theme-text)" }}
-      >
-        {value}
-      </span>
+    <div className="field">
+      <div className="field-l">{l}</div>
+      <div className="field-v">{v}</div>
     </div>
   );
 }

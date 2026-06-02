@@ -618,6 +618,7 @@ async def get_upload_history(
     result = await db.execute(
         select(UploadedFile)
         .where(UploadedFile.user_id == user_id)
+        .where(UploadedFile.deleted_at.is_(None))
         .order_by(UploadedFile.created_at.desc())
     )
     uploads = result.scalars().all()
@@ -636,6 +637,58 @@ async def get_upload_history(
         })
 
     return UploadHistoryResponse(items=items, total=len(items))
+
+
+@router.delete("/{upload_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_upload(
+    upload_id: UUID,
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-delete an upload and cascade soft-delete the records it produced.
+
+    Never hard-deletes. The uploaded_file is marked deleted_at, every
+    health_record linked to it via source_file_id is soft-deleted too, and an
+    audit entry is written. User-scoped.
+    """
+    result = await db.execute(
+        select(UploadedFile).where(
+            UploadedFile.id == upload_id,
+            UploadedFile.user_id == user_id,
+            UploadedFile.deleted_at.is_(None),
+        )
+    )
+    upload = result.scalar_one_or_none()
+    if not upload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
+
+    now = datetime.now(timezone.utc)
+
+    # Cascade soft-delete the records this upload produced.
+    records_result = await db.execute(
+        select(HealthRecord).where(
+            HealthRecord.source_file_id == upload_id,
+            HealthRecord.user_id == user_id,
+            HealthRecord.deleted_at.is_(None),
+        )
+    )
+    cascaded = records_result.scalars().all()
+    for record in cascaded:
+        record.deleted_at = now
+
+    upload.deleted_at = now
+    await db.commit()
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="upload.delete",
+        resource_type="uploaded_file",
+        resource_id=upload_id,
+        ip_address=request.client.host if request.client else None,
+        details={"records_soft_deleted": len(cascaded)},
+    )
 
 
 ALLOWED_UNSTRUCTURED = {".pdf", ".rtf", ".tif", ".tiff"}
