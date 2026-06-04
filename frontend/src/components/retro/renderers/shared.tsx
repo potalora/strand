@@ -30,7 +30,13 @@ export function arr(val: unknown): unknown[] {
 export function nested(root: Record<string, unknown>, ...keys: string[]): unknown {
   let current: unknown = root;
   for (const key of keys) {
-    if (current && typeof current === "object" && !Array.isArray(current)) {
+    if (current == null) return undefined;
+    if (Array.isArray(current)) {
+      // numeric key indexes into an array (e.g. nested(r, "coding", "0", "display"))
+      const idx = Number(key);
+      if (!Number.isInteger(idx)) return undefined;
+      current = current[idx];
+    } else if (typeof current === "object") {
       current = (current as Record<string, unknown>)[key];
     } else {
       return undefined;

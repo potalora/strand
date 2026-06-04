@@ -259,3 +259,24 @@ async def test_by_code_excludes_non_observations_and_other_users(
     data = resp.json()
     assert data["total"] == 1
     assert data["items"][0]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_coded_value_uses_coding_display_fallback(client: AsyncClient, db_session: AsyncSession):
+    """A coded observation carrying only valueCodeableConcept.coding[].display
+    (no .text) must surface that display as the value, not the code's name."""
+    headers, uid = await auth_headers(client)
+    patient = await create_test_patient(db_session, uid)
+    u, p = UUID(uid), patient.id
+    await _add_obs(
+        db_session, u, p, "72166-2",
+        datetime(2026, 1, 6, tzinfo=timezone.utc),
+        value=None, display="Tobacco smoking status NHIS", category=["social-history"],
+        fhir_extra={"valueCodeableConcept": {"coding": [{"display": "Never smoker", "code": "266919005"}]}},
+    )
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/observations/by-code", headers=headers)
+    assert resp.status_code == 200
+    entry = next(i for i in resp.json()["items"] if i["code"] == "72166-2")
+    assert entry["latest"]["value"] == "Never smoker"

@@ -19,6 +19,8 @@ import { CarePlanRenderer } from "./CarePlanRenderer";
 import { CommunicationRenderer } from "./CommunicationRenderer";
 import { AppointmentRenderer } from "./AppointmentRenderer";
 import { CareTeamRenderer } from "./CareTeamRenderer";
+import { QuestionnaireResponseRenderer } from "./QuestionnaireResponseRenderer";
+import { ImmunizationRecommendationRenderer } from "./ImmunizationRecommendationRenderer";
 import { GenericRenderer } from "./GenericRenderer";
 
 export interface FhirResourceRendererProps {
@@ -82,6 +84,12 @@ export function FhirResourceRenderer({
 
     case "care_team":
       return <CareTeamRenderer r={r} />;
+
+    case "questionnaire_response":
+      return <QuestionnaireResponseRenderer r={r} />;
+
+    case "immunization_recommendation":
+      return <ImmunizationRecommendationRenderer r={r} />;
 
     default:
       return <GenericRenderer r={r} />;

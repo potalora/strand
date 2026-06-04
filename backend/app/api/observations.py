@@ -82,6 +82,10 @@ def _string_value(record: HealthRecord, fhir: dict) -> str:
     value_cc = fhir.get("valueCodeableConcept") or {}
     if value_cc.get("text"):
         return value_cc["text"]
+    for coding in value_cc.get("coding") or []:
+        disp = coding.get("display") or coding.get("code")
+        if disp:
+            return disp
 
     return record.display_text or ""
 
