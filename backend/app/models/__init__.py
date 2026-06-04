@@ -11,6 +11,7 @@ from app.models.provenance import Provenance
 from app.models.audit import AuditLog
 from app.models.token_blacklist import RevokedToken
 from app.models.cross_reference import RecordCrossReference
+from app.models.summary_item import SummaryItem
 
 __all__ = [
     "User",
@@ -24,4 +25,5 @@ __all__ = [
     "AuditLog",
     "RevokedToken",
     "RecordCrossReference",
+    "SummaryItem",
 ]

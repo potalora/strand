@@ -3,20 +3,53 @@
 import React from "react";
 import { DetailRow, SectionDivider, str, nested, formatDate, arr, obj } from "./shared";
 
+/** Pull a human-readable label from a CodeableConcept: text first, then first coding display. */
+function conceptLabel(concept: unknown): string {
+  const c = obj(concept);
+  return str(c.text) || str(nested(c, "coding", "0", "display"));
+}
+
 export function ConditionRenderer({ r }: { r: Record<string, unknown> }) {
-  const name = str(nested(r, "code", "text")) || "";
+  // Name: most CDA/Epic conditions carry only code.coding[].display, not code.text.
+  const name = conceptLabel(r.code);
+
   const clinicalStatus =
     str(nested(r, "clinicalStatus", "coding", "0", "code")) ||
+    str(nested(r, "clinicalStatus", "coding", "0", "display")) ||
     str(nested(r, "clinicalStatus", "text")) ||
     "";
-  const onset = formatDate(r.onsetDateTime);
-  const abatement = formatDate(r.abatementDateTime);
-  const categoryText =
-    str(nested(r, "category", "0", "text")) ||
-    str(nested(r, "category", "0", "coding", "0", "display")) ||
-    "";
-  const notes = str(nested(r, "note", "0", "text"));
-  const verificationStatus = str(nested(r, "verificationStatus", "coding", "0", "code"));
+  const verificationStatus =
+    str(nested(r, "verificationStatus", "coding", "0", "code")) ||
+    str(nested(r, "verificationStatus", "coding", "0", "display")) ||
+    str(nested(r, "verificationStatus", "text"));
+
+  // Onset / abatement — handle DateTime, Period, and String variants.
+  const onset =
+    formatDate(r.onsetDateTime) ||
+    formatDate(nested(r, "onsetPeriod", "start")) ||
+    str(r.onsetString);
+  const abatement =
+    formatDate(r.abatementDateTime) ||
+    formatDate(nested(r, "abatementPeriod", "end")) ||
+    str(r.abatementString);
+  const recordedDate = formatDate(r.recordedDate);
+
+  const severity = conceptLabel(r.severity);
+  const stage = conceptLabel(nested(r, "stage", "0", "summary"));
+
+  // Body sites recorded.
+  const bodySites: string[] = [];
+  for (const bs of arr(r.bodySite)) {
+    const label = conceptLabel(bs);
+    if (label) bodySites.push(label);
+  }
+
+  // Notes.
+  const notes: string[] = [];
+  for (const n of arr(r.note)) {
+    const t = str(obj(n).text);
+    if (t) notes.push(t);
+  }
 
   const statusLower = clinicalStatus.toLowerCase();
   const statusConfig: Record<string, { bg: string; text: string; pulse: boolean }> = {
@@ -28,7 +61,7 @@ export function ConditionRenderer({ r }: { r: Record<string, unknown> }) {
   };
   const config = statusConfig[statusLower] ?? { bg: "var(--theme-bg-deep)", text: "var(--theme-text)", pulse: false };
 
-  // Category chip labels
+  // Category chip labels.
   const categories = arr(r.category);
   const categoryChips: string[] = [];
   for (const cat of categories) {
@@ -47,27 +80,37 @@ export function ConditionRenderer({ r }: { r: Record<string, unknown> }) {
         </p>
       )}
 
-      {/* Clinical status pill */}
-      {clinicalStatus && (
-        <div className="flex items-center gap-2">
-          <span
-            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-full"
-            style={{ backgroundColor: config.bg, color: config.text }}
-          >
-            {config.pulse && (
-              <span
-                className="w-1.5 h-1.5 rounded-full pulse-dot"
-                style={{ backgroundColor: config.text, "--dot-color": config.text } as React.CSSProperties}
-              />
-            )}
-            {clinicalStatus}
-          </span>
-          {verificationStatus && verificationStatus !== "confirmed" && (
+      {/* Clinical status pill + verification + severity (verbatim, no good/bad coloring) */}
+      {(clinicalStatus || verificationStatus || severity) && (
+        <div className="flex flex-wrap items-center gap-2">
+          {clinicalStatus && (
+            <span
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-full"
+              style={{ backgroundColor: config.bg, color: config.text }}
+            >
+              {config.pulse && (
+                <span
+                  className="w-1.5 h-1.5 rounded-full pulse-dot"
+                  style={{ backgroundColor: config.text, "--dot-color": config.text } as React.CSSProperties}
+                />
+              )}
+              {clinicalStatus}
+            </span>
+          )}
+          {verificationStatus && verificationStatus.toLowerCase() !== "confirmed" && (
             <span
               className="text-[11px] px-1.5 py-0.5 rounded"
               style={{ backgroundColor: "var(--theme-bg-deep)", color: "var(--theme-text-muted)" }}
             >
               {verificationStatus}
+            </span>
+          )}
+          {severity && (
+            <span
+              className="text-[11px] px-1.5 py-0.5 rounded"
+              style={{ backgroundColor: "var(--theme-bg-deep)", color: "var(--theme-text-muted)" }}
+            >
+              {severity}
             </span>
           )}
         </div>
@@ -76,7 +119,7 @@ export function ConditionRenderer({ r }: { r: Record<string, unknown> }) {
       {/* Timeline bar: onset → abatement */}
       {onset && (
         <div
-          className="flex items-center gap-2 px-3 py-2 rounded-md text-xs"
+          className="flex flex-wrap items-center gap-2 px-3 py-2 rounded-md text-xs"
           style={{ backgroundColor: "var(--theme-bg-deep)" }}
         >
           <span style={{ color: "var(--theme-text-muted)" }}>Onset</span>
@@ -90,6 +133,16 @@ export function ConditionRenderer({ r }: { r: Record<string, unknown> }) {
           )}
         </div>
       )}
+
+      <DetailRow label="Recorded" value={recordedDate} />
+
+      {/* Body site(s) */}
+      {bodySites.length > 0 && (
+        <DetailRow label="Body Site" value={bodySites.join(", ")} />
+      )}
+
+      {/* Stage */}
+      <DetailRow label="Stage" value={stage} />
 
       {/* Category chips */}
       {categoryChips.length > 0 && (
@@ -109,23 +162,24 @@ export function ConditionRenderer({ r }: { r: Record<string, unknown> }) {
         </div>
       )}
 
-      {categoryText && !categoryChips.includes(categoryText) && (
-        <DetailRow label="Category" value={categoryText} />
-      )}
-
       {/* Notes */}
-      {notes && (
+      {notes.length > 0 && (
         <>
           <SectionDivider />
-          <div
-            className="px-3 py-2 rounded-md text-xs"
-            style={{
-              backgroundColor: "var(--theme-bg-deep)",
-              color: "var(--theme-text-dim)",
-              borderLeft: "2px solid var(--theme-border-active)",
-            }}
-          >
-            {notes}
+          <div className="space-y-2">
+            {notes.map((note, i) => (
+              <div
+                key={i}
+                className="px-3 py-2 rounded-md text-xs"
+                style={{
+                  backgroundColor: "var(--theme-bg-deep)",
+                  color: "var(--theme-text-dim)",
+                  borderLeft: "2px solid var(--theme-border-active)",
+                }}
+              >
+                {note}
+              </div>
+            ))}
           </div>
         </>
       )}

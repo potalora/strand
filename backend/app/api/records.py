@@ -12,6 +12,7 @@ from app.dependencies import get_authenticated_user_id
 from app.middleware.audit import log_audit_event
 from app.models.record import HealthRecord
 from app.schemas.records import HealthRecordResponse, RecordListResponse
+from app.services.utils.source_label import source_label
 
 router = APIRouter(prefix="/records", tags=["records"])
 
@@ -229,6 +230,102 @@ async def export_records(
     )
 
 
+@router.get("/recent")
+async def recent_records(
+    request: Request,
+    limit: int = Query(5, ge=1, le=50),
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Most recently ingested records (by created_at), for the "Recently added" feed.
+
+    Declared before /{record_id} so the literal path isn't captured as a UUID.
+    """
+    result = await db.execute(
+        select(HealthRecord)
+        .where(
+            HealthRecord.user_id == user_id,
+            HealthRecord.deleted_at.is_(None),
+            HealthRecord.is_duplicate.is_(False),
+        )
+        .order_by(HealthRecord.created_at.desc())
+        .limit(limit)
+    )
+    records = result.scalars().all()
+
+    items = []
+    for r in records:
+        value_qty = (r.fhir_resource or {}).get("valueQuantity") or {}
+        raw_value = value_qty.get("value")
+        is_num = isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool)
+        items.append(
+            {
+                "id": str(r.id),
+                "record_type": r.record_type,
+                "display_text": r.display_text,
+                "effective_date": r.effective_date.isoformat() if r.effective_date else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "source": source_label(r.source_format, r.source_system),
+                "value": raw_value if is_num else None,
+                "unit": value_qty.get("unit") if is_num else None,
+            }
+        )
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="records.recent",
+        resource_type="health_record",
+        ip_address=request.client.host if request.client else None,
+        details={"limit": limit, "count": len(items)},
+    )
+
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/stats")
+async def record_stats(
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Aggregate stats for the masthead: total, date span, distinct source count.
+
+    Declared before /{record_id} so the literal path isn't captured as a UUID.
+    """
+    base_filter = [
+        HealthRecord.user_id == user_id,
+        HealthRecord.deleted_at.is_(None),
+        HealthRecord.is_duplicate.is_(False),
+    ]
+
+    agg = await db.execute(
+        select(
+            func.count(),
+            func.min(HealthRecord.effective_date),
+            func.max(HealthRecord.effective_date),
+            func.count(func.distinct(HealthRecord.source_format)),
+        ).where(*base_filter)
+    )
+    total, first_date, last_date, source_count = agg.one()
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="records.stats",
+        resource_type="health_record",
+        ip_address=request.client.host if request.client else None,
+        details={"total": total or 0},
+    )
+
+    return {
+        "total": total or 0,
+        "first_date": first_date.isoformat() if first_date else None,
+        "last_date": last_date.isoformat() if last_date else None,
+        "source_count": source_count or 0,
+    }
+
+
 @router.get("/{record_id}", response_model=HealthRecordResponse)
 async def get_record(
     record_id: UUID,
@@ -258,6 +355,43 @@ async def get_record(
     )
 
     return HealthRecordResponse.model_validate(record)
+
+
+@router.get("/{record_id}/fhir")
+async def get_record_fhir(
+    record_id: UUID,
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the record's raw FHIR resource as JSON, for single-record export."""
+    result = await db.execute(
+        select(HealthRecord).where(
+            HealthRecord.id == record_id,
+            HealthRecord.user_id == user_id,
+            HealthRecord.deleted_at.is_(None),
+            HealthRecord.is_duplicate.is_(False),
+        )
+    )
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="records.fhir_export",
+        resource_type="health_record",
+        resource_id=record_id,
+        ip_address=request.client.host if request.client else None,
+    )
+
+    return JSONResponse(
+        content=record.fhir_resource,
+        headers={
+            "Content-Disposition": f'attachment; filename="record-{record_id}.json"'
+        },
+    )
 
 
 @router.delete("/{record_id}", status_code=204)

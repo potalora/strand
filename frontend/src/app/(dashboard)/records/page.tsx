@@ -6,6 +6,8 @@ import { Lock, Search } from "lucide-react";
 import { api } from "@/lib/api";
 import type { DashboardOverview, HealthRecord, RecordListResponse } from "@/types/api";
 import { RECORD_TYPE_LABELS } from "@/lib/constants";
+import { sourceLabel } from "@/lib/source-label";
+import { recordTitle } from "@/lib/record-title";
 import { RetroBadge } from "@/components/retro/RetroBadge";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
@@ -236,9 +238,9 @@ export default function RecordsPage() {
                     <td>
                       <RetroBadge recordType={r.record_type} />
                     </td>
-                    <td className="desc">{r.display_text}</td>
+                    <td className="desc">{recordTitle(r)}</td>
                     <td className="num">{fmtDate(r.effective_date)}</td>
-                    <td className="muted">{r.source_format || "--"}</td>
+                    <td className="muted">{r.source_format ? sourceLabel(r.source_format) : "--"}</td>
                     <td className="num">{r.code_value || "--"}</td>
                   </tr>
                 ))}

@@ -249,6 +249,71 @@ export interface SeriesResponse {
   total: number;
 }
 
+// --- Snapshot Overview ---------------------------------------------------
+// A single recorded reading of an observation, shown exactly as the source
+// reported it (range/flag verbatim, "per source"). The app adds no judgment.
+export interface ObservationReading {
+  id: string;
+  value: number | string | null;
+  unit: string;
+  date: string | null;
+  source: string;
+  ref_low: number | null;
+  ref_high: number | null;
+  interpretation: string;
+}
+
+// One distinct observation code with its latest + prior reading and the full
+// numeric (unit-normalized) series. Powers the Snapshot marker grid.
+// API → GET /observations/by-code (recency-sorted server-side).
+export interface ObservationByCode {
+  code: string;
+  display: string;
+  category: string | null;
+  count: number;
+  latest: ObservationReading;
+  prior: ObservationReading | null;
+  series: { date: string | null; value: number }[];
+}
+
+export interface ObservationsByCodeResponse {
+  items: ObservationByCode[];
+  total: number;
+}
+
+// Records ordered by ingestion time (created_at), not clinical date.
+// API → GET /records/recent.
+export interface RecentRecordItem {
+  id: string;
+  record_type: string;
+  display_text: string;
+  effective_date: string | null;
+  created_at: string | null;
+  source: string;
+  value: number | string | null;
+  unit: string | null;
+}
+
+export interface RecentRecordsResponse {
+  items: RecentRecordItem[];
+  total: number;
+}
+
+// Masthead counts + clinical date span. API → GET /records/stats.
+export interface RecordStats {
+  total: number;
+  first_date: string | null;
+  last_date: string | null;
+  source_count: number;
+}
+
+// A record hand-added to the working summary. API → POST /summary/items.
+export interface SummaryItem {
+  id: string;
+  record_id: string;
+  created_at: string;
+}
+
 export interface DedupCandidate {
   id: string;
   similarity_score: number;

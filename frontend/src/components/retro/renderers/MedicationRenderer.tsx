@@ -1,29 +1,84 @@
 "use client";
 
 import React from "react";
-import { DetailRow, StatusBadge, BarRow, str, obj, arr, nested, formatDate } from "./shared";
+import { DetailRow, SectionDivider, StatusBadge, BarRow, str, obj, arr, nested, formatDate, formatDateTime } from "./shared";
+
+/** Pull a human-readable label from a CodeableConcept: text first, then first coding display. */
+function conceptLabel(concept: unknown): string {
+  const c = obj(concept);
+  return str(c.text) || str(nested(c, "coding", "0", "display"));
+}
+
+/** Build a "value unit" string from a Quantity, omitting empty parts. */
+function quantityText(q: unknown): string {
+  const o = obj(q);
+  const value = str(o.value);
+  const unit = str(o.unit) || str(o.code);
+  if (!value) return "";
+  return unit ? `${value} ${unit}` : value;
+}
 
 export function MedicationRenderer({ r }: { r: Record<string, unknown> }) {
+  // Name: works for both MedicationRequest and MedicationStatement.
+  // Real CDA statements often carry only medicationReference (no inline name);
+  // in that case there is no resolvable label and we render none rather than a broken ref.
   const name =
-    str(nested(r, "medicationCodeableConcept", "text")) ||
-    str(nested(r, "code", "text")) ||
+    conceptLabel(r.medicationCodeableConcept) ||
+    conceptLabel(r.code) ||
     "";
 
-  const dosageArr = arr(r.dosageInstruction ?? r.dosage);
+  // Dosage: MedicationRequest -> dosageInstruction[], MedicationStatement -> dosage[].
+  const dosageArr = arr(r.dosageInstruction).length ? arr(r.dosageInstruction) : arr(r.dosage);
   const firstDosage = obj(dosageArr[0]);
-  const dosageText = str(firstDosage.text) || str(nested(firstDosage, "doseAndRate", "0", "doseQuantity", "value"));
-  const route = str(nested(firstDosage, "route", "text")) || str(nested(firstDosage, "route", "coding", "0", "display"));
-  const timing = str(nested(firstDosage, "timing", "code", "text")) || str(nested(firstDosage, "timing", "repeat", "frequency"));
-  const prescriber = str(nested(r, "requester", "display"));
-  const authoredOn = formatDate(r.authoredOn);
-  const effectiveStart = formatDate(nested(r, "effectivePeriod", "start") ?? nested(r, "dispenseRequest", "validityPeriod", "start"));
-  const effectiveEnd = formatDate(nested(r, "effectivePeriod", "end") ?? nested(r, "dispenseRequest", "validityPeriod", "end"));
-  const status = str(r.status);
+  const doseQty = quantityText(nested(firstDosage, "doseAndRate", "0", "doseQuantity"));
+  const dosageText = str(firstDosage.text) || doseQty;
+  const route =
+    str(nested(firstDosage, "route", "text")) ||
+    str(nested(firstDosage, "route", "coding", "0", "display"));
+  const timing =
+    str(nested(firstDosage, "timing", "code", "text")) ||
+    str(nested(firstDosage, "timing", "code", "coding", "0", "display")) ||
+    str(nested(firstDosage, "timing", "repeat", "frequency"));
 
-  // Dispense info
-  const dispenseQuantity = str(nested(r, "dispenseRequest", "quantity", "value"));
-  const dispenseUnit = str(nested(r, "dispenseRequest", "quantity", "unit"));
+  const status = str(r.status);
+  const intent = str(r.intent);
+  const category =
+    str(nested(r, "category", "0", "text")) ||
+    str(nested(r, "category", "0", "coding", "0", "display"));
+
+  // Prescriber: only show a human-readable display, never a bare URN reference.
+  const prescriber = str(nested(r, "requester", "display"));
+
+  // Dates.
+  const authoredOn = formatDateTime(r.authoredOn);
+  // MedicationStatement timing — read effectiveDateTime AND effectivePeriod.
+  const effectiveSingle = formatDate(r.effectiveDateTime);
+  const effectiveStart = formatDate(
+    nested(r, "effectivePeriod", "start") ?? nested(r, "dispenseRequest", "validityPeriod", "start"),
+  );
+  const effectiveEnd = formatDate(
+    nested(r, "effectivePeriod", "end") ?? nested(r, "dispenseRequest", "validityPeriod", "end"),
+  );
+  const dateAsserted = formatDate(r.dateAsserted);
+
+  // Dispense info.
+  const dispenseQuantity = quantityText(nested(r, "dispenseRequest", "quantity"));
   const refills = str(nested(r, "dispenseRequest", "numberOfRepeatsAllowed"));
+  const pharmacy = str(nested(r, "dispenseRequest", "performer", "display"));
+
+  // Reasons recorded for the medication (verbatim, no interpretation).
+  const reasons: string[] = [];
+  for (const rc of arr(r.reasonCode)) {
+    const label = conceptLabel(rc);
+    if (label) reasons.push(label);
+  }
+
+  // Notes.
+  const notes: string[] = [];
+  for (const n of arr(r.note)) {
+    const t = str(obj(n).text);
+    if (t) notes.push(t);
+  }
 
   return (
     <div className="space-y-3">
@@ -51,9 +106,28 @@ export function MedicationRenderer({ r }: { r: Record<string, unknown> }) {
         </div>
       )}
 
-      <DetailRow label="Prescriber" value={prescriber} />
+      {/* Reason(s) recorded */}
+      {reasons.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {reasons.map((reason) => (
+            <span
+              key={reason}
+              className="px-2 py-0.5 text-[11px] font-medium rounded"
+              style={{
+                backgroundColor: "var(--record-medication-bg)",
+                color: "var(--record-medication-text)",
+              }}
+            >
+              {reason}
+            </span>
+          ))}
+        </div>
+      )}
 
-      {/* Date range bar */}
+      <DetailRow label="Prescriber" value={prescriber} />
+      <DetailRow label="Category" value={category} />
+
+      {/* Effective date range (MedicationStatement period / Request validity) */}
       {(effectiveStart || effectiveEnd) && (
         <div
           className="flex items-center gap-2 px-3 py-2 rounded-md text-xs"
@@ -74,22 +148,61 @@ export function MedicationRenderer({ r }: { r: Record<string, unknown> }) {
         </div>
       )}
 
-      {authoredOn && !effectiveStart && <DetailRow label="Authored" value={authoredOn} />}
+      {/* Single effective date (MedicationStatement effectiveDateTime) */}
+      {effectiveSingle && !effectiveStart && !effectiveEnd && (
+        <DetailRow label="Effective" value={effectiveSingle} />
+      )}
+
+      {authoredOn && !effectiveStart && !effectiveEnd && (
+        <DetailRow label="Authored" value={authoredOn} />
+      )}
+      <DetailRow label="Asserted" value={dateAsserted} />
 
       {/* Dispense info */}
-      {(dispenseQuantity || refills) && (
+      {(dispenseQuantity || refills || pharmacy) && (
         <BarRow
           items={[
-            { label: "Quantity", value: dispenseQuantity ? `${dispenseQuantity} ${dispenseUnit}` : "" },
+            { label: "Quantity", value: dispenseQuantity },
             { label: "Refills", value: refills },
+            { label: "Pharmacy", value: pharmacy },
           ]}
         />
       )}
 
-      {status && (
-        <div className="pt-1">
-          <StatusBadge label={status} />
+      {(status || intent) && (
+        <div className="flex items-center gap-2 pt-1">
+          {status && <StatusBadge label={status} />}
+          {intent && (
+            <span
+              className="text-[11px] px-1.5 py-0.5 rounded"
+              style={{ backgroundColor: "var(--theme-bg-deep)", color: "var(--theme-text-muted)" }}
+            >
+              {intent}
+            </span>
+          )}
         </div>
+      )}
+
+      {/* Notes */}
+      {notes.length > 0 && (
+        <>
+          <SectionDivider />
+          <div className="space-y-2">
+            {notes.map((note, i) => (
+              <div
+                key={i}
+                className="px-3 py-2 rounded-md text-xs"
+                style={{
+                  backgroundColor: "var(--theme-bg-deep)",
+                  color: "var(--theme-text-dim)",
+                  borderLeft: "2px solid var(--theme-border-active)",
+                }}
+              >
+                {note}
+              </div>
+            ))}
+          </div>
+        </>
       )}
     </div>
   );

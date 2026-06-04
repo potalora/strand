@@ -16,6 +16,8 @@ import type {
   AuditLogEntry,
 } from "@/types/api";
 import { RECORD_TYPE_LABELS } from "@/lib/constants";
+import { sourceLabel } from "@/lib/source-label";
+import { recordTitle } from "@/lib/record-title";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { RetroBadge } from "@/components/retro/RetroBadge";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
@@ -477,9 +479,9 @@ function RecordsTab() {
                 <td>
                   <RetroBadge recordType={r.record_type} short />
                 </td>
-                <td className="desc">{r.display_text}</td>
+                <td className="desc">{recordTitle(r)}</td>
                 <td className="num">{fmtDate(r.effective_date)}</td>
-                <td className="num">{r.source_format}</td>
+                <td className="num">{sourceLabel(r.source_format)}</td>
                 <td className="num">
                   {[r.code_system, r.code_value].filter(Boolean).join(" ") || "—"}
                 </td>
@@ -780,9 +782,9 @@ function DedupRecPair({
                 {label}
               </span>
             </div>
-            <div style={{ fontWeight: 600, fontSize: 14.5 }}>{rec.display_text}</div>
+            <div style={{ fontWeight: 600, fontSize: 14.5 }}>{recordTitle(rec)}</div>
             <div className="num" style={{ fontSize: 12, marginTop: 6 }}>
-              {rec.source_format} · {fmtDate(rec.effective_date)}
+              {sourceLabel(rec.source_format)} · {fmtDate(rec.effective_date)}
             </div>
           </>
         ) : (

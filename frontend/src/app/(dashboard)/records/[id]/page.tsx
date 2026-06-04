@@ -9,6 +9,8 @@ import type { HealthRecord } from "@/types/api";
 import { usePreferencesStore } from "@/stores/usePreferencesStore";
 import { RECORD_TYPE_ICONS, getObservationIcon } from "@/lib/record-icons";
 import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
+import { sourceLabel } from "@/lib/source-label";
+import { recordTitle } from "@/lib/record-title";
 import { RetroBadge } from "@/components/retro/RetroBadge";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { FhirResourceRenderer } from "@/components/retro/FhirResourceRenderer";
@@ -125,7 +127,7 @@ export default function RecordDetailPage() {
           )}
           <div className="min-w-0 flex-1">
             <h1 className="display" style={{ fontSize: 34, margin: 0, color: "var(--text)" }}>
-              {record.display_text}
+              {recordTitle(record)}
             </h1>
             <div className="flex items-center gap-2" style={{ marginTop: 10 }}>
               <RetroBadge recordType={record.record_type} />
@@ -159,7 +161,7 @@ export default function RecordDetailPage() {
         {/* 4. Metadata fields */}
         <div style={{ marginTop: 18 }}>
           <Field label="Date" value={fmtDate(record.effective_date)} />
-          <Field label="Source" value={record.source_format} />
+          <Field label="Source" value={sourceLabel(record.source_format)} />
           <Field label="FHIR type" value={record.fhir_resource_type} />
           {record.code_value && (
             <Field
@@ -199,7 +201,7 @@ export default function RecordDetailPage() {
       <ConfirmDialog
         open={confirmOpen}
         title="Delete record?"
-        description={record.display_text}
+        description={recordTitle(record)}
         confirmLabel="Delete"
         cancelLabel="Cancel"
         variant="destructive"

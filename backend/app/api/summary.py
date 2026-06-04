@@ -3,8 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -12,6 +13,8 @@ from app.dependencies import get_authenticated_user_id
 from app.middleware.audit import log_audit_event
 from app.models.ai_summary import AISummaryPrompt
 from app.models.patient import Patient
+from app.models.record import HealthRecord
+from app.models.summary_item import SummaryItem
 from app.schemas.summary import (
     BuildPromptRequest,
     GenerateSummaryRequest,
@@ -19,6 +22,8 @@ from app.schemas.summary import (
     DuplicateWarning,
     PasteResponseRequest,
     PromptResponse,
+    SummaryItemCreate,
+    SummaryItemResponse,
 )
 from app.services.ai.prompt_builder import build_prompt
 
@@ -375,3 +380,136 @@ async def generate_summary_endpoint(
         model_used=summary_data["model_used"],
         generated_at=prompt_record.generated_at,
     )
+
+
+@router.post("/items", response_model=SummaryItemResponse)
+async def add_summary_item(
+    body: SummaryItemCreate,
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> SummaryItemResponse:
+    """Stage a record into the user's "Add to summary" basket.
+
+    Idempotent: re-adding a record returns the existing item rather than erroring
+    on the unique (user_id, record_id) constraint. 404 if the record does not
+    exist or is not owned by the user.
+    """
+    record_result = await db.execute(
+        select(HealthRecord).where(
+            HealthRecord.id == body.record_id,
+            HealthRecord.user_id == user_id,
+            HealthRecord.deleted_at.is_(None),
+        )
+    )
+    if record_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    existing = await db.execute(
+        select(SummaryItem).where(
+            SummaryItem.user_id == user_id,
+            SummaryItem.record_id == body.record_id,
+        )
+    )
+    item = existing.scalar_one_or_none()
+
+    if item is None:
+        item = SummaryItem(id=uuid4(), user_id=user_id, record_id=body.record_id)
+        db.add(item)
+        try:
+            await db.commit()
+            await db.refresh(item)
+        except IntegrityError:
+            # Lost a race against a concurrent add — fetch the winner.
+            await db.rollback()
+            existing = await db.execute(
+                select(SummaryItem).where(
+                    SummaryItem.user_id == user_id,
+                    SummaryItem.record_id == body.record_id,
+                )
+            )
+            item = existing.scalar_one()
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="summary.item_add",
+        resource_type="summary_item",
+        resource_id=item.id,
+        ip_address=request.client.host if request.client else None,
+        details={"record_id": str(body.record_id)},
+    )
+
+    return SummaryItemResponse(
+        id=item.id, record_id=item.record_id, created_at=item.created_at
+    )
+
+
+@router.get("/items")
+async def list_summary_items(
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """List the user's summary basket, joined to record display_text/record_type."""
+    result = await db.execute(
+        select(SummaryItem, HealthRecord.display_text, HealthRecord.record_type)
+        .join(HealthRecord, SummaryItem.record_id == HealthRecord.id)
+        .where(SummaryItem.user_id == user_id)
+        .order_by(SummaryItem.created_at.desc())
+    )
+    rows = result.all()
+
+    items = [
+        {
+            "id": str(item.id),
+            "record_id": str(item.record_id),
+            "display_text": display_text,
+            "record_type": record_type,
+            "created_at": item.created_at.isoformat() if item.created_at else None,
+        }
+        for item, display_text, record_type in rows
+    ]
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="summary.items_list",
+        resource_type="summary_item",
+        ip_address=request.client.host if request.client else None,
+    )
+
+    return {"items": items, "total": len(items)}
+
+
+@router.delete("/items/{item_id}", status_code=204)
+async def delete_summary_item(
+    item_id: UUID,
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove a record from the user's summary basket. 404 if not owned."""
+    result = await db.execute(
+        select(SummaryItem).where(
+            SummaryItem.id == item_id,
+            SummaryItem.user_id == user_id,
+        )
+    )
+    item = result.scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Summary item not found")
+
+    await db.delete(item)
+    await db.commit()
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="summary.item_remove",
+        resource_type="summary_item",
+        resource_id=item_id,
+        ip_address=request.client.host if request.client else None,
+    )
+
+    return Response(status_code=204)

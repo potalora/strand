@@ -1,27 +1,56 @@
 "use client";
 
 import React from "react";
-import { DetailRow, StatusBadge, str, arr, obj, nested, formatDate } from "./shared";
+import { DetailRow, StatusBadge, str, arr, obj, nested, formatDateTime } from "./shared";
+
+// CodeableConcept text: prefer .text, else first coding .display.
+function codeableText(val: unknown): string {
+  const c = obj(val);
+  return str(c.text) || str(obj(arr(c.coding)[0]).display);
+}
 
 export function CommunicationRenderer({ r }: { r: Record<string, unknown> }) {
   const status = str(r.status);
-  const sent = formatDate(r.sent);
-  const received = formatDate(r.received);
+  const sent = formatDateTime(r.sent);
+  const received = formatDateTime(r.received);
+  const sender = str(nested(r, "sender", "display"));
+  const topic = codeableText(r.topic);
 
-  // Payload content
+  // payload[] — contentString or contentAttachment.title
   const payloads = arr(r.payload);
   const payloadTexts: string[] = [];
   for (const p of payloads) {
-    const text = str(obj(p).contentString);
+    const pObj = obj(p);
+    const text = str(pObj.contentString) || str(nested(pObj, "contentAttachment", "title"));
     if (text) payloadTexts.push(text);
   }
 
-  // Category badges
-  const categories = arr(r.category);
+  // category[] — display/text
   const categoryTexts: string[] = [];
-  for (const cat of categories) {
-    const text = str(obj(cat).text) || str(nested(obj(cat), "coding", "0", "display"));
+  for (const cat of arr(r.category)) {
+    const text = codeableText(cat);
     if (text) categoryTexts.push(text);
+  }
+
+  // recipient[].display
+  const recipients: string[] = [];
+  for (const rec of arr(r.recipient)) {
+    const label = str(obj(rec).display) || str(obj(rec).reference);
+    if (label) recipients.push(label);
+  }
+
+  // medium[] — display/text
+  const mediums: string[] = [];
+  for (const m of arr(r.medium)) {
+    const label = codeableText(m);
+    if (label) mediums.push(label);
+  }
+
+  // note[].text
+  const notes: string[] = [];
+  for (const n of arr(r.note)) {
+    const text = str(obj(n).text);
+    if (text) notes.push(text);
   }
 
   return (
@@ -29,9 +58,9 @@ export function CommunicationRenderer({ r }: { r: Record<string, unknown> }) {
       {/* Category badges */}
       {categoryTexts.length > 0 && (
         <div className="flex flex-wrap gap-1.5">
-          {categoryTexts.map((cat) => (
+          {categoryTexts.map((cat, i) => (
             <span
-              key={cat}
+              key={`${cat}-${i}`}
               className="px-2 py-0.5 text-[11px] font-medium rounded"
               style={{
                 backgroundColor: "var(--record-communication-bg)",
@@ -42,6 +71,15 @@ export function CommunicationRenderer({ r }: { r: Record<string, unknown> }) {
             </span>
           ))}
         </div>
+      )}
+
+      {topic && (
+        <p
+          className="text-base font-semibold"
+          style={{ color: "var(--theme-text)", fontFamily: "var(--font-body)" }}
+        >
+          {topic}
+        </p>
       )}
 
       {/* Message bubbles */}
@@ -69,8 +107,20 @@ export function CommunicationRenderer({ r }: { r: Record<string, unknown> }) {
         {status && <StatusBadge label={status} />}
       </div>
 
+      <DetailRow label="From" value={sender} />
+      {recipients.length > 0 && (
+        <DetailRow label={recipients.length > 1 ? "Recipients" : "Recipient"} value={recipients.join(", ")} />
+      )}
       <DetailRow label="Sent" value={sent} />
       <DetailRow label="Received" value={received} />
+      {mediums.length > 0 && <DetailRow label="Medium" value={mediums.join(", ")} />}
+
+      {/* Notes */}
+      {notes.map((text, i) => (
+        <p key={i} className="text-xs italic" style={{ color: "var(--theme-text-dim)" }}>
+          {text}
+        </p>
+      ))}
     </div>
   );
 }

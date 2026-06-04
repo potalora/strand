@@ -63,3 +63,13 @@ class GenerateSummaryResponse(BaseModel):
     de_identification_report: dict | None = None
     model_used: str
     generated_at: datetime
+
+
+class SummaryItemCreate(BaseModel):
+    record_id: UUID
+
+
+class SummaryItemResponse(BaseModel):
+    id: UUID
+    record_id: UUID
+    created_at: datetime
