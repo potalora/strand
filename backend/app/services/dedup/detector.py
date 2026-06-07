@@ -217,12 +217,21 @@ def _compare_records(a: HealthRecord, b: HealthRecord) -> tuple[float, dict]:
             score += 0.2
             reasons["text_fuzzy_match"] = True
 
-    # Same date (within 24h)
+    # Date relationship. Same-day records strongly support a duplicate. The
+    # same code/text on dates more than a week apart are far more likely to be
+    # distinct time-series events — repeat labs/vitals, annual immunizations,
+    # separate encounters — than a true duplicate, so penalize them below the
+    # review threshold instead of flooding the queue. A few days apart is
+    # ambiguous (same event with differing cross-system timestamps) and stays
+    # neutral. A missing date on either side is not comparable — no adjustment.
     if a.effective_date and b.effective_date:
-        delta = abs((a.effective_date - b.effective_date).total_seconds())
-        if delta < 86400:  # 24 hours
+        delta_days = abs((a.effective_date - b.effective_date).total_seconds()) / 86400.0
+        if delta_days < 1:
             score += 0.2
             reasons["date_proximity"] = True
+        elif delta_days > 7:
+            score -= 0.35
+            reasons["date_distant"] = True
 
     # Same status
     if a.status and b.status and a.status == b.status:
@@ -243,7 +252,7 @@ def _compare_records(a: HealthRecord, b: HealthRecord) -> tuple[float, dict]:
         score += 0.15
         reasons["section_match"] = True
 
-    return min(score, 1.0), reasons
+    return max(0.0, min(score, 1.0)), reasons
 
 
 def _fuzzy_match(a: str, b: str) -> float:

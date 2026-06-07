@@ -358,19 +358,40 @@ function RecordsTab() {
 
   const triggerRefresh = useCallback(() => setRefreshKey((k) => k + 1), []);
 
-  // API → GET /records (paginated, server-sorted). Search + type filter stay
-  // client-side over the loaded page; column sort is sent to the server via
-  // ?sort=&order= and refetches.
+  // API → GET /records (server-sorted). The tree/table needs every record, but
+  // the endpoint caps page_size at 100, so we page through and accumulate
+  // (a single page_size=500 request 422s and left the tab empty). Column sort
+  // is sent to the server via ?sort=&order=; search + type filter stay
+  // client-side over the loaded set.
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
     const order = sort.dir === 1 ? "asc" : "desc";
-    api
-      .get<RecordListResponse>(
-        `/records?page=1&page_size=500&sort=${SORT_API_KEY[sort.key]}&order=${order}`
-      )
-      .then((data) => setRecords(data.items || []))
-      .catch(() => setRecords([]))
-      .finally(() => setLoading(false));
+    const sortKey = SORT_API_KEY[sort.key];
+    const PAGE_SIZE = 100; // backend maximum
+
+    (async () => {
+      try {
+        const all: HealthRecord[] = [];
+        for (let page = 1; page <= 1000; page++) {
+          const data = await api.get<RecordListResponse>(
+            `/records?page=${page}&page_size=${PAGE_SIZE}&sort=${sortKey}&order=${order}`
+          );
+          const items = data.items || [];
+          all.push(...items);
+          if (items.length < PAGE_SIZE || all.length >= (data.total ?? all.length)) break;
+        }
+        if (!cancelled) setRecords(all);
+      } catch {
+        if (!cancelled) setRecords([]);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [refreshKey, sort]);
 
   const types = useMemo(

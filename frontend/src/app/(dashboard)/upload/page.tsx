@@ -307,7 +307,7 @@ export default function UploadPage() {
     }
   }, []);
 
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+  const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop,
     accept: {
       "application/json": [".json"],
@@ -320,6 +320,15 @@ export default function UploadPage() {
       "image/tiff": [".tif", ".tiff"],
     },
     multiple: true,
+    // Disable react-dropzone's built-in click-to-open. Its root click handler
+    // fires the FILE picker, which raced with our "Select folder" button: a
+    // single trusted click opened TWO dialogs (file + directory) because the
+    // button's stopPropagation does not reliably suppress the ancestor root
+    // handler, and the file picker could win — leaving the user unable to pick
+    // a folder. With noClick the body is drag-only; the explicit "Browse files"
+    // (open()) and "Select folder" (folder input) buttons each open exactly one
+    // picker per gesture. Drag-and-drop is unaffected by noClick.
+    noClick: true,
   });
 
   // --- Clear all selected files ---
@@ -545,7 +554,7 @@ export default function UploadPage() {
         {...getRootProps()}
         onDropCapture={handleDropCapture}
         className={`dropzone ${isDragActive ? "drag" : ""}`}
-        style={{ cursor: "pointer" }}
+        style={{ cursor: "default" }}
       >
         <input {...getInputProps()} />
         <div className="dz-ic">
@@ -563,18 +572,10 @@ export default function UploadPage() {
           <button
             className="btn ghost"
             onClick={(e) => {
+              // Defensive: keep the click off the dropzone root (it is
+              // drag-only now, but this guards against a future body handler).
               e.stopPropagation();
-              const input = document.querySelector(
-                'input[type="file"]:not([webkitdirectory])'
-              ) as HTMLInputElement | null;
-              if (input) {
-                // Reset value so re-selecting the SAME file still fires a
-                // change event (browsers suppress it when the value is
-                // unchanged) — otherwise re-picking a just-uploaded file is
-                // a silent no-op with no preview.
-                input.value = "";
-                input.click();
-              }
+              open();
             }}
           >
             <FileText size={14} />

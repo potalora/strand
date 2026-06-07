@@ -88,6 +88,81 @@ class TestCompareRecordsUpgraded:
         assert reasons.get("cross_source") is True
 
 
+class TestDateDistancePenalty:
+    """Same code/text on far-apart dates are distinct time-series events
+    (repeat labs/vitals, annual immunizations, separate encounters), not
+    duplicates. They must score below the review threshold instead of
+    flooding the dedup queue.
+    """
+
+    def test_distant_dates_score_below_review_threshold(self):
+        """Identical code/text/status a year apart must not reach LLM review."""
+        a = FakeRecord(
+            code_value="39156-5",
+            display_text="BMI",
+            status="final",
+            effective_date=datetime(2025, 1, 21, tzinfo=timezone.utc),
+        )
+        b = FakeRecord(
+            code_value="39156-5",
+            display_text="BMI",
+            status="final",
+            effective_date=datetime(2026, 2, 18, tzinfo=timezone.utc),
+        )
+        score, reasons = _compare_records(a, b)
+        # Without a penalty this is 0.4 + 0.3 + 0.1 = 0.8 (false positive).
+        assert score < 0.6, f"distant-date pair should fall below review, got {score}"
+        assert reasons.get("date_distant") is True
+        assert "date_proximity" not in reasons
+
+    def test_same_day_duplicate_preserved(self):
+        """A genuine same-day duplicate must still score for review/merge."""
+        day = datetime(2026, 6, 7, tzinfo=timezone.utc)
+        a = FakeRecord(code_value="39156-5", display_text="BMI", status="final", effective_date=day)
+        b = FakeRecord(code_value="39156-5", display_text="BMI", status="final", effective_date=day)
+        score, reasons = _compare_records(a, b)
+        assert score >= 0.7
+        assert reasons.get("date_proximity") is True
+        assert "date_distant" not in reasons
+
+    def test_missing_date_not_penalized(self):
+        """When one record has no date we cannot compare — no penalty.
+
+        Guards the real merge case: a CDA condition with an onset date vs the
+        same condition from a cumulative export with a null date.
+        """
+        a = FakeRecord(
+            code_value="E55.9",
+            display_text="Vitamin D deficiency",
+            effective_date=datetime(2023, 10, 5, tzinfo=timezone.utc),
+        )
+        b = FakeRecord(code_value="E55.9", display_text="Vitamin D deficiency", effective_date=None)
+        score, reasons = _compare_records(a, b)
+        assert score == pytest.approx(0.7)  # code 0.4 + text 0.3, no date signal
+        assert "date_distant" not in reasons
+        assert "date_proximity" not in reasons
+
+    def test_dates_within_a_few_days_not_penalized(self):
+        """A few days apart is ambiguous (same event, cross-system timestamps)
+        — neither bonus nor penalty."""
+        a = FakeRecord(
+            code_value="R14.0",
+            display_text="Abdominal distension",
+            status="active",
+            effective_date=datetime(2026, 2, 18, tzinfo=timezone.utc),
+        )
+        b = FakeRecord(
+            code_value="R14.0",
+            display_text="Abdominal distension",
+            status="active",
+            effective_date=datetime(2026, 2, 20, tzinfo=timezone.utc),
+        )
+        score, reasons = _compare_records(a, b)
+        assert score == pytest.approx(0.8)  # code 0.4 + text 0.3 + status 0.1
+        assert "date_distant" not in reasons
+        assert "date_proximity" not in reasons
+
+
 class TestRunUploadDedup:
     """Tests for the full dedup orchestration flow."""
 
