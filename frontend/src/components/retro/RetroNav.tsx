@@ -4,8 +4,9 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
-import { Sun, Moon, Search, Bell, Activity } from "lucide-react";
+import { Sun, Moon, Search, Activity } from "lucide-react";
 import { useAuthStore } from "@/stores/useAuthStore";
+import { useUserStore } from "@/stores/useUserStore";
 import { api } from "@/lib/api";
 import type { UserResponse } from "@/types/api";
 
@@ -48,18 +49,17 @@ export function RetroNav() {
   const pathname = usePathname();
   const router = useRouter();
   const { accessToken, clearTokens } = useAuthStore();
+  const { user, fetchUser, clearUser } = useUserStore();
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
-  const [user, setUser] = useState<UserResponse | null>(null);
 
   useEffect(() => setMounted(true), []);
 
+  // Shared store: fetched once, cached, retried on a transient 401 (so the
+  // avatar initials never silently fall back to the email/placeholder).
   useEffect(() => {
-    api
-      .get<UserResponse>("/auth/me")
-      .then(setUser)
-      .catch(() => {});
-  }, []);
+    void fetchUser();
+  }, [fetchUser]);
 
   const handleLogout = async () => {
     try {
@@ -67,6 +67,7 @@ export function RetroNav() {
     } catch {
       // Logout even if the server call fails
     }
+    clearUser();
     clearTokens();
     router.push("/login");
   };
@@ -111,9 +112,6 @@ export function RetroNav() {
             {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
           </button>
         )}
-        <Link href="/settings" className="icon-btn" aria-label="Settings &amp; notifications">
-          <Bell size={17} />
-        </Link>
         <button
           onClick={handleLogout}
           className="user-av"

@@ -71,7 +71,11 @@ async def list_records(
     direction = sort_col.asc() if order == "asc" else sort_col.desc()
     if sort_col is HealthRecord.effective_date:
         direction = direction.nullsfirst() if order == "asc" else direction.nullslast()
-    query = query.order_by(direction)
+    # Append a stable tiebreaker on the primary key so the ordering is a TOTAL
+    # order. Without it, large tie groups (shared/NULL effective_date, repeated
+    # record_type) leave the row order undefined between page queries, so OFFSET
+    # pagination can return the same row on two pages and silently drop another.
+    query = query.order_by(direction, HealthRecord.id.asc())
     query = query.offset((page - 1) * page_size).limit(page_size)
     result = await db.execute(query)
     records = result.scalars().all()

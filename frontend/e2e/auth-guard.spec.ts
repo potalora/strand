@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { browserLogin } from "./helpers/browser-login";
 import { testEmail, TEST_PASSWORD } from "./helpers/test-data";
@@ -56,20 +56,24 @@ test.describe("Authentication guards", () => {
     await page.getByRole("button", { name: "Sign out" }).click();
     await page.waitForURL(/\/login/, { timeout: 10_000 });
 
-    // Verify localStorage auth state is cleared
-    const authState = await page.evaluate(() => {
-      const raw = localStorage.getItem("medtimeline-auth");
-      if (!raw) return null;
-      try {
-        return JSON.parse(raw);
-      } catch {
-        return null;
-      }
-    });
-
-    // Either the key is removed entirely, or isAuthenticated is false
-    if (authState !== null) {
-      expect(authState.state?.isAuthenticated).toBe(false);
-    }
+    // Verify localStorage auth state is cleared. The persisted store flushes
+    // asynchronously after logout, so poll until it settles to a cleared state
+    // (key removed, or isAuthenticated false) rather than reading once.
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(() => {
+            const raw = localStorage.getItem("medtimeline-auth");
+            if (!raw) return "cleared";
+            try {
+              const parsed = JSON.parse(raw);
+              return parsed.state?.isAuthenticated === false ? "cleared" : "authed";
+            } catch {
+              return "cleared";
+            }
+          }),
+        { timeout: 5_000 }
+      )
+      .toBe("cleared");
   });
 });

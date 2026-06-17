@@ -48,6 +48,10 @@ async function refreshAccessToken(): Promise<string | null> {
       if (!res.ok) return null;
       const data = await res.json();
       if (!data?.access_token || !data?.refresh_token) return null;
+      // A logout (clearTokens) during the in-flight refresh removes the stored
+      // refresh token. Do NOT resurrect a session that was deliberately ended:
+      // discard the rotated tokens if the session was cleared while we waited.
+      if (!getRefreshToken()) return null;
       // Keep the zustand store (and its localStorage mirror) in sync so that
       // components reading accessToken (e.g. logout) use the rotated token.
       useAuthStore.getState().setTokens(data.access_token, data.refresh_token);
@@ -125,12 +129,16 @@ class ApiClient {
       headers,
     });
 
-    // Transparently refresh an expired access token once, then retry. Auth
-    // endpoints are excluded (their 401s are real credential/refresh failures).
+    // Transparently refresh an expired access token once, then retry. Most auth
+    // endpoints are excluded (their 401s are real credential/refresh failures),
+    // but /auth/me carries the access token like any data endpoint — a 401 there
+    // is an expired-token race that SHOULD be refreshed + retried, otherwise the
+    // current-user fetch silently fails and the account name renders blank.
+    const isRefreshableAuthEndpoint = endpoint.startsWith("/auth/me");
     if (
       response.status === 401 &&
       !_retry &&
-      !endpoint.startsWith("/auth/")
+      (!endpoint.startsWith("/auth/") || isRefreshableAuthEndpoint)
     ) {
       const newToken = await refreshAccessToken();
       if (newToken) {

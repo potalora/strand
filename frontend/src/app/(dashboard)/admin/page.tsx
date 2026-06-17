@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
+import { useTheme } from "next-themes";
 import {
   Search,
   Trash2,
@@ -15,9 +16,12 @@ import {
   ArrowRight,
   GitMerge,
   Undo2,
+  Sun,
+  Moon,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { useAuthStore } from "@/stores/useAuthStore";
+import { useUserStore } from "@/stores/useUserStore";
 import { usePreferencesStore } from "@/stores/usePreferencesStore";
 import type {
   RecordListResponse,
@@ -29,7 +33,6 @@ import type {
   MergeRecord,
   MergesResponse,
   UndoBulkResponse,
-  UserResponse,
   DashboardOverview,
   AuditLogResponse,
   AuditLogEntry,
@@ -53,16 +56,29 @@ const fmtDate = (s: string | null | undefined) => {
 const TABS = [
   { key: "records", label: "Records", icon: FileStack },
   { key: "extractions", label: "Extractions", icon: Upload },
-  { key: "dedup", label: "Duplicates", icon: Copy },
-  { key: "merges", label: "Merges", icon: GitMerge },
+  { key: "dedup", label: "Deduplication", icon: Copy },
   { key: "sys", label: "System", icon: Settings },
 ];
+
+type DedupSub = "pending" | "ledger";
+
+// Map the `?tab=` (and `?sub=`) query into a concrete (tab, sub) pair. The old
+// standalone "Merges" tab is gone, so a legacy `?tab=merges` deep-link resolves
+// to the Deduplication tab's "Merge ledger" sub-tab (bookmarks keep working).
+function resolveTabState(rawTab: string | null, rawSub: string | null): {
+  tab: string;
+  sub: DedupSub;
+} {
+  if (rawTab === "merges") return { tab: "dedup", sub: "ledger" };
+  return { tab: rawTab || "records", sub: rawSub === "ledger" ? "ledger" : "pending" };
+}
 
 export default function AdminPage() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const initialTab = searchParams.get("tab") || "records";
-  const [activeTab, setActiveTab] = useState(initialTab);
+  const initial = resolveTabState(searchParams.get("tab"), searchParams.get("sub"));
+  const [activeTab, setActiveTab] = useState(initial.tab);
+  const [dedupSub, setDedupSub] = useState<DedupSub>(initial.sub);
   const [shown, setShown] = useState(false);
 
   useEffect(() => {
@@ -71,13 +87,20 @@ export default function AdminPage() {
   }, []);
 
   useEffect(() => {
-    const tab = searchParams.get("tab") || "records";
-    setActiveTab(tab);
+    const next = resolveTabState(searchParams.get("tab"), searchParams.get("sub"));
+    setActiveTab(next.tab);
+    setDedupSub(next.sub);
   }, [searchParams]);
 
   const handleTabChange = (key: string) => {
     setActiveTab(key);
-    router.replace(`/admin?tab=${key}`, { scroll: false });
+    const url = key === "dedup" ? `/admin?tab=dedup&sub=${dedupSub}` : `/admin?tab=${key}`;
+    router.replace(url, { scroll: false });
+  };
+
+  const handleSubChange = (sub: DedupSub) => {
+    setDedupSub(sub);
+    router.replace(`/admin?tab=dedup&sub=${sub}`, { scroll: false });
   };
 
   return (
@@ -109,9 +132,54 @@ export default function AdminPage() {
 
       {activeTab === "records" && <RecordsTab />}
       {activeTab === "extractions" && <ExtractionsTab />}
-      {activeTab === "dedup" && <DedupTab />}
-      {activeTab === "merges" && <DedupMergesTab />}
+      {activeTab === "dedup" && (
+        <DeduplicationTab sub={dedupSub} onSubChange={handleSubChange} />
+      )}
       {activeTab === "sys" && <SystemTab />}
+    </div>
+  );
+}
+
+/* ==========================================
+   DEDUPLICATION TAB — Pending review + Merge ledger sub-tabs
+   ========================================== */
+
+// Wraps the two dedup panes under one top tab. A segmented pill control (the
+// established `.filt` vocabulary, also used by the ledger's Auto/Manual toggle)
+// switches sub-views, reading as clearly secondary to the top `.tabs` underline.
+function DeduplicationTab({
+  sub,
+  onSubChange,
+}: {
+  sub: DedupSub;
+  onSubChange: (sub: DedupSub) => void;
+}) {
+  const SUBS: { key: DedupSub; label: string }[] = [
+    { key: "pending", label: "Pending review" },
+    { key: "ledger", label: "Merge ledger" },
+  ];
+
+  return (
+    <div>
+      <div
+        role="group"
+        aria-label="Deduplication views"
+        style={{ display: "flex", gap: 8, marginBottom: 20, flexWrap: "wrap" }}
+      >
+        {SUBS.map((s) => (
+          <button
+            key={s.key}
+            className="filt"
+            aria-pressed={sub === s.key}
+            onClick={() => onSubChange(s.key)}
+            style={{ textTransform: "none" }}
+          >
+            {s.label}
+          </button>
+        ))}
+      </div>
+
+      {sub === "pending" ? <DedupTab /> : <DedupMergesTab />}
     </div>
   );
 }
@@ -1570,7 +1638,7 @@ function DedupMergesTab() {
             </>
           ) : (
             <div className="muted" style={{ fontSize: 14.5 }}>
-              No merges yet — run a scan from the Duplicates tab.
+              No merges yet — run a scan from the Pending review tab.
             </div>
           )}
         </div>
@@ -1849,23 +1917,31 @@ function maskEmail(email: string | undefined | null): string {
 }
 
 function SystemTab() {
-  const [user, setUser] = useState<UserResponse | null>(null);
+  // Account identity comes from the shared user store (fetched once, retried on
+  // a transient 401) so the name never blanks. The overview gates this pane's
+  // spinner; the name field shows its own skeleton until the user resolves.
+  const { user, status: userStatus, fetchUser, clearUser } = useUserStore();
   const [overview, setOverview] = useState<DashboardOverview | null>(null);
   const [auditLog, setAuditLog] = useState<AuditLogEntry[]>([]);
   const [auditLoading, setAuditLoading] = useState(true);
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
+  const [mounted, setMounted] = useState(false);
   const { clearTokens } = useAuthStore();
+  const { theme, setTheme } = useTheme();
+  const { skipDeleteConfirm, setSkipDeleteConfirm } = usePreferencesStore();
+
+  useEffect(() => setMounted(true), []);
 
   useEffect(() => {
-    Promise.all([
-      api.get<UserResponse>("/auth/me").catch(() => null),
-      api.get<DashboardOverview>("/dashboard/overview").catch(() => null),
-    ])
-      .then(([userData, overviewData]) => {
-        setUser(userData);
-        setOverview(overviewData);
-      })
+    void fetchUser();
+  }, [fetchUser]);
+
+  useEffect(() => {
+    api
+      .get<DashboardOverview>("/dashboard/overview")
+      .catch(() => null)
+      .then((overviewData) => setOverview(overviewData))
       .finally(() => setLoading(false));
   }, []);
 
@@ -1905,11 +1981,24 @@ function SystemTab() {
     } catch {
       // Best-effort: still clear locally even if the call fails.
     }
+    clearUser();
     clearTokens();
     window.location.href = "/login";
   };
 
   if (loading) return <RetroLoadingState text="Loading system info" />;
+
+  // Name: show "Not set" only once the user has genuinely loaded with an empty
+  // display_name. While still loading (or after a transient error with no cached
+  // user) show a skeleton — a transient 401 must NOT render a blank/"Not set".
+  const nameNode: ReactNode = user
+    ? user.display_name?.trim() || "Not set"
+    : userStatus === "loaded"
+      ? "Not set"
+      : <FieldSkeleton width={108} />;
+  const emailNode: ReactNode = user ? maskEmail(user.email) : <FieldSkeleton width={150} />;
+
+  const isDark = mounted && theme === "dark";
 
   const span =
     overview?.date_range_start && overview?.date_range_end
@@ -1931,8 +2020,8 @@ function SystemTab() {
             Account
           </h3>
           <div className="s12">
-            <Field l="Name" v={user?.display_name?.trim() || "Not set"} />
-            <Field l="Email" v={maskEmail(user?.email)} />
+            <Field l="Name" v={nameNode} />
+            <Field l="Email" v={emailNode} />
             <Field l="Record owner" v="You" />
             {/* TODO(backend): created_at not on /auth/me yet */}
             <Field l="Member since" v="—" />
@@ -1954,6 +2043,71 @@ function SystemTab() {
             <Field l="Sources" v={String(overview?.total_uploads ?? 0)} />
             <Field l="Span" v={span} />
           </div>
+        </div>
+      </div>
+
+      {/* Preferences (folded in from the former /settings page) */}
+      <div className="card-surface pad" style={{ marginBottom: 18 }}>
+        <h3 className="sec-title" style={{ marginBottom: 6 }}>
+          Preferences
+        </h3>
+
+        {/* Appearance */}
+        <div
+          className="field"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 16,
+          }}
+        >
+          <div>
+            <div className="field-l" style={{ marginBottom: 6 }}>
+              Appearance
+            </div>
+            <div className="field-v" style={{ padding: 0 }}>
+              {isDark ? "Dark" : "Light"} theme
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn ghost sm"
+            onClick={() => setTheme(isDark ? "light" : "dark")}
+            aria-label="Toggle theme"
+          >
+            {isDark ? <Sun size={15} /> : <Moon size={15} />}
+            Switch to {isDark ? "light" : "dark"}
+          </button>
+        </div>
+
+        {/* Delete confirmation */}
+        <div
+          className="field"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 16,
+          }}
+        >
+          <div>
+            <div className="field-l" style={{ marginBottom: 6 }}>
+              Delete confirmation
+            </div>
+            <div className="field-v" style={{ padding: 0 }}>
+              {skipDeleteConfirm
+                ? "Off — records are removed without a prompt"
+                : "On — confirm before removing a record"}
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn ghost sm"
+            onClick={() => setSkipDeleteConfirm(!skipDeleteConfirm)}
+          >
+            {skipDeleteConfirm ? "Re-enable prompt" : "Disable prompt"}
+          </button>
         </div>
       </div>
 
@@ -2030,11 +2184,30 @@ function SystemTab() {
   );
 }
 
-function Field({ l, v }: { l: string; v: string }) {
+function Field({ l, v }: { l: string; v: ReactNode }) {
   return (
     <div className="field">
       <div className="field-l">{l}</div>
       <div className="field-v">{v}</div>
     </div>
+  );
+}
+
+// Loading placeholder for a field value — reuses the theme's `pulse-fade`
+// keyframe so a still-loading account name shows a shimmer instead of "Not set".
+function FieldSkeleton({ width = 120 }: { width?: number }) {
+  return (
+    <span
+      aria-hidden
+      style={{
+        display: "inline-block",
+        width,
+        height: "0.9em",
+        borderRadius: 4,
+        background: "var(--bg-2)",
+        animation: "pulse-fade 1.4s ease-in-out infinite",
+        verticalAlign: "middle",
+      }}
+    />
   );
 }

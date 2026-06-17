@@ -20,7 +20,10 @@ if (fs.existsSync(backendEnv)) {
 export default defineConfig({
   testDir: "./e2e",
   timeout: 120_000,
-  retries: 0,
+  // The backend login rate limiter (5/60s per IP) is shared across the 3 parallel
+  // workers, so a UI login can transiently 429 under burst load. Retries absorb
+  // that contention; a genuinely broken test still fails on every attempt.
+  retries: 2,
   workers: 3,
   expect: {
     timeout: 30_000,

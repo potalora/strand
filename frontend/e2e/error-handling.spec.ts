@@ -1,8 +1,19 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { browserLogin } from "./helpers/browser-login";
 import { testEmail, TEST_PASSWORD } from "./helpers/test-data";
 
+/**
+ * Graceful-degradation under backend failure. Repaired for the "Reimagined" IA:
+ * the Overview (home) page no longer calls /dashboard/overview — it loads
+ * /observations/by-code, /records, /records/recent, /records/stats,
+ * /dashboard/patients and /auth/me — so we fail those instead. The masthead
+ * ("Personal Health Record") always renders, even when every data call fails.
+ *
+ * The console-error gate is also active here: intentional 500s / aborts surface
+ * as browser "Failed to load resource" / "net::ERR_" noise (allowlisted), so any
+ * real uncaught error or app-level console.error would still fail the test.
+ */
 test.describe("Error handling — graceful degradation", () => {
   const email = testEmail("errors");
 
@@ -11,58 +22,49 @@ test.describe("Error handling — graceful degradation", () => {
     await api.register(email, TEST_PASSWORD);
   });
 
-  test("500 on dashboard overview renders gracefully", async ({ page }) => {
+  test("500 on home data endpoints renders gracefully", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
 
-    // Intercept dashboard overview to return 500
-    await page.route("**/api/v1/dashboard/overview", (route) =>
-      route.fulfill({ status: 500, body: "Internal Server Error" })
-    );
-
-    // Collect console errors to verify no uncaught exceptions
-    const consoleErrors: string[] = [];
-    page.on("pageerror", (err) => consoleErrors.push(err.message));
+    // Fail every data endpoint the Overview page loads.
+    for (const ep of [
+      "observations/by-code",
+      "records",
+      "records/recent",
+      "records/stats",
+      "dashboard/patients",
+    ]) {
+      await page.route(`**/api/v1/${ep}*`, (route) =>
+        route.fulfill({ status: 500, body: "Internal Server Error" })
+      );
+    }
 
     await page.goto("/");
     await page.waitForLoadState("networkidle");
 
-    // Page should still render — navigation is visible
+    // The masthead + navigation still render despite the failed data calls.
     await expect(page.locator("nav")).toBeVisible();
-    await expect(page.getByText("Home")).toBeVisible();
-
-    // No uncaught JS errors
-    expect(
-      consoleErrors.filter((e) => !e.includes("ResizeObserver"))
-    ).toHaveLength(0);
+    await expect(page.getByText("Personal Health Record")).toBeVisible();
   });
 
   test("500 on timeline shows empty state", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
 
-    // Intercept timeline endpoint to return 500
     await page.route("**/api/v1/timeline*", (route) =>
       route.fulfill({ status: 500, body: "Internal Server Error" })
     );
 
-    const consoleErrors: string[] = [];
-    page.on("pageerror", (err) => consoleErrors.push(err.message));
-
     await page.goto("/timeline");
     await page.waitForLoadState("networkidle");
 
-    // Page loads without crashing — nav is present
+    // Page loads without crashing — nav is present and the empty state shows.
     await expect(page.locator("nav")).toBeVisible();
+    await expect(page.getByText("No events.")).toBeVisible({ timeout: 10_000 });
 
-    // No stack traces visible on page
+    // No stack traces leak into the DOM.
     const bodyText = await page.locator("body").textContent();
     expect(bodyText).not.toContain("Traceback");
     expect(bodyText).not.toContain("at Object.");
     expect(bodyText).not.toContain("TypeError");
-
-    // No uncaught JS errors
-    expect(
-      consoleErrors.filter((e) => !e.includes("ResizeObserver"))
-    ).toHaveLength(0);
   });
 
   test("network error on summary generate shows page gracefully", async ({
@@ -70,44 +72,36 @@ test.describe("Error handling — graceful degradation", () => {
   }) => {
     await browserLogin(page, email, TEST_PASSWORD);
 
-    // Intercept summary generate to abort (simulates network failure)
+    // Aborting the (on-demand) generate call must not crash page load.
     await page.route("**/api/v1/summary/generate", (route) => route.abort());
-
-    const consoleErrors: string[] = [];
-    page.on("pageerror", (err) => consoleErrors.push(err.message));
 
     await page.goto("/summaries");
     await page.waitForLoadState("networkidle");
 
-    // Page renders without crashing — nav is visible
     await expect(page.locator("nav")).toBeVisible();
-
-    // No uncaught JS errors
-    expect(
-      consoleErrors.filter((e) => !e.includes("ResizeObserver"))
-    ).toHaveLength(0);
   });
 
-  test("API error does not expose stack traces", async ({ page }) => {
+  test("API error does not expose stack traces / raw detail", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
 
-    // Intercept dashboard overview with a JSON error response
-    await page.route("**/api/v1/dashboard/overview", (route) =>
-      route.fulfill({
-        status: 500,
-        contentType: "application/json",
-        body: JSON.stringify({ detail: "Internal Server Error" }),
-      })
-    );
+    // Return a JSON error with a raw detail on every home data endpoint.
+    for (const ep of ["records/stats", "observations/by-code", "records"]) {
+      await page.route(`**/api/v1/${ep}*`, (route) =>
+        route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: "Internal Server Error" }),
+        })
+      );
+    }
 
     await page.goto("/");
     await page.waitForLoadState("networkidle");
 
-    // The raw error detail should NOT be displayed to the user
+    // The raw error detail must NOT be surfaced to the user.
     const bodyText = await page.locator("body").textContent();
     expect(bodyText).not.toContain("Internal Server Error");
 
-    // Page still renders navigation
     await expect(page.locator("nav")).toBeVisible();
   });
 });

@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import JSZip from "jszip";
 import { ApiClient } from "./helpers/api-client";
+import { browserLogin } from "./helpers/browser-login";
 import { PATHS, hasTestData, testEmail, TEST_PASSWORD } from "./helpers/test-data";
 
 let testIndex = 0;
@@ -22,12 +23,10 @@ async function setupBrowserUser(
   await api.register(email, TEST_PASSWORD);
   await api.login(email, TEST_PASSWORD);
 
-  // Log in via the browser so the frontend session is authenticated
-  await page.goto("/login");
-  await page.locator("#email").fill(email);
-  await page.locator("#password").fill(TEST_PASSWORD);
-  await page.locator('button[type="submit"]').click();
-  await page.waitForURL(/\/$/, { timeout: 30_000 });
+  // Log in via the browser so the frontend session is authenticated. Use the
+  // shared helper, which retries on the login rate limiter (429) under parallel
+  // load — a raw inline login would time out waiting for the redirect.
+  await browserLogin(page, email, TEST_PASSWORD);
   return email;
 }
 
@@ -39,7 +38,7 @@ test.describe("Structured file uploads", () => {
     await setupBrowserUser(page, api);
 
     await page.goto("/upload");
-    await page.waitForSelector("text=Drop files or folders");
+    await page.waitForSelector("text=Drop files or a folder");
 
     const fileInput = page.locator('input[type="file"]').first();
     await fileInput.setInputFiles(PATHS.fhirBundle);
@@ -109,7 +108,7 @@ test.describe("Structured file uploads", () => {
 
     try {
       await page.goto("/upload");
-      await page.waitForSelector("text=Drop files or folders");
+      await page.waitForSelector("text=Drop files or a folder");
 
       const fileInput = page.locator('input[type="file"]').first();
       await fileInput.setInputFiles(tmpZipPath);

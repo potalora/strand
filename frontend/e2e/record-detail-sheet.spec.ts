@@ -1,11 +1,17 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures/console-gate";
 import { browserLogin } from "./helpers/browser-login";
 import { ApiClient } from "./helpers/api-client";
 import { testEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";
 
 const email = testEmail("record-detail-sheet");
 
-test.describe("Record Detail Sheet (Admin Drawer)", () => {
+/**
+ * Repaired for the flat Admin → Records table. The detail drawer now opens by
+ * clicking a `tr.clickable` row (no more tree). Drawer header is "Record detail";
+ * the Advanced section toggles the raw FHIR JSON; the delete control carries
+ * aria-label "Delete record".
+ */
+test.describe("Record detail drawer (Admin)", () => {
   const api = new ApiClient();
 
   test.beforeAll(async () => {
@@ -15,80 +21,40 @@ test.describe("Record Detail Sheet (Admin Drawer)", () => {
     await api.pollUploadStatus(result.upload_id, 60_000);
   });
 
-  test("opens drawer with record type icon and badge", async ({ page }) => {
+  async function openFirstRecord(page: import("@playwright/test").Page) {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({ timeout: 10_000 });
+    const row = page.locator("tr.clickable").first();
+    await expect(row).toBeVisible({ timeout: 15_000 });
+    await row.click();
+    await expect(page.getByText("Record detail")).toBeVisible({ timeout: 10_000 });
+  }
 
-    // Expand the first record type group in the tree
-    const firstGroupRow = page
-      .locator("span")
-      .filter({
-        hasText: /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(firstGroupRow).toBeVisible({ timeout: 15_000 });
-    await firstGroupRow.locator("..").click();
-
-    // Click the first record's text to open the detail sheet
-    const recordRow = page.locator('input[type="checkbox"]').first().locator("..");
-    const recordText = recordRow.locator("span").first();
-    await expect(recordText).toBeVisible({ timeout: 10_000 });
-    await recordText.click();
-
-    // Should show "Record Details" header
-    await expect(page.getByText("Record Details")).toBeVisible({ timeout: 5_000 });
+  test("opens drawer with header and actions", async ({ page }) => {
+    await openFirstRecord(page);
+    // Drawer actions present.
+    await expect(page.getByRole("button", { name: /Add to summary/ })).toBeVisible();
+    await expect(page.getByRole("button", { name: /Export FHIR/ })).toBeVisible();
   });
 
-  test("Advanced section is collapsed by default", async ({ page }) => {
-    await browserLogin(page, email, TEST_PASSWORD);
-    await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({ timeout: 10_000 });
+  test("Advanced section is collapsed by default, expands to JSON", async ({
+    page,
+  }) => {
+    await openFirstRecord(page);
 
-    // Expand first group and click first record
-    const firstGroupRow = page
-      .locator("span")
-      .filter({
-        hasText: /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(firstGroupRow).toBeVisible({ timeout: 15_000 });
-    await firstGroupRow.locator("..").click();
-
-    const recordRow = page.locator('input[type="checkbox"]').first().locator("..");
-    await recordRow.locator("span").first().click();
-
-    await expect(page.getByText("Record Details")).toBeVisible({ timeout: 5_000 });
-
-    // Advanced button should be visible
     const advancedBtn = page.getByText("Advanced");
     await expect(advancedBtn).toBeVisible();
 
-    // Click Advanced to expand — should show JSON content
     await advancedBtn.click();
-    await expect(page.locator("pre").first()).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator("pre.json-syntax").first()).toBeVisible({
+      timeout: 5_000,
+    });
   });
 
-  test("delete button is present", async ({ page }) => {
-    await browserLogin(page, email, TEST_PASSWORD);
-    await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({ timeout: 10_000 });
-
-    // Expand first group and click first record
-    const firstGroupRow = page
-      .locator("span")
-      .filter({
-        hasText: /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(firstGroupRow).toBeVisible({ timeout: 15_000 });
-    await firstGroupRow.locator("..").click();
-
-    const recordRow = page.locator('input[type="checkbox"]').first().locator("..");
-    await recordRow.locator("span").first().click();
-
-    await expect(page.getByText("Record Details")).toBeVisible({ timeout: 5_000 });
-    // Delete button in the detail sheet (shows Trash icon + "Delete" text)
-    await expect(page.getByRole("button", { name: "Delete" })).toBeVisible();
+  test("delete control is present in the drawer", async ({ page }) => {
+    await openFirstRecord(page);
+    await expect(
+      page.getByRole("button", { name: "Delete record" })
+    ).toBeVisible();
   });
 });

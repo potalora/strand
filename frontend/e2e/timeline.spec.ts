@@ -1,8 +1,17 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { browserLogin } from "./helpers/browser-login";
 import { testEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";
 
+/**
+ * Repaired for the "Reimagined" Timeline. Current IA:
+ *  - Filter pills read "All", "Conditions", "Labs & vitals", "Medications", …
+ *    (not "ALL"/"COND"/"OBS"); the active one carries aria-pressed.
+ *  - Month group headers are Title-case "Jan 2024" (not "JAN 2024"); each group
+ *    shows its own count (there is no global "N events" header).
+ *  - Empty state text is "No events."; the detail drawer header is "Record detail".
+ *  - Event cards are `button.tl-card`.
+ */
 test.describe("Timeline page", () => {
   const email = testEmail("timeline");
 
@@ -20,102 +29,79 @@ test.describe("Timeline page", () => {
   test("events render grouped by month", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/timeline");
-    // Month headings use abbreviated format: "JAN 2024", "FEB 2010", etc.
-    const monthHeading = page.locator("span").filter({
-      hasText: /^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{4}$/,
+    const monthHeading = page.locator(".tl-grp-label").filter({
+      hasText: /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}$/,
     });
     await expect(monthHeading.first()).toBeVisible({ timeout: 15_000 });
   });
 
-  test("event count in header", async ({ page }) => {
+  test("filter pills render", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/timeline");
-    const countText = page.locator("span").filter({
-      hasText: /^\d+\s+events$/,
-    });
-    await expect(countText.first()).toBeVisible({ timeout: 15_000 });
-  });
-
-  test("filter buttons render", async ({ page }) => {
-    await browserLogin(page, email, TEST_PASSWORD);
-    await page.goto("/timeline");
-    // Filter bar has buttons: ALL, COND, OBS, MED, etc.
     await expect(
-      page.locator("button", { hasText: "ALL" })
+      page.getByRole("button", { name: "All", exact: true })
     ).toBeVisible({ timeout: 10_000 });
     await expect(
-      page.locator("button", { hasText: "COND" })
+      page.getByRole("button", { name: "Conditions", exact: true })
     ).toBeVisible();
     await expect(
-      page.locator("button", { hasText: "OBS" })
+      page.getByRole("button", { name: "Labs & vitals", exact: true })
     ).toBeVisible();
   });
 
-  test("click filter narrows events", async ({ page }) => {
+  test("click filter narrows events and sets aria-pressed", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/timeline");
-    // Wait for events to load
-    const countText = page.locator("span").filter({
-      hasText: /^\d+\s+events$/,
+
+    const cards = page.locator("button.tl-card");
+    await expect(cards.first()).toBeVisible({ timeout: 15_000 });
+    const allCount = await cards.count();
+
+    const conditions = page.getByRole("button", {
+      name: "Conditions",
+      exact: true,
     });
-    await expect(countText).toBeVisible({ timeout: 15_000 });
+    await conditions.click();
+    await expect(conditions).toHaveAttribute("aria-pressed", "true");
 
-    const allCountText = await countText.textContent();
-    const allCount = parseInt(allCountText!);
-
-    // Click a specific type filter
-    await page.locator("button", { hasText: "COND" }).click();
-    // Wait for data to reload
-    await expect(countText).toBeVisible({ timeout: 10_000 });
-    const filteredCountText = await countText.textContent();
-    const filteredCount = parseInt(filteredCountText!);
-
-    // Filtered count should differ from all (or filter button should be active)
-    expect(filteredCount).toBeLessThanOrEqual(allCount);
-  });
-
-  test("click ALL clears filter", async ({ page }) => {
-    await browserLogin(page, email, TEST_PASSWORD);
-    await page.goto("/timeline");
-    const countText = page.locator("span").filter({
-      hasText: /^\d+\s+events$/,
-    });
-    await expect(countText).toBeVisible({ timeout: 15_000 });
-    const originalCount = await countText.textContent();
-    const originalNum = parseInt(originalCount!);
-
-    // Apply a filter
-    await page.locator("button", { hasText: "COND" }).click();
-    await page.waitForTimeout(1000);
-
-    // Click ALL to clear
-    await page.locator("button", { hasText: "ALL" }).click();
-    // Wait for the count to restore — use polling assertion
+    // The filtered set is a subset of the full set.
     await expect(async () => {
-      const text = await countText.textContent();
-      const num = parseInt(text!);
-      expect(num).toBe(originalNum);
+      const filtered = await cards.count();
+      expect(filtered).toBeLessThanOrEqual(allCount);
     }).toPass({ timeout: 10_000 });
   });
 
-  test("click event opens detail sheet", async ({ page }) => {
+  test("click All restores the full set", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/timeline");
-    // Wait for events to render — they are divs with cursor-pointer class and onClick
-    const eventCard = page.locator("div.cursor-pointer").first();
-    await expect(eventCard).toBeVisible({ timeout: 15_000 });
 
-    // Click the first event
-    await eventCard.click();
+    const cards = page.locator("button.tl-card");
+    await expect(cards.first()).toBeVisible({ timeout: 15_000 });
+    const originalCount = await cards.count();
 
-    // RecordDetailSheet should open
-    await expect(
-      page.getByText("Record Details")
-    ).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("button", { name: "Conditions", exact: true }).click();
+    await page.waitForTimeout(1000);
+
+    const all = page.getByRole("button", { name: "All", exact: true });
+    await all.click();
+    await expect(all).toHaveAttribute("aria-pressed", "true");
+    await expect(async () => {
+      expect(await cards.count()).toBe(originalCount);
+    }).toPass({ timeout: 10_000 });
   });
 
-  test("empty filter shows no events message", async ({ page }) => {
-    // Mock the timeline API to return empty results
+  test("click event opens detail drawer", async ({ page }) => {
+    await browserLogin(page, email, TEST_PASSWORD);
+    await page.goto("/timeline");
+    const card = page.locator("button.tl-card").first();
+    await expect(card).toBeVisible({ timeout: 15_000 });
+    await card.click();
+    await expect(page.getByText("Record detail")).toBeVisible({
+      timeout: 10_000,
+    });
+  });
+
+  test("empty timeline shows no events message", async ({ page }) => {
     await page.route("**/api/v1/timeline**", (route) =>
       route.fulfill({
         status: 200,
@@ -127,8 +113,6 @@ test.describe("Timeline page", () => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/timeline");
 
-    await expect(
-      page.getByText("No events found")
-    ).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("No events.")).toBeVisible({ timeout: 10_000 });
   });
 });

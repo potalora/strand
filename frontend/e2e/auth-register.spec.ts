@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { testEmail, TEST_PASSWORD } from "./helpers/test-data";
 
@@ -62,10 +62,10 @@ test.describe("Register page", () => {
     await page.locator("#password").fill(TEST_PASSWORD);
     await page.locator('button[type="submit"]').click();
 
-    // Immediately check for loading text on the button
+    // Immediately check for loading text on the button (uses an ellipsis char).
     await expect(
       page.locator('button[type="submit"]')
-    ).toHaveText("Creating account...", { timeout: 5_000 });
+    ).toHaveText(/Creating account/, { timeout: 5_000 });
   });
 
   test("sign in link navigates to login", async ({ page }) => {

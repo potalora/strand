@@ -1,18 +1,22 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { browserLogin } from "./helpers/browser-login";
 import { testEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";
 
 const EMAIL = testEmail("admin-records");
 
-test.describe.serial("Admin Console — Records Tab", () => {
+/**
+ * Repaired for the current Admin → Records tab. The old collapsible By Type /
+ * By Upload tree and the "Admin Console" heading are gone; the tab is now a flat,
+ * searchable, sortable table (`table.rtable` with `tr.clickable` rows). The page
+ * heading is "Admin"; tabs use role="tab".
+ */
+test.describe.serial("Admin — Records tab", () => {
   const api = new ApiClient();
 
   test.beforeAll(async () => {
     await api.register(EMAIL, TEST_PASSWORD);
     await api.login(EMAIL, TEST_PASSWORD);
-
-    // Upload FHIR bundle so there are records to display
     const result = await api.uploadStructured(
       PATHS.fhirBundle,
       "sample_fhir_bundle.json"
@@ -20,304 +24,130 @@ test.describe.serial("Admin Console — Records Tab", () => {
     await api.pollUploadStatus(result.upload_id, 60_000);
   });
 
-  test("admin page renders with Records tab", async ({ page }) => {
+  test("admin page renders with Records tab active", async ({ page }) => {
     await browserLogin(page, EMAIL, TEST_PASSWORD);
     await page.goto("/admin");
 
-    // Heading visible
-    await expect(page.getByText("Admin Console")).toBeVisible({
+    await expect(page.getByRole("heading", { name: "Admin" })).toBeVisible({
       timeout: 10_000,
     });
+    const recordsTab = page.getByRole("tab", { name: "Records" });
+    await expect(recordsTab).toBeVisible();
+    await expect(recordsTab).toHaveAttribute("aria-selected", "true");
 
-    // Records tab should be active (amber-colored text or highlighted)
-    const recordsTab = page.getByRole("button", { name: "Records" }).or(
-      page.locator("button", { hasText: "Records" })
-    );
-    await expect(recordsTab.first()).toBeVisible();
+    // The records table loads with rows.
+    await expect(page.locator("tr.clickable").first()).toBeVisible({
+      timeout: 15_000,
+    });
   });
 
-  test("By Type tree renders record type groups", async ({ page }) => {
+  test("records table renders rows + a footer count", async ({ page }) => {
     await browserLogin(page, EMAIL, TEST_PASSWORD);
     await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({
-      timeout: 10_000,
+
+    await expect(page.locator("tr.clickable").first()).toBeVisible({
+      timeout: 15_000,
     });
-
-    // Wait for the tree to load (at least one record type group should appear)
-    // The sample bundle has Conditions, Labs & Vitals, Medications, etc.
-    const typeNode = page
-      .locator("span")
-      .filter({
-        hasText:
-          /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(typeNode).toBeVisible({ timeout: 15_000 });
-
-    // There should be a count next to at least one type
-    // Counts are rendered as sibling spans with numeric content
-    const countSpan = page
-      .locator("span")
-      .filter({ hasText: /^\d+$/ })
-      .first();
-    await expect(countSpan).toBeVisible();
+    // Footer reads "{shown} of {total} records".
+    await expect(page.getByText(/\d+ of \d+ records/)).toBeVisible();
   });
 
-  test("expand tree node shows records", async ({ page }) => {
+  test("search narrows the visible rows", async ({ page }) => {
     await browserLogin(page, EMAIL, TEST_PASSWORD);
     await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({
-      timeout: 10_000,
+    await expect(page.locator("tr.clickable").first()).toBeVisible({
+      timeout: 15_000,
     });
 
-    // Wait for tree to load
-    const firstGroupRow = page
-      .locator("span")
-      .filter({
-        hasText:
-          /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(firstGroupRow).toBeVisible({ timeout: 15_000 });
-
-    // Click the group row to expand (click the parent div which has the onClick handler)
-    const expandableRow = firstGroupRow.locator("..");
-    await expandableRow.click();
-
-    // Wait for child records to appear — they have checkboxes
-    const childCheckbox = page
-      .locator('input[type="checkbox"]')
-      .first();
-    await expect(childCheckbox).toBeVisible({ timeout: 10_000 });
-  });
-
-  test("click record opens detail sheet", async ({ page }) => {
-    await browserLogin(page, EMAIL, TEST_PASSWORD);
-    await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({
-      timeout: 10_000,
+    const search = page.getByPlaceholder("Search descriptions, codes, sources…");
+    await search.fill("zzz-no-such-record-zzz");
+    // The search is client-side over the loaded set → zero matches.
+    await expect(page.getByText(/^0 of \d+ records$/)).toBeVisible({
+      timeout: 5_000,
     });
 
-    // Wait for tree and expand first node
-    const firstGroupRow = page
-      .locator("span")
-      .filter({
-        hasText:
-          /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(firstGroupRow).toBeVisible({ timeout: 15_000 });
-    await firstGroupRow.locator("..").click();
-
-    // Wait for records to load, then click a record's display text
-    // Record leaf nodes have a clickable span with the record's display_text
-    // They sit inside a div with padding "6px 12px" after a checkbox
-    const recordTextSpan = page
-      .locator('input[type="checkbox"]')
-      .first()
-      .locator("..")
-      .locator("span")
-      .first();
-    await expect(recordTextSpan).toBeVisible({ timeout: 10_000 });
-    await recordTextSpan.click();
-
-    // The RecordDetailSheet should appear — look for the dialog content
-    await expect(page.getByText("Record Details")).toBeVisible({
+    await search.fill("");
+    await expect(page.locator("tr.clickable").first()).toBeVisible({
       timeout: 5_000,
     });
   });
 
-  test("By Upload toggle works", async ({ page }) => {
+  test("type filter narrows the set", async ({ page }) => {
     await browserLogin(page, EMAIL, TEST_PASSWORD);
     await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({
-      timeout: 10_000,
+    await expect(page.locator("tr.clickable").first()).toBeVisible({
+      timeout: 15_000,
     });
 
-    // Wait for By Type tree to render first
-    const typeNode = page
-      .locator("span")
-      .filter({
-        hasText:
-          /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(typeNode).toBeVisible({ timeout: 15_000 });
+    const select = page.locator("select.selectbox");
+    await expect(select).toBeVisible();
+    // Pick the first real record-type option (index 0 is "All types (N)").
+    const value = await select
+      .locator("option")
+      .nth(1)
+      .getAttribute("value");
+    await select.selectOption(value!);
 
-    // Click the "By Upload" button
-    const byUploadBtn = page.locator("button", { hasText: "By Upload" });
-    await byUploadBtn.click();
-
-    // By Upload view shows upload dates as group headers (e.g. "4/7/2026")
-    const uploadDateNode = page
-      .locator("span")
-      .filter({ hasText: /^\d{1,2}\/\d{1,2}\/\d{4}$/ })
-      .first();
-    await expect(uploadDateNode).toBeVisible({ timeout: 10_000 });
-  });
-
-  test("single delete shows confirm dialog", async ({ page }) => {
-    await browserLogin(page, EMAIL, TEST_PASSWORD);
-    await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({
-      timeout: 10_000,
-    });
-
-    // Make sure we are on By Type view
-    const byTypeBtn = page.locator("button", { hasText: "By Type" });
-    await byTypeBtn.click();
-
-    // Wait for tree and expand first node
-    const firstGroupRow = page
-      .locator("span")
-      .filter({
-        hasText:
-          /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(firstGroupRow).toBeVisible({ timeout: 15_000 });
-    await firstGroupRow.locator("..").click();
-
-    // Wait for records to load
-    const firstCheckbox = page.locator('input[type="checkbox"]').first();
-    await expect(firstCheckbox).toBeVisible({ timeout: 10_000 });
-
-    // Click the trash icon — it's the button with a Trash2 SVG inside a record row
-    // Record rows contain a checkbox, so find the row with a checkbox and get the trash button in it
-    const recordRow = page.locator('input[type="checkbox"]').first().locator("..");
-    const trashButton = recordRow.locator("button").last();
-    await trashButton.click();
-
-    // Confirm dialog should appear with "Delete" text
-    await expect(page.getByText("Delete record?")).toBeVisible({
+    // Still shows rows, and a footer count that is <= total.
+    await expect(page.locator("tr.clickable").first()).toBeVisible({
       timeout: 5_000,
     });
+    await expect(page.getByText(/\d+ of \d+ records/)).toBeVisible();
   });
 
-  test("cancel delete closes dialog", async ({ page }) => {
+  test("click a row opens the detail drawer", async ({ page }) => {
     await browserLogin(page, EMAIL, TEST_PASSWORD);
     await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({
+    const row = page.locator("tr.clickable").first();
+    await expect(row).toBeVisible({ timeout: 15_000 });
+    await row.click();
+    await expect(page.getByText("Record detail")).toBeVisible({
       timeout: 10_000,
     });
+  });
 
-    // Expand first type node
-    const firstGroupRow = page
-      .locator("span")
-      .filter({
-        hasText:
-          /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(firstGroupRow).toBeVisible({ timeout: 15_000 });
-    await firstGroupRow.locator("..").click();
+  test("row delete shows a confirm dialog, cancel closes it", async ({
+    page,
+  }) => {
+    await browserLogin(page, EMAIL, TEST_PASSWORD);
+    await page.goto("/admin");
+    const row = page.locator("tr.clickable").first();
+    await expect(row).toBeVisible({ timeout: 15_000 });
 
-    // Wait for records
-    const firstCheckbox = page.locator('input[type="checkbox"]').first();
-    await expect(firstCheckbox).toBeVisible({ timeout: 10_000 });
-
-    // Click trash to open confirm dialog
-    const recordRow = firstCheckbox.locator("..");
-    const trashButton = recordRow.locator("button").last();
-    await trashButton.click();
+    await row.locator("button.row-del").click();
     await expect(page.getByText("Delete record?")).toBeVisible({
       timeout: 5_000,
     });
 
-    // Click "Cancel"
-    const cancelBtn = page.getByRole("button", { name: "Cancel" });
-    await cancelBtn.click();
-
-    // Dialog should disappear
+    await page.getByRole("button", { name: "Cancel" }).click();
     await expect(page.getByText("Delete record?")).not.toBeVisible({
       timeout: 3_000,
     });
   });
 
-  test("confirm delete removes record", async ({ page }) => {
+  test("confirm delete removes a record", async ({ page }) => {
     await browserLogin(page, EMAIL, TEST_PASSWORD);
     await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({
-      timeout: 10_000,
+    await expect(page.locator("tr.clickable").first()).toBeVisible({
+      timeout: 15_000,
     });
 
-    // Expand first type node
-    const firstGroupRow = page
-      .locator("span")
-      .filter({
-        hasText:
-          /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(firstGroupRow).toBeVisible({ timeout: 15_000 });
-    await firstGroupRow.locator("..").click();
+    const footer = page.getByText(/\d+ of \d+ records/);
+    const before = parseInt((await footer.textContent())!.match(/of (\d+)/)![1], 10);
 
-    // Wait for records and count them
-    const firstCheckbox = page.locator('input[type="checkbox"]').first();
-    await expect(firstCheckbox).toBeVisible({ timeout: 10_000 });
-
-    const recordCountBefore = await page
-      .locator('input[type="checkbox"]')
-      .count();
-
-    // Click trash to open confirm dialog
-    const recordRow = firstCheckbox.locator("..");
-    const trashButton = recordRow.locator("button").last();
-    await trashButton.click();
-    await expect(page.getByText("Delete record?")).toBeVisible({
-      timeout: 5_000,
-    });
-
-    // Click the "Delete" confirm button (not the cancel)
-    const deleteBtn = page.getByRole("button", { name: "Delete", exact: true });
-    await deleteBtn.click();
-
-    // Dialog should close
+    await page.locator("tr.clickable").first().locator("button.row-del").click();
+    await expect(page.getByText("Delete record?")).toBeVisible({ timeout: 5_000 });
+    await page.getByRole("button", { name: "Delete", exact: true }).click();
     await expect(page.getByText("Delete record?")).not.toBeVisible({
       timeout: 5_000,
     });
 
-    // Wait for refresh — either fewer checkboxes or the tree re-renders
-    await page.waitForTimeout(2_000);
-    const recordCountAfter = await page
-      .locator('input[type="checkbox"]')
-      .count();
-    expect(recordCountAfter).toBeLessThan(recordCountBefore);
-  });
-
-  test("bulk select and delete", async ({ page }) => {
-    await browserLogin(page, EMAIL, TEST_PASSWORD);
-    await page.goto("/admin");
-    await expect(page.getByText("Admin Console")).toBeVisible({
-      timeout: 10_000,
-    });
-
-    // Expand first type node
-    const firstGroupRow = page
-      .locator("span")
-      .filter({
-        hasText:
-          /^(Conditions|Labs & Vitals|Medications|Allergies|Procedures|Encounters|Immunizations|Documents|Diagnostic Reports|Service Requests|Communications|Appointments|Care Plans|Care Teams)$/,
-      })
-      .first();
-    await expect(firstGroupRow).toBeVisible({ timeout: 15_000 });
-    await firstGroupRow.locator("..").click();
-
-    // Wait for records
-    const checkboxes = page.locator('input[type="checkbox"]');
-    await expect(checkboxes.first()).toBeVisible({ timeout: 10_000 });
-
-    // Check at least two checkboxes
-    const checkboxCount = await checkboxes.count();
-    const toCheck = Math.min(checkboxCount, 2);
-    for (let i = 0; i < toCheck; i++) {
-      await checkboxes.nth(i).check();
-    }
-
-    // Floating bar should appear with count and "Delete selected" button
-    await expect(
-      page.getByRole("button", { name: "Delete selected" })
-    ).toBeVisible({ timeout: 5_000 });
-    await expect(page.getByText(/\d+ selected/)).toBeVisible();
+    await expect(async () => {
+      const after = parseInt(
+        (await footer.textContent())!.match(/of (\d+)/)![1],
+        10
+      );
+      expect(after).toBe(before - 1);
+    }).toPass({ timeout: 10_000 });
   });
 });

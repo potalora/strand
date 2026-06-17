@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures/console-gate";
 import { browserLogin } from "./helpers/browser-login";
 import { ApiClient } from "./helpers/api-client";
 import { testEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";

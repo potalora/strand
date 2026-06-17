@@ -270,6 +270,30 @@ export default function UploadPage() {
         );
         setExtractionProgress(data);
 
+        // Also refresh each file's live status so the per-row "unstructured
+        // files detected" table tracks reality through completion. The aggregate
+        // bar above moves on its own counts; without this merge the rows stayed
+        // frozen at their trigger-time status (e.g. "processing") forever. Keyed
+        // by upload id (`f.id`), which matches `pendingExtractions[].upload_id`.
+        try {
+          const pending = await api.get<{
+            files: { id: string; ingestion_status: string }[];
+          }>(
+            "/upload/pending-extraction?statuses=pending_extraction,processing,completed,failed,awaiting_confirmation,awaiting_review,completed_with_merges,dedup_scanning"
+          );
+          if (pending.files?.length) {
+            setExtractionStatuses((prev) => {
+              const next = { ...prev };
+              for (const f of pending.files) {
+                if (f.id && f.ingestion_status) next[f.id] = f.ingestion_status;
+              }
+              return next;
+            });
+          }
+        } catch {
+          /* per-row refresh is best-effort; aggregate bar still updates */
+        }
+
         // Stop polling when nothing is processing or pending
         if (data.processing === 0 && data.pending === 0) {
           if (progressPollRef.current) {

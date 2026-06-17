@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -41,11 +42,16 @@ def entity_to_health_record_dict(
     user_id: UUID,
     patient_id: UUID,
     source_file_id: UUID | None = None,
+    document_date: datetime | None = None,
 ) -> dict | None:
     """Convert an extracted entity to a dict suitable for creating a HealthRecord.
 
     Returns None for entity types that should not be stored as individual records
     (e.g., dosage, route, frequency — these are attributes of medications).
+
+    ``document_date`` is the encounter/visit date for the source document; it is
+    used as a last-resort effective_date when the entity carries no date of its
+    own (see :func:`_extract_effective_date`).
     """
     mapping = ENTITY_TO_RECORD_TYPE.get(entity.entity_class)
     if mapping is None:
@@ -55,7 +61,7 @@ def entity_to_health_record_dict(
     fhir_resource = _build_fhir_resource(entity, fhir_resource_type)
     display_text = _build_display_text(entity)
 
-    effective_date = _extract_effective_date(entity)
+    effective_date = _extract_effective_date(entity, document_date)
 
     return {
         "id": uuid4(),
@@ -78,22 +84,142 @@ def entity_to_health_record_dict(
     }
 
 
-_DATE_ATTRIBUTE_KEYS = ("date", "effective_date", "onset_date", "performed_date", "recorded_date")
+# Explicit date-bearing attribute keys, broadest-first. LangExtract is not
+# consistent about which key it uses, so we accept the common variants.
+_DATE_ATTRIBUTE_KEYS = (
+    "date",
+    "effective_date",
+    "onset_date",
+    "performed_date",
+    "recorded_date",
+    "result_date",
+    "collection_date",
+    "collected_date",
+    "specimen_date",
+    "report_date",
+    "reported_date",
+    "visit_date",
+    "encounter_date",
+    "service_date",
+    "diagnosis_date",
+    "diagnosed_date",
+    "administered_date",
+    "administration_date",
+    "start_date",
+    "observation_date",
+    "observed_date",
+    "measured_date",
+    "noted_date",
+    "datetime",
+    "timestamp",
+)
+
+# Fixed default so generalized month/year values resolve their missing day to
+# the 1st deterministically (instead of dateutil's implicit "today").
+_DAY_DEFAULT = datetime(2000, 1, 1)
+
+# Recognize dates embedded in free text. Each alternative REQUIRES a 4-digit
+# year so numeric noise (e.g. a blood pressure "120/80", a ratio, a dose) is
+# never misread as a date.
+_MONTHS = (
+    "January|February|March|April|May|June|July|August|September|October|"
+    "November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec"
+)
+_DATE_TEXT_PATTERN = re.compile(
+    r"\b(?:"
+    r"\d{4}-\d{1,2}-\d{1,2}"  # ISO 2024-09-24
+    r"|\d{4}-\d{1,2}"  # ISO year-month 2024-09
+    r"|\d{1,2}/\d{1,2}/\d{4}"  # 09/24/2024
+    r"|\d{1,2}/\d{4}"  # generalized 9/2024 (day dropped)
+    rf"|(?:{_MONTHS})\.?\s+\d{{1,2}},?\s+\d{{4}}"  # September 24, 2024
+    rf"|(?:{_MONTHS})\.?\s+\d{{4}}"  # generalized September 2024
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Entity classes whose effective date is sensibly the encounter/visit date when
+# the entity has none of its own. Family history is excluded: it is relationship-
+# based and inherently dateless, so stamping the visit date would misrepresent it.
+_DOCUMENT_DATE_INELIGIBLE = frozenset({"family_history"})
 
 
-def _extract_effective_date(entity: ExtractedEntity) -> datetime | None:
-    """Extract clinical date from entity attributes.
+def _find_date_in_text(text: str | None) -> datetime | None:
+    """Return the first parseable date embedded in free text, or None.
 
-    Checks multiple attribute keys for date values.
-    Returns None if no date can be determined — never defaults to now().
+    Only matches tokens carrying a 4-digit year, so numeric clinical values are
+    not misread as dates.
     """
-    attrs = entity.attributes
+    if not text:
+        return None
+    match = _DATE_TEXT_PATTERN.search(str(text))
+    if not match:
+        return None
+    return parse_datetime(match.group(0), default=_DAY_DEFAULT)
+
+
+def _extract_effective_date(
+    entity: ExtractedEntity, document_date: datetime | None = None
+) -> datetime | None:
+    """Extract a clinical date for an entity, never fabricating a wrong one.
+
+    Resolution order (most reliable first):
+      1. explicit date-bearing attribute keys (parsed directly, then scanned for
+         an embedded date if the raw value is free text);
+      2. a date embedded in any other attribute value;
+      3. a date embedded in the entity text;
+      4. the document/encounter ``document_date`` fallback (for eligible types).
+
+    Returns None if no trustworthy date is available.
+    """
+    attrs = entity.attributes or {}
+
+    # 1. Explicit date keys.
     for key in _DATE_ATTRIBUTE_KEYS:
         raw = attrs.get(key)
-        if raw:
-            parsed = parse_datetime(str(raw))
-            if parsed:
-                return parsed
+        if not raw:
+            continue
+        parsed = parse_datetime(str(raw), default=_DAY_DEFAULT)
+        if parsed:
+            return parsed
+        embedded = _find_date_in_text(str(raw))
+        if embedded:
+            return embedded
+
+    # 2. Dates embedded in other (non-date-key) attribute values.
+    for key, value in attrs.items():
+        if key in _DATE_ATTRIBUTE_KEYS or not isinstance(value, str):
+            continue
+        embedded = _find_date_in_text(value)
+        if embedded:
+            return embedded
+
+    # 3. Date embedded in the entity text.
+    embedded = _find_date_in_text(entity.text)
+    if embedded:
+        return embedded
+
+    # 4. Document/encounter fallback for eligible entity types.
+    if document_date is not None and entity.entity_class not in _DOCUMENT_DATE_INELIGIBLE:
+        return document_date
+
+    return None
+
+
+def resolve_document_date(
+    entities: list[ExtractedEntity], primary_visit_date: str | None = None
+) -> datetime | None:
+    """Derive a single document/encounter date to use as an entity fallback.
+
+    Prefers an encounter entity's own date; otherwise the parsed document's
+    primary visit date. Returns None when neither is available.
+    """
+    for entity in entities:
+        if entity.entity_class == "encounter":
+            enc_date = _extract_effective_date(entity)
+            if enc_date:
+                return enc_date
+    if primary_visit_date:
+        return parse_datetime(str(primary_visit_date), default=_DAY_DEFAULT)
     return None
 
 

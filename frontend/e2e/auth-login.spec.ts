@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { testEmail, TEST_PASSWORD } from "./helpers/test-data";
 
@@ -60,7 +60,8 @@ test.describe("Login page", () => {
 
   test("register link navigates to /register", async ({ page }) => {
     await page.goto("/login");
-    await page.getByRole("link", { name: "Register" }).click();
+    // The link reads "Create one" ("No account? Create one") and points at /register.
+    await page.locator('a[href="/register"]').click();
     await page.waitForURL(/\/register/, { timeout: 10_000 });
   });
 

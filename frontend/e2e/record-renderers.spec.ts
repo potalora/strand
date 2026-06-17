@@ -1,13 +1,36 @@
-import { test, expect } from "@playwright/test";
-import { browserLogin } from "./helpers/browser-login";
+import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { testEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";
 
+const API_BASE = "http://localhost:8000/api/v1";
 const email = testEmail("record-renderers");
+
+// One login (with 429 backoff) → both tokens, so each test injects auth into
+// localStorage instead of driving a UI login. This removes ~15 per-test logins
+// from the suite's pressure on the 5/60s login rate limiter — that per-test
+// browserLogin was the single biggest contributor and flaked under full-suite load.
+async function loginTokens(): Promise<{ accessToken: string; refreshToken: string }> {
+  for (let i = 0; i < 6; i++) {
+    const res = await fetch(`${API_BASE}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password: TEST_PASSWORD }),
+    });
+    if (res.status === 429) {
+      await new Promise((r) => setTimeout(r, Math.min(2000 * 2 ** i, 20_000)));
+      continue;
+    }
+    if (!res.ok) throw new Error(`login failed: ${res.status}`);
+    const d = await res.json();
+    return { accessToken: d.access_token, refreshToken: d.refresh_token };
+  }
+  throw new Error("login rate-limited");
+}
 
 test.describe("Type-specific Renderers", () => {
   const api = new ApiClient();
   let recordsByType: Record<string, string[]> = {};
+  let auth: { accessToken: string; refreshToken: string };
 
   test.beforeAll(async () => {
     await api.register(email, TEST_PASSWORD);
@@ -22,9 +45,28 @@ test.describe("Type-specific Renderers", () => {
       if (!recordsByType[type]) recordsByType[type] = [];
       recordsByType[type].push(item.id);
     }
+
+    auth = await loginTokens();
   });
 
-  // Helper: login and navigate to a record of a given type
+  // Inject the (real) auth state before each navigation — no per-test UI login.
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript((a) => {
+      localStorage.setItem(
+        "medtimeline-auth",
+        JSON.stringify({
+          state: {
+            accessToken: a.accessToken,
+            refreshToken: a.refreshToken,
+            isAuthenticated: true,
+          },
+          version: 0,
+        })
+      );
+    }, auth);
+  });
+
+  // Helper: navigate to a record of a given type and assert on the rendered page.
   async function verifyRecordType(
     page: import("@playwright/test").Page,
     recordType: string,
@@ -36,9 +78,7 @@ test.describe("Type-specific Renderers", () => {
       return;
     }
 
-    await browserLogin(page, email, TEST_PASSWORD);
-
-    // Navigate to record page
+    // Navigate to record page (auth injected via beforeEach)
     await page.goto(`/records/${ids[0]}`);
     await page.waitForSelector("h1, [data-testid='record-title']", { timeout: 10_000 });
 

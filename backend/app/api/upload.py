@@ -893,9 +893,19 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
             # Step 5: Auto-confirm. Ensure a patient exists (create a blank
             # placeholder for unstructured-first users) so extraction always
             # yields records instead of stalling at awaiting_confirmation.
-            from app.services.extraction.entity_to_fhir import entity_to_health_record_dict
+            from app.services.extraction.entity_to_fhir import (
+                entity_to_health_record_dict,
+                resolve_document_date,
+            )
 
             patient = await _ensure_patient(db, user_id)
+
+            # Encounter/visit date used as a fallback for entities that carry no
+            # date of their own — recovers dates for records the note ties to the
+            # visit (labs, vitals, meds, …) without fabricating wrong ones.
+            document_date = resolve_document_date(
+                unique_entities, parsed_doc.primary_visit_date
+            )
 
             if patient:  # always true — _ensure_patient never returns None (defensive)
                 from app.services.ingestion.reextraction import soft_delete_prior_extracted
@@ -908,7 +918,7 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
 
                 for entity in unique_entities:
                     record_dict = entity_to_health_record_dict(
-                        entity, user_id, patient.id, upload_id
+                        entity, user_id, patient.id, upload_id, document_date=document_date
                     )
                     if record_dict is None:
                         continue
@@ -978,10 +988,31 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
             # H4: Log full error internally, expose only error type to client
             logger.error("Unstructured processing failed for %s: %s", upload_id, e, exc_info=True)
             error_type = type(e).__name__
-            upload.ingestion_status = "failed"
-            upload.ingestion_errors = [{"error": "Processing failed. Please retry or contact support.", "error_type": error_type}]
-            upload.processing_completed_at = datetime.now(timezone.utc)
-            await db.commit()
+            # A failed INSERT/commit poisons the session — the next commit would
+            # raise PendingRollbackError, so the failed-status write would never
+            # persist and the file would stay 'processing'. _recover_stuck_files
+            # would then retry it 3x (~30 min + wasted Gemini calls) and finally
+            # mislabel it with a generic 'TimeoutError'. Roll back FIRST to clear
+            # the session, then re-load the upload row and record the REAL error.
+            try:
+                await db.rollback()
+                result = await db.execute(
+                    select(UploadedFile).where(UploadedFile.id == upload_id)
+                )
+                upload = result.scalar_one_or_none()
+                if upload is not None:
+                    upload.ingestion_status = "failed"
+                    upload.ingestion_errors = [
+                        {
+                            "error": "Processing failed. Please retry or contact support.",
+                            "error_type": error_type,
+                        }
+                    ]
+                    upload.processing_completed_at = datetime.now(timezone.utc)
+                    await db.commit()
+            except Exception:
+                logger.exception("Failed to record extraction failure for %s", upload_id)
+                await db.rollback()
 
 
 @router.post(
@@ -1216,7 +1247,10 @@ async def confirm_extraction(
         raise HTTPException(status_code=400, detail="patient_id is required")
 
     from app.services.extraction.entity_extractor import ExtractedEntity
-    from app.services.extraction.entity_to_fhir import entity_to_health_record_dict
+    from app.services.extraction.entity_to_fhir import (
+        entity_to_health_record_dict,
+        resolve_document_date,
+    )
 
     patient_uuid = UUID(body.patient_id)
     created_count = 0
@@ -1226,8 +1260,8 @@ async def confirm_extraction(
     if replaced:
         logger.info("Manual re-confirm replaced %d prior records for %s", replaced, upload_id)
 
-    for entity_data in body.confirmed_entities:
-        entity = ExtractedEntity(
+    entities = [
+        ExtractedEntity(
             entity_class=entity_data.entity_class,
             text=entity_data.text,
             attributes=entity_data.attributes,
@@ -1235,12 +1269,21 @@ async def confirm_extraction(
             end_pos=entity_data.end_pos,
             confidence=entity_data.confidence,
         )
+        for entity_data in body.confirmed_entities
+    ]
 
+    # Fallback visit date for dateless entities (see _process_unstructured).
+    document_date = resolve_document_date(
+        entities, (upload.document_metadata or {}).get("primary_visit_date")
+    )
+
+    for entity in entities:
         record_dict = entity_to_health_record_dict(
             entity=entity,
             user_id=user_id,
             patient_id=patient_uuid,
             source_file_id=upload_id,
+            document_date=document_date,
         )
         if record_dict is None:
             continue

@@ -1,10 +1,19 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { browserLogin } from "./helpers/browser-login";
 import { PATHS, testEmail, TEST_PASSWORD } from "./helpers/test-data";
 
 const email = testEmail("summaries");
 
+/**
+ * Repaired for the current Summaries page labels:
+ *  - Summary types: "Full record" / "By category" / "Date range".
+ *  - Output formats: "Natural language" / "JSON data" / "Both".
+ *  - Results card heading is "Summary" (not "Summary results"); the count line is
+ *    "{n} records · {model}" (middot, not "|"); result tabs are
+ *    "Narrative" / "JSON data".
+ *  - History toggle is "Show ({n})"; each entry is a row button ("{type} summary").
+ */
 test.describe("Summaries page", () => {
   test.beforeAll(async () => {
     const api = new ApiClient();
@@ -15,6 +24,7 @@ test.describe("Summaries page", () => {
     // Wait for data to be queryable
     await new Promise((r) => setTimeout(r, 2000));
   });
+
   test("patient selector loads patients", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/summaries");
@@ -22,7 +32,6 @@ test.describe("Summaries page", () => {
     const select = page.locator("select").first();
     await expect(select).toBeVisible({ timeout: 10_000 });
 
-    // Wait for patient options to load (may take a moment after upload)
     await expect(async () => {
       const text = await select.textContent();
       expect(text).not.toContain("No patients found");
@@ -33,22 +42,24 @@ test.describe("Summaries page", () => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/summaries");
 
-    await expect(page.getByText("Full")).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByText("Category")).toBeVisible();
-    await expect(page.getByText("Date range")).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Full record" })
+    ).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole("button", { name: "By category" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Date range" })).toBeVisible();
   });
 
-  test("category dropdown appears for Category type", async ({ page }) => {
+  test("category dropdown appears for By category type", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/summaries");
 
-    // Wait for page to load
-    await expect(page.getByText("Full")).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.getByRole("button", { name: "Full record" })
+    ).toBeVisible({ timeout: 10_000 });
 
-    // Click the Category tab
-    await page.getByText("Category", { exact: true }).click();
+    await page.getByRole("button", { name: "By category" }).click();
 
-    // A category select dropdown should appear with options like "Labs & Vitals"
+    // The category select appears with options like "Labs & Vitals".
     const categorySelect = page.locator("select").nth(1);
     await expect(categorySelect).toBeVisible({ timeout: 5_000 });
     await expect(categorySelect).toContainText("Labs & Vitals");
@@ -58,81 +69,58 @@ test.describe("Summaries page", () => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/summaries");
 
-    await expect(page.getByRole("button", { name: "Full" })).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.getByRole("button", { name: "Full record" })
+    ).toBeVisible({ timeout: 10_000 });
 
-    // Click the Date range tab button
     await page.getByRole("button", { name: "Date range" }).click();
 
-    // Labels and textboxes should appear
     await expect(page.getByText("From", { exact: true })).toBeVisible({ timeout: 5_000 });
     await expect(page.getByText("To", { exact: true })).toBeVisible();
-    // Date inputs render as textboxes in the accessibility tree
     const textboxes = page.getByRole("textbox");
     await expect(textboxes.first()).toBeVisible();
   });
 
-  test("output format radio buttons work", async ({ page }) => {
+  test("output format options work", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/summaries");
 
-    await expect(page.getByText("Output format")).toBeVisible({
-      timeout: 10_000,
-    });
+    await expect(page.getByText("Output format")).toBeVisible({ timeout: 10_000 });
 
-    // Verify all three options exist
-    await expect(page.getByText("Natural Language")).toBeVisible();
-    await expect(page.getByText("JSON", { exact: true })).toBeVisible();
-    await expect(page.getByText("Both")).toBeVisible();
+    // Output formats are a segmented button group (aria-pressed), not radios.
+    const nl = page.getByRole("button", { name: "Natural language" });
+    const json = page.getByRole("button", { name: "JSON data" });
+    const both = page.getByRole("button", { name: "Both" });
+    await expect(nl).toBeVisible();
+    await expect(json).toBeVisible();
+    await expect(both).toBeVisible();
 
-    // Click "JSON" radio and verify it's checked
-    const jsonRadio = page.locator('input[type="radio"][value="json"]');
-    await jsonRadio.click();
-    await expect(jsonRadio).toBeChecked();
+    // Toggle JSON, then back to natural language; aria-pressed tracks selection.
+    await json.click();
+    await expect(json).toHaveAttribute("aria-pressed", "true");
 
-    // Click "Natural Language" and verify
-    const nlRadio = page.locator(
-      'input[type="radio"][value="natural_language"]'
-    );
-    await nlRadio.click();
-    await expect(nlRadio).toBeChecked();
-    await expect(jsonRadio).not.toBeChecked();
+    await nl.click();
+    await expect(nl).toHaveAttribute("aria-pressed", "true");
+    await expect(json).toHaveAttribute("aria-pressed", "false");
   });
 
-  test("generate button disabled without patient", async ({ page }) => {
+  test("generate button is present and enabled with a patient", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/summaries");
 
-    // Wait for page load
-    await expect(page.getByText("Generate summary")).toBeVisible({
-      timeout: 10_000,
-    });
-
-    // If there are patients, the button will be enabled (auto-selects first).
-    // We need to check the case where no patient is selected.
-    // The select auto-picks the first patient, so we verify the button
-    // is at least present and becomes disabled if we clear the selection.
-    const generateBtn = page.getByRole("button", {
-      name: "Generate summary",
-    });
-    await expect(generateBtn).toBeVisible();
-
-    // The page auto-selects the first patient, so the button should be enabled
-    // when patients exist. This test verifies the button exists and is functional.
-    // The disabled logic is: disabled={loading || !selectedPatient}
+    const generateBtn = page.getByRole("button", { name: "Generate summary" });
+    await expect(generateBtn).toBeVisible({ timeout: 10_000 });
+    // The page auto-selects the first patient, so the button is enabled.
     await expect(generateBtn).toBeEnabled();
   });
 
   test("generate produces a result", async ({ page }) => {
-    test.skip(
-      !process.env.GEMINI_API_KEY,
-      "Requires GEMINI_API_KEY"
-    );
+    test.skip(!process.env.GEMINI_API_KEY, "Requires GEMINI_API_KEY");
     test.setTimeout(120_000);
 
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/summaries");
 
-    // Wait for patient selector to populate (not "No patients found")
     const select = page.locator("select").first();
     await expect(select).toBeVisible({ timeout: 10_000 });
     await expect(async () => {
@@ -140,22 +128,16 @@ test.describe("Summaries page", () => {
       expect(text).not.toContain("No patients found");
     }).toPass({ timeout: 15_000 });
 
-    // Click generate with defaults (full summary, both format)
-    const generateBtn = page.getByRole("button", {
-      name: "Generate summary",
-    });
-    await generateBtn.click();
+    await page.getByRole("button", { name: "Generate summary" }).click();
 
-    // Wait for results to appear
-    await expect(page.getByText("Summary results")).toBeVisible({
+    // The results card heading is "Summary".
+    await expect(page.getByRole("heading", { name: "Summary", exact: true })).toBeVisible({
       timeout: 60_000,
     });
-
-    // Should show record count and model info (e.g. "38 records | gemini-3-flash-preview")
-    await expect(page.getByText(/\d+ records \|/)).toBeVisible();
-
-    // Natural language tab button should be visible in results
-    await expect(page.getByRole("button", { name: "Natural language" })).toBeVisible();
+    // Count line: "{n} records · {model}".
+    await expect(page.getByText(/\d+ record/)).toBeVisible();
+    // Result tabs: "Narrative" / "JSON data".
+    await expect(page.getByRole("button", { name: "Narrative" })).toBeVisible();
   });
 
   test("history entry reopens a saved summary without regenerating", async ({
@@ -174,86 +156,66 @@ test.describe("Summaries page", () => {
       expect(text).not.toContain("No patients found");
     }).toPass({ timeout: 15_000 });
 
-    // Generate once to populate history.
     await page.getByRole("button", { name: "Generate summary" }).click();
-    await expect(page.getByText("Summary results")).toBeVisible({
+    await expect(page.getByRole("heading", { name: "Summary", exact: true })).toBeVisible({
       timeout: 60_000,
     });
 
-    // Reload so the in-memory result is cleared — only the saved history remains.
+    // Reload so the in-memory result clears — only saved history remains.
     await page.reload();
     await expect(select).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByText("Summary results")).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: "Summary", exact: true })).toHaveCount(0);
 
-    // Open history and click the saved entry.
-    await page
-      .getByRole("button", { name: /Summary history \(\d+\)/ })
-      .click();
-    await page.locator('button:has-text("View →")').first().click();
+    // Expand history ("Show (N)") and open the saved entry row.
+    await page.getByRole("button", { name: /Show \(\d+\)/ }).click();
+    await page.locator("button.lrow").first().click();
 
-    // It re-renders quickly (a stored GET, not a 60s Gemini regeneration).
-    await expect(page.getByText("Summary results")).toBeVisible({
-      timeout: 10_000,
+    // It re-renders quickly from the stored summary (not a 60s regeneration).
+    await expect(page.getByRole("heading", { name: "Summary", exact: true })).toBeVisible({
+      timeout: 15_000,
     });
-    await expect(page.getByText(/\d+ records \|/)).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: "Natural language" })
-    ).toBeVisible();
+    // Multiple "{n} records" appear (each history row + the result), so scope to first.
+    await expect(page.getByText(/\d+ record/).first()).toBeVisible();
+    await expect(page.getByRole("button", { name: "Narrative" })).toBeVisible();
   });
 
   test("AI disclaimer always visible", async ({ page }) => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/summaries");
 
-    // The disclaimer card with "Notice" badge should always be present
     await expect(page.getByText("Notice")).toBeVisible({ timeout: 10_000 });
+    // "de-identified" also appears in the masthead, so assert the disclaimer's
+    // unique no-medical-advice clause instead.
     await expect(
-      page.getByText("do not constitute medical advice", { exact: false })
-    ).toBeVisible();
-    await expect(
-      page.getByText("de-identified", { exact: false })
+      page.getByText("do not constitute", { exact: false })
     ).toBeVisible();
   });
 
-  test("de-identification report renders after generation", async ({
-    page,
-  }) => {
-    test.skip(
-      !process.env.GEMINI_API_KEY,
-      "Requires GEMINI_API_KEY"
-    );
+  test("de-identification report renders after generation", async ({ page }) => {
+    test.skip(!process.env.GEMINI_API_KEY, "Requires GEMINI_API_KEY");
     test.setTimeout(120_000);
 
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/summaries");
 
-    // Wait for patients
     const select = page.locator("select").first();
     await expect(select).toBeVisible({ timeout: 10_000 });
 
-    // Generate a summary
-    const generateBtn = page.getByRole("button", {
-      name: "Generate summary",
-    });
-    await generateBtn.click();
-
-    // Wait for results
-    await expect(page.getByText("Summary results")).toBeVisible({
+    await page.getByRole("button", { name: "Generate summary" }).click();
+    await expect(page.getByRole("heading", { name: "Summary", exact: true })).toBeVisible({
       timeout: 60_000,
     });
 
-    // De-identification report appears only when PHI was scrubbed
-    // Check for either the report section or the summary content
+    // The de-identification report appears only when PHI was scrubbed; otherwise
+    // the summary itself still rendered.
     const deidentReport = page.getByText("De-identification report");
-    const summaryContent = page.getByText("Summary results");
     const hasDeident = await deidentReport.isVisible().catch(() => false);
-
-    // If deident report exists, verify it. Otherwise, just confirm results rendered.
     if (hasDeident) {
       await expect(deidentReport).toBeVisible();
     } else {
-      // PHI scrubber found nothing to redact — results still rendered
-      await expect(summaryContent).toBeVisible();
+      await expect(
+        page.getByRole("heading", { name: "Summary", exact: true })
+      ).toBeVisible();
     }
   });
 });
