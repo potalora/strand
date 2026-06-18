@@ -55,6 +55,16 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("PHI-NER warm-load raised at startup")
 
+    # Kick off a NON-BLOCKING, staleness-gated RxNorm medication-index refresh.
+    # Fire-and-forget background task: it returns immediately, runs the (rare)
+    # rebuild in a worker thread, and fails open — startup is never blocked.
+    try:
+        from app.services.extraction.terminology import schedule_medication_refresh
+
+        schedule_medication_refresh()
+    except Exception:
+        logger.exception("medication index refresh scheduling failed at startup")
+
     # Start the extraction worker
     from app.api.upload import start_extraction_worker
     start_extraction_worker()
