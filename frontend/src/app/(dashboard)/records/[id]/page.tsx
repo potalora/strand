@@ -130,7 +130,7 @@ export default function RecordDetailPage() {
               {recordTitle(record)}
             </h1>
             <div className="flex items-center gap-2" style={{ marginTop: 10 }}>
-              <RetroBadge recordType={record.record_type} />
+              <RetroBadge recordType={record.record_type} fhirResource={record.fhir_resource} />
               {record.status && (
                 <span className="text-xs" style={{ color: "var(--text-dim)" }}>
                   {record.status}

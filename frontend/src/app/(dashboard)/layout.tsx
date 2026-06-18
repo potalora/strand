@@ -4,6 +4,7 @@ import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { RetroNav } from "@/components/retro/RetroNav";
 import { FloatingDock } from "@/components/retro/FloatingDock";
+import { GlobalExtractionStatusBar } from "@/components/retro/GlobalExtractionStatusBar";
 import { useAuthStore, useHasHydrated } from "@/stores/useAuthStore";
 
 export default function DashboardLayout({
@@ -30,6 +31,7 @@ export default function DashboardLayout({
       <RetroNav />
       <main className="main-narrow">{children}</main>
       <FloatingDock />
+      <GlobalExtractionStatusBar />
     </div>
   );
 }

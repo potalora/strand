@@ -183,7 +183,7 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
                     {recordTitle(record)}
                   </h2>
                   <div className="flex items-center gap-2 mt-2.5">
-                    <RetroBadge recordType={record.record_type} />
+                    <RetroBadge recordType={record.record_type} fhirResource={record.fhir_resource} />
                     {record.status && (
                       <span className="text-xs" style={{ color: "var(--text-dim)" }}>
                         {record.status}

@@ -12,7 +12,7 @@ STORABLE ENTITIES (create health records):
 - vital: Vital signs (BP, HR, Temp, SpO2, Weight, Height, BMI). Include: type, value, unit.
 - procedure: Medical procedures performed ON THIS PATIENT. Include: date, status.
 - allergy: Drug/food/substance allergies. Include: reaction, severity.
-- encounter: A clinical visit or encounter. Extract ONLY the PRIMARY visit (the visit this document is about). Include: visit_type (office, telehealth, emergency, inpatient), date, cpt_code, reason.
+- encounter: A clinical visit or encounter. Extract ONLY the PRIMARY visit (the visit this document is about). Include: visit_type (office, telehealth, emergency, inpatient), date, cpt_code, reason, facility/medical_center (the clinic, hospital, or medical-center name where the visit occurred), and summary (a one- to two-sentence synopsis of the visit / chief complaint, drawn from the note).
 - imaging_result: Diagnostic test/imaging results (EGD, MRI, CT, ultrasound, X-ray, breath test, gastric emptying, SBFT, colonoscopy, etc). Include: procedure_name, date, findings, interpretation, category (imaging, endoscopy, nuclear_medicine, pulmonary, laboratory_panel).
 - family_history: Health conditions of family members. Include: relationship (mother, father, grandmother, grandfather, sibling, etc.), condition, status, notes.
 - social_history: Social/lifestyle factors. Include: category (diet, alcohol, tobacco, exercise, birth_history, occupation), value, date.
@@ -36,6 +36,18 @@ RULES:
 8. IMAGING RESULTS: Extract the FINDINGS and INTERPRETATION, not just the procedure name. Include the date of the study.
 9. ASSESSMENT & PLAN: Extract as a single entity containing the full A&P narrative. Summarize each numbered plan item in the plan_items array.
 10. Confidence scoring: High (>0.8) for exact matches with clear context, Medium (0.5-0.8) for context-dependent extractions, Low (<0.5) for ambiguous mentions.
+
+PRECISION RULES (do NOT invent records — false records erode trust):
+11. PROCEDURES — performed only. Extract a procedure ONLY when the text shows it was actually done: it has a date, or "s/p", "status post", "underwent", "performed", "h/o … removed", or a surgical -ectomy/-otomy. Do NOT extract a procedure that is merely recommended, planned, "due for", "scheduled", "consider", "screening options include", or a differential mention ("recommend colonoscopy", "due for colonoscopy" → SKIP).
+12. NO FRAGMENTS. Never emit a bare value with no named analyte/drug — "2mg", "120/80", "98.6", "5' 9\"" are value-only fragments, NOT observations. A lab/vital MUST include the test/analyte name alongside the value ("Glucose 95 mg/dL"). A named-but-valueless panel order ("CBC", "CMP", "A1c") is allowed.
+13. LIFESTYLE / COUNSELING → social_history, not lab/observation. "Exercise:", "Diet:", "Alcohol:", "Tobacco:" content is social_history (set category). Do NOT file it as a lab_result or vital. Do NOT extract imperative counseling/directives ("avoid alcohol", "stop smoking", "increase exercise") as records — those are recommendations, not the patient's history.
+14. MEDICATIONS — recognizable drug name required. Do NOT extract drug-class abbreviations ("PPI", "NSAID", "SSRI", "LDN"), bare/garbage tokens ("Go", "b12"), routes, or frequencies as medications. Only a specific, recognizable drug name is a medication.
+15. PROVIDER — capture the note's attending/ordering provider as a provider entity (extraction_class="provider") with specialty/role attributes when present (e.g. "Dr. Smith, Cardiology"). This lets the visit's clinician be attached downstream.
+16. PHI placeholders ("[NAME]", "[DATE]", "[MRN]", "[REDACTED]") are redaction markers, NOT content — never extract them as entities.
+
+ENRICHMENT RULES (capture structured detail so records are not bare labels):
+17. MEDICATION DOSAGE — attach dose, route, and frequency AS ATTRIBUTES ON THE MEDICATION entity (keys `dose` e.g. "500mg", `route` e.g. "PO", `frequency` e.g. "BID"), or a single combined `dosage` sig (e.g. "500mg PO BID"). Inline attributes are preferred over separate dosage/route/frequency entities so a structured dosageInstruction can be built.
+18. CONDITION ONSET — when the text gives a diagnosis/onset/since date for a condition ("since 2015", "diagnosed 2018", "onset 03/2020"), attach it as an `onset_date` attribute on the condition entity.
 """
 
 CLINICAL_EXAMPLES = [
@@ -55,7 +67,7 @@ CLINICAL_EXAMPLES = [
             lx.data.Extraction(
                 extraction_class="medication",
                 extraction_text="Cefazolin",
-                attributes={"medication_group": "Cefazolin", "drug_class": "antibiotic", "confidence": "0.95"},
+                attributes={"medication_group": "Cefazolin", "drug_class": "antibiotic", "dose": "250 mg", "route": "IV", "frequency": "TID", "confidence": "0.95"},
             ),
             lx.data.Extraction(
                 extraction_class="frequency",
@@ -85,7 +97,7 @@ CLINICAL_EXAMPLES = [
         ],
     ),
     lx.data.ExampleData(
-        text="HbA1c 6.8% (ref 4.0-5.6). Metformin 500mg PO BID for type 2 diabetes. Allergic to Penicillin (rash). Colonoscopy performed 01/2024.",
+        text="HbA1c 6.8% (ref 4.0-5.6). Metformin 500mg PO BID for type 2 diabetes (diagnosed 2015). Allergic to Penicillin (rash). Colonoscopy performed 01/2024.",
         extractions=[
             lx.data.Extraction(
                 extraction_class="lab_result",
@@ -95,27 +107,12 @@ CLINICAL_EXAMPLES = [
             lx.data.Extraction(
                 extraction_class="medication",
                 extraction_text="Metformin",
-                attributes={"medication_group": "Metformin"},
-            ),
-            lx.data.Extraction(
-                extraction_class="dosage",
-                extraction_text="500mg",
-                attributes={"medication_group": "Metformin", "value": "500", "unit": "mg"},
-            ),
-            lx.data.Extraction(
-                extraction_class="route",
-                extraction_text="PO",
-                attributes={"medication_group": "Metformin", "full_name": "oral"},
-            ),
-            lx.data.Extraction(
-                extraction_class="frequency",
-                extraction_text="BID",
-                attributes={"medication_group": "Metformin", "meaning": "twice daily"},
+                attributes={"medication_group": "Metformin", "dose": "500mg", "route": "PO", "frequency": "BID"},
             ),
             lx.data.Extraction(
                 extraction_class="condition",
                 extraction_text="type 2 diabetes",
-                attributes={"status": "active"},
+                attributes={"status": "active", "onset_date": "2015"},
             ),
             lx.data.Extraction(
                 extraction_class="allergy",
@@ -146,6 +143,7 @@ CLINICAL_EXAMPLES = [
         text=(
             "GI Follow-Up Visit - Telehealth\n"
             "Date: 03/15/2025\n"
+            "Clinic: Riverside Gastroenterology Associates\n"
             "Reason: Follow-up gastroparesis and GERD management\n\n"
             "Medications:\n"
             "Omeprazole 40mg PO daily\n"
@@ -188,7 +186,9 @@ CLINICAL_EXAMPLES = [
                 attributes={
                     "visit_type": "telehealth",
                     "date": "03/15/2025",
+                    "facility": "Riverside Gastroenterology Associates",
                     "reason": "Follow-up gastroparesis and GERD management",
+                    "summary": "Telehealth follow-up for gastroparesis and GERD management.",
                     "confidence": "0.95",
                 },
             ),
@@ -196,42 +196,12 @@ CLINICAL_EXAMPLES = [
             lx.data.Extraction(
                 extraction_class="medication",
                 extraction_text="Omeprazole",
-                attributes={"medication_group": "Omeprazole", "confidence": "0.95"},
-            ),
-            lx.data.Extraction(
-                extraction_class="dosage",
-                extraction_text="40mg",
-                attributes={"medication_group": "Omeprazole", "value": "40", "unit": "mg"},
-            ),
-            lx.data.Extraction(
-                extraction_class="route",
-                extraction_text="PO",
-                attributes={"medication_group": "Omeprazole", "full_name": "oral"},
-            ),
-            lx.data.Extraction(
-                extraction_class="frequency",
-                extraction_text="daily",
-                attributes={"medication_group": "Omeprazole", "meaning": "once daily"},
+                attributes={"medication_group": "Omeprazole", "dose": "40mg", "route": "PO", "frequency": "daily", "confidence": "0.95"},
             ),
             lx.data.Extraction(
                 extraction_class="medication",
                 extraction_text="Metoclopramide",
-                attributes={"medication_group": "Metoclopramide", "confidence": "0.95"},
-            ),
-            lx.data.Extraction(
-                extraction_class="dosage",
-                extraction_text="10mg",
-                attributes={"medication_group": "Metoclopramide", "value": "10", "unit": "mg"},
-            ),
-            lx.data.Extraction(
-                extraction_class="route",
-                extraction_text="PO",
-                attributes={"medication_group": "Metoclopramide", "full_name": "oral"},
-            ),
-            lx.data.Extraction(
-                extraction_class="frequency",
-                extraction_text="QID before meals",
-                attributes={"medication_group": "Metoclopramide", "meaning": "four times daily before meals"},
+                attributes={"medication_group": "Metoclopramide", "dose": "10mg", "route": "PO", "frequency": "QID before meals", "confidence": "0.95"},
             ),
             # Conditions
             lx.data.Extraction(
@@ -405,6 +375,44 @@ CLINICAL_EXAMPLES = [
                     "confidence": "0.90",
                 },
             ),
+        ],
+    ),
+    # Negative / precision example — teaches the model what NOT to extract
+    # (recommended procedures, value-only fragments, drug-class abbreviations,
+    # imperative lifestyle counseling) and how to route lifestyle + provider.
+    lx.data.ExampleData(
+        text=(
+            "Seen by Dr. Alvarez, Gastroenterology.\n"
+            "Recommend colonoscopy; patient is due for screening. Consider EGD if symptoms persist.\n"
+            "s/p Cholecystectomy 06/2019.\n"
+            "Started PPI therapy. Avoid NSAIDs.\n"
+            "Weight 2mg.\n"
+            "Exercise: Avid runner, 3x/week.\n"
+            "Alcohol: advised to avoid alcohol."
+        ),
+        extractions=[
+            # Provider captured (B2)
+            lx.data.Extraction(
+                extraction_class="provider",
+                extraction_text="Dr. Alvarez",
+                attributes={"specialty": "Gastroenterology", "role": "attending"},
+            ),
+            # Colonoscopy + EGD: SKIPPED (recommended / due-for / consider — A1)
+            # Performed surgery IS extracted (A1 — has s/p + date)
+            lx.data.Extraction(
+                extraction_class="procedure",
+                extraction_text="Cholecystectomy",
+                attributes={"date": "06/2019", "status": "completed", "confidence": "0.95"},
+            ),
+            # "PPI" drug class: SKIPPED (A4). "NSAIDs" directive: SKIPPED (A4/A3)
+            # "Weight 2mg": SKIPPED (value-only fragment, nonsensical — A2)
+            # Lifestyle routed to social_history, NOT observation (A3)
+            lx.data.Extraction(
+                extraction_class="social_history",
+                extraction_text="Avid runner, 3x/week",
+                attributes={"category": "exercise", "value": "Avid runner, 3x/week", "confidence": "0.85"},
+            ),
+            # "Alcohol: advised to avoid alcohol": SKIPPED (imperative counseling — A3)
         ],
     ),
 ]

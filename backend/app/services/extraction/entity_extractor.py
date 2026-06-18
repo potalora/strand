@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import langextract as lx
@@ -44,11 +45,21 @@ BACKOFF_BASE = 2  # seconds
 _TRANSIENT_ERROR_KEYWORDS = ("429", "resource_exhausted", "quota", "rate", "timeout", "connection")
 
 
-def extract_entities(text: str, source_file: str, api_key: str) -> ExtractionResult:
+def extract_entities(
+    text: str,
+    source_file: str,
+    api_key: str,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> ExtractionResult:
     """Extract clinical entities from text using LangExtract.
 
     This is synchronous because LangExtract is synchronous.
     Use extract_entities_async() from async callers.
+
+    ``progress_callback`` is optional and, when provided, is invoked once this
+    chunk's extraction completes — ``(stage, completed_delta, entity_count)``.
+    The worker uses it to advance section-level progress. Keeping it optional
+    leaves existing callers/tests unaffected.
     """
     try:
         for attempt in range(MAX_RETRIES):
@@ -106,6 +117,11 @@ def extract_entities(text: str, source_file: str, api_key: str) -> ExtractionRes
         logger.info(
             "Extracted %d entities from %s", len(entities), source_file
         )
+        if progress_callback is not None:
+            try:
+                progress_callback("extracting_entities", 1, len(entities))
+            except Exception:  # progress is best-effort, never fail extraction
+                logger.debug("progress_callback raised; ignoring", exc_info=True)
         return ExtractionResult(
             source_file=source_file,
             source_text=text,
@@ -122,7 +138,12 @@ def extract_entities(text: str, source_file: str, api_key: str) -> ExtractionRes
 
 
 async def extract_entities_async(
-    text: str, source_file: str, api_key: str
+    text: str,
+    source_file: str,
+    api_key: str,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> ExtractionResult:
     """Async wrapper around synchronous LangExtract call."""
-    return await asyncio.to_thread(extract_entities, text, source_file, api_key)
+    return await asyncio.to_thread(
+        extract_entities, text, source_file, api_key, progress_callback
+    )

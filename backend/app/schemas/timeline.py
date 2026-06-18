@@ -13,6 +13,7 @@ class TimelineEvent(BaseModel):
     effective_date: datetime | None
     code_display: str | None
     category: list[str] | None
+    provider: str | None = None
 
     model_config = {"from_attributes": True}
 

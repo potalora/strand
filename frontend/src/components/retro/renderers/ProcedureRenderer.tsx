@@ -1,18 +1,17 @@
 "use client";
 
 import React from "react";
-import { DetailRow, StatusBadge, SectionDivider, str, obj, arr, nested, formatDate } from "./shared";
-
-/** Collect display text from an array of FHIR references, e.g. performer[].actor. */
-function refDisplays(items: unknown[], ...keys: string[]): string[] {
-  const out: string[] = [];
-  for (const item of items) {
-    const node = keys.length ? nested(obj(item), ...keys) : item;
-    const display = str(obj(node).display);
-    if (display && !out.includes(display)) out.push(display);
-  }
-  return out;
-}
+import {
+  DetailRow,
+  StatusBadge,
+  SectionDivider,
+  str,
+  obj,
+  arr,
+  nested,
+  formatDate,
+  performerNames,
+} from "./shared";
 
 /** Collect human text from a codeableConcept[] (text → coding display → coding code). */
 function conceptTexts(items: unknown[]): string[] {
@@ -44,8 +43,8 @@ export function ProcedureRenderer({ r }: { r: Record<string, unknown> }) {
     date = periodEnd && periodEnd !== periodStart ? `${periodStart} → ${periodEnd}` : periodStart;
   }
 
-  // Performers — list all actors.
-  const performers = refDisplays(arr(r.performer), "actor");
+  // Performers — list all actors (display preferred, readable reference fallback).
+  const performers = performerNames(arr(r.performer), "actor");
   const asserter = str(nested(r, "asserter", "display"));
 
   // Reasons / body sites / outcomes — descriptive, what the source recorded.

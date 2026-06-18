@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -287,11 +288,189 @@ def build_display_text(resource: dict, resource_type: str) -> str:
     return resource_type
 
 
-def map_fhir_resource(resource: dict) -> dict | None:
-    """Map a single FHIR resource to a health_records insert dict."""
+# Resource types that NAME the references an encounter points at (provider,
+# medical center, location). The biggest structured-encounter gap was
+# reference-only participants/serviceProviders — ~48% carried
+# ``individual.reference = "Practitioner/<id>"`` with no ``display``, so the UI
+# dropped them. FHIR bundles (and CDA→FHIR output) usually ship these resources
+# alongside the encounter; we index them and backfill the missing ``display``.
+_REFERENCE_RESOURCE_TYPES = frozenset({"Practitioner", "Organization", "Location"})
+
+
+def _human_name_to_display(name: Any) -> str | None:
+    """Render a FHIR ``HumanName`` (or a list of them) as a single display string.
+
+    Prefers an explicit ``text``; otherwise joins prefix + given + family +
+    suffix. Accepts a bare string for resilience. Returns ``None`` when nothing
+    usable is present.
+    """
+    if isinstance(name, list):
+        name = next((n for n in name if isinstance(n, dict) and n), None)
+    if isinstance(name, str):
+        stripped = name.strip()
+        return stripped or None
+    if not isinstance(name, dict):
+        return None
+
+    text = name.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    # Ordered name parts: prefix → given → family → suffix.
+    parts: list[str] = []
+    for key in ("prefix", "given", "family", "suffix"):
+        val = name.get(key)
+        if isinstance(val, list):
+            parts.extend(str(p).strip() for p in val if p and str(p).strip())
+        elif isinstance(val, str) and val.strip():
+            parts.append(val.strip())
+
+    full = " ".join(parts).strip()
+    return full or None
+
+
+def _resource_reference_name(resource: dict) -> str | None:
+    """Display name for a referenceable resource, or ``None`` if it has none."""
+    rt = resource.get("resourceType")
+    if rt == "Practitioner":
+        return _human_name_to_display(resource.get("name"))
+    if rt in ("Organization", "Location"):
+        name = resource.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
+
+
+def build_reference_name_map(entries: Iterable[dict]) -> dict[str, str]:
+    """Map ``"<ResourceType>/<id>"`` and ``fullUrl`` → display name.
+
+    Indexes every Practitioner/Organization/Location in the bundle so an
+    encounter's ``reference`` strings can be resolved to readable names. Keyed by
+    both the relative reference (``Practitioner/p1``) and the entry ``fullUrl``
+    (``urn:uuid:...``) to cover both reference styles. First name wins.
+    """
+    ref_map: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        resource = entry.get("resource")
+        if not isinstance(resource, dict):
+            continue
+        if resource.get("resourceType") not in _REFERENCE_RESOURCE_TYPES:
+            continue
+        name = _resource_reference_name(resource)
+        if not name:
+            continue
+        rt = resource.get("resourceType")
+        rid = resource.get("id")
+        if rt and rid:
+            ref_map.setdefault(f"{rt}/{rid}", name)
+        full_url = entry.get("fullUrl")
+        if isinstance(full_url, str) and full_url:
+            ref_map.setdefault(full_url, name)
+    return ref_map
+
+
+def _fill_reference_display(ref_obj: Any, ref_map: dict[str, str]) -> None:
+    """Populate ``display`` on a FHIR Reference from ``ref_map`` (in place).
+
+    Only fills when the reference is missing a display; never overwrites a name
+    the source already provided.
+    """
+    if not isinstance(ref_obj, dict) or ref_obj.get("display"):
+        return
+    reference = ref_obj.get("reference")
+    if not isinstance(reference, str):
+        return
+    name = ref_map.get(reference)
+    if name:
+        ref_obj["display"] = name
+
+
+def resolve_encounter_references(resource: dict, ref_map: dict[str, str] | None) -> dict:
+    """Backfill provider/facility/location ``display`` on a FHIR Encounter.
+
+    Resolves ``participant[].individual`` (provider), ``serviceProvider`` (the
+    medical center) and ``location[].location`` from the bundle's contained
+    Practitioner/Organization/Location resources. Assumes those referenced
+    resources travel in the same bundle (the common case for FHIR exports and
+    CDA→FHIR output); references to resources not present are left untouched and
+    the UI drops opaque refs. Mutates and returns ``resource``.
+    """
+    if not ref_map or resource.get("resourceType") != "Encounter":
+        return resource
+    for participant in resource.get("participant", []) or []:
+        if isinstance(participant, dict):
+            _fill_reference_display(participant.get("individual"), ref_map)
+    _fill_reference_display(resource.get("serviceProvider"), ref_map)
+    for loc in resource.get("location", []) or []:
+        if isinstance(loc, dict):
+            _fill_reference_display(loc.get("location"), ref_map)
+    return resource
+
+
+# Tokens that mark a location display as a *facility / organization* (B6).
+_FACILITY_KEYWORDS = (
+    "hospital", "clinic", "medical", "health", "center", "centre", "associates",
+    "group", "practice", "pharmacy", "laborator", "imaging", "radiology",
+    "institute", "department", "dept", "medicine", "care", "physicians",
+    "specialists", "oncology", "cardiology", "orthopedic", "surgery", "urgent",
+)
+# Tokens that mark a location display as a *room / bed* — never a serviceProvider.
+_ROOM_KEYWORDS = (
+    "room", "rm ", " rm", "bed", "exam", "suite", "floor", "wing", "bay",
+    "chair", "cubicle", "pod ", "ward",
+)
+
+
+def _looks_like_facility(display: str) -> bool:
+    """True when a location display clearly names a facility/org, not a room."""
+    d = display.lower()
+    if any(tok in d for tok in _ROOM_KEYWORDS):
+        return False
+    return any(tok in d for tok in _FACILITY_KEYWORDS)
+
+
+def enrich_encounter_service_provider(resource: dict) -> dict:
+    """Surface a facility as ``serviceProvider`` on a FHIR Encounter (B6).
+
+    Many encounter exports carry the facility only under ``location`` and leave
+    ``serviceProvider`` empty (0% filled in the audit). When the encounter has
+    no serviceProvider but a location whose display clearly names a facility,
+    promote that display to ``serviceProvider``. Conservative: room/bed-style
+    location names are skipped so an exam room is never labelled the provider.
+    Mutates and returns ``resource``.
+    """
+    if resource.get("resourceType") != "Encounter":
+        return resource
+    if resource.get("serviceProvider"):
+        return resource
+    for loc in resource.get("location", []) or []:
+        if not isinstance(loc, dict):
+            continue
+        display = (loc.get("location") or {}).get("display")
+        if display and _looks_like_facility(display):
+            resource["serviceProvider"] = {"display": display}
+            break
+    return resource
+
+
+def map_fhir_resource(resource: dict, ref_map: dict[str, str] | None = None) -> dict | None:
+    """Map a single FHIR resource to a health_records insert dict.
+
+    ``ref_map`` (from :func:`build_reference_name_map`) lets encounters resolve
+    reference-only providers/facilities/locations to readable names. Optional so
+    existing callers keep working; resolution is simply skipped when absent.
+    """
     resource_type = resource.get("resourceType")
     if not resource_type or resource_type not in SUPPORTED_RESOURCE_TYPES:
         return None
+
+    if resource_type == "Encounter":
+        # Resolve reference-only names first, then fall back to promoting a
+        # facility-like location to serviceProvider if still unset.
+        resolve_encounter_references(resource, ref_map)
+        enrich_encounter_service_provider(resource)
 
     record_type = SUPPORTED_RESOURCE_TYPES[resource_type]
     code_system, code_value, code_display = extract_coding(resource)
@@ -375,6 +554,9 @@ async def _parse_small_bundle(
         entries = [{"resource": data}]
 
     stats["total_entries"] = len(entries)
+    # Index Practitioner/Organization/Location names so encounters can resolve
+    # reference-only providers/facilities to readable names.
+    ref_map = build_reference_name_map(entries)
     batch = []
 
     for i, entry in enumerate(entries):
@@ -389,7 +571,7 @@ async def _parse_small_bundle(
             continue
 
         try:
-            mapped = map_fhir_resource(resource)
+            mapped = map_fhir_resource(resource, ref_map)
             if mapped:
                 mapped["user_id"] = user_id
                 mapped["patient_id"] = patient_id
@@ -437,6 +619,12 @@ async def _parse_large_bundle(
     stats = {"total_entries": 0, "records_inserted": 0, "records_skipped": 0, "errors": []}
     batch = []
 
+    # First streaming pass: index Practitioner/Organization/Location names only
+    # (small even in large bundles — just id→name strings) so the main pass can
+    # resolve encounter reference-only providers/facilities/locations.
+    with open(file_path, "rb") as f:
+        ref_map = build_reference_name_map(ijson.items(f, "entry.item"))
+
     with open(file_path, "rb") as f:
         entries = ijson.items(f, "entry.item")
         for i, entry in enumerate(entries):
@@ -452,7 +640,7 @@ async def _parse_large_bundle(
                 continue
 
             try:
-                mapped = map_fhir_resource(resource)
+                mapped = map_fhir_resource(resource, ref_map)
                 if mapped:
                     mapped["user_id"] = user_id
                     mapped["patient_id"] = patient_id

@@ -80,6 +80,40 @@ export function formatDateTime(val: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
+// Provider / performer references
+// ---------------------------------------------------------------------------
+
+/** Resolve a single FHIR Reference (e.g. an Observation.performer entry or an
+ *  Encounter.participant.individual) to a human-readable provider name. Prefers
+ *  the reference `display`; falls back to a non-opaque `reference` string,
+ *  dropping bare Type/UUID references that carry no readable name. */
+export function performerName(ref: unknown): string {
+  const display = str(obj(ref).display);
+  if (display) return display;
+  const reference = str(obj(ref).reference);
+  if (!reference) return "";
+  // References are typically "Practitioner/<uuid>" / "Organization/<uuid>" —
+  // opaque and not useful to surface. Show the type/id only when it isn't a UUID.
+  const [, id] = reference.split("/");
+  const looksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}/i.test(id ?? "");
+  return looksLikeUuid ? "" : reference;
+}
+
+/** Resolve an array of FHIR References to a de-duplicated list of provider
+ *  names. `keys` optionally drills into each item first (e.g. "individual" for
+ *  Encounter.participant[].individual, "actor" for Procedure.performer[].actor;
+ *  omit for Observation.performer[], which is a flat Reference[]). */
+export function performerNames(items: unknown[], ...keys: string[]): string[] {
+  const out: string[] = [];
+  for (const item of items) {
+    const node = keys.length ? nested(obj(item), ...keys) : item;
+    const name = performerName(node);
+    if (name && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Shared UI primitives
 // ---------------------------------------------------------------------------
 

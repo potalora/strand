@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -46,3 +46,14 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Cooperative cancel: the API sets this; the extraction worker checks it
+    # between stages and aborts cleanly, marking the file ``cancelled``.
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    # Section-level progress for the unstructured extraction pipeline. The
+    # worker writes the current stage (extracting_text / scrubbing_phi /
+    # extracting_entities / mapping_fhir) and a {section_index, section_total}
+    # detail so the frontend can show "section 3 of 8".
+    progress_stage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    progress_detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

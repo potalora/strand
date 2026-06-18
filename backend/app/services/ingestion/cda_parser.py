@@ -14,11 +14,14 @@ from typing import Any
 from app.services.ingestion.fhir_parser import (
     SUPPORTED_RESOURCE_TYPES,
     build_display_text,
+    build_reference_name_map,
+    enrich_encounter_service_provider,
     extract_categories,
     extract_coding,
     extract_effective_date,
     extract_effective_date_end,
     extract_status,
+    resolve_encounter_references,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +93,10 @@ def parse_cda_document(
     # --- Map each entry ---
     records: list[dict] = []
     entries = bundle.get("entry", [])
+    # Index Practitioner/Organization/Location names (built from ALL entries,
+    # including the Practitioner/Organization the loop below skips) so encounters
+    # can resolve reference-only providers/facilities to readable names.
+    ref_map = build_reference_name_map(entries)
     for entry in entries:
         resource = entry.get("resource")
         if not resource:
@@ -104,6 +111,10 @@ def parse_cda_document(
         if resource_type not in SUPPORTED_RESOURCE_TYPES:
             logger.debug("Skipping unsupported resource type from CDA: %s", resource_type)
             continue
+
+        if resource_type == "Encounter":
+            resolve_encounter_references(resource, ref_map)
+            enrich_encounter_service_provider(resource)
 
         record_type = SUPPORTED_RESOURCE_TYPES[resource_type]
         code_system, code_value, code_display = extract_coding(resource)

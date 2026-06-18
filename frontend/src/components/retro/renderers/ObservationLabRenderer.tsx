@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { DetailRow, StatusBadge, str, obj, arr, nested, formatDateTime } from "./shared";
+import { DetailRow, StatusBadge, str, obj, arr, nested, formatDateTime, performerNames } from "./shared";
 import { Gauge } from "@/components/retro/DataViz";
 
 // ---------------------------------------------------------------------------
@@ -38,20 +38,6 @@ function interpretationLabel(code: string): string {
     default:
       return code;
   }
-}
-
-/** Resolve a single performer entry to a display string, preferring a human
- *  display, then a non-opaque reference (drops bare Type/UUID references). */
-function performerLabel(p: unknown): string {
-  const display = str(obj(p).display);
-  if (display) return display;
-  const reference = str(obj(p).reference);
-  if (!reference) return "";
-  // References here are typically "Organization/<uuid>" — opaque, not useful to
-  // surface. Only show the type segment if there is no UUID-looking id.
-  const [, id] = reference.split("/");
-  const looksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}/i.test(id ?? "");
-  return looksLikeUuid ? "" : reference;
 }
 
 export function ObservationLabRenderer({ r }: { r: Record<string, unknown> }) {
@@ -97,8 +83,7 @@ export function ObservationLabRenderer({ r }: { r: Record<string, unknown> }) {
   const interpLabel = interpCode ? interpretationLabel(interpCode) : "";
 
   // Performer(s) — preferring display, falling back to a readable reference.
-  const performers = arr(r.performer).map(performerLabel).filter(Boolean);
-  const performerText = performers.join(", ");
+  const performerText = performerNames(arr(r.performer)).join(", ");
 
   // Specimen, if the source recorded one.
   const specimen =

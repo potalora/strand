@@ -5,12 +5,72 @@ import logging
 import re
 from datetime import datetime
 from uuid import UUID, uuid4
+from xml.sax.saxutils import escape as _xml_escape
 
+from app.services.extraction import terminology
 from app.services.extraction.entity_extractor import ExtractedEntity
+from app.services.extraction.terminology import parse_dosage  # re-exported for callers/tests
 from app.services.ingestion.content_hash import content_hash
 from app.utils.date_utils import parse_datetime
 
+__all__ = [
+    "entity_to_health_record_dict",
+    "resolve_document_date",
+    "resolve_document_provider",
+    "parse_lab_measurement",
+    "parse_dosage",
+]
+
 logger = logging.getLogger(__name__)
+
+# v3 ObservationInterpretation code system (H/L/HH/LL/A/N/POS/NEG).
+_INTERP_SYSTEM = "http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation"
+
+# Attribute keys that may carry the provider/performer of a record. Checked in
+# order; the first non-empty value wins (B2).
+_PROVIDER_ATTR_KEYS = (
+    "provider",
+    "performer",
+    "performed_by",
+    "ordering_provider",
+    "ordered_by",
+    "rendering_provider",
+    "attending",
+    "attending_provider",
+    "physician",
+    "doctor",
+    "provider_name",
+)
+
+# Lab *panel/order* names that, when they appear with no measured value, denote
+# an order rather than a result — emitted as a ServiceRequest, not an empty
+# Observation (B8).
+_LAB_PANEL_NAMES = frozenset(
+    {
+        "cbc",
+        "cbc with differential",
+        "complete blood count",
+        "cmp",
+        "comprehensive metabolic panel",
+        "bmp",
+        "basic metabolic panel",
+        "metabolic panel",
+        "lipid panel",
+        "lipid profile",
+        "hepatic panel",
+        "liver panel",
+        "liver function tests",
+        "lft",
+        "lfts",
+        "thyroid panel",
+        "urinalysis",
+        "ua",
+        "fit",
+        "fecal immunochemical test",
+        "a1c",
+        "hemoglobin a1c",
+    }
+)
 
 # Map LangExtract entity classes to FHIR record types
 ENTITY_TO_RECORD_TYPE: dict[str, tuple[str, str] | None] = {
@@ -43,6 +103,7 @@ def entity_to_health_record_dict(
     patient_id: UUID,
     source_file_id: UUID | None = None,
     document_date: datetime | None = None,
+    document_provider: str | None = None,
 ) -> dict | None:
     """Convert an extracted entity to a dict suitable for creating a HealthRecord.
 
@@ -52,13 +113,30 @@ def entity_to_health_record_dict(
     ``document_date`` is the encounter/visit date for the source document; it is
     used as a last-resort effective_date when the entity carries no date of its
     own (see :func:`_extract_effective_date`).
+
+    ``document_provider`` is the document-level attending/ordering provider; it
+    is attached to the resource (participant/performer/requester) when the entity
+    carries no provider of its own (B2). Both new params are optional with safe
+    defaults so existing call sites keep working unchanged.
     """
     mapping = ENTITY_TO_RECORD_TYPE.get(entity.entity_class)
     if mapping is None:
         return None
 
     record_type, fhir_resource_type = mapping
-    fhir_resource = _build_fhir_resource(entity, fhir_resource_type)
+
+    # B1 — standard terminology coding (None for unknown/uncodable terms).
+    coding = _resolve_coding(entity)
+    # B2 — provider/performer (entity-level first, document-level fallback).
+    provider = _resolve_provider(entity, document_provider)
+
+    # B8 — a named lab panel with no value is an order, not an empty result.
+    if _is_panel_order(entity):
+        record_type, fhir_resource_type = "service_request", "ServiceRequest"
+
+    fhir_resource = _build_fhir_resource(
+        entity, fhir_resource_type, coding=coding, provider=provider
+    )
     display_text = _build_display_text(entity)
 
     effective_date = _extract_effective_date(entity, document_date)
@@ -76,6 +154,8 @@ def entity_to_health_record_dict(
         "effective_date": effective_date,
         "status": entity.attributes.get("status", "unknown"),
         "category": [record_type],
+        "code_system": coding.system if coding else None,
+        "code_value": coding.code if coding else None,
         "code_display": entity.text,
         "display_text": display_text,
         "is_duplicate": False,
@@ -223,7 +303,297 @@ def resolve_document_date(
     return None
 
 
-def _build_fhir_resource(entity: ExtractedEntity, resource_type: str) -> dict:
+def resolve_document_provider(entities: list[ExtractedEntity]) -> str | None:
+    """Derive a single document-level provider to attach to records (B2).
+
+    Returns the first ``provider`` entity's name — preferring a ``name``/
+    ``provider_name`` attribute, falling back to the entity text. Callers pass
+    the result as ``document_provider`` to :func:`entity_to_health_record_dict`
+    so encounters/observations/procedures without their own provider still get
+    a participant/performer. Returns ``None`` when no provider was extracted.
+    """
+    for entity in entities:
+        if entity.entity_class != "provider":
+            continue
+        attrs = entity.attributes or {}
+        name = _first_attr(attrs, ("name", "provider_name", "full_name", "display"))
+        if name:
+            return name
+        if entity.text and entity.text.strip():
+            return entity.text.strip()
+    return None
+
+
+# --- Richness helpers (B1-B8) ----------------------------------------------
+
+
+def _first_attr(attrs: dict, keys: tuple[str, ...]) -> str | None:
+    """Return the first non-blank string value among ``keys`` in ``attrs``."""
+    for key in keys:
+        val = attrs.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return None
+
+
+def _narrative_div(text: str) -> str:
+    """Wrap a plain-text visit summary in a FHIR Narrative XHTML ``div``.
+
+    FHIR R4 ``Encounter`` has no dedicated note/summary field, so an AI-extracted
+    visit summary is stored as the resource's human-readable ``text.div``
+    (the canonical FHIR place for it). The text is XML-escaped to keep the div
+    well-formed.
+    """
+    return f'<div xmlns="http://www.w3.org/1999/xhtml">{_xml_escape(text)}</div>'
+
+
+# Attribute keys that may carry a visit summary / chief complaint / narrative
+# on an AI-extracted encounter, checked in order.
+_ENCOUNTER_SUMMARY_KEYS = (
+    "summary",
+    "visit_summary",
+    "chief_complaint",
+    "narrative",
+    "hpi",
+    "history_of_present_illness",
+)
+
+
+def _resolve_coding(entity: ExtractedEntity) -> terminology.Coding | None:
+    """Map an extracted entity to a standard terminology coding (B1).
+
+    Returns ``None`` for entity types without a curated map or unknown terms.
+    """
+    attrs = entity.attributes or {}
+    cls = entity.entity_class
+    if cls == "condition":
+        return terminology.lookup_condition(entity.text)
+    if cls == "medication":
+        return terminology.lookup_medication(entity.text)
+    if cls == "lab_result":
+        return terminology.lookup_lab(attrs.get("test") or entity.text)
+    if cls == "procedure":
+        return terminology.lookup_procedure(attrs.get("procedure_name") or entity.text)
+    return None
+
+
+def _resolve_provider(
+    entity: ExtractedEntity, document_provider: str | None = None
+) -> str | None:
+    """Resolve the provider/performer for an entity (B2).
+
+    Prefers a provider named in the entity's own attributes; otherwise falls
+    back to the document-level provider passed by the caller.
+    """
+    attrs = entity.attributes or {}
+    own = _first_attr(attrs, _PROVIDER_ATTR_KEYS)
+    if own:
+        return own
+    if document_provider and document_provider.strip():
+        return document_provider.strip()
+    return None
+
+
+# Reference range like "(70-99)", "135–145", "3.5 to 5.0".
+_LAB_RANGE_RE = re.compile(
+    r"\(?\s*(\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d+(?:\.\d+)?)\s*\)?"
+)
+# A measured value plus optional unit. The value must not be glued to a letter
+# (so "A1c"/"B12"/"T4" analyte digits are not mistaken for the value).
+_LAB_VALUE_RE = re.compile(
+    r"(?<![A-Za-z\d.])(\d+(?:\.\d+)?)\s*"
+    r"(%|[A-Za-zµ][A-Za-z0-9µ%/.\-]*)?"
+)
+# Word interpretation flags (longest first).
+_INTERP_WORDS = (
+    ("critical high", "HH"),
+    ("critical low", "LL"),
+    ("abnormal", "A"),
+    ("normal", "N"),
+    ("positive", "POS"),
+    ("negative", "NEG"),
+    ("high", "H"),
+    ("low", "L"),
+    ("wnl", "N"),
+)
+_INTERP_WORD_RE = re.compile(
+    r"(?:^|\s)(critical high|critical low|abnormal|normal|positive|negative|high|low|wnl)(?:\s|$)",
+    re.IGNORECASE,
+)
+# Trailing single/double-letter flag, requiring whitespace before it so the
+# trailing "L" of "mIU/L" is not read as a "low" flag.
+_INTERP_LETTER_RE = re.compile(r"(?:^|\s)(HH|LL|H|L)\s*$", re.IGNORECASE)
+
+
+def parse_lab_measurement(text: str | None) -> dict:
+    """Parse a lab string into value / unit / reference range / interpretation.
+
+    Handles strings like ``"Glucose 95 mg/dL (70-99) H"`` →
+    ``{value: 95.0, unit: "mg/dL", ref_low: 70.0, ref_high: 99.0,
+    interpretation: "H", analyte: "Glucose"}``. Missing pieces are ``None``.
+    """
+    result: dict = {
+        "value": None,
+        "unit": None,
+        "ref_low": None,
+        "ref_high": None,
+        "interpretation": None,
+        "analyte": None,
+    }
+    if not text:
+        return result
+    s = str(text)
+
+    # 1. Reference range (removed before value parsing so its numbers don't leak).
+    m = _LAB_RANGE_RE.search(s)
+    if m:
+        try:
+            result["ref_low"] = float(m.group(1))
+            result["ref_high"] = float(m.group(2))
+        except (ValueError, TypeError):
+            pass
+        s = s[: m.start()] + " " + s[m.end():]
+
+    # 2. Interpretation flag (word form anywhere, else a trailing letter flag).
+    interp = None
+    wm = _INTERP_WORD_RE.search(s)
+    if wm:
+        token = wm.group(1).lower()
+        for word, code in _INTERP_WORDS:
+            if token == word:
+                interp = code
+                break
+        s = s[: wm.start()] + " " + s[wm.end():]
+    if interp is None:
+        lm = _INTERP_LETTER_RE.search(s)
+        if lm:
+            interp = lm.group(1).upper()
+            s = s[: lm.start()]
+    result["interpretation"] = interp
+
+    # 3. Value + unit.
+    vm = _LAB_VALUE_RE.search(s)
+    if vm:
+        try:
+            result["value"] = float(vm.group(1))
+        except (ValueError, TypeError):
+            result["value"] = None
+        unit = (vm.group(2) or "").strip().rstrip(".,;:")
+        result["unit"] = unit or None
+        analyte = str(text)[: _value_offset_in_original(str(text), vm.group(1))].strip()
+        result["analyte"] = analyte.rstrip(",;:- ").strip() or None
+    else:
+        result["analyte"] = str(text).strip() or None
+
+    return result
+
+
+def _value_offset_in_original(original: str, value_str: str) -> int:
+    """Offset of the measured value in the original text (for analyte slicing)."""
+    idx = original.find(value_str)
+    return idx if idx >= 0 else len(original)
+
+
+def _lab_measurement(entity: ExtractedEntity) -> dict:
+    """Merge explicit lab attributes with values parsed from the entity text.
+
+    Explicit attributes win; text parsing fills the gaps.
+    """
+    attrs = entity.attributes or {}
+    parsed = parse_lab_measurement(entity.text)
+
+    def coalesce(attr_keys: tuple[str, ...], parsed_key: str):
+        val = _first_attr(attrs, attr_keys)
+        return val if val is not None else parsed[parsed_key]
+
+    return {
+        "value": coalesce(("value",), "value"),
+        "unit": coalesce(("unit", "units"), "unit"),
+        "ref_low": coalesce(("ref_low", "reference_low", "low"), "ref_low"),
+        "ref_high": coalesce(("ref_high", "reference_high", "high"), "ref_high"),
+        "interpretation": coalesce(("interpretation", "flag", "abnormal_flag"), "interpretation"),
+        "analyte": attrs.get("test") or parsed["analyte"] or entity.text,
+    }
+
+
+def _is_panel_order(entity: ExtractedEntity) -> bool:
+    """True when a lab entity is a known panel name carrying no measured value (B8)."""
+    if entity.entity_class != "lab_result":
+        return False
+    if _lab_measurement(entity)["value"] is not None:
+        return False
+    attrs = entity.attributes or {}
+    name = terminology.normalize_term(attrs.get("test") or entity.text)
+    return name in _LAB_PANEL_NAMES
+
+
+def _build_dosage_instruction(entity: ExtractedEntity) -> dict | None:
+    """Build a FHIR ``dosageInstruction`` element from a medication entity (B4).
+
+    Parses a sig string (``dosage``/``sig``/``dose`` attributes) into
+    ``doseAndRate`` + ``route`` + ``timing``, falling back to explicit
+    value/unit/frequency attributes. Returns ``None`` when nothing is known.
+    """
+    attrs = entity.attributes or {}
+    sig = _first_attr(attrs, ("dosage", "sig", "dose", "instructions", "directions"))
+    parsed = parse_dosage(sig) if sig else None
+    di: dict = {}
+    if sig:
+        di["text"] = sig
+
+    dose_value = dose_unit = None
+    if parsed and parsed["dose_value"] is not None:
+        dose_value, dose_unit = parsed["dose_value"], parsed["dose_unit"]
+    elif attrs.get("value"):
+        try:
+            dose_value = float(attrs["value"])
+            dose_unit = attrs.get("unit") or None
+        except (ValueError, TypeError):
+            pass
+    if dose_value is not None:
+        dq: dict = {"value": dose_value}
+        if dose_unit:
+            dq["unit"] = dose_unit
+        di["doseAndRate"] = [{"doseQuantity": dq}]
+        di.setdefault("text", f"{entity.text} {('%g' % dose_value)}{dose_unit or ''}".strip())
+
+    route = attrs.get("route") or (parsed["route"] if parsed else None)
+    if route:
+        di["route"] = {"text": route}
+
+    if parsed and parsed["frequency"]:
+        di["timing"] = {
+            "repeat": {
+                "frequency": parsed["frequency"],
+                "period": parsed["period"],
+                "periodUnit": parsed["period_unit"],
+            }
+        }
+    elif attrs.get("frequency"):
+        pf = parse_dosage(str(attrs["frequency"]))
+        if pf["frequency"]:
+            di["timing"] = {
+                "repeat": {
+                    "frequency": pf["frequency"],
+                    "period": pf["period"],
+                    "periodUnit": pf["period_unit"],
+                }
+            }
+        else:
+            di["text"] = (di.get("text", "") + " " + str(attrs["frequency"])).strip()
+
+    if parsed and parsed["as_needed"]:
+        di["asNeeded"] = True
+
+    return di or None
+
+
+def _build_fhir_resource(
+    entity: ExtractedEntity,
+    resource_type: str,
+    coding: terminology.Coding | None = None,
+    provider: str | None = None,
+) -> dict:
     """Build a minimal FHIR resource JSON from an extracted entity."""
     resource: dict = {"resourceType": resource_type}
     attrs = entity.attributes
@@ -231,16 +601,15 @@ def _build_fhir_resource(entity: ExtractedEntity, resource_type: str) -> dict:
     if resource_type == "MedicationRequest":
         resource["status"] = "active"
         resource["intent"] = "order"
-        resource["medicationCodeableConcept"] = {"text": entity.text}
-        # Attach grouped dosage info if available
-        dosage_parts = []
-        if attrs.get("medication_group"):
-            dose_text = entity.text
-            if "value" in attrs and "unit" in attrs:
-                dose_text = f"{entity.text} {attrs['value']}{attrs['unit']}"
-            dosage_parts.append(dose_text)
-        if dosage_parts:
-            resource["dosageInstruction"] = [{"text": " ".join(dosage_parts)}]
+        med_cc: dict = {"text": entity.text}
+        if coding:
+            med_cc["coding"] = [coding.as_coding()]
+        resource["medicationCodeableConcept"] = med_cc
+        dosage_instruction = _build_dosage_instruction(entity)
+        if dosage_instruction:
+            resource["dosageInstruction"] = [dosage_instruction]
+        if provider:
+            resource["requester"] = {"display": provider}
 
     elif resource_type == "Condition":
         status = attrs.get("status", "active")
@@ -249,35 +618,54 @@ def _build_fhir_resource(entity: ExtractedEntity, resource_type: str) -> dict:
         resource["clinicalStatus"] = {
             "coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-clinical", "code": status}]
         }
-        resource["code"] = {"text": entity.text}
+        code_obj: dict = {"text": entity.text}
+        if coding:
+            code_obj["coding"] = [coding.as_coding()]
+        resource["code"] = code_obj
+        onset = _first_attr(
+            attrs,
+            ("onset_date", "onset", "onset_datetime", "since", "since_date",
+             "diagnosed", "diagnosis_date", "diagnosed_date"),
+        )
+        if onset:
+            resource["onsetDateTime"] = onset
 
     elif resource_type == "Observation":
         resource["status"] = "final"
         if entity.entity_class == "lab_result":
+            meas = _lab_measurement(entity)
             resource["category"] = [{"coding": [{"code": "laboratory"}]}]
-            resource["code"] = {"text": attrs.get("test", entity.text)}
-            if "value" in attrs:
+            code_obj = {"text": meas["analyte"] or entity.text}
+            if coding:
+                code_obj["coding"] = [coding.as_coding()]
+            resource["code"] = code_obj
+            if meas["value"] is not None:
                 try:
-                    resource["valueQuantity"] = {
-                        "value": float(attrs["value"]),
-                        "unit": attrs.get("unit", ""),
-                    }
+                    vq: dict = {"value": float(meas["value"])}
+                    if meas["unit"]:
+                        vq["unit"] = meas["unit"]
+                    resource["valueQuantity"] = vq
                 except (ValueError, TypeError):
-                    resource["valueString"] = attrs.get("value", entity.text)
-            if "ref_low" in attrs or "ref_high" in attrs:
-                ref_range: dict = {}
-                if "ref_low" in attrs:
-                    try:
-                        ref_range["low"] = {"value": float(attrs["ref_low"])}
-                    except (ValueError, TypeError):
-                        pass
-                if "ref_high" in attrs:
-                    try:
-                        ref_range["high"] = {"value": float(attrs["ref_high"])}
-                    except (ValueError, TypeError):
-                        pass
-                if ref_range:
-                    resource["referenceRange"] = [ref_range]
+                    resource["valueString"] = str(meas["value"])
+            ref_range = {}
+            if meas["ref_low"] is not None:
+                try:
+                    ref_range["low"] = {"value": float(meas["ref_low"])}
+                except (ValueError, TypeError):
+                    pass
+            if meas["ref_high"] is not None:
+                try:
+                    ref_range["high"] = {"value": float(meas["ref_high"])}
+                except (ValueError, TypeError):
+                    pass
+            if ref_range:
+                resource["referenceRange"] = [ref_range]
+            if meas["interpretation"]:
+                resource["interpretation"] = [
+                    {"coding": [{"system": _INTERP_SYSTEM, "code": str(meas["interpretation"])}]}
+                ]
+            if provider:
+                resource["performer"] = [{"display": provider}]
         elif entity.entity_class == "social_history":
             category_label = attrs.get("category", "social-history")
             resource["category"] = [{"coding": [{"code": "social-history"}]}]
@@ -291,7 +679,23 @@ def _build_fhir_resource(entity: ExtractedEntity, resource_type: str) -> dict:
 
     elif resource_type == "Procedure":
         resource["status"] = "completed"
-        resource["code"] = {"text": entity.text}
+        proc_code: dict = {"text": entity.text}
+        if coding:
+            proc_code["coding"] = [coding.as_coding()]
+        resource["code"] = proc_code
+        if provider:
+            resource["performer"] = [{"actor": {"display": provider}}]
+
+    elif resource_type == "ServiceRequest":
+        # A lab panel/order named without a measured value (B8).
+        resource["status"] = "active"
+        resource["intent"] = "order"
+        sr_code: dict = {"text": (attrs.get("test") or entity.text)}
+        if coding:
+            sr_code["coding"] = [coding.as_coding()]
+        resource["code"] = sr_code
+        if provider:
+            resource["requester"] = {"display": provider}
 
     elif resource_type == "AllergyIntolerance":
         resource["clinicalStatus"] = {
@@ -312,15 +716,42 @@ def _build_fhir_resource(entity: ExtractedEntity, resource_type: str) -> dict:
         class_code, class_display = class_map.get(visit_type, ("AMB", "ambulatory"))
         resource["status"] = "finished"
         resource["class"] = {"code": class_code, "display": class_display}
+
+        # Visit type / title — a readable label for the visit. Prefer an explicit
+        # description, else the extracted visit phrase (entity.text). Merge a CPT
+        # code into the same CodeableConcept so the title and code travel together.
+        type_text = _first_attr(attrs, ("visit_description", "encounter_type", "visit_type_text"))
+        if not type_text and entity.text and entity.text.strip():
+            type_text = entity.text.strip()
         cpt_code = attrs.get("cpt_code")
+        type_concept: dict = {}
+        if type_text:
+            type_concept["text"] = type_text
         if cpt_code:
-            resource["type"] = [{"coding": [{"system": "http://www.ama-assn.org/go/cpt", "code": cpt_code}]}]
+            type_concept["coding"] = [
+                {"system": "http://www.ama-assn.org/go/cpt", "code": cpt_code}
+            ]
+        if type_concept:
+            resource["type"] = [type_concept]
+
         reason = attrs.get("reason")
         if reason:
             resource["reasonCode"] = [{"text": reason}]
         date_val = attrs.get("date")
         if date_val:
             resource["period"] = {"start": date_val}
+        if provider:
+            resource["participant"] = [{"individual": {"display": provider}}]
+        facility = _first_attr(
+            attrs, ("facility", "medical_center", "location", "service_provider", "organization")
+        )
+        if facility:
+            resource["serviceProvider"] = {"display": facility}
+
+        # Visit summary / chief complaint → FHIR human-readable narrative.
+        summary = _first_attr(attrs, _ENCOUNTER_SUMMARY_KEYS)
+        if summary:
+            resource["text"] = {"status": "additional", "div": _narrative_div(summary)}
 
     elif resource_type == "DiagnosticReport":
         category = attrs.get("category", "imaging")
@@ -333,6 +764,12 @@ def _build_fhir_resource(entity: ExtractedEntity, resource_type: str) -> dict:
         interpretation = attrs.get("interpretation")
         if interpretation:
             resource["conclusionCode"] = [{"text": interpretation}]
+        # B7 — performing lab / radiologist.
+        performer = provider or _first_attr(
+            attrs, ("lab", "performing_lab", "radiologist", "facility")
+        )
+        if performer:
+            resource["performer"] = [{"display": performer}]
 
     elif resource_type == "FamilyMemberHistory":
         relationship = attrs.get("relationship", "unknown")

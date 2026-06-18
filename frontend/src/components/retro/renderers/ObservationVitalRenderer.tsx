@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { DetailRow, StatusBadge, str, obj, arr, nested, formatDateTime } from "./shared";
+import { DetailRow, StatusBadge, str, obj, arr, nested, formatDateTime, performerNames } from "./shared";
 
 // ---------------------------------------------------------------------------
 // Local helpers (kept here so shared.tsx stays untouched)
@@ -85,6 +85,9 @@ export function ObservationVitalRenderer({ r }: { r: Record<string, unknown> }) 
   const bodySite =
     str(nested(r, "bodySite", "text")) || str(nested(r, "bodySite", "coding", "0", "display"));
 
+  // Who recorded it — preferring a display name, falling back to a readable reference.
+  const performers = performerNames(arr(r.performer));
+
   const notes = arr(r.note)
     .map((n) => str(obj(n).text))
     .filter(Boolean);
@@ -162,6 +165,7 @@ export function ObservationVitalRenderer({ r }: { r: Record<string, unknown> }) 
 
       <DetailRow label="Date" value={effective} />
       <DetailRow label="Body Site" value={bodySite} />
+      <DetailRow label={performers.length > 1 ? "Performers" : "Performer"} value={performers.join(", ")} />
 
       {status && (
         <div className="pt-1">

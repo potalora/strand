@@ -236,7 +236,7 @@ export default function RecordsPage() {
                 {records.map((r) => (
                   <tr key={r.id} className="clickable" onClick={() => setSelected(r.id)}>
                     <td>
-                      <RetroBadge recordType={r.record_type} />
+                      <RetroBadge recordType={r.record_type} category={r.category} />
                     </td>
                     <td className="desc">{recordTitle(r)}</td>
                     <td className="num">{fmtDate(r.effective_date)}</td>

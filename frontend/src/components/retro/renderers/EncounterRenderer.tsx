@@ -1,7 +1,8 @@
 "use client";
 
 import React from "react";
-import { DetailRow, StatusBadge, str, obj, arr, nested, formatDate } from "./shared";
+import { DetailRow, StatusBadge, str, obj, arr, nested, formatDate, performerNames } from "./shared";
+import { narrativeText } from "./narrative";
 
 const CLASS_BORDER_COLORS: Record<string, string> = {
   amb: "var(--theme-sage)",
@@ -96,14 +97,24 @@ export function EncounterRenderer({ r }: { r: Record<string, unknown> }) {
 
   const klass = classLabel(r);
 
-  // Locations and providers — list all, not just the first.
-  const locations = refDisplays(arr(r.location), "location");
-  const providers = refDisplays(arr(r.participant), "individual");
+  // Providers — list all, not just the first; decode a readable reference when
+  // no display is present.
+  const providers = performerNames(arr(r.participant), "individual");
 
   // Reasons — list all coded reasons.
   const reasons = conceptTexts(arr(r.reasonCode));
 
   const serviceProvider = str(nested(r, "serviceProvider", "display"));
+
+  // Locations (rooms/departments), minus any entry that just repeats the
+  // medical center promoted from a location.
+  const locations = refDisplays(arr(r.location), "location").filter(
+    (loc) => loc !== serviceProvider,
+  );
+
+  // Visit summary — AI-extracted encounters carry a synopsis in the FHIR
+  // Narrative (text.div). Rendered as plain prose; nothing shown when absent.
+  const summary = narrativeText(nested(r, "text", "div"));
 
   // Hospitalization details (inpatient stays).
   const admitSource =
@@ -187,10 +198,32 @@ export function EncounterRenderer({ r }: { r: Record<string, unknown> }) {
         </div>
       )}
 
+      {/* Provider leads — the most-asked-for visit detail. */}
       <DetailRow label={providers.length > 1 ? "Providers" : "Provider"} value={providers.join(", ")} />
+      <DetailRow label="Medical center" value={serviceProvider} />
       <DetailRow label={locations.length > 1 ? "Locations" : "Location"} value={locations.join(", ")} />
-      <DetailRow label="Service provider" value={serviceProvider} />
       <DetailRow label={reasons.length > 1 ? "Reasons" : "Reason"} value={reasons.join("; ")} />
+
+      {summary && (
+        <div className="flex flex-col gap-1 py-1">
+          <span
+            className="text-[11px] font-medium uppercase tracking-wide"
+            style={{ color: "var(--theme-text-muted)" }}
+          >
+            Summary
+          </span>
+          <p
+            className="text-sm px-3 py-2 rounded-md"
+            style={{
+              color: "var(--theme-text)",
+              backgroundColor: "var(--theme-bg-deep)",
+              lineHeight: 1.5,
+            }}
+          >
+            {summary}
+          </p>
+        </div>
+      )}
 
       <DetailRow label="Admit source" value={admitSource} />
       <DetailRow label="Discharge disposition" value={dischargeDisposition} />
