@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import {
   FolderUp,
@@ -11,6 +11,7 @@ import {
   Lock,
   RotateCcw,
   Trash2,
+  X,
 } from "lucide-react";
 import { useDirectoryUpload } from "@/hooks/useDirectoryUpload";
 import { getFilesFromDrop } from "@/lib/getFilesFromDrop";
@@ -19,8 +20,17 @@ import type {
   UploadResponse,
   UnstructuredUploadResponse,
   TriggerExtractionResponse,
-  ExtractionProgressResponse,
 } from "@/types/api";
+import {
+  deriveBatch,
+  formatStage,
+  isTerminalStatus,
+} from "@/lib/extraction-progress";
+import {
+  statusMapFromFiles,
+  useExtractionStore,
+  type TrackedFileInput,
+} from "@/stores/useExtractionStore";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
 
@@ -59,15 +69,19 @@ function formatFileSize(bytes: number): string {
 function statusDotColor(status: string): string {
   switch (status) {
     case "completed":
+    case "completed_with_merges":
+    case "awaiting_confirmation":
+    case "awaiting_review":
     case "parsed":
       return "var(--success)";
     case "processing":
     case "pending_extraction":
-    case "awaiting_confirmation":
+    case "dedup_scanning":
     case "pending":
       return "var(--primary)";
     case "failed":
       return "var(--danger)";
+    case "cancelled":
     case "duplicate_file":
     case "duplicate":
       return "var(--text-muted)";
@@ -179,21 +193,26 @@ export default function UploadPage() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
-  // --- Extraction trigger state (for unstructured files from ZIP uploads) ---
-  const [pendingExtractions, setPendingExtractions] = useState<
-    { upload_id: string; filename: string; status: string }[]
-  >([]);
+  // --- Current extraction batch (shared with the global status bar) ---
+  // The store is the single source of truth: starting a batch RESETS the prior
+  // one (so a new upload never carries stale rows), progress is polled scoped to
+  // THIS batch by the always-mounted GlobalExtractionStatusBar, and `dismissed`
+  // drives the terminal "all done" + Dismiss.
+  const batchIds = useExtractionStore((s) => s.batchIds);
+  const files = useExtractionStore((s) => s.files);
+  const progress = useExtractionStore((s) => s.progress);
+  const dismissed = useExtractionStore((s) => s.dismissed);
+  const cancelling = useExtractionStore((s) => s.cancelling);
+  const startBatch = useExtractionStore((s) => s.startBatch);
+  const mergeFileStatuses = useExtractionStore((s) => s.mergeFileStatuses);
+  const markTriggered = useExtractionStore((s) => s.markTriggered);
+  const markCancelling = useExtractionStore((s) => s.markCancelling);
+  const dismissBatch = useExtractionStore((s) => s.dismiss);
+
+  // ZIP-extracted children that still need a manual Extract click.
   const [selectedForExtraction, setSelectedForExtraction] = useState<Set<string>>(
     new Set()
   );
-  const [extractionTriggered, setExtractionTriggered] = useState(false);
-  const [extractionStatuses, setExtractionStatuses] = useState<
-    Record<string, string>
-  >({});
-
-  // --- Extraction progress (replaces entity review) ---
-  const [extractionProgress, setExtractionProgress] = useState<ExtractionProgressResponse | null>(null);
-  const progressPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // --- Directory upload (client-side zipping) ---
   const {
@@ -236,6 +255,13 @@ export default function UploadPage() {
     void fetchHistory();
   }, [historyOpen, historyLoaded, fetchHistory]);
 
+  // When the batch reaches a terminal state, refresh history so rows show final
+  // status/record counts instead of the stale pending snapshot.
+  const batch = deriveBatch(progress, statusMapFromFiles(files));
+  useEffect(() => {
+    if (batch.allTerminal) setHistoryLoaded(false);
+  }, [batch.allTerminal]);
+
   // --- Delete an upload (cascade soft-deletes its records server-side) ---
   const performDeleteUpload = useCallback(
     async (id: string) => {
@@ -257,70 +283,6 @@ export default function UploadPage() {
     },
     [fetchHistory]
   );
-
-  // --- Poll for extraction progress ---
-  const startProgressPolling = useCallback(() => {
-    // Clear any existing poll
-    if (progressPollRef.current) clearInterval(progressPollRef.current);
-
-    const poll = async () => {
-      try {
-        const data = await api.get<ExtractionProgressResponse>(
-          "/upload/extraction-progress"
-        );
-        setExtractionProgress(data);
-
-        // Also refresh each file's live status so the per-row "unstructured
-        // files detected" table tracks reality through completion. The aggregate
-        // bar above moves on its own counts; without this merge the rows stayed
-        // frozen at their trigger-time status (e.g. "processing") forever. Keyed
-        // by upload id (`f.id`), which matches `pendingExtractions[].upload_id`.
-        try {
-          const pending = await api.get<{
-            files: { id: string; ingestion_status: string }[];
-          }>(
-            "/upload/pending-extraction?statuses=pending_extraction,processing,completed,failed,awaiting_confirmation,awaiting_review,completed_with_merges,dedup_scanning"
-          );
-          if (pending.files?.length) {
-            setExtractionStatuses((prev) => {
-              const next = { ...prev };
-              for (const f of pending.files) {
-                if (f.id && f.ingestion_status) next[f.id] = f.ingestion_status;
-              }
-              return next;
-            });
-          }
-        } catch {
-          /* per-row refresh is best-effort; aggregate bar still updates */
-        }
-
-        // Stop polling when nothing is processing or pending
-        if (data.processing === 0 && data.pending === 0) {
-          if (progressPollRef.current) {
-            clearInterval(progressPollRef.current);
-            progressPollRef.current = null;
-          }
-          // Extraction finished — refresh upload history so rows show their
-          // final status/record counts instead of the stale pending snapshot
-          // captured right after upload.
-          setHistoryLoaded(false);
-        }
-      } catch {
-        /* continue polling */
-      }
-    };
-
-    // Fetch immediately, then poll
-    poll();
-    progressPollRef.current = setInterval(poll, 2000);
-  }, []);
-
-  // Cleanup polling on unmount
-  useEffect(() => {
-    return () => {
-      if (progressPollRef.current) clearInterval(progressPollRef.current);
-    };
-  }, []);
 
   // --- Drop handler ---
   const onDrop = useCallback((acceptedFiles: File[]) => {
@@ -371,6 +333,9 @@ export default function UploadPage() {
     setUploadResults([]);
 
     const results: UploadResult[] = [];
+    // Every unstructured upload ID produced by THIS action — direct files,
+    // batch files, and ZIP-extracted children — becomes the new batch.
+    const batchInputs: TrackedFileInput[] = [];
 
     // Separate structured vs unstructured
     const structured = selectedFiles.filter(isStructured);
@@ -384,13 +349,16 @@ export default function UploadPage() {
         const resp = await api.postForm<UploadResponse>("/upload", formData);
         results.push({ type: "structured", filename: file.name, response: resp });
         if (resp.unstructured_uploads && resp.unstructured_uploads.length > 0) {
-          setPendingExtractions((prev) => {
-            const existing = new Set(prev.map((p) => p.upload_id));
-            const newFiles = resp.unstructured_uploads!.filter(
-              (f) => !existing.has(f.upload_id)
-            );
-            return [...prev, ...newFiles];
-          });
+          for (const u of resp.unstructured_uploads) {
+            // ZIP children are NOT auto-claimed by the worker — they need a
+            // manual Extract, so mark needsTrigger.
+            batchInputs.push({
+              upload_id: u.upload_id,
+              filename: u.filename,
+              status: u.status || "pending_extraction",
+              needsTrigger: true,
+            });
+          }
         }
       } catch (err) {
         results.push({
@@ -401,7 +369,7 @@ export default function UploadPage() {
       }
     }
 
-    // Upload unstructured files
+    // Upload unstructured files (auto-claimed by the extraction worker).
     if (unstructured.length === 1) {
       const file = unstructured[0];
       try {
@@ -412,6 +380,12 @@ export default function UploadPage() {
           formData
         );
         results.push({ type: "unstructured", filename: file.name, response: resp });
+        batchInputs.push({
+          upload_id: resp.upload_id,
+          filename: file.name,
+          status: resp.status || "pending_extraction",
+          needsTrigger: false,
+        });
       } catch (err) {
         results.push({
           type: "unstructured",
@@ -432,6 +406,12 @@ export default function UploadPage() {
           const upload = resp.uploads[i];
           const filename = unstructured[i]?.name || `file-${i}`;
           results.push({ type: "unstructured", filename, response: upload });
+          batchInputs.push({
+            upload_id: upload.upload_id,
+            filename,
+            status: upload.status || "pending_extraction",
+            needsTrigger: false,
+          });
         }
       } catch (err) {
         for (const file of unstructured) {
@@ -444,68 +424,97 @@ export default function UploadPage() {
       }
     }
 
-    // Start progress polling if any unstructured files were uploaded
-    if (unstructured.length > 0) {
-      startProgressPolling();
+    // Replace any prior batch with this one (resets stale rows — §2a ii). The
+    // global status bar picks it up and starts polling scoped to these IDs.
+    if (batchInputs.length > 0) {
+      startBatch(batchInputs);
+      setSelectedForExtraction(new Set());
     }
 
     setUploadResults(results);
     setSelectedFiles([]);
     setUploading(false);
     setHistoryLoaded(false);
-  }, [selectedFiles, startProgressPolling]);
+  }, [selectedFiles, startBatch]);
 
-  // --- Extraction trigger handlers ---
+  // --- Trigger extraction for the selected ZIP children ---
   const handleTriggerExtraction = useCallback(async () => {
     if (selectedForExtraction.size === 0) return;
-    setExtractionTriggered(true);
-
     const ids = Array.from(selectedForExtraction);
-
+    // Optimistically reflect the trigger; polling refines from here.
+    markTriggered(ids);
+    mergeFileStatuses(ids.map((id) => ({ id, ingestion_status: "processing" })));
     try {
       const resp = await api.post<TriggerExtractionResponse>(
         "/upload/trigger-extraction",
         { upload_ids: ids }
       );
-
-      const statuses: Record<string, string> = {};
-      for (const r of resp.results) {
-        statuses[r.upload_id] = r.status;
-      }
-      setExtractionStatuses(statuses);
-
-      // Start polling for progress
-      startProgressPolling();
+      mergeFileStatuses(
+        resp.results.map((r) => ({ id: r.upload_id, ingestion_status: r.status }))
+      );
     } catch {
-      setExtractionTriggered(false);
+      /* the file stays tracked; the next poll reflects reality */
     }
-  }, [selectedForExtraction, startProgressPolling]);
+  }, [selectedForExtraction, markTriggered, mergeFileStatuses]);
 
+  // --- Cancel in-flight extractions ---
+  const handleCancel = useCallback(
+    async (ids: string[]) => {
+      if (ids.length === 0) return;
+      markCancelling(ids);
+      try {
+        await api.cancelExtraction(ids);
+      } catch {
+        /* the file stays in flight; next poll reflects reality */
+      }
+    },
+    [markCancelling]
+  );
+
+  // --- Retry failed files (re-batches them so the bar tracks the retry) ---
   const handleRetryFailed = useCallback(async () => {
     try {
       const resp = await api.get<{
         files: { id: string; filename: string }[];
       }>("/upload/pending-extraction?statuses=failed");
-
       if (resp.files.length === 0) return;
-
-      const ids = resp.files.map((f) => f.id);
-      await api.post<TriggerExtractionResponse>(
-        "/upload/trigger-extraction",
-        { upload_ids: ids }
-      );
-      startProgressPolling();
+      const inputs: TrackedFileInput[] = resp.files.map((f) => ({
+        upload_id: f.id,
+        filename: f.filename,
+        status: "processing",
+        needsTrigger: false,
+      }));
+      await api.post<TriggerExtractionResponse>("/upload/trigger-extraction", {
+        upload_ids: inputs.map((f) => f.upload_id),
+      });
+      startBatch(inputs);
     } catch {
       /* silently fail */
     }
-  }, [startProgressPolling]);
+  }, [startBatch]);
 
-  const handleDismissExtractionPanel = useCallback(() => {
-    setPendingExtractions([]);
-    setSelectedForExtraction(new Set());
-    setExtractionTriggered(false);
-    setExtractionStatuses({});
-  }, []);
+  // --- Retry / extract a single history row ---
+  const handleHistoryExtract = useCallback(
+    async (upload: UploadHistoryItem) => {
+      try {
+        await api.post<TriggerExtractionResponse>("/upload/trigger-extraction", {
+          upload_ids: [upload.id],
+        });
+        startBatch([
+          {
+            upload_id: upload.id,
+            filename: upload.filename,
+            status: "processing",
+            needsTrigger: false,
+          },
+        ]);
+        setHistoryLoaded(false);
+      } catch {
+        /* silently fail */
+      }
+    },
+    [startBatch]
+  );
 
   const toggleExtractionSelection = useCallback((uploadId: string) => {
     setSelectedForExtraction((prev) => {
@@ -515,16 +524,6 @@ export default function UploadPage() {
       return next;
     });
   }, []);
-
-  const toggleSelectAllExtraction = useCallback(() => {
-    if (selectedForExtraction.size === pendingExtractions.length) {
-      setSelectedForExtraction(new Set());
-    } else {
-      setSelectedForExtraction(
-        new Set(pendingExtractions.map((p) => p.upload_id))
-      );
-    }
-  }, [pendingExtractions, selectedForExtraction]);
 
   // --- Directory drop handler (intercepts before react-dropzone) ---
   const handleDropCapture = useCallback(
@@ -544,18 +543,33 @@ export default function UploadPage() {
   const structuredCount = selectedFiles.filter(isStructured).length;
   const unstructuredCount = selectedFiles.filter(isUnstructured).length;
 
-  // --- Progress bar helpers ---
-  const progressPercent = extractionProgress && extractionProgress.total > 0
-    ? Math.round(((extractionProgress.completed + extractionProgress.failed) / extractionProgress.total) * 100)
-    : 0;
-  // Show the progress card whenever we have extraction data with files, and
-  // keep it visible through completion (processing 0 → "Extraction complete")
-  // until the user dismisses it (Dismiss nulls extractionProgress). Gating on
-  // `processing > 0` alone made the card vanish on completion for directly
-  // uploaded files, so the "Extraction complete · N records created" summary
-  // was never shown.
-  const showProgress = !!extractionProgress && extractionProgress.total > 0;
-  const allDone = extractionProgress && extractionProgress.processing === 0 && extractionProgress.total > 0;
+  // --- Batch-derived view state ---
+  const fileList = batchIds.map((id) => files[id]).filter(Boolean);
+  // ZIP children still awaiting a manual Extract.
+  const triggerFiles = fileList.filter(
+    (f) => f.needsTrigger && !f.triggered && !isTerminalStatus(f.status)
+  );
+  // Files already in (or done with) the extraction pipeline.
+  const pipelineFiles = fileList.filter((f) => !f.needsTrigger || f.triggered);
+  const showTriggerPanel = !dismissed && triggerFiles.length > 0;
+  const showProgressCard =
+    !dismissed &&
+    batchIds.length > 0 &&
+    (progress !== null || pipelineFiles.length > 0);
+  const inFlight = pipelineFiles.filter(
+    (f) => !isTerminalStatus(f.status) && !cancelling.includes(f.upload_id)
+  );
+
+  const allTriggerSelected =
+    triggerFiles.length > 0 &&
+    triggerFiles.every((f) => selectedForExtraction.has(f.upload_id));
+  const toggleSelectAllExtraction = useCallback(() => {
+    if (allTriggerSelected) {
+      setSelectedForExtraction(new Set());
+    } else {
+      setSelectedForExtraction(new Set(triggerFiles.map((f) => f.upload_id)));
+    }
+  }, [allTriggerSelected, triggerFiles]);
 
   // --- Render ---
   return (
@@ -836,18 +850,20 @@ export default function UploadPage() {
       )}
 
       {/* ==========================================
-          EXTRACTION PROGRESS BAR
+          EXTRACTION PROGRESS / SUMMARY (scoped to the current batch)
           ========================================== */}
-      {showProgress && extractionProgress && (
+      {showProgressCard && (
         <div className="card-surface pad">
           <div className="card-h">
             <h3 className="sec-title">
-              {extractionProgress.processing > 0
-                ? "Extracting clinical entities"
-                : "Extraction complete"}
+              {batch.allTerminal
+                ? batch.failed > 0
+                  ? "Extraction finished with errors"
+                  : "Extraction complete"
+                : "Extracting clinical entities"}
             </h3>
             <span className="muted mono" style={{ fontSize: 12 }}>
-              {extractionProgress.records_created} records created
+              {batch.recordsCreated} record{batch.recordsCreated === 1 ? "" : "s"} created
             </span>
           </div>
 
@@ -858,14 +874,16 @@ export default function UploadPage() {
                 className="mono"
                 style={{
                   fontSize: 13,
-                  color:
-                    extractionProgress.processing > 0
-                      ? "var(--primary)"
-                      : "var(--success)",
+                  color: batch.allTerminal
+                    ? batch.failed > 0
+                      ? "var(--danger)"
+                      : "var(--success)"
+                    : "var(--primary)",
                 }}
               >
-                {extractionProgress.completed + extractionProgress.failed} of{" "}
-                {extractionProgress.total} files processed
+                {progress === null
+                  ? "Preparing extraction…"
+                  : `${batch.done} of ${batch.total} file${batch.total === 1 ? "" : "s"} processed`}
               </span>
             </div>
 
@@ -873,88 +891,154 @@ export default function UploadPage() {
             <div className="bar">
               <i
                 style={{
-                  width: `${progressPercent}%`,
+                  width: `${batch.percent}%`,
                   background:
-                    allDone && extractionProgress.failed === 0
+                    batch.allTerminal && batch.failed === 0
                       ? "var(--success)"
-                      : "var(--primary)",
+                      : batch.failed > 0 && batch.allTerminal
+                        ? "var(--danger)"
+                        : "var(--primary)",
                 }}
               />
             </div>
 
             {/* Status breakdown */}
             <div className="reasons">
-              {extractionProgress.completed > 0 && (
+              {batch.completed > 0 && (
                 <span className="tag">
                   <span className="tdot" style={{ background: "var(--success)" }} />
-                  {extractionProgress.completed} completed
+                  {batch.completed} completed
                 </span>
               )}
-              {extractionProgress.processing > 0 && (
+              {batch.processing > 0 && (
                 <span className="tag">
                   <span className="tdot" style={{ background: "var(--primary)" }} />
-                  {extractionProgress.processing} processing
+                  {batch.processing} processing
                 </span>
               )}
-              {extractionProgress.failed > 0 && (
+              {batch.failed > 0 && (
                 <span className="tag">
                   <span className="tdot" style={{ background: "var(--danger)" }} />
-                  {extractionProgress.failed} failed
+                  {batch.failed} failed
                 </span>
               )}
-              {extractionProgress.pending > 0 && (
+              {batch.cancelled > 0 && (
                 <span className="tag">
                   <span className="tdot" style={{ background: "var(--text-muted)" }} />
-                  {extractionProgress.pending} pending
+                  {batch.cancelled} cancelled
+                </span>
+              )}
+              {batch.pending > 0 && (
+                <span className="tag">
+                  <span className="tdot" style={{ background: "var(--text-muted)" }} />
+                  {batch.pending} pending
                 </span>
               )}
             </div>
 
-            {/* Retry button when there are failed files and nothing processing */}
-            {allDone && extractionProgress.failed > 0 && (
-              <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-                <button
-                  className="btn ghost sm"
-                  onClick={() => {
-                    setExtractionProgress(null);
-                    setExtractionTriggered(false);
-                  }}
-                >
-                  Dismiss
-                </button>
-                <button className="btn sm" onClick={handleRetryFailed}>
-                  Retry {extractionProgress.failed} failed
-                </button>
+            {/* Per-file rows with live status + section progress + cancel */}
+            {pipelineFiles.length > 0 && (
+              <div className="tablewrap">
+                <table className="rtable">
+                  <thead>
+                    <tr>
+                      <th>File</th>
+                      <th>Status</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pipelineFiles.map((f) => {
+                      const isCancelling = cancelling.includes(f.upload_id);
+                      const terminal = isTerminalStatus(f.status);
+                      const stage = formatStage(f.progress_stage, f.progress_detail);
+                      const shownStatus = isCancelling ? "cancelled" : f.status;
+                      return (
+                        <tr key={f.upload_id}>
+                          <td className="desc">
+                            <span
+                              style={{
+                                maxWidth: 280,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                                display: "inline-block",
+                              }}
+                              title={f.filename}
+                            >
+                              {f.filename}
+                            </span>
+                            {stage && !terminal && !isCancelling && (
+                              <div className="muted mono" style={{ fontSize: 11, marginTop: 3 }}>
+                                {stage}
+                              </div>
+                            )}
+                          </td>
+                          <td>
+                            <span className="tag">
+                              <span
+                                className="tdot"
+                                style={{ background: statusDotColor(shownStatus) }}
+                              />
+                              {isCancelling ? "cancelling…" : statusLabel(f.status)}
+                            </span>
+                          </td>
+                          <td>
+                            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                              {!terminal && !isCancelling && (
+                                <button
+                                  className="row-del"
+                                  title={`Cancel ${f.filename}`}
+                                  aria-label={`Cancel ${f.filename}`}
+                                  onClick={() => handleCancel([f.upload_id])}
+                                >
+                                  <X size={15} />
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
             )}
 
-            {/* Dismiss when all done with no failures */}
-            {allDone && extractionProgress.failed === 0 && (
-              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            {/* Actions */}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              {inFlight.length > 0 && (
                 <button
                   className="btn ghost sm"
-                  onClick={() => {
-                    setExtractionProgress(null);
-                    setExtractionTriggered(false);
-                  }}
+                  onClick={() => handleCancel(inFlight.map((f) => f.upload_id))}
                 >
+                  Cancel all
+                </button>
+              )}
+              {batch.allTerminal && (
+                <button className="btn ghost sm" onClick={dismissBatch}>
                   Dismiss
                 </button>
-              </div>
-            )}
+              )}
+              {batch.allTerminal && batch.failed > 0 && (
+                <button className="btn sm" onClick={handleRetryFailed}>
+                  Retry {batch.failed} failed
+                </button>
+              )}
+            </div>
           </div>
         </div>
       )}
 
       {/* ==========================================
-          EXTRACTION TRIGGER PANEL
+          EXTRACTION TRIGGER PANEL (ZIP children awaiting Extract)
           ========================================== */}
-      {pendingExtractions.length > 0 && (
+      {showTriggerPanel && (
         <div className="card-surface pad">
           <div style={{ marginBottom: 16 }}>
             <h3 className="sec-title">
-              {pendingExtractions.length} unstructured file
-              {pendingExtractions.length !== 1 ? "s" : ""} detected
+              {triggerFiles.length} unstructured file
+              {triggerFiles.length !== 1 ? "s" : ""} detected
             </h3>
             <p className="muted" style={{ fontSize: 12.5, margin: "4px 0 0" }}>
               Text extraction is required before clinical entities can be added to the record.
@@ -968,12 +1052,8 @@ export default function UploadPage() {
                   <th style={{ width: 32 }}>
                     <input
                       type="checkbox"
-                      checked={
-                        selectedForExtraction.size === pendingExtractions.length &&
-                        pendingExtractions.length > 0
-                      }
+                      checked={allTriggerSelected}
                       onChange={toggleSelectAllExtraction}
-                      disabled={extractionTriggered}
                       style={{ accentColor: "var(--primary)" }}
                     />
                   </th>
@@ -983,10 +1063,8 @@ export default function UploadPage() {
                 </tr>
               </thead>
               <tbody>
-                {pendingExtractions.map((file) => {
+                {triggerFiles.map((file) => {
                   const ext = file.filename.split(".").pop()?.toLowerCase() || "";
-                  const currentStatus =
-                    extractionStatuses[file.upload_id] || file.status;
                   return (
                     <tr key={file.upload_id}>
                       <td>
@@ -994,7 +1072,6 @@ export default function UploadPage() {
                           type="checkbox"
                           checked={selectedForExtraction.has(file.upload_id)}
                           onChange={() => toggleExtractionSelection(file.upload_id)}
-                          disabled={extractionTriggered}
                           style={{ accentColor: "var(--primary)" }}
                         />
                       </td>
@@ -1020,9 +1097,9 @@ export default function UploadPage() {
                         <span className="tag">
                           <span
                             className="tdot"
-                            style={{ background: statusDotColor(currentStatus) }}
+                            style={{ background: statusDotColor(file.status) }}
                           />
-                          {currentStatus}
+                          {statusLabel(file.status)}
                         </span>
                       </td>
                     </tr>
@@ -1041,20 +1118,19 @@ export default function UploadPage() {
             }}
           >
             <span className="muted" style={{ fontSize: 12.5 }}>
-              {selectedForExtraction.size} of {pendingExtractions.length} selected
+              {selectedForExtraction.size} of {triggerFiles.length} selected
             </span>
             <div style={{ display: "flex", gap: 8 }}>
-              <button className="btn ghost sm" onClick={handleDismissExtractionPanel}>
+              <button className="btn ghost sm" onClick={dismissBatch}>
                 Do later
               </button>
               <button
                 className="btn sm"
                 onClick={handleTriggerExtraction}
-                disabled={selectedForExtraction.size === 0 || extractionTriggered}
+                disabled={selectedForExtraction.size === 0}
               >
-                {extractionTriggered
-                  ? "Extracting…"
-                  : `Extract ${selectedForExtraction.size} file${selectedForExtraction.size !== 1 ? "s" : ""}`}
+                Extract {selectedForExtraction.size} file
+                {selectedForExtraction.size !== 1 ? "s" : ""}
               </button>
             </div>
           </div>
@@ -1177,17 +1253,9 @@ export default function UploadPage() {
                                 upload.ingestion_status === "processing") && (
                                 <button
                                   className="btn ghost sm"
-                                  onClick={async (e: React.MouseEvent) => {
+                                  onClick={(e: React.MouseEvent) => {
                                     e.stopPropagation();
-                                    try {
-                                      await api.post<TriggerExtractionResponse>(
-                                        "/upload/trigger-extraction",
-                                        { upload_ids: [upload.id] }
-                                      );
-                                      setHistoryLoaded(false);
-                                    } catch {
-                                      // Silently fail
-                                    }
+                                    void handleHistoryExtract(upload);
                                   }}
                                 >
                                   <RotateCcw size={13} />

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Lock } from "lucide-react";
+import { Lock, UserRound } from "lucide-react";
 import { api } from "@/lib/api";
 import type { TimelineResponse, TimelineEvent, UserResponse } from "@/types/api";
 import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
@@ -160,10 +160,23 @@ export default function TimelinePage() {
                       <span className="tl-rail" style={{ background: colors.dot }} />
                       <span className="tl-main">
                         <span className="tl-top">
-                          <RetroBadge recordType={r.record_type} />
+                          <RetroBadge recordType={r.record_type} category={r.category} />
                           <span className="tl-title">{r.display_text}</span>
                         </span>
                         {r.code_display && <span className="tl-sub">{r.code_display}</span>}
+                        {r.provider && (
+                          <span
+                            className="tl-sub tl-provider"
+                            style={{ display: "flex", alignItems: "center", gap: 5 }}
+                          >
+                            <UserRound
+                              size={12}
+                              strokeWidth={1.9}
+                              style={{ opacity: 0.65, flexShrink: 0 }}
+                            />
+                            <span className="truncate">{r.provider}</span>
+                          </span>
+                        )}
                       </span>
                       <span className="tl-date">
                         {fmtShort(r.effective_date)}

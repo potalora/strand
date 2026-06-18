@@ -1,4 +1,9 @@
 import { useAuthStore } from "@/stores/useAuthStore";
+import type { ExtractionProgressResponse } from "@/types/api";
+import type {
+  CancelExtractionResponse,
+  ExtractionFileStatus,
+} from "@/types/upload";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
 
@@ -186,6 +191,49 @@ class ApiClient {
 
   async delete<T>(endpoint: string, token?: string): Promise<T> {
     return this.request<T>(endpoint, { method: "DELETE", token });
+  }
+
+  // --- Extraction progress / control (session §2a iii–iv) ---
+
+  /**
+   * Scoped extraction progress. Pass the current batch's upload IDs to read
+   * "1 of 1" instead of the user-global "84 of 85". With no IDs the endpoint
+   * falls back to counting all unstructured files (legacy behavior).
+   */
+  async getExtractionProgress(
+    uploadIds?: string[]
+  ): Promise<ExtractionProgressResponse> {
+    const qs =
+      uploadIds && uploadIds.length
+        ? `?ids=${encodeURIComponent(uploadIds.join(","))}`
+        : "";
+    return this.get<ExtractionProgressResponse>(
+      `/upload/extraction-progress${qs}`
+    );
+  }
+
+  /**
+   * Per-file status for a batch (filtered client-side to the batch IDs). Carries
+   * optional `progress_stage` / `progress_detail` for section-level progress.
+   */
+  async getExtractionFileStatuses(
+    statuses: string[]
+  ): Promise<{ files: ExtractionFileStatus[]; total: number }> {
+    const qs = statuses.length
+      ? `?statuses=${encodeURIComponent(statuses.join(","))}`
+      : "";
+    return this.get<{ files: ExtractionFileStatus[]; total: number }>(
+      `/upload/pending-extraction${qs}`
+    );
+  }
+
+  /** Cancel in-flight extractions; the worker stops and marks them `cancelled`. */
+  async cancelExtraction(
+    uploadIds: string[]
+  ): Promise<CancelExtractionResponse> {
+    return this.post<CancelExtractionResponse>("/upload/cancel", {
+      upload_ids: uploadIds,
+    });
   }
 }
 

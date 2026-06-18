@@ -24,6 +24,9 @@ class UploadStatusResponse(BaseModel):
     ingestion_errors: list[Any] = []
     processing_started_at: datetime | None = None
     processing_completed_at: datetime | None = None
+    # Section-level extraction progress (unstructured pipeline).
+    progress_stage: str | None = None
+    progress_detail: dict | None = None
 
 
 class UploadHistoryItem(BaseModel):
@@ -87,6 +90,18 @@ class PendingExtractionFile(BaseModel):
     file_size_bytes: int | None = None
     created_at: str | None = None
     ingestion_status: str | None = None
+    # Section-level extraction progress (unstructured pipeline).
+    progress_stage: str | None = None
+    progress_detail: dict | None = None
+
+
+class CancelExtractionRequest(BaseModel):
+    upload_ids: list[str]
+
+
+class CancelExtractionResponse(BaseModel):
+    cancelled: list[str]
+    skipped: list[str]
 
 
 class TriggerExtractionResult(BaseModel):

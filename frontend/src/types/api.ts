@@ -56,6 +56,10 @@ export interface TimelineEvent {
   effective_date: string | null;
   code_display: string | null;
   category: string[] | null;
+  // Human-readable provider/performer, server-derived from the record's
+  // fhir_resource (Encounter.participant / Observation.performer /
+  // Procedure.performer). Null when the record carries none.
+  provider?: string | null;
 }
 
 export interface TimelineResponse {

@@ -225,6 +225,8 @@ from app.models.record import HealthRecord
 from app.models.uploaded_file import UploadedFile
 from app.schemas.upload import (
     BatchUploadResponse,
+    CancelExtractionRequest,
+    CancelExtractionResponse,
     ConfirmExtractionRequest,
     ExtractedEntitySchema,
     ExtractionResultResponse,
@@ -234,6 +236,20 @@ from app.schemas.upload import (
     UploadResponse,
     UploadStatusResponse,
 )
+
+# Statuses that count as "done" for batch progress. ``cancelled`` is terminal
+# (user-initiated), so it is folded into the completed/terminal bucket — never
+# left in pending/processing — so a progress bar can reach 100%.
+_PROGRESS_DONE_STATUSES = [
+    "completed",
+    "awaiting_confirmation",
+    "awaiting_review",
+    "completed_with_merges",
+    "cancelled",
+]
+
+# A file may only be cancelled while extraction is queued or actively running.
+_CANCELLABLE_STATUSES = {"pending_extraction", "processing"}
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/upload", tags=["upload"])
@@ -451,6 +467,8 @@ async def get_pending_extractions(
                 file_size_bytes=f.file_size_bytes,
                 created_at=f.created_at.isoformat() if f.created_at else None,
                 ingestion_status=f.ingestion_status,
+                progress_stage=f.progress_stage,
+                progress_detail=f.progress_detail,
             ).model_dump()
             for f in files
         ],
@@ -460,23 +478,30 @@ async def get_pending_extractions(
 
 @router.get("/extraction-progress")
 async def extraction_progress(
+    ids: str | None = None,
     user_id: UUID = Depends(get_authenticated_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Get extraction progress counts for the user's unstructured files."""
+    """Get extraction progress counts for the user's unstructured files.
+
+    When ``ids`` (comma-separated upload UUIDs) is provided, the counts are
+    scoped to just those uploads — so a single-file upload reads "1 of 1", not
+    "84 of 85" across the whole history. Still user-scoped. The ``cancelled``
+    terminal status is folded into ``completed`` so the bar can reach 100%.
+    """
     from sqlalchemy import func, case
 
-    result = await db.execute(
+    query = (
         select(
             func.count().label("total"),
-            func.count().filter(UploadedFile.ingestion_status.in_(["completed", "awaiting_confirmation", "awaiting_review", "completed_with_merges"])).label("completed"),
+            func.count().filter(UploadedFile.ingestion_status.in_(_PROGRESS_DONE_STATUSES)).label("completed"),
             func.count().filter(UploadedFile.ingestion_status == "processing").label("processing"),
             func.count().filter(UploadedFile.ingestion_status == "failed").label("failed"),
             func.count().filter(UploadedFile.ingestion_status == "pending_extraction").label("pending"),
             func.coalesce(
                 func.sum(
                     case(
-                        (UploadedFile.ingestion_status.in_(["completed", "awaiting_confirmation", "awaiting_review", "completed_with_merges"]), UploadedFile.record_count),
+                        (UploadedFile.ingestion_status.in_(_PROGRESS_DONE_STATUSES), UploadedFile.record_count),
                         else_=0,
                     )
                 ),
@@ -489,7 +514,21 @@ async def extraction_progress(
         # inflate the progress denominator ("1 of 2 processed" when 1 is a dup).
         .where(UploadedFile.ingestion_status != "duplicate_file")
     )
-    row = result.one()
+
+    if ids is not None:
+        id_list: list[UUID] = []
+        for token in ids.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                id_list.append(UUID(token))
+            except ValueError:
+                continue  # ignore malformed ids rather than 500
+        # An explicit (possibly empty) id filter scopes to those uploads only.
+        query = query.where(UploadedFile.id.in_(id_list))
+
+    row = (await db.execute(query)).one()
 
     return {
         "total": row.total,
@@ -499,6 +538,63 @@ async def extraction_progress(
         "pending": row.pending,
         "records_created": row.records_created,
     }
+
+
+@router.post("/cancel", response_model=CancelExtractionResponse)
+async def cancel_extraction(
+    body: CancelExtractionRequest,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> CancelExtractionResponse:
+    """Request cancellation of in-flight / queued extractions.
+
+    Sets ``cancel_requested`` on the user's own files that are still
+    cancellable (queued or processing). The DB-polling worker checks the flag
+    between stages and aborts cleanly, marking the file ``cancelled``. Files
+    that are already terminal (or not owned) are returned in ``skipped``.
+    """
+    parsed: dict[str, UUID] = {}
+    for raw in body.upload_ids:
+        try:
+            parsed[raw] = UUID(raw)
+        except (ValueError, AttributeError):
+            parsed[raw] = None  # unparseable → always skipped
+
+    valid_uuids = [u for u in parsed.values() if u is not None]
+    owned: dict[UUID, UploadedFile] = {}
+    if valid_uuids:
+        result = await db.execute(
+            select(UploadedFile).where(
+                UploadedFile.id.in_(valid_uuids),
+                UploadedFile.user_id == user_id,
+            )
+        )
+        owned = {u.id: u for u in result.scalars().all()}
+
+    cancelled: list[str] = []
+    skipped: list[str] = []
+    for raw in body.upload_ids:
+        uid = parsed.get(raw)
+        upload = owned.get(uid) if uid is not None else None
+        if upload is not None and upload.ingestion_status in _CANCELLABLE_STATUSES:
+            upload.cancel_requested = True
+            cancelled.append(raw)
+        else:
+            skipped.append(raw)
+
+    if cancelled:
+        await db.commit()
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="upload.cancel",
+        resource_type="uploaded_file",
+        resource_id=None,
+        details={"cancelled": len(cancelled), "skipped": len(skipped)},
+    )
+
+    return CancelExtractionResponse(cancelled=cancelled, skipped=skipped)
 
 
 @router.post("/trigger-extraction")
@@ -605,6 +701,8 @@ async def get_upload_status(
         ingestion_errors=upload.ingestion_errors or [],
         processing_started_at=upload.processing_started_at,
         processing_completed_at=upload.processing_completed_at,
+        progress_stage=upload.progress_stage,
+        progress_detail=upload.progress_detail,
     )
 
 
@@ -733,11 +831,50 @@ async def _ensure_patient(db: AsyncSession, user_id: UUID) -> Patient:
     return patient
 
 
+async def _is_cancel_requested(db: AsyncSession, upload_id: UUID) -> bool:
+    """Re-read the ``cancel_requested`` flag from the DB (read-committed).
+
+    The cancel endpoint commits the flag on a different connection, so the
+    worker must re-query rather than trust its (possibly stale) in-memory row.
+    """
+    row = await db.execute(
+        text("SELECT cancel_requested FROM uploaded_files WHERE id = :id"),
+        {"id": upload_id},
+    )
+    return bool(row.scalar())
+
+
+async def _mark_cancelled(db: AsyncSession, upload: UploadedFile) -> None:
+    """Mark a file as cleanly cancelled (terminal). Rolls back any poisoned
+    session first so the terminal write always persists."""
+    try:
+        upload.ingestion_status = "cancelled"
+        upload.progress_stage = None
+        upload.processing_completed_at = datetime.now(timezone.utc)
+        await db.commit()
+    except Exception:
+        logger.exception("Failed to mark %s cancelled; retrying after rollback", upload.id)
+        await db.rollback()
+        await db.execute(
+            text(
+                "UPDATE uploaded_files SET ingestion_status = 'cancelled', "
+                "progress_stage = NULL, processing_completed_at = :now WHERE id = :id"
+            ),
+            {"now": datetime.now(timezone.utc), "id": upload.id},
+        )
+        await db.commit()
+
+
 async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID) -> None:
     """Background task: extract text then entities from an unstructured file.
 
     Uses section-aware extraction: Gemini parses document structure first,
     then LangExtract runs per-section (respecting the 2000-char buffer).
+
+    Cooperative cancel: ``cancel_requested`` is checked at the start and between
+    stages; when set the file is marked ``cancelled`` (terminal) and no further
+    work is done. Section-level progress is written to ``progress_stage`` /
+    ``progress_detail`` as the pipeline advances.
     """
     from app.services.extraction.text_extractor import extract_text, detect_file_type as _detect_file_type
     from app.services.extraction.text_extractor import FileType as _FileType
@@ -754,9 +891,22 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
         if not upload:
             return
 
+        # Cooperative cancel: if cancellation was requested before the worker
+        # got here, abort immediately without doing any extraction work.
+        if upload.cancel_requested:
+            await _mark_cancelled(db, upload)
+            return
+
         try:
+            from app.services.extraction.entity_validator import (
+                normalize_entity_text,
+                validate_entities,
+            )
+
             upload.processing_started_at = datetime.now(timezone.utc)
             upload.ingestion_status = "processing"
+            upload.progress_stage = "extracting_text"
+            upload.progress_detail = None
             await db.commit()
 
             sem = _get_gemini_semaphore()
@@ -770,7 +920,12 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
                     extracted_text, file_type = await extract_text(file_path, settings.gemini_api_key)
             text = extracted_text
             upload.extracted_text = text
+            upload.progress_stage = "scrubbing_phi"
             await db.commit()
+
+            if await _is_cancel_requested(db, upload_id):
+                await _mark_cancelled(db, upload)
+                return
 
             # Step 2: Scrub PHI before entity extraction — local, no semaphore.
             # Pass the user's known patient identifiers so their own name / MRN /
@@ -816,6 +971,10 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
             }
             await db.commit()
 
+            if await _is_cancel_requested(db, upload_id):
+                await _mark_cancelled(db, upload)
+                return
+
             # Step 4: Per-section entity extraction (with small-chunk batching)
             all_entities = []
             extraction_tasks = []
@@ -835,6 +994,11 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
             if current_batch:
                 extraction_tasks.append((current_batch, current_section))
 
+            section_total = len(extraction_tasks)
+            upload.progress_stage = "extracting_entities"
+            upload.progress_detail = {"section_index": 0, "section_total": section_total}
+            await db.commit()
+
             # Process sections concurrently (configurable)
             section_sem = asyncio.Semaphore(settings.section_extraction_concurrency)
 
@@ -846,8 +1010,35 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
                         )
                 return chunk_result, section_type
 
-            tasks = [extract_chunk(chunk, stype) for chunk, stype in extraction_tasks]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Use as_completed so we can advance section-level progress and check
+            # for a cancel request between sections without serializing the
+            # actual (concurrent) Gemini calls.
+            tasks = [
+                asyncio.create_task(extract_chunk(chunk, stype))
+                for chunk, stype in extraction_tasks
+            ]
+            results: list = []
+            done_count = 0
+            for fut in asyncio.as_completed(tasks):
+                try:
+                    results.append(await fut)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # surfaced to _collect_entities as a failure
+                    results.append(exc)
+                done_count += 1
+                upload.progress_detail = {
+                    "section_index": done_count,
+                    "section_total": section_total,
+                }
+                await db.commit()
+                if await _is_cancel_requested(db, upload_id):
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    await _mark_cancelled(db, upload)
+                    return
 
             collected, failed_chunks = _collect_entities(results, len(extraction_tasks))
             all_entities.extend(collected)
@@ -867,14 +1058,25 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
                     len(extraction_tasks),
                 )
 
-            # Deduplicate entities within the same document (same text + same type)
+            # Precision guards (A1-A5): drop/repair the false entities
+            # LangExtract invents (mentioned-not-performed procedures, value-only
+            # fragments, lifestyle-as-observation, drug-class abbreviations, PHI
+            # placeholders) BEFORE they become records.
+            all_entities = validate_entities(all_entities)
+
+            # Deduplicate entities within the same document. Normalize the text
+            # first (collapse whitespace, strip parenthetical/date variants,
+            # casefold) so near-duplicates like "Cystectomy (2020)" and
+            # "Cystectomy" collapse instead of producing the same record N times.
             seen = set()
             unique_entities = []
             for entity in all_entities:
-                key = (entity.entity_class, entity.text.strip().lower())
+                key = (entity.entity_class, normalize_entity_text(entity.text))
                 if key not in seen:
                     seen.add(key)
                     unique_entities.append(entity)
+
+            upload.progress_stage = "mapping_fhir"
 
             # Store entities on upload record
             upload.extraction_entities = [
@@ -896,6 +1098,7 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
             from app.services.extraction.entity_to_fhir import (
                 entity_to_health_record_dict,
                 resolve_document_date,
+                resolve_document_provider,
             )
 
             patient = await _ensure_patient(db, user_id)
@@ -906,6 +1109,10 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
             document_date = resolve_document_date(
                 unique_entities, parsed_doc.primary_visit_date
             )
+            # Note-level attending/ordering provider used as a fallback so AI
+            # encounters/observations/procedures get a participant/performer
+            # even when the individual entity carries no provider of its own (B2).
+            document_provider = resolve_document_provider(unique_entities)
 
             if patient:  # always true — _ensure_patient never returns None (defensive)
                 from app.services.ingestion.reextraction import soft_delete_prior_extracted
@@ -918,7 +1125,9 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
 
                 for entity in unique_entities:
                     record_dict = entity_to_health_record_dict(
-                        entity, user_id, patient.id, upload_id, document_date=document_date
+                        entity, user_id, patient.id, upload_id,
+                        document_date=document_date,
+                        document_provider=document_provider,
                     )
                     if record_dict is None:
                         continue
@@ -971,6 +1180,7 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
                 # Run dedup scan in background
                 upload.ingestion_status = "dedup_scanning"
                 upload.record_count = len(created_records)
+                upload.progress_stage = None
                 await db.commit()
 
                 from app.services.ingestion.coordinator import _run_dedup_background
@@ -981,6 +1191,7 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
                 # No patient found — fall back to manual confirmation
                 upload.ingestion_status = "awaiting_confirmation"
 
+            upload.progress_stage = None
             upload.processing_completed_at = datetime.now(timezone.utc)
             await db.commit()
 
@@ -1002,6 +1213,7 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
                 upload = result.scalar_one_or_none()
                 if upload is not None:
                     upload.ingestion_status = "failed"
+                    upload.progress_stage = None
                     upload.ingestion_errors = [
                         {
                             "error": "Processing failed. Please retry or contact support.",
@@ -1250,6 +1462,7 @@ async def confirm_extraction(
     from app.services.extraction.entity_to_fhir import (
         entity_to_health_record_dict,
         resolve_document_date,
+        resolve_document_provider,
     )
 
     patient_uuid = UUID(body.patient_id)
@@ -1276,6 +1489,8 @@ async def confirm_extraction(
     document_date = resolve_document_date(
         entities, (upload.document_metadata or {}).get("primary_visit_date")
     )
+    # Note-level provider fallback for records without their own provider (B2).
+    document_provider = resolve_document_provider(entities)
 
     for entity in entities:
         record_dict = entity_to_health_record_dict(
@@ -1284,6 +1499,7 @@ async def confirm_extraction(
             patient_id=patient_uuid,
             source_file_id=upload_id,
             document_date=document_date,
+            document_provider=document_provider,
         )
         if record_dict is None:
             continue

@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { DetailRow, StatusBadge, str, obj, arr, nested, formatDateTime } from "./shared";
+import { DetailRow, StatusBadge, str, obj, arr, nested, formatDateTime, performerNames } from "./shared";
 
 // ---------------------------------------------------------------------------
 // Local helpers (kept here so shared.tsx stays untouched)
@@ -50,6 +50,7 @@ export function ObservationSocialRenderer({ r }: { r: Record<string, unknown> })
 
   const effective = formatDateTime(r.effectiveDateTime ?? nested(r, "effectivePeriod", "start"));
   const status = str(r.status);
+  const performers = performerNames(arr(r.performer));
 
   // Components (e.g. pack-years, period of use) — verbatim from the source.
   const components = arr(r.component)
@@ -102,6 +103,7 @@ export function ObservationSocialRenderer({ r }: { r: Record<string, unknown> })
       )}
 
       <DetailRow label="Date" value={effective} />
+      <DetailRow label={performers.length > 1 ? "Performers" : "Performer"} value={performers.join(", ")} />
 
       {status && (
         <div className="pt-1">

@@ -39,11 +39,36 @@ class PatEncMapper(EpicMapper):
             "period": {"start": contact_date.isoformat()},
         }
 
+        # Visit type / title — gives the renderer a meaningful header beyond the
+        # bare class code (e.g. "Office Visit", "Telehealth", "Hospital Encounter").
+        enc_type = (
+            self.safe_get(row, "ENC_TYPE_C_NAME")
+            or self.safe_get(row, "APPT_PRC_ID_PRC_NAME")
+        )
+        if enc_type:
+            resource["type"] = [{"text": enc_type}]
+
         dept = self.safe_get(row, "DEPARTMENT_ID_EXTERNAL_NAME")
         if dept:
             resource["location"] = [{"location": {"display": dept}}]
 
-        provider = self.safe_get(row, "VISIT_PROV_ID_PROV_NAME")
+        # B6 — facility / managing organization (serviceProvider was 0%).
+        # Prefer an explicit facility/location-name column; fall back to the
+        # department name so the field is populated whenever any is available.
+        facility = (
+            self.safe_get(row, "LOC_ID_LOC_NAME")
+            or self.safe_get(row, "DEPARTMENT_ID_DEPARTMENT_NAME")
+            or dept
+        )
+        if facility:
+            resource["serviceProvider"] = {"display": facility}
+
+        # Provider — the visit provider, falling back to the PCP so an encounter
+        # without a named visit provider still surfaces a clinician.
+        provider = (
+            self.safe_get(row, "VISIT_PROV_ID_PROV_NAME")
+            or self.safe_get(row, "PCP_PROV_ID_PROV_NAME")
+        )
         title = self.safe_get(row, "VISIT_PROV_TITLE_NAME")
         if provider:
             display = f"{provider}, {title}" if title else provider
