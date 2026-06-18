@@ -82,6 +82,12 @@ Condition, Observation, MedicationRequest, MedicationStatement, AllergyIntoleran
 
 </details>
 
+## Coding and cleanup
+
+As records come in, MedTimeline tries to attach a standard code to each one: RxNorm for medications, ICD-10-CM for conditions, LOINC for the common labs. The vocabularies are bundled and matched locally, so no terminology lookups leave your machine. The medication list refreshes itself from RxNorm on startup and about once a week, and falls back to the copy committed in the repo when there's no network. SNOMED and CPT aren't included (they aren't freely redistributable), so procedures get a local label instead. Anything the vocabularies don't recognize stays uncoded rather than guessed.
+
+Extraction from documents also drops obvious noise before anything is stored: bare measurements like "2mg", procedures only mentioned in passing rather than performed, PHI placeholders left behind by the scrubber. The point is to keep the timeline made of real records, not fragments.
+
 ## AI modes
 
 MedTimeline organizes records and produces summaries. It never diagnoses, recommends treatment, or gives medical advice — and either way, records are de-identified before any model sees them. There are two ways to run it:
@@ -145,9 +151,10 @@ backend/
 │       ├── ingestion/       # coordinator, fhir_parser, epic_parser, cda_parser, xdm_parser,
 │       │                    # cda_dedup, bulk_inserter, epic_mappers/ (14)
 │       ├── ai/              # prompt_builder, summarizer, phi_scrubber, patient_phi, phi_ner
-│       ├── extraction/      # text_extractor, entity_extractor, section_parser, entity_to_fhir
+│       ├── extraction/      # text_extractor, entity_extractor, entity_validator, section_parser,
+│       │                    # entity_to_fhir, terminology (+ bundled terminology_data/)
 │       └── dedup/           # detector, orchestrator, llm_judge, field_merger
-├── tests/                   # ~57 files, ~697 tests
+├── tests/                   # ~69 files
 └── alembic/                 # migrations
 
 frontend/src/
@@ -174,9 +181,12 @@ cp .env.example .env
 
 # 3. backend
 cd backend && pip install -e ".[dev]"
+python -m spacy download en_core_web_md      # PHI name-redaction model
 alembic upgrade head
 DATABASE_URL=postgresql+asyncpg://localhost:5432/medtimeline_test alembic upgrade head
 uvicorn app.main:app --reload --port 8000
+# the medication terminology index refreshes on startup; to build it up front:
+# python scripts/build_terminology_index.py --refresh-live
 
 # 4. frontend
 cd frontend && npm install && npm run dev
@@ -187,13 +197,14 @@ cd frontend && npm install && npm run dev
 
 ```bash
 cd backend
-python -m pytest -m "not slow"        # 681 fast tests
-python -m pytest --run-slow            # all 697 (16 slow need GEMINI_API_KEY + real data)
+python -m pytest -m "not slow"        # ~1058 fast tests
+python -m pytest                       # everything — plain pytest includes the slow tests
+python -m pytest -m slow               # just the slow ones (need GEMINI_API_KEY + real data)
 python -m pytest tests/test_hipaa_compliance.py
 python -m pytest tests/fidelity/       # Epic / FHIR / CDA fidelity (skip without real fixtures)
 ```
 
-697 tests across 57 files. They run against `medtimeline_test`, auto-derived from `DATABASE_URL`. The slow ones call the real Gemini API; fidelity tests need real-data fixtures and skip when those are absent. A 120s per-test timeout backstops hangs in the fast suite; slow tests get a longer bound.
+The fast suite is ~1058 tests across ~69 files, run against `medtimeline_test` (auto-derived from `DATABASE_URL`). There's no `--run-slow` flag — plain `pytest` already runs the slow tests, which hit the real Gemini API, so `-m "not slow"` is what you want day to day. Fidelity tests need real-data fixtures and skip when those are absent. A 120s per-test timeout backstops hangs in the fast suite; slow tests get a longer bound.
 
 ## API
 
@@ -205,8 +216,8 @@ Full contract: [`docs/backend-handoff.md`](docs/backend-handoff.md)
 | **Records** | `GET /records` (`?status=` `?sort=` `?order=`) `/records/:id` `/records/search` `/records/series` `/records/export` `DELETE /records/:id` |
 | **Timeline** | `GET /timeline` |
 | **Dashboard** | `GET /dashboard/overview` `/labs` `/patients` `/sources` |
-| **Upload** | `POST /upload` `/upload/unstructured` `/unstructured-batch` `/trigger-extraction` `DELETE /upload/:id` |
-| **Upload status** | `GET /upload/:id/status` `/errors` `/extraction` `/history` `/pending-extraction` `/extraction-progress` |
+| **Upload** | `POST /upload` `/upload/unstructured` `/unstructured-batch` `/trigger-extraction` `/upload/cancel` `DELETE /upload/:id` |
+| **Upload status** | `GET /upload/:id/status` `/errors` `/extraction` `/history` `/pending-extraction` `/extraction-progress` (`?ids=` to scope to one batch) |
 | **Upload review** | `POST /upload/:id/confirm-extraction` `GET /upload/:id/review` `POST /review/resolve` `/undo-merge` |
 | **Dedup** | `GET /dedup/candidates` `POST /dedup/merge` `/dismiss` |
 | **AI Summary** | `POST /summary/build-prompt` `/generate` `/paste-response` `GET /summary/prompts` `/prompts/:id` `/responses` |
