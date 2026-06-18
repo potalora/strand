@@ -47,10 +47,13 @@ code against its source terminology — correctness matters more than coverage.
 """
 from __future__ import annotations
 
+import asyncio
 import gzip
+import importlib.util
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -133,6 +136,26 @@ _INDEX_FILES = {
 }
 _INDEX_CACHE: dict[str, dict[str, Coding]] = {}
 
+# Live, periodically-refreshed RxNorm medication index. Written under the
+# gitignored ``backend/data/`` tree so refreshes never dirty the tracked
+# baseline. Medication lookups prefer this when present; everything else (and
+# the first-clone / offline case) falls back to the committed baseline.
+_LIVE_MED_CACHE = Path(__file__).resolve().parents[3] / "data" / "terminology" / "medications.json.gz"
+# The offline build script (reused by the live refresh to rebuild medications).
+_BUILD_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "build_terminology_index.py"
+
+
+def medication_live_cache_path() -> Path:
+    """Path of the gitignored live medication index (may not exist yet)."""
+    return _LIVE_MED_CACHE
+
+
+def _resolve_index_path(category: str) -> Path:
+    """Resolve the on-disk index path, preferring the live cache for medications."""
+    if category == "medication" and _LIVE_MED_CACHE.exists():
+        return _LIVE_MED_CACHE
+    return _DATA_DIR / _INDEX_FILES[category]
+
 # Bare/abbreviated medication synonyms applied at load time as a runtime overlay
 # (so no index rebuild is needed). Each maps a human alias -> a canonical term
 # already present in the RxNorm medication index whose Coding is reused. The same
@@ -172,7 +195,7 @@ def _load_index(category: str) -> dict[str, Coding]:
     if cached is not None:
         return cached
     index: dict[str, Coding] = {}
-    path = _DATA_DIR / _INDEX_FILES[category]
+    path = _resolve_index_path(category)
     try:
         with gzip.open(path, "rt", encoding="utf-8") as fh:
             payload = json.load(fh)
@@ -193,6 +216,77 @@ def _load_index(category: str) -> dict[str, Coding]:
         _apply_medication_synonyms(index)
     _INDEX_CACHE[category] = index
     return index
+
+
+# --- Live medication-index refresh (RxNorm) --------------------------------
+# A periodic *bulk* refresh — NOT a per-lookup network call. Ingestion stays
+# fully offline; this only rebuilds the medications index occasionally so RxNorm
+# coverage stays current. Everything fails open: any error keeps the existing
+# index (live cache or committed baseline) in service.
+
+
+def _age_days(path: Path) -> float:
+    """Age of ``path`` in days from its mtime (raises if it doesn't exist)."""
+    return (time.time() - path.stat().st_mtime) / 86400.0
+
+
+def _load_build_module():
+    """Import the offline build script as a module (reuses its build logic)."""
+    spec = importlib.util.spec_from_file_location("_terminology_build", _BUILD_SCRIPT)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise ImportError(f"cannot load build script at {_BUILD_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _build_medication_cache(out_path: Path) -> None:
+    """Rebuild ONLY the medications index from RxNorm into ``out_path``.
+
+    Reuses the offline build script's ``build_medications`` (RxNav pull + curated
+    overlays). Network-bound; callers wrap this in fail-open handling.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _load_build_module().build_medications(offline=False, out_path=out_path)
+
+
+def refresh_medication_index(max_age_days: int = 7) -> bool:
+    """Refresh the live RxNorm medication index if missing/stale; fail-open.
+
+    No-ops (returns ``False``, no network) when the live cache exists and is
+    younger than ``max_age_days``. Otherwise rebuilds it from RxNorm, writes the
+    gitignored live cache, hot-swaps the in-memory index, and returns ``True``.
+    On ANY error (no connectivity, fetch/parse failure) it logs a warning, keeps
+    whatever index is already in service, and returns ``False`` — never raises.
+    """
+    try:
+        cache = _LIVE_MED_CACHE
+        if cache.exists() and _age_days(cache) < max_age_days:
+            return False
+        _build_medication_cache(cache)
+        _INDEX_CACHE.pop("medication", None)  # hot-swap on next lookup/load
+        _load_index("medication")
+        logger.info("medication index refreshed from RxNorm -> %s", cache)
+        return True
+    except Exception as exc:  # noqa: BLE001 — fail-open by design
+        logger.warning("medication index refresh skipped (keeping existing): %s", exc)
+        return False
+
+
+def schedule_medication_refresh(max_age_days: int = 7) -> "asyncio.Task":
+    """Schedule a NON-BLOCKING background medication refresh; return the task.
+
+    Runs the (blocking) refresh in a worker thread so the event loop / startup is
+    never blocked, and the staleness gate makes it a millisecond no-op most boots.
+    Errors are swallowed (defense in depth on top of the fail-open refresh).
+    """
+    async def _runner() -> None:
+        try:
+            await asyncio.to_thread(refresh_medication_index, max_age_days)
+        except Exception:  # noqa: BLE001 — never let a background refresh surface
+            logger.warning("background medication refresh raised", exc_info=True)
+
+    return asyncio.create_task(_runner())
 
 
 def _lookup(

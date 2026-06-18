@@ -440,7 +440,8 @@ def build_conditions() -> dict:
     return meta
 
 
-def build_medications(offline: bool) -> dict:
+def build_medications(offline: bool, out_path: Path | None = None) -> dict:
+    out_path = out_path or (DATA_DIR / "medications.json.gz")
     codes: dict[str, list] = {}
     index: dict[str, str] = {}
     rxnorm_count = 0
@@ -490,7 +491,7 @@ def build_medications(offline: bool) -> dict:
             "system": RXNORM_SYSTEM, "rxnorm_concepts": rxnorm_count,
             "supplements": len(SUPPLEMENT_ENTRIES)}
     print(f"  total: {len(codes)} codes, {len(index)} aliases")
-    _write_index(DATA_DIR / "medications.json.gz", codes, index, meta)
+    _write_index(out_path, codes, index, meta)
     return meta
 
 
@@ -612,7 +613,22 @@ def main() -> int:
                     help="skip all network calls (RxNorm index empty, LOINC unverified)")
     ap.add_argument("--only", choices=["conditions", "medications", "labs", "procedures"],
                     help="build only one category")
+    ap.add_argument("--refresh-live", action="store_true",
+                    help="refresh the gitignored LIVE medication cache from RxNorm "
+                         "(used at install/startup; never touches the committed baseline)")
     args = ap.parse_args()
+
+    if args.refresh_live:
+        # Delegate to the single source of truth for the live refresh (fail-open).
+        from app.services.extraction.terminology import (
+            medication_live_cache_path,
+            refresh_medication_index,
+        )
+        refreshed = refresh_medication_index(max_age_days=0)
+        print(f"live medication cache {'refreshed' if refreshed else 'unchanged/offline'}: "
+              f"{medication_live_cache_path()}")
+        return 0
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     metas: dict[str, dict] = {}
     if args.only in (None, "conditions"):
