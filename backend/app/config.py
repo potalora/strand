@@ -86,12 +86,6 @@ class Settings(BaseSettings):
     extraction_engine: str = "gemini"
     # WS-A: spans/sections below this confidence escalate to Gemini (hybrid).
     extraction_local_confidence_threshold: float = 0.6
-    # WS-B PHI engine. "legacy" = hand-rolled regex+NER layers; "presidio" =
-    # Microsoft Presidio analyzer with re-homed known-identity + eponym layers.
-    phi_engine: str = "legacy"
-    # WS-B: clinical LOCATION de-id pass (closes the city Safe Harbor gap) via a
-    # clinical model. Fails open, non-latching, warm-loaded. Off until validated.
-    phi_location_ner_enabled: bool = False
     # WS-C: high-threshold RapidFuzz fallback for terminology lookups. Default ON
     # — fires only after exact/token lookups miss, and requires BOTH token_set_ratio
     # AND char-level ratio >= 88 (subset-inflation guard) so a near-miss of nothing
