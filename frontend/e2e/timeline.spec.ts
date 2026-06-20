@@ -115,4 +115,64 @@ test.describe("Timeline page", () => {
 
     await expect(page.getByText("No events.")).toBeVisible({ timeout: 10_000 });
   });
+
+  test("rows render the inline metric strip from preview, and omit it when null", async ({
+    page,
+  }) => {
+    await page.route("**/api/v1/timeline**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          total: 2,
+          events: [
+            {
+              id: "11111111-1111-1111-1111-111111111111",
+              record_type: "observation",
+              display_text: "Vitamin D",
+              effective_date: "2026-02-28T00:00:00Z",
+              code_display: "Vitamin D",
+              category: ["laboratory"],
+              provider: null,
+              preview: {
+                value: "17",
+                unit: "ng/mL",
+                flag: "LOW",
+                emphasis: "notable",
+                gauge: { value: 17, low: 30, high: 100 },
+                facets: [],
+              },
+            },
+            {
+              id: "22222222-2222-2222-2222-222222222222",
+              record_type: "document",
+              display_text: "Visit note",
+              effective_date: "2026-02-27T00:00:00Z",
+              code_display: null,
+              category: ["document"],
+              provider: null,
+              preview: null,
+            },
+          ],
+        }),
+      })
+    );
+
+    await browserLogin(page, email, TEST_PASSWORD);
+    await page.goto("/timeline");
+
+    // Lab row: metric strip with mono value, neutral notable flag, and gauge.
+    const labCard = page.locator("button.tl-card", { hasText: "Vitamin D" });
+    await expect(labCard).toBeVisible({ timeout: 10_000 });
+    await expect(labCard.locator(".tl-ms-val")).toContainText("17");
+    await expect(
+      labCard.locator('.tl-ms-flag[data-emphasis="notable"]')
+    ).toHaveText("LOW");
+    await expect(labCard.locator(".tl-ms-gauge .gauge")).toBeVisible();
+
+    // Document row (preview null): no metric strip at all.
+    const docCard = page.locator("button.tl-card", { hasText: "Visit note" });
+    await expect(docCard).toBeVisible();
+    await expect(docCard.locator(".tl-ms")).toHaveCount(0);
+  });
 });
