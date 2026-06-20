@@ -11,6 +11,7 @@ from app.dependencies import get_authenticated_user_id
 from app.middleware.audit import log_audit_event
 from app.models.record import HealthRecord
 from app.schemas.timeline import TimelineEvent, TimelineResponse, TimelineStats
+from app.services.timeline_preview import build_timeline_preview
 from app.services.timeline_service import extract_provider_display
 
 router = APIRouter(prefix="/timeline", tags=["timeline"])
@@ -59,6 +60,7 @@ async def get_timeline(
             code_display=r.code_display,
             category=r.category,
             provider=extract_provider_display(r.fhir_resource, r.record_type),
+            preview=build_timeline_preview(r.fhir_resource, r.record_type),
         )
         for r in records
     ]

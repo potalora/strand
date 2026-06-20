@@ -108,6 +108,64 @@ async def test_timeline_excludes_records_without_date(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
+async def test_timeline_includes_scalar_preview(client: AsyncClient, db_session: AsyncSession):
+    """WS-T: events carry a server-computed scalar preview; records with nothing
+    to surface inline have preview=None."""
+    from datetime import datetime, timezone
+    from uuid import UUID, uuid4
+
+    from app.models.record import HealthRecord
+
+    headers, uid = await auth_headers(client)
+    patient = await create_test_patient(db_session, uid)
+
+    lab = HealthRecord(
+        id=uuid4(),
+        patient_id=patient.id,
+        user_id=UUID(uid),
+        record_type="observation",
+        fhir_resource_type="Observation",
+        fhir_resource={
+            "resourceType": "Observation",
+            "category": [{"coding": [{"code": "laboratory"}]}],
+            "valueQuantity": {"value": 17, "unit": "ng/mL"},
+            "interpretation": [{"coding": [{"code": "L"}]}],
+            "referenceRange": [{"low": {"value": 30}, "high": {"value": 100}}],
+        },
+        source_format="fhir_r4",
+        display_text="Vitamin D",
+        effective_date=datetime(2026, 2, 28, tzinfo=timezone.utc),
+    )
+    doc = HealthRecord(
+        id=uuid4(),
+        patient_id=patient.id,
+        user_id=UUID(uid),
+        record_type="document",
+        fhir_resource_type="DocumentReference",
+        fhir_resource={"resourceType": "DocumentReference"},
+        source_format="fhir_r4",
+        display_text="Visit note",
+        effective_date=datetime(2026, 2, 27, tzinfo=timezone.utc),
+    )
+    db_session.add_all([lab, doc])
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/timeline", headers=headers)
+    assert resp.status_code == 200
+    events = {e["display_text"]: e for e in resp.json()["events"]}
+
+    preview = events["Vitamin D"]["preview"]
+    assert preview is not None
+    assert preview["value"] == "17"
+    assert preview["unit"] == "ng/mL"
+    assert preview["flag"] == "LOW"
+    assert preview["emphasis"] == "notable"
+    assert preview["gauge"] == {"value": 17.0, "low": 30.0, "high": 100.0}
+
+    assert events["Visit note"]["preview"] is None
+
+
+@pytest.mark.asyncio
 async def test_timeline_stats(client: AsyncClient, db_session: AsyncSession):
     """GET /timeline/stats returns aggregated statistics."""
     headers, uid = await auth_headers(client)
