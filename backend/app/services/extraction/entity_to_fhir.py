@@ -11,6 +11,7 @@ from app.services.extraction import terminology
 from app.services.extraction.entity_extractor import ExtractedEntity
 from app.services.extraction.terminology import parse_dosage  # re-exported for callers/tests
 from app.services.ingestion.content_hash import content_hash
+from app.services.ingestion.fhir_validation import validate_and_log_fhir
 from app.utils.date_utils import parse_datetime
 
 __all__ = [
@@ -137,6 +138,10 @@ def entity_to_health_record_dict(
     fhir_resource = _build_fhir_resource(
         entity, fhir_resource_type, coding=coding, provider=provider
     )
+    # WS-D: log-only structural validation of the AI-built resource. ai_built=True
+    # so a partial resource is never failed/strict-rejected — it always ingests;
+    # fail-open/non-latching, never blocks.
+    validate_and_log_fhir(fhir_resource, record_type, ai_built=True)
     display_text = _build_display_text(entity)
 
     effective_date = _extract_effective_date(entity, document_date)

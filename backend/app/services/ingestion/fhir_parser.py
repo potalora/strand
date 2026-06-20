@@ -10,6 +10,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.ingestion.fhir_validation import validate_and_log_fhir
 from app.services.ingestion.idempotent_inserter import idempotent_insert_records
 
 logger = logging.getLogger(__name__)
@@ -479,6 +480,11 @@ def map_fhir_resource(resource: dict, ref_map: dict[str, str] | None = None) -> 
     effective_date = extract_effective_date(resource)
     effective_date_end = extract_effective_date_end(resource)
     display_text = build_display_text(resource, resource_type)
+
+    # WS-D: log-only structural validation of the mapped bundle resource.
+    # Fail-open/non-latching — never blocks ingestion (the resource is returned
+    # regardless of any drift signal).
+    validate_and_log_fhir(resource, record_type, ai_built=False)
 
     return {
         "record_type": record_type,
