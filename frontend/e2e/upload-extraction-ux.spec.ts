@@ -12,7 +12,8 @@ import { testEmail, TEST_PASSWORD } from "./helpers/test-data";
  * progress timeline without waiting on a live LLM extract.
  *
  *   (i)   terminal "all done" + a working Dismiss
- *   (ii)  a new upload RESETS the prior panel's rows
+ *   (ii)  a new upload while the prior is in-flight ACCUMULATES rows (WS-U; the
+ *         prior in-flight batch is not dropped)
  *   (iii) progress is scoped to the current batch (`?ids=…`), not user-global
  *   (iv)  a global, cross-page status bar with section detail + Cancel
  *
@@ -186,7 +187,7 @@ test.describe("Upload/extraction UX (§2a)", () => {
     await expect(cardComplete).toHaveCount(0);
   });
 
-  test("(ii) a new upload resets the prior batch's rows", async ({ page }) => {
+  test("(ii) a new upload while the prior is in-flight accumulates rows", async ({ page }) => {
     const api = new ApiClient();
     const email = testEmail("ux-reset");
     await api.register(email, TEST_PASSWORD);
@@ -219,15 +220,21 @@ test.describe("Upload/extraction UX (§2a)", () => {
       page.locator("tr", { hasText: "first.pdf" }).first()
     ).toBeVisible();
 
-    // A brand-new upload (second.pdf) replaces the batch.
-    be.pendingFiles = [{ id: "uB", filename: "second.pdf", ingestion_status: "processing" }];
+    // A second upload while first.pdf is still processing: WS-U accumulates the
+    // in-flight batch — the prior row is NOT dropped (the fix for the bug where the
+    // status pane under-counted concurrent uploads vs the Admin extractions pane).
+    be.progress = { total: 2, completed: 0, processing: 2, failed: 0, pending: 0, records_created: 0 };
+    be.pendingFiles = [
+      { id: "uA", filename: "first.pdf", ingestion_status: "processing" },
+      { id: "uB", filename: "second.pdf", ingestion_status: "processing" },
+    ];
     await selectAndUpload(page, "second.pdf");
 
     await expect(
       page.locator("tr", { hasText: "second.pdf" }).first()
     ).toBeVisible({ timeout: 15_000 });
-    // The carried-over row from the prior batch is gone.
-    await expect(page.locator("tr", { hasText: "first.pdf" })).toHaveCount(0);
+    // The prior batch's row is STILL shown — accumulated, not replaced (WS-U).
+    await expect(page.locator("tr", { hasText: "first.pdf" }).first()).toBeVisible();
   });
 
   test("(iv) global status bar shows section detail, persists across pages, and cancels", async ({
