@@ -489,6 +489,13 @@
 .field-v { font-size: 14.5px; color: var(--text); line-height: 1.5; }
 .panel { background: var(--card-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 18px; }
 
+/* "From this visit" — linked-record rows in the encounter detail (reuse timeline row vocabulary) */
+.dv-linked { display: flex; flex-direction: column; gap: 8px; }
+.dv-linked-row { appearance: none; cursor: pointer; text-align: left; width: 100%; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; transition: border-color 0.16s, transform 0.16s; }
+.dv-linked-row:hover { border-color: var(--border-strong); transform: translateX(2px); }
+.dv-linked-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dv-linked-title { font-size: 13.5px; font-weight: 600; color: var(--text); }
+
 /* gauge — neutral reference-range marker (no good/bad band) */
 .gauge { position: relative; height: 7px; border-radius: var(--radius-pill); background: var(--bg-2); margin-top: 12px; }
 .gauge-band { position: absolute; top: 0; height: 100%; border-radius: var(--radius-pill); background: var(--border-strong); opacity: 0.6; }

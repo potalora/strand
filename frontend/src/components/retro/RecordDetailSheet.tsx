@@ -7,12 +7,13 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sh
 import { api } from "@/lib/api";
 import { sourceLabel } from "@/lib/source-label";
 import { recordTitle } from "@/lib/record-title";
-import type { HealthRecord, SeriesResponse, SeriesPoint, SummaryItem } from "@/types/api";
+import type { HealthRecord, SeriesResponse, SeriesPoint, SummaryItem, TimelineEvent } from "@/types/api";
 import { usePreferencesStore } from "@/stores/usePreferencesStore";
 import { useUIStore } from "@/stores/useUIStore";
 import { RECORD_TYPE_ICONS, getObservationIcon } from "@/lib/record-icons";
 import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
 import { RetroBadge } from "./RetroBadge";
+import { TimelineMetricStrip } from "./TimelineMetricStrip";
 import { RetroLoadingState } from "./RetroLoadingState";
 import { FhirResourceRenderer } from "./FhirResourceRenderer";
 import { Sparkline } from "./DataViz";
@@ -36,6 +37,10 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
   const [addingSummary, setAddingSummary] = useState(false);
   const [inSummary, setInSummary] = useState(false);
   const [exporting, setExporting] = useState(false);
+  // Records extracted from the same visit/note (encounters only).
+  const [linked, setLinked] = useState<TimelineEvent[]>([]);
+  // Lets a "From this visit" row navigate the sheet without touching the parent.
+  const [viewId, setViewId] = useState<string | null>(recordId);
 
   const { skipDeleteConfirm, setSkipDeleteConfirm } = usePreferencesStore();
   const setDetailOpen = useUIStore((s) => s.setDetailOpen);
@@ -46,17 +51,24 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
     return () => setDetailOpen(false);
   }, [open, setDetailOpen]);
 
+  // Reset the in-sheet navigation override whenever the parent opens a record.
   useEffect(() => {
-    if (!recordId || !open) {
+    setViewId(recordId);
+  }, [recordId, open]);
+
+  useEffect(() => {
+    if (!viewId || !open) {
       setRecord(null);
+      setLinked([]);
       return;
     }
 
     setLoading(true);
     setTrend([]);
+    setLinked([]);
     setInSummary(false);
     api
-      .get<HealthRecord>(`/records/${recordId}`)
+      .get<HealthRecord>(`/records/${viewId}`)
       .then((rec) => {
         setRecord(rec);
         // For recurring observations, pull the recorded series for a neutral trend line.
@@ -66,10 +78,17 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
             .then((s) => setTrend(s.items ?? []))
             .catch(() => setTrend([]));
         }
+        // "From this visit": sibling records extracted from the same note.
+        if (rec.record_type === "encounter") {
+          api
+            .get<TimelineEvent[]>(`/records/${viewId}/linked`)
+            .then((items) => setLinked(items ?? []))
+            .catch(() => setLinked([]));
+        }
       })
       .catch(() => setRecord(null))
       .finally(() => setLoading(false));
-  }, [recordId, open]);
+  }, [viewId, open]);
 
   function handleDeleteClick() {
     if (skipDeleteConfirm) {
@@ -214,6 +233,35 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
                       {fmtShort(trend[trend.length - 1].effective_date)} · {trend[trend.length - 1].value}
                       {trend[trend.length - 1].unit ? ` ${trend[trend.length - 1].unit}` : ""}
                     </span>
+                  </div>
+                </div>
+              )}
+
+              {/* 2c. "From this visit" — sibling records extracted from the same note. */}
+              {record.record_type === "encounter" && linked.length > 0 && (
+                <div className="panel">
+                  <div className="field-l" style={{ marginBottom: 8 }}>
+                    From this visit · {linked.length} record{linked.length === 1 ? "" : "s"}
+                  </div>
+                  <div className="dv-linked">
+                    {linked.slice(0, 25).map((item) => (
+                      <button
+                        key={item.id}
+                        className="dv-linked-row"
+                        onClick={() => setViewId(item.id)}
+                      >
+                        <span className="dv-linked-top">
+                          <RetroBadge recordType={item.record_type} category={item.category} />
+                          <span className="dv-linked-title">{item.display_text}</span>
+                        </span>
+                        <TimelineMetricStrip preview={item.preview} />
+                      </button>
+                    ))}
+                    {linked.length > 25 && (
+                      <div className="muted" style={{ fontSize: 12, paddingTop: 2 }}>
+                        +{linked.length - 25} more from this visit
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
