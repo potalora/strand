@@ -12,6 +12,9 @@ from app.dependencies import get_authenticated_user_id
 from app.middleware.audit import log_audit_event
 from app.models.record import HealthRecord
 from app.schemas.records import HealthRecordResponse, RecordListResponse
+from app.schemas.timeline import TimelineEvent
+from app.services.timeline_preview import build_timeline_preview
+from app.services.timeline_service import extract_provider_display
 from app.services.utils.source_label import source_label
 
 router = APIRouter(prefix="/records", tags=["records"])
@@ -396,6 +399,57 @@ async def get_record_fhir(
             "Content-Disposition": f'attachment; filename="record-{record_id}.json"'
         },
     )
+
+
+@router.get("/{record_id}/linked", response_model=list[TimelineEvent])
+async def get_linked_records(
+    record_id: UUID,
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> list[TimelineEvent]:
+    """Records linked to this record's visit — the "From this visit" set.
+
+    Returns sibling records (conditions, meds, labs, …) carrying
+    ``linked_encounter_id == record_id`` — everything extracted from the same
+    note/visit. User-scoped; excludes soft-deleted + duplicate rows. Returned in
+    the timeline-event shape (with scalar previews) so the UI renders them as rich
+    rows. ``id`` is appended to the sort for stable ordering across NULL/tied dates.
+    """
+    result = await db.execute(
+        select(HealthRecord)
+        .where(
+            HealthRecord.linked_encounter_id == record_id,
+            HealthRecord.user_id == user_id,
+            HealthRecord.deleted_at.is_(None),
+            HealthRecord.is_duplicate.is_(False),
+        )
+        .order_by(HealthRecord.effective_date.desc(), HealthRecord.id)
+    )
+    records = result.scalars().all()
+
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="records.linked",
+        resource_type="health_record",
+        resource_id=record_id,
+        ip_address=request.client.host if request.client else None,
+    )
+
+    return [
+        TimelineEvent(
+            id=r.id,
+            record_type=r.record_type,
+            display_text=r.display_text,
+            effective_date=r.effective_date,
+            code_display=r.code_display,
+            category=r.category,
+            provider=extract_provider_display(r.fhir_resource, r.record_type),
+            preview=build_timeline_preview(r.fhir_resource, r.record_type),
+        )
+        for r in records
+    ]
 
 
 @router.delete("/{record_id}", status_code=204)
