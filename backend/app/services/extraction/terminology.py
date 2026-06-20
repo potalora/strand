@@ -334,7 +334,12 @@ def _fuzzy_lookup(index: dict[str, Coding], key: str) -> Coding | None:
 
 
 def _lookup(
-    category: str, text: str | None, *, first_token: bool, last_token: bool = False
+    category: str,
+    text: str | None,
+    *,
+    first_token: bool,
+    last_token: bool = False,
+    fuzzy: bool | None = None,
 ) -> Coding | None:
     """Look up a normalized term in a category index.
 
@@ -366,7 +371,8 @@ def _lookup(
                 tail = index.get(tokens[-1])
                 if tail is not None:
                     return tail
-    if settings.terminology_fuzzy_enabled:
+    use_fuzzy = settings.terminology_fuzzy_enabled if fuzzy is None else fuzzy
+    if use_fuzzy:
         return _fuzzy_lookup(index, key)
     return None
 
@@ -376,9 +382,13 @@ def lookup_condition(text: str | None) -> Coding | None:
     return _lookup("condition", text, first_token=False)
 
 
-def lookup_medication(text: str | None) -> Coding | None:
-    """Map a medication/supplement label to an RxNorm (or local) coding, or ``None``."""
-    return _lookup("medication", text, first_token=True, last_token=True)
+def lookup_medication(text: str | None, *, fuzzy: bool | None = None) -> Coding | None:
+    """Map a medication/supplement label to an RxNorm (or local) coding, or ``None``.
+
+    ``fuzzy`` overrides ``settings.terminology_fuzzy_enabled`` for this call — pass
+    ``fuzzy=False`` for an exact/normalized-only lookup (used by the PHI de-id drug
+    guard, which must be fast and must never protect a span via a fuzzy match)."""
+    return _lookup("medication", text, first_token=True, last_token=True, fuzzy=fuzzy)
 
 
 def lookup_lab(text: str | None) -> Coding | None:

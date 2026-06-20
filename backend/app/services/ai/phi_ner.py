@@ -106,9 +106,27 @@ def warm_load_ner() -> bool:
     return _get_nlp() is not None
 
 
+def _is_known_medication(word: str) -> bool:
+    """True when the token codes to a known drug — clinical content the general NER
+    model routinely mistags as PERSON (e.g. "Rifaximin", "Rituximab"). Legacy
+    preserved such drugs only by accident of redaction order; this terminology-
+    backed check makes it deterministic. Uses an EXACT (non-fuzzy) lookup so it is
+    O(1) per token and can never protect a real name via a fuzzy match. Fail-open:
+    any error means "not a known drug" (token stays eligible for redaction), so it
+    can never cause under-redaction by raising."""
+    if len(word) < 4:
+        return False
+    try:
+        from app.services.extraction import terminology
+
+        return terminology.lookup_medication(word, fuzzy=False) is not None
+    except Exception:  # noqa: BLE001 - guard must never break scrubbing
+        return False
+
+
 def _is_name_token(token) -> bool:
     """A token worth redacting: an alphabetic proper noun / Title-Case word
-    that is not a protected clinical eponym."""
+    that is not a protected clinical eponym or known drug name."""
     if not token.is_alpha:
         return False
     if not (token.pos_ == "PROPN" or token.is_title):
@@ -117,6 +135,8 @@ def _is_name_token(token) -> bool:
     if lower in CLINICAL_EPONYMS:
         return False
     if lower.endswith(CLINICAL_SUFFIXES):
+        return False
+    if _is_known_medication(token.text):
         return False
     return True
 

@@ -388,6 +388,33 @@ def _operators():
     return ops
 
 
+# Presidio entity types that anonymize to a person-name token ([NAME]).
+_PERSON_ENTITY_TYPES = frozenset({"PERSON"})
+
+
+def _drop_medication_false_positives(results, text):
+    """Drop PERSON detections whose span is a known drug name.
+
+    Presidio's general spaCy PERSON recognizer mistags drugs (e.g. "Rifaximin")
+    as people in name-like contexts; redacting them would destroy clinical content
+    (the exact over-redaction the legacy path avoided only by accident of order).
+    A span that codes to a known medication (EXACT, non-fuzzy) is clinical content,
+    not a name. The patient deny-list uses a distinct entity type, so a known
+    patient is NEVER affected — this only removes drug false-positives."""
+    if not results:
+        return results
+    from app.services.extraction import terminology
+
+    kept = []
+    for r in results:
+        if r.entity_type in _PERSON_ENTITY_TYPES:
+            span = text[r.start : r.end].strip()
+            if len(span) >= 4 and terminology.lookup_medication(span, fuzzy=False) is not None:
+                continue
+        kept.append(r)
+    return kept
+
+
 def scrub_phi_presidio(
     text: str,
     patient_names: list[str] | None = None,
@@ -420,6 +447,7 @@ def scrub_phi_presidio(
         score_threshold=_SCORE_THRESHOLD,
         return_decision_process=False,
     )
+    results = _drop_medication_false_positives(results, text)
 
     if results:
         anonymized = anonymizer.anonymize(

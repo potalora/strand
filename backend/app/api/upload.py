@@ -1049,6 +1049,14 @@ async def _run_local_extraction_engine(db, upload, upload_id, user_id, text, eng
         await _mark_cancelled(db, upload)
         return None
 
+    # Publish the real section count so the upload UI shows section progress for
+    # the local/hybrid engine too (the Gemini path emits live per-section updates;
+    # the local pass is near-instant, so we publish the total once sections are
+    # processed — never leave it at 0, which reads as "no progress").
+    _n_sections = max(len(result.sections), 1)
+    upload.progress_detail = {"section_index": _n_sections, "section_total": _n_sections}
+    await db.commit()
+
     parsed_doc = ParsedDocument(
         sections=result.sections,
         document_type=result.document_metadata.get("document_type", "clinical_note"),
