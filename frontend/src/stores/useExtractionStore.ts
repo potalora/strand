@@ -88,7 +88,24 @@ export const useExtractionStore = create<ExtractionState>((set) => ({
   ...EMPTY,
 
   startBatch: (input) =>
-    set(() => {
+    set((state) => {
+      const priorInFlight = Object.values(state.files).some(
+        (f) => !isTerminalStatus(f.status)
+      );
+      if (priorInFlight) {
+        // A prior batch is still extracting — accumulate the new upload instead
+        // of dropping it (concurrent uploads must all stay tracked). The poll
+        // loop re-arms on the new batchIds and re-scopes progress to the union.
+        const files = { ...state.files };
+        const batchIds = [...state.batchIds];
+        for (const f of input) {
+          if (!files[f.upload_id]) batchIds.push(f.upload_id);
+          files[f.upload_id] = toTracked(f);
+        }
+        return { batchIds, files, dismissed: false };
+      }
+      // Prior batch finished (or none) — fresh batch, dropping stale terminal
+      // rows (the original anti-stale intent, §2a ii).
       const files: Record<string, TrackedFile> = {};
       for (const f of input) files[f.upload_id] = toTracked(f);
       return {
