@@ -55,6 +55,37 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("PHI-NER warm-load raised at startup")
 
+    # WS-B: warm-load the Presidio engine + clinical LOCATION model when their
+    # flags are on (both default OFF, so this is dormant unless opted in). Same
+    # rationale as the NER warm-load: build the singleton at boot, not under load.
+    if settings.phi_engine == "presidio":
+        try:
+            from app.services.ai.phi_presidio import warm_load_presidio
+
+            if warm_load_presidio():
+                logger.info("Presidio de-identification engine warm-loaded")
+            else:
+                logger.warning(
+                    "Presidio engine NOT available at startup; scrub_phi will "
+                    "retry per-call and fall back to legacy on failure"
+                )
+        except Exception:
+            logger.exception("Presidio warm-load raised at startup")
+
+    if settings.phi_location_ner_enabled:
+        try:
+            from app.services.ai.phi_location_ner import warm_load_location_ner
+
+            if warm_load_location_ner():
+                logger.info("Clinical LOCATION de-id model warm-loaded")
+            else:
+                logger.warning(
+                    "Clinical LOCATION model NOT available at startup; the "
+                    "LOCATION pass will retry per-call (fail-open, non-latching)"
+                )
+        except Exception:
+            logger.exception("Clinical LOCATION model warm-load raised at startup")
+
     # Kick off a NON-BLOCKING, staleness-gated RxNorm medication-index refresh.
     # Fire-and-forget background task: it returns immediately, runs the (rare)
     # rebuild in a worker thread, and fails open — startup is never blocked.

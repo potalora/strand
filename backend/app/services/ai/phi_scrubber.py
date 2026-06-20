@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import logging
-from typing import Any
 
 from app.config import settings
 
@@ -77,6 +76,15 @@ def scrub_phi(
 ) -> tuple[str, dict[str, int]]:
     """Remove PHI from text and return scrubbed text + de-identification report.
 
+    Dispatches to the de-identification engine selected by ``settings.phi_engine``:
+
+    * ``"legacy"`` (default) — the hand-rolled regex + known-identity + spaCy NER
+      layers below.
+    * ``"presidio"`` — Microsoft Presidio analyzer with the same four layers
+      re-homed, plus an optional clinical LOCATION pass (``phi_presidio``). If the
+      Presidio path raises, this falls back to the legacy path: de-identification
+      must never crash a caller before any scrubbing happens.
+
     Args:
         enable_ner: Run the spaCy NER pass for free-text person names (providers,
             family, anyone not in the patient record). Defaults to
@@ -85,6 +93,48 @@ def scrub_phi(
 
     Returns:
         tuple: (scrubbed_text, report_dict)
+    """
+    if settings.phi_engine == "presidio":
+        try:
+            from app.services.ai.phi_presidio import scrub_phi_presidio
+
+            return scrub_phi_presidio(
+                text,
+                patient_names=patient_names,
+                patient_dob=patient_dob,
+                patient_address=patient_address,
+                patient_mrn=patient_mrn,
+                enable_ner=enable_ner,
+            )
+        except Exception:  # noqa: BLE001 - never let de-id crash the caller
+            logger.warning(
+                "Presidio de-identification path failed; falling back to the "
+                "legacy regex scrubber for this call",
+                exc_info=True,
+            )
+
+    return _scrub_phi_legacy(
+        text,
+        patient_names=patient_names,
+        patient_dob=patient_dob,
+        patient_address=patient_address,
+        patient_mrn=patient_mrn,
+        enable_ner=enable_ner,
+    )
+
+
+def _scrub_phi_legacy(
+    text: str,
+    patient_names: list[str] | None = None,
+    patient_dob: str | None = None,
+    patient_address: str | None = None,
+    patient_mrn: str | None = None,
+    enable_ner: bool | None = None,
+) -> tuple[str, dict[str, int]]:
+    """Legacy hand-rolled regex + known-identity + spaCy NER scrubber.
+
+    Default de-identification path (``PHI_ENGINE=legacy``). Unchanged behavior;
+    kept authoritative until the Presidio path is validated on real data.
     """
     report: dict[str, int] = {}
     scrubbed = text
