@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from app.config import settings
 from app.services.extraction import text_extractor
+from tests.conftest import private_fixture_root
 
-_TEST_DATA = Path(__file__).resolve().parents[2] / "test_data"
-_NOTE = next(iter(_TEST_DATA.glob("note_*.pdf")), None)
-_SCANNED = _TEST_DATA / "ibs_smart.pdf"
+# Real-data fixtures resolve via REAL_MEDICAL_FIXTURES_DIR (gitignored, off-repo);
+# originals live under <root>/raw/. No in-repo fallback — skip cleanly if absent.
+_FIXROOT = private_fixture_root()
+_RAW = (_FIXROOT / "raw") if _FIXROOT else None
+_NOTE = next(iter(_RAW.glob("note_*.pdf")), None) if _RAW else None
+_SCANNED = (_RAW / "ibs_smart.pdf") if _RAW else None
 _HAS_KEY = bool(settings.gemini_api_key)
 
 
@@ -36,7 +39,7 @@ async def test_router_textlayer_note_skips_gemini_vision():
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not _HAS_KEY or not _SCANNED.exists(),
+@pytest.mark.skipif(not _HAS_KEY or not (_SCANNED and _SCANNED.exists()),
                     reason="GEMINI_API_KEY + scanned ibs_smart.pdf required")
 @pytest.mark.asyncio
 async def test_router_scanned_pdf_falls_back_to_gemini_vision():

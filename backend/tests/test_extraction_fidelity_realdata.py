@@ -13,15 +13,18 @@ import pathlib
 import pytest
 from striprtf.striprtf import rtf_to_text
 
-# test_data/ lives at the repo root (backend/tests/ -> repo root is parents[2]).
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-RTF_DIR = REPO_ROOT / "test_data" / "Requested Record" / "Rich Text"
+from tests.conftest import private_fixture_root
+
+# Real Epic RTF corpus lives off-repo (gitignored), under
+# <REAL_MEDICAL_FIXTURES_DIR>/raw/Requested Record/Rich Text/. No in-repo fallback.
+_FIXROOT = private_fixture_root()
+RTF_DIR = (_FIXROOT / "raw" / "Requested Record" / "Rich Text") if _FIXROOT else None
 
 pytestmark = [pytest.mark.fidelity, pytest.mark.asyncio]
 
 
 def _real_notes() -> list[pathlib.Path]:
-    return sorted(RTF_DIR.glob("*.RTF")) if RTF_DIR.is_dir() else []
+    return sorted(RTF_DIR.glob("*.RTF")) if RTF_DIR and RTF_DIR.is_dir() else []
 
 
 def _models_available() -> bool:
@@ -34,7 +37,7 @@ def _models_available() -> bool:
 async def test_local_extraction_on_real_rtf_notes():
     notes = _real_notes()
     if not notes:
-        pytest.skip("real RTF notes absent (test_data/ is gitignored)")
+        pytest.skip("real RTF notes absent (set REAL_MEDICAL_FIXTURES_DIR)")
     if not _models_available():
         pytest.skip("scispaCy/medspaCy not installed (.[clinical-nlp])")
 

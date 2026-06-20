@@ -41,21 +41,27 @@ from app.models.uploaded_file import UploadedFile
 from app.services.ingestion.coordinator import _ingest_xdm
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from tests.conftest import auth_headers, create_test_patient
+from tests.conftest import auth_headers, create_test_patient, private_fixture_root
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-MAY_DIR = REPO_ROOT / "HealthSummary_May_29_2026" / "IHE_XDM" / "Pedro1"
-APR_DIR = REPO_ROOT / "test_data" / "HealthSummary_Apr_05_2026" / "IHE_XDM" / "Pedro1"
+# Real IHE-XDM extracts resolve via REAL_MEDICAL_FIXTURES_DIR (gitignored,
+# off-repo); originals live under <root>/raw/. No in-repo fallback.
+# NOTE: the previous MAY_DIR pointed at REPO_ROOT (missing the test_data
+# segment), so it silently skipped on every run — now both extracts resolve
+# consistently under raw/.
+_FIXROOT = private_fixture_root()
+_RAW = (_FIXROOT / "raw") if _FIXROOT else None
+MAY_DIR = (_RAW / "HealthSummary_May_29_2026" / "IHE_XDM" / "Pedro1") if _RAW else None
+APR_DIR = (_RAW / "HealthSummary_Apr_05_2026" / "IHE_XDM" / "Pedro1") if _RAW else None
 
 pytestmark = pytest.mark.fidelity
 
 skip_if_no_may = pytest.mark.skipif(
-    not (MAY_DIR / "METADATA.XML").exists(),
-    reason=f"Real MAY XDM extract not found at {MAY_DIR}",
+    not (MAY_DIR and (MAY_DIR / "METADATA.XML").exists()),
+    reason="REAL_MEDICAL_FIXTURES_DIR unset or MAY XDM extract (raw/HealthSummary_May_29_2026) missing",
 )
 skip_if_no_apr = pytest.mark.skipif(
-    not (APR_DIR / "METADATA.XML").exists(),
-    reason=f"Real APRIL XDM extract not found at {APR_DIR}",
+    not (APR_DIR and (APR_DIR / "METADATA.XML").exists()),
+    reason="REAL_MEDICAL_FIXTURES_DIR unset or APRIL XDM extract (raw/HealthSummary_Apr_05_2026) missing",
 )
 
 

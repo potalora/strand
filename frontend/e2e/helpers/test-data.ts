@@ -2,7 +2,20 @@ import * as fs from "fs";
 import * as path from "path";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
-export const TEST_DATA_DIR = path.join(REPO_ROOT, "test_data");
+
+// Real medical fixtures live OUTSIDE the repo (gitignored, off-repo) and are
+// resolved via REAL_MEDICAL_FIXTURES_DIR; originals are under <root>/raw/.
+// playwright.config.ts loads .env.test.local so this var is present here. When
+// it is unset, TEST_DATA_DIR points at a path that does not exist, so
+// hasTestData() returns false and the data-dependent specs skip cleanly —
+// there is intentionally no in-repo fallback (real PHI never lives in the repo).
+function privateFixtureRaw(): string {
+  const root = process.env.REAL_MEDICAL_FIXTURES_DIR;
+  if (!root) return path.join(__dirname, "__REAL_MEDICAL_FIXTURES_DIR_unset__");
+  const expanded = root.replace(/^~(?=$|\/)/, process.env.HOME ?? "");
+  return path.join(expanded, "raw");
+}
+export const TEST_DATA_DIR = privateFixtureRaw();
 export const FIXTURES_DIR = path.join(REPO_ROOT, "backend", "tests", "fixtures");
 
 export const PATHS = {

@@ -17,6 +17,7 @@ env/
 # Environment variables
 .env
 .env.local
+.env.*.local
 .env.production
 
 # IDE
@@ -86,8 +87,13 @@ backend/.python-version
 # Settings (keep template, ignore local copy)
 settings.json
 
-# Claude Code local config
+# Claude Code local config (canonical CLAUDE.md lives in the private
+# private-agent-context repo, symlinked in as CLAUDE.local.md — never commit
+# any of these to this repo)
 CLAUDE.md
+CLAUDE.local.md
+CLAUDE.private.md
+.claude/private/
 .claude/
 .playwright-mcp/
 

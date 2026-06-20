@@ -2,10 +2,16 @@ import { defineConfig } from "@playwright/test";
 import * as fs from "fs";
 import * as path from "path";
 
-// Load backend .env so tests can check GEMINI_API_KEY, etc.
-const backendEnv = path.resolve(__dirname, "../backend/.env");
-if (fs.existsSync(backendEnv)) {
-  for (const line of fs.readFileSync(backendEnv, "utf-8").split("\n")) {
+// Load env files so tests can read GEMINI_API_KEY (backend/.env) and
+// REAL_MEDICAL_FIXTURES_DIR (repo-root .env.test.local — points at the off-repo
+// real medical fixtures). First value wins; a real process.env always overrides.
+const repoRoot = path.resolve(__dirname, "..");
+for (const envFile of [
+  path.resolve(__dirname, "../backend/.env"),
+  path.resolve(repoRoot, ".env.test.local"),
+]) {
+  if (!fs.existsSync(envFile)) continue;
+  for (const line of fs.readFileSync(envFile, "utf-8").split("\n")) {
     const trimmed = line.replace(/\r$/, "").trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const eq = trimmed.indexOf("=");

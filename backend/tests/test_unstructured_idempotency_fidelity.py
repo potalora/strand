@@ -19,16 +19,24 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
-from tests.conftest import TEST_DB_URL, auth_headers, create_test_patient
+from tests.conftest import (
+    TEST_DB_URL,
+    auth_headers,
+    create_test_patient,
+    private_fixture_root,
+)
 
 # ---------------------------------------------------------------------------
-# Locate real note PDF (gitignored under test_data/).
+# Locate real note PDF via REAL_MEDICAL_FIXTURES_DIR (gitignored, off-repo).
+# Originals live under <root>/raw/. No in-repo fallback.
 # ---------------------------------------------------------------------------
-_TEST_DATA = Path(__file__).resolve().parents[2] / "test_data"
-_NOTE = next(iter(_TEST_DATA.glob("note_*.pdf")), None)
+_FIXROOT = private_fixture_root()
+_RAW = (_FIXROOT / "raw") if _FIXROOT else None
+_NOTE = next(iter(_RAW.glob("note_*.pdf")), None) if _RAW else None
 
 _SKIP_REASON = (
-    "real note PDF (test_data/note_*.pdf) and GEMINI_API_KEY are both required"
+    "REAL_MEDICAL_FIXTURES_DIR with a real note PDF (raw/note_*.pdf) and "
+    "GEMINI_API_KEY are all required"
 )
 _SHOULD_SKIP = _NOTE is None or not settings.gemini_api_key
 

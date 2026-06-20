@@ -28,6 +28,31 @@ NOKEEP = httpx.Limits(max_keepalive_connections=0, max_connections=8)
 results: dict = {"steps": [], "started_at": datetime.now(timezone.utc).isoformat()}
 
 
+def _fixtures_raw() -> Path:
+    """Resolve the off-repo real-medical-fixtures ``raw/`` dir.
+
+    Reads ``REAL_MEDICAL_FIXTURES_DIR`` (falling back to repo-root
+    ``.env.test.local``). Real PHI never lives in the repo, so there is no
+    in-repo fallback.
+    """
+    import os
+
+    root = os.environ.get("REAL_MEDICAL_FIXTURES_DIR")
+    if not root:
+        envf = ROOT / ".env.test.local"
+        if envf.exists():
+            for ln in envf.read_text().splitlines():
+                if ln.strip().startswith("REAL_MEDICAL_FIXTURES_DIR="):
+                    root = ln.split("=", 1)[1].strip()
+                    break
+    if not root:
+        raise SystemExit(
+            "REAL_MEDICAL_FIXTURES_DIR not set and no .env.test.local found; "
+            "real medical fixtures live off-repo (~/Private/medical-test-fixtures)."
+        )
+    return Path(root).expanduser() / "raw"
+
+
 def log(m: str) -> None:
     print(f"[{datetime.now(timezone.utc):%H:%M:%S}] {m}", flush=True)
 
@@ -94,7 +119,7 @@ def main() -> int:
             time.sleep(4)
         return {"status": "timeout"}
 
-    td = ROOT / "test_data"
+    td = _fixtures_raw()
     steps = [
         ("EhiExport (One Medical FHIR)", "2026-01-06", "fhir",
          td / "EhiExport-22259" / "fhir_109989389_22259_1767722729.json"),
@@ -105,7 +130,7 @@ def main() -> int:
         ("HealthSummary April XDM", "2026-04-05", "xdm",
          td / "HealthSummary_Apr_05_2026" / "IHE_XDM"),
         ("HealthSummary May XDM (superset)", "2026-05-29", "xdm",
-         ROOT / "HealthSummary_May_29_2026" / "IHE_XDM"),
+         td / "HealthSummary_May_29_2026" / "IHE_XDM"),
         ("ibs_smart.pdf (image OCR)", "2026-05-29", "unstructured",
          td / "ibs_smart.pdf"),
     ]
