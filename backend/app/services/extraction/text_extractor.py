@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 from enum import Enum
 from pathlib import Path
@@ -9,6 +10,7 @@ import pdfplumber
 from striprtf.striprtf import rtf_to_text
 
 from app.config import settings
+from app.utils.file_utils import decrypt_file
 
 if TYPE_CHECKING:
     from app.services.ai.llm.config import LLMConfig
@@ -52,7 +54,10 @@ def extract_text_from_pdf_local(file_path: Path) -> tuple[str, float]:
     """
     page_texts: list[str] = []
     total_chars = 0
-    with pdfplumber.open(file_path) as pdf:
+    # CRYPTO-02: decrypt the at-rest file (legacy plaintext passes through), then
+    # hand pdfplumber the bytes via BytesIO so it never reads ciphertext off disk.
+    pdf_bytes = decrypt_file(file_path)
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page_count = len(pdf.pages) or 1
         for page in pdf.pages:
             parts = [page.extract_text() or ""]
@@ -75,7 +80,8 @@ def detect_file_type(file_path: Path) -> FileType:
 
 def extract_text_from_rtf(file_path: Path) -> str:
     """Extract plaintext from RTF using striprtf (local, no API)."""
-    raw = file_path.read_text(encoding="utf-8", errors="replace")
+    # CRYPTO-02: decrypt the at-rest file (legacy plaintext passes through).
+    raw = decrypt_file(file_path).decode("utf-8", errors="replace")
     return rtf_to_text(raw)
 
 
@@ -285,7 +291,7 @@ async def _extract_text_from_pdf_gemini(
     """
     from app.services.ai.llm.types import DocumentPart
 
-    pdf_bytes = file_path.read_bytes()
+    pdf_bytes = decrypt_file(file_path)  # CRYPTO-02: decrypt at-rest (legacy passthrough)
     return await _ocr_via_provider(
         [DocumentPart(pdf_bytes, "application/pdf")],
         config,
@@ -323,7 +329,7 @@ async def extract_text_from_tiff(
     """Extract text from a TIFF image via the configured vision provider (OCR)."""
     from app.services.ai.llm.types import ImagePart
 
-    tiff_bytes = file_path.read_bytes()
+    tiff_bytes = decrypt_file(file_path)  # CRYPTO-02: decrypt at-rest (legacy passthrough)
     return await _ocr_via_provider(
         [ImagePart(tiff_bytes, "image/tiff")],
         config,

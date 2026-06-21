@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -13,10 +14,29 @@ from app.database import async_session_factory
 from app.middleware.audit import AuditMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 
+
+def resolve_log_level(log_level: str, is_production: bool) -> int:
+    """Resolve the effective logging level, clamping below INFO in production.
+
+    DEBUG logs can carry extracted entity text / clinical PHI (SEC-PHI-08), so in
+    production we never emit below INFO even if ``LOG_LEVEL=DEBUG`` is configured.
+    Development/test keep full DEBUG control for troubleshooting. An unrecognized
+    level falls back to INFO.
+    """
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    if is_production and level < logging.INFO:
+        return logging.INFO
+    return level
+
+
 logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    level=resolve_log_level(settings.log_level, settings.is_production),
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+
+# Keep a reference to background fire-and-forget tasks so they aren't GC'd while
+# pending (asyncio only holds a weak reference to scheduled tasks).
+_background_tasks: set[asyncio.Task] = set()
 
 
 logger = logging.getLogger(__name__)
@@ -103,6 +123,25 @@ async def lifespan(app: FastAPI):
         schedule_medication_refresh()
     except Exception:
         logger.exception("medication index refresh scheduling failed at startup")
+
+    # W23: purge expired ``revoked_tokens`` rows so the JWT blacklist (and the
+    # per-request revocation lookup) doesn't grow without bound. Fire-and-forget
+    # so startup is never delayed; fail-open so a DB hiccup can't block boot. Runs
+    # ONCE here — a deployment can add a periodic schedule (cron/arq) on top.
+    async def _purge_revoked_tokens() -> None:
+        try:
+            from app.services.auth_service import purge_expired_revoked_tokens
+
+            async with async_session_factory() as db:
+                removed = await purge_expired_revoked_tokens(db)
+                if removed:
+                    logger.info("Purged %d expired revoked tokens on startup", removed)
+        except Exception:
+            logger.exception("Failed to purge expired revoked tokens on startup")
+
+    purge_task = asyncio.create_task(_purge_revoked_tokens())
+    _background_tasks.add(purge_task)
+    purge_task.add_done_callback(_background_tasks.discard)
 
     # Start the extraction worker
     from app.api.upload import start_extraction_worker

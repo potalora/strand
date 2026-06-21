@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import async_session_factory
+from app.utils.file_utils import EncryptedFileWriter
 
 # Per-event-loop semaphore caches.
 #
@@ -300,7 +302,8 @@ async def _stream_upload_to_disk(
     *,
     request: Request | None = None,
     detail: str = "File too large",
-) -> tuple[int, bytes]:
+    encrypt: bool = True,
+) -> tuple[int, bytes, str]:
     """Stream an ``UploadFile`` to ``file_path`` in chunks, enforcing a hard cap.
 
     Rejects early on an oversized declared ``Content-Length``, then copies the
@@ -308,15 +311,31 @@ async def _stream_upload_to_disk(
     — aborting and unlinking the partial file the moment the total exceeds
     ``max_bytes`` (SEC-DOS-01: never materialize the whole body in RAM).
 
-    Returns ``(bytes_written, header)`` where ``header`` is the first chunk's
-    leading bytes, so callers can validate magic bytes without re-reading.
+    CRYPTO-02: when ``encrypt`` is True (default) the file is written as a framed
+    AES-256-GCM blob — each plaintext chunk is encrypted into its own frame as it
+    streams, so the bytes at rest never carry plaintext PHI and the whole file is
+    never buffered in memory. Structured uploads (FHIR JSON / ZIP / Epic / CDA)
+    pass ``encrypt=False`` because their ingest read path streams the file in
+    plaintext immediately after upload (it is owned by the ingestion coordinator);
+    the operator migration script encrypts those archives at rest after ingest.
+
+    The size cap and the magic-byte header are always computed on PLAINTEXT bytes
+    read from the body, independent of encryption. The returned ``hash`` is the
+    SHA-256 of the plaintext, so deduplication-by-hash stays deterministic
+    regardless of the random per-frame nonces.
+
+    Returns ``(bytes_written, header, plaintext_sha256_hex)`` where ``header`` is
+    the first chunk's leading plaintext bytes, so callers can validate magic
+    bytes without re-reading.
     """
     _reject_if_content_length_exceeds(request, max_bytes, detail)
 
     total = 0
     header = b""
+    hasher = hashlib.sha256()
     try:
         with open(file_path, "wb") as f:
+            writer = EncryptedFileWriter(f) if encrypt else None
             while True:
                 chunk = await file.read(UPLOAD_CHUNK_SIZE)
                 if not chunk:
@@ -326,13 +345,19 @@ async def _stream_upload_to_disk(
                 total += len(chunk)
                 if total > max_bytes:
                     raise HTTPException(status_code=413, detail=detail)
-                f.write(chunk)
+                hasher.update(chunk)
+                if writer is not None:
+                    writer.write_chunk(chunk)
+                else:
+                    f.write(chunk)
+            if writer is not None:
+                writer.finalize()  # write the header even for an empty body
     except BaseException:
         # Drop any partial file on rejection/error so a too-large upload leaves
         # nothing behind on disk.
         file_path.unlink(missing_ok=True)
         raise
-    return total, header
+    return total, header, hasher.hexdigest()
 
 
 def _validate_magic_bytes(content: bytes, ext: str) -> bool:
@@ -419,8 +444,12 @@ async def upload_file(
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     file_path = _safe_file_path(upload_dir, user_id, file.filename)
+    # Structured ingestion reads the file in plaintext immediately below via the
+    # coordinator, so it is written plaintext (encrypt=False). The operator
+    # migration script encrypts these archives at rest after ingest (CRYPTO-02).
     await _stream_upload_to_disk(
-        file, file_path, settings.max_file_size_mb * 1024 * 1024, request=request
+        file, file_path, settings.max_file_size_mb * 1024 * 1024, request=request,
+        encrypt=False,
     )
 
     # Run ingestion synchronously for now (small files)
@@ -469,12 +498,16 @@ async def upload_epic_export(
     # C6 + SEC-DOS-01: stream to disk under the Epic export ceiling instead of
     # buffering up to 5 GB into RAM, rejecting early on Content-Length.
     file_path = _safe_file_path(upload_dir, user_id, file.filename)
+    # Structured ingestion (coordinator) reads this ZIP in plaintext right after
+    # upload, so write it plaintext (encrypt=False); the migration script
+    # encrypts it at rest after ingest (CRYPTO-02).
     await _stream_upload_to_disk(
         file,
         file_path,
         settings.max_epic_export_size_mb * 1024 * 1024,
         request=request,
         detail=f"Epic export too large. Maximum size: {settings.max_epic_export_size_mb}MB",
+        encrypt=False,
     )
 
     from app.services.ingestion.coordinator import ingest_file
@@ -1478,7 +1511,8 @@ async def upload_unstructured(
     # SEC-DOS-01: stream the body to disk in bounded chunks (reject early on an
     # oversized Content-Length), then validate/hash from disk.
     file_path = _safe_file_path(upload_dir, user_id, file.filename)
-    file_size, header = await _stream_upload_to_disk(
+    # CRYPTO-02: encrypt the unstructured PHI document at rest as it streams.
+    file_size, header, file_hash = await _stream_upload_to_disk(
         file, file_path, settings.max_file_size_mb * 1024 * 1024, request=request
     )
 
@@ -1490,9 +1524,8 @@ async def upload_unstructured(
             detail=f"File content does not match expected format for {ext}",
         )
 
-    from app.services.ingestion.coordinator import compute_file_hash
-    file_hash = compute_file_hash(file_path)
-
+    # ``file_hash`` is the PLAINTEXT SHA-256 from the streaming pass — deterministic
+    # for re-upload dedup despite the random per-frame encryption nonces.
     from app.services.ingestion.reextraction import find_prior_extracted_upload
     prior = await find_prior_extracted_upload(db, user_id, file_hash)
 
@@ -1549,7 +1582,6 @@ async def upload_unstructured_batch(
 ) -> BatchUploadResponse:
     """Upload multiple unstructured files for concurrent processing."""
     from app.services.extraction.text_extractor import detect_file_type
-    from app.services.ingestion.coordinator import compute_file_hash
     from app.services.ingestion.reextraction import find_prior_extracted_upload
 
     upload_dir = Path(settings.upload_dir)
@@ -1567,8 +1599,9 @@ async def upload_unstructured_batch(
         file_path = _safe_file_path(upload_dir, user_id, file.filename)
         # SEC-DOS-01: stream each file to disk under the size cap; oversize files
         # abort + unlink and are silently skipped (batch is best-effort).
+        # CRYPTO-02: encrypt each unstructured PHI document at rest as it streams.
         try:
-            file_size, header = await _stream_upload_to_disk(
+            file_size, header, file_hash = await _stream_upload_to_disk(
                 file, file_path, settings.max_file_size_mb * 1024 * 1024
             )
         except HTTPException:
@@ -1578,7 +1611,7 @@ async def upload_unstructured_batch(
             file_path.unlink(missing_ok=True)
             continue
 
-        file_hash = compute_file_hash(file_path)
+        # Plaintext SHA-256 from the streaming pass (deterministic re-upload dedup).
         prior = await find_prior_extracted_upload(db, user_id, file_hash)
 
         upload_record = UploadedFile(

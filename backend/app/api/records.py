@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -18,6 +19,22 @@ from app.services.timeline_service import extract_provider_display
 from app.services.utils.source_label import source_label
 
 router = APIRouter(prefix="/records", tags=["records"])
+
+
+def _search_signal(value: str | None) -> dict:
+    """Privacy-preserving fingerprint of a free-text search term for the audit log.
+
+    W25 (SEC-PHI-08 / HIPAA AUDIT-08): a record search can carry PHI (a patient
+    name, MRN, …) and ``audit_log.details`` is JSONB stored in plaintext, so we
+    must NEVER persist the raw query string. Instead we store a truncated
+    SHA-256 of the normalized term plus its length and presence — enough to spot
+    "same search repeated" activity without leaking the term itself.
+    """
+    if not value:
+        return {"search_present": False}
+    normalized = value.strip().casefold().encode("utf-8")
+    digest = hashlib.sha256(normalized).hexdigest()[:16]
+    return {"search_present": True, "search_hash": digest, "search_len": len(value)}
 
 
 # Server-side sort: maps the ?sort= key to a column. Anything else falls back
@@ -89,7 +106,12 @@ async def list_records(
         action="records.list",
         resource_type="health_record",
         ip_address=request.client.host if request.client else None,
-        details={"record_type": record_type, "search": search, "page": page, "total": total},
+        details={
+            "record_type": record_type,
+            **_search_signal(search),
+            "page": page,
+            "total": total,
+        },
     )
 
     return RecordListResponse(
@@ -130,7 +152,7 @@ async def search_records(
         action="records.search",
         resource_type="health_record",
         ip_address=request.client.host if request.client else None,
-        details={"query": q, "result_count": len(records)},
+        details={**_search_signal(q), "result_count": len(records)},
     )
 
     return {

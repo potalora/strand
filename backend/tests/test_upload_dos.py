@@ -247,18 +247,29 @@ async def test_ingest_fhir_does_not_json_load_whole_bundle(
 
 @pytest.mark.asyncio
 async def test_stream_upload_to_disk_writes_and_returns_header(tmp_path):
-    """Happy path: streams the whole body to disk, returns size + header."""
+    """Happy path: streams the whole body to disk, returns size + header + hash.
+
+    CRYPTO-02: the default path encrypts at rest, so the on-disk bytes are NOT the
+    plaintext — they decrypt back to it. The returned header/hash are PLAINTEXT.
+    """
+    import hashlib
+
     from app.api.upload import _stream_upload_to_disk
+    from app.utils.file_utils import decrypt_file, is_encrypted_file
     from starlette.datastructures import UploadFile as StarletteUploadFile
 
     data = b"%PDF-1.4\n" + b"abcdefghijklmnop" + b"x" * 1000
     uf = StarletteUploadFile(file=io.BytesIO(data), filename="x.pdf")
     dest = tmp_path / "x.pdf"
 
-    total, header = await _stream_upload_to_disk(uf, dest, max_bytes=10 * 1024 * 1024)
+    total, header, digest = await _stream_upload_to_disk(uf, dest, max_bytes=10 * 1024 * 1024)
     assert total == len(data)
-    assert dest.read_bytes() == data
     assert header == data[:16]
+    assert digest == hashlib.sha256(data).hexdigest()
+    # Encrypted at rest, but round-trips to the original plaintext.
+    assert is_encrypted_file(dest)
+    assert dest.read_bytes() != data
+    assert decrypt_file(dest) == data
 
 
 @pytest.mark.asyncio
