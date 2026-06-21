@@ -144,7 +144,7 @@ erDiagram
 
 **Frontend**: Next.js 15 / TypeScript / Tailwind CSS 4 / shadcn/ui / TanStack Query / Zustand. Auth is custom JWT — access + rotated refresh tokens in a Zustand store, with transparent 401 refresh in `lib/api.ts` (no auth framework).
 
-**Infra**: PostgreSQL 16 + Redis 7 via Homebrew, macOS. No Docker.
+**Infra**: PostgreSQL 16 + Redis 7, run in Docker for the containerized stack or via Homebrew for native macOS dev.
 
 ## Project structure
 
@@ -173,7 +173,31 @@ frontend/src/
 
 The frontend theme is "Reimagined": warm paper, a deep ink-blue (Prussian) accent, and an italic serif display face (Source Serif 4 × Source Sans 3 × IBM Plex Mono). It reads as a records organizer, not a dashboard — values are shown neutrally, with no good/bad coloring.
 
-## Setup
+## Quick start (Docker)
+
+The quickest way to run the whole stack. You need Docker Desktop, or Docker Engine with the compose plugin.
+
+```bash
+git clone https://github.com/potalora/ai-clinical-uploads-exports.git
+cd ai-clinical-uploads-exports
+
+cp .env.docker.example .env
+just gen-secrets            # or: bash scripts/gen-secrets.sh
+# fills DB_PASSWORD, JWT_SECRET_KEY, DATABASE_ENCRYPTION_KEY
+# optional: add GEMINI_API_KEY for live AI summaries; prompt-only mode works without it
+
+docker compose up -d        # or: just up
+```
+
+Open http://localhost:3000. The API runs at http://localhost:8000.
+
+The stack binds to 127.0.0.1 only, so nothing is reachable from outside your machine. On-device clinical extraction is off by default to keep the image small; rebuild with `--build-arg CLINICAL_NLP=true` if you want it. To upgrade, bump `APP_VERSION` in `.env` and run `docker compose pull && docker compose up -d`. There's no auto-update, on purpose: with health data you decide when to move to a new version.
+
+## Develop
+
+If you're working on MedTimeline rather than just running it, the `justfile` wraps the dev loop. `just setup` provisions the toolchain (uv for the backend, npm for the frontend) and brings up Postgres and Redis in Docker; `just dev` runs both servers with reload; `just test` runs the suites. The native steps below still work if you'd rather manage the services yourself.
+
+## Manual setup (native, macOS)
 
 ```bash
 # 1. infra
