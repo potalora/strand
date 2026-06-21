@@ -62,28 +62,35 @@ async def list_records(
     db: AsyncSession = Depends(get_db),
 ) -> RecordListResponse:
     """List health records with pagination, filtering, and sorting."""
-    query = select(HealthRecord).where(
+    # Build the WHERE once and reuse it for both the count and the page fetch so
+    # the two never drift. The leading predicates mirror the partial index
+    # ``(user_id, …) WHERE deleted_at IS NULL AND is_duplicate IS FALSE`` exactly
+    # (note: ``.is_(False)`` emits ``IS FALSE`` — Postgres will NOT match an
+    # ``IS FALSE`` query against a ``= false`` partial-index predicate, so the
+    # index DDL must use ``IS FALSE`` too, or every query silently full-scans).
+    conditions = [
         HealthRecord.user_id == user_id,
         HealthRecord.deleted_at.is_(None),
         HealthRecord.is_duplicate.is_(False),
-    )
-
+    ]
     if record_type:
-        query = query.where(HealthRecord.record_type == record_type)
+        conditions.append(HealthRecord.record_type == record_type)
     if status:
-        query = query.where(HealthRecord.status == status)
+        conditions.append(HealthRecord.status == status)
     if search:
-        query = query.where(
+        conditions.append(
             or_(
                 HealthRecord.display_text.ilike(f"%{search}%"),
                 HealthRecord.code_display.ilike(f"%{search}%"),
             )
         )
 
-    # Count total
-    count_query = select(func.count()).select_from(query.subquery())
-    total_result = await db.execute(count_query)
-    total = total_result.scalar() or 0
+    # Count total. A direct ``COUNT`` over the same WHERE (no
+    # ``select(HealthRecord).subquery()`` wrapper) lets Postgres satisfy it from
+    # the partial index as an index-only scan that skips the table's
+    # soft-deleted/duplicate rows — instead of materializing a wide subquery.
+    # It decrypts nothing: no ``HealthRecord`` rows cross into Python.
+    total = (await db.execute(select(func.count()).where(*conditions))).scalar() or 0
 
     # Fetch page — server-side sort with sensible nulls handling; default is
     # newest-first by effective date.
@@ -95,8 +102,15 @@ async def list_records(
     # order. Without it, large tie groups (shared/NULL effective_date, repeated
     # record_type) leave the row order undefined between page queries, so OFFSET
     # pagination can return the same row on two pages and silently drop another.
-    query = query.order_by(direction, HealthRecord.id.asc())
-    query = query.offset((page - 1) * page_size).limit(page_size)
+    # LIMIT/OFFSET are pushed into SQL so only the page's rows are loaded — and
+    # therefore only the page's ``fhir_resource`` values are decrypted.
+    query = (
+        select(HealthRecord)
+        .where(*conditions)
+        .order_by(direction, HealthRecord.id.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
     result = await db.execute(query)
     records = result.scalars().all()
 
