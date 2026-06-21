@@ -12,6 +12,7 @@ from app.models.audit import AuditLog
 from app.models.token_blacklist import RevokedToken
 from app.models.cross_reference import RecordCrossReference
 from app.models.summary_item import SummaryItem
+from app.models.llm_settings import LLMProviderConfig, UserLLMPreferences
 
 __all__ = [
     "User",
@@ -26,4 +27,6 @@ __all__ = [
     "RevokedToken",
     "RecordCrossReference",
     "SummaryItem",
+    "LLMProviderConfig",
+    "UserLLMPreferences",
 ]
