@@ -31,6 +31,7 @@ import {
   type LlmRouting,
   type ProviderUpdate,
   type ProviderTestResult,
+  type OcrNotice,
 } from "@/lib/api";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { useUserStore } from "@/stores/useUserStore";
@@ -56,6 +57,7 @@ import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { RetroBadge } from "@/components/retro/RetroBadge";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
 import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
+import { OcrNotices } from "@/components/retro/OcrNotices";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const fmtDate = (s: string | null | undefined) => {
@@ -208,6 +210,8 @@ interface ExtractionFile {
   file_size_bytes: number | null;
   created_at: string | null;
   ingestion_status?: string;
+  // Per-file OCR provider notices (fallback/unreadable). Default [].
+  notices?: OcrNotice[];
 }
 
 const EXTRACTION_STATUS_HUE: Record<string, string> = {
@@ -389,7 +393,10 @@ function ExtractionsTab() {
                       aria-label={`Select ${file.filename}`}
                     />
                   </td>
-                  <td className="desc">{file.filename}</td>
+                  <td className="desc">
+                    {file.filename}
+                    <OcrNotices notices={file.notices} />
+                  </td>
                   <td className="num" style={{ textTransform: "uppercase" }}>
                     {ext || "—"}
                   </td>

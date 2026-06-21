@@ -57,3 +57,7 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # detail so the frontend can show "section 3 of 8".
     progress_stage: Mapped[str | None] = mapped_column(Text, nullable=True)
     progress_detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Durable per-file user-facing notices (e.g. an OCR provider refusal +
+    # fallback, or a document no provider could read). Each entry:
+    # {type, level, message, detail}. Surfaced in upload history + Extractions.
+    notices: Mapped[list] = mapped_column(JSONB, server_default="[]")

@@ -126,7 +126,12 @@ def _vision_candidates(config: LLMConfig, api_key: str) -> list:
 
 
 async def _ocr_via_provider(
-    parts: list, config: LLMConfig | None, api_key: str, instruction: str
+    parts: list,
+    config: LLMConfig | None,
+    api_key: str,
+    instruction: str,
+    *,
+    trace: list | None = None,
 ) -> str:
     """Run OCR over ``parts``, falling back across configured vision providers.
 
@@ -135,6 +140,9 @@ async def _ocr_via_provider(
     vision provider is tried, in order. Returns the first non-empty OCR text;
     ``""`` only when every candidate yields no text; raises only when no
     candidate could be tried at all.
+
+    When ``trace`` is provided, each attempt appends ``{"provider", "status"}``
+    (``ok`` / ``refused`` / ``error``) so callers can surface a user-facing notice.
     """
     from app.services.ai.llm import LLMMessage, LLMRequest
     from app.services.ai.llm.config import LLMConfig
@@ -156,18 +164,68 @@ async def _ocr_via_provider(
             text = (await provider.complete(req)).text or ""
         except Exception as exc:  # noqa: BLE001 - try the next provider
             last_err = exc
+            if trace is not None:
+                trace.append({"provider": name, "status": "error"})
             logger.warning("OCR via %s failed (%s); trying next vision provider", name, exc)
             continue
         if text.strip():
+            if trace is not None:
+                trace.append({"provider": name, "status": "ok"})
             return text
+        if trace is not None:
+            trace.append({"provider": name, "status": "refused"})
         logger.info("OCR via %s returned no text (blocked/empty); trying next", name)
     if last_err is not None:
         raise last_err
     return ""
 
 
+_PROVIDER_LABELS = {
+    "gemini": "Gemini", "vertex": "Vertex", "openai": "OpenAI",
+    "anthropic": "Anthropic", "openrouter": "OpenRouter",
+    "ollama": "Ollama", "lmstudio": "LM Studio",
+}
+
+
+def build_ocr_notice(trace: list) -> dict | None:
+    """Map an OCR attempt ``trace`` to a user-facing notice, or ``None``.
+
+    ``trace`` is a list of ``{"provider", "status"}`` (``ok``/``refused``/``error``).
+    Returns an ``ocr_fallback`` info notice when an earlier provider refused/failed
+    but a later one produced text; an ``ocr_unreadable`` warning when attempts were
+    made but none produced text; ``None`` when no OCR happened or the first provider
+    simply worked (nothing worth telling the user).
+    """
+    if not trace:
+        return None
+
+    def label(name: str) -> str:
+        return _PROVIDER_LABELS.get(name, name)
+
+    used = next((a["provider"] for a in trace if a["status"] == "ok"), None)
+    failed = [a["provider"] for a in trace if a["status"] in ("refused", "error")]
+    if used is None:
+        tried = ", ".join(label(a["provider"]) for a in trace)
+        return {
+            "type": "ocr_unreadable",
+            "level": "warning",
+            "message": f"No AI provider could read this document (tried {tried}).",
+            "detail": {"used": None, "refused": failed, "attempts": trace},
+        }
+    if not failed:
+        return None  # the chosen provider worked first try — nothing to surface
+    refused = ", ".join(label(p) for p in failed)
+    return {
+        "type": "ocr_fallback",
+        "level": "info",
+        "message": f"Read by {label(used)} — {refused} declined this document.",
+        "detail": {"used": used, "refused": failed, "attempts": trace},
+    }
+
+
 async def _extract_text_from_pdf_gemini(
-    file_path: Path, api_key: str, config: LLMConfig | None = None
+    file_path: Path, api_key: str, config: LLMConfig | None = None,
+    *, trace: list | None = None,
 ) -> str:
     """OCR a (scanned) PDF by sending its bytes to the configured vision provider.
 
@@ -183,11 +241,13 @@ async def _extract_text_from_pdf_gemini(
         api_key,
         "Extract all text from this document faithfully. Preserve structure, tables, "
         "and formatting. Return only the extracted text, no commentary.",
+        trace=trace,
     )
 
 
 async def extract_text_from_pdf(
-    file_path: Path, api_key: str, config: LLMConfig | None = None
+    file_path: Path, api_key: str, config: LLMConfig | None = None,
+    *, trace: list | None = None,
 ) -> str:
     """Local-first PDF text extraction; fall back to vision OCR when untrustworthy."""
     try:
@@ -202,11 +262,12 @@ async def extract_text_from_pdf(
         )
     except Exception:
         logger.exception("Local PDF extraction failed for %s — using vision OCR", file_path.name)
-    return await _extract_text_from_pdf_gemini(file_path, api_key, config)
+    return await _extract_text_from_pdf_gemini(file_path, api_key, config, trace=trace)
 
 
 async def extract_text_from_tiff(
-    file_path: Path, api_key: str, config: LLMConfig | None = None
+    file_path: Path, api_key: str, config: LLMConfig | None = None,
+    *, trace: list | None = None,
 ) -> str:
     """Extract text from a TIFF image via the configured vision provider (OCR)."""
     from app.services.ai.llm.types import ImagePart
@@ -218,16 +279,21 @@ async def extract_text_from_tiff(
         api_key,
         "Extract all text from this scanned document. Preserve the original layout "
         "and structure. Return only the extracted text, no commentary.",
+        trace=trace,
     )
 
 
 async def extract_text(
-    file_path: Path, api_key: str, config: LLMConfig | None = None
+    file_path: Path, api_key: str, config: LLMConfig | None = None,
+    *, trace: list | None = None,
 ) -> tuple[str, FileType]:
     """Dispatch to the appropriate text extractor based on file type.
 
     Returns:
         tuple: (extracted_text, file_type)
+
+    When ``trace`` is provided, vision OCR (scanned PDF / TIFF) records its
+    per-provider attempts into it; RTF and text-layer PDFs leave it empty.
 
     Raises:
         ValueError: If the file type is unsupported.
@@ -241,9 +307,9 @@ async def extract_text(
     if file_type == FileType.RTF:
         text = extract_text_from_rtf(file_path)
     elif file_type == FileType.PDF:
-        text = await extract_text_from_pdf(file_path, api_key, config)
+        text = await extract_text_from_pdf(file_path, api_key, config, trace=trace)
     elif file_type == FileType.TIFF:
-        text = await extract_text_from_tiff(file_path, api_key, config)
+        text = await extract_text_from_tiff(file_path, api_key, config, trace=trace)
     else:
         raise ValueError(f"Unsupported file type: {file_type}")
 

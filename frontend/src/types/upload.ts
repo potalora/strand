@@ -4,6 +4,7 @@
  * Re-export the existing aggregate shape for convenience.
  */
 import type { ProgressDetail } from "@/lib/extraction-progress";
+import type { OcrNotice } from "@/lib/api";
 
 export type { ExtractionProgressResponse } from "@/types/api";
 
@@ -24,4 +25,7 @@ export interface ExtractionFileStatus {
   ingestion_status: string;
   progress_stage?: string | null;
   progress_detail?: ProgressDetail | null;
+  // Per-file OCR provider notices (fallback/unreadable). Default [] — older
+  // payloads omit it, so consumers must treat missing as no notices.
+  notices?: OcrNotice[];
 }

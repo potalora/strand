@@ -245,6 +245,23 @@ class ApiClient {
   }
 }
 
+// --- OCR provider notices -------------------------------------------------
+// A durable, per-file notice surfaced when OCR fell back across vision
+// providers (one provider refused/failed but a later one read the document) or
+// when no provider could read it. Rides along on each uploaded-file status
+// object (`notices`, default []). `detail` is available but not shown by
+// default. See docs/superpowers/specs/2026-06-21-ocr-provider-notices-design.md.
+export interface OcrNotice {
+  type: "ocr_fallback" | "ocr_unreadable";
+  level: "info" | "warning";
+  message: string;
+  detail?: {
+    used?: string | null;
+    refused?: string[];
+    attempts?: { provider: string; status: string }[];
+  };
+}
+
 export class ApiError extends Error {
   status: number;
 

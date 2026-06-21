@@ -27,6 +27,8 @@ class UploadStatusResponse(BaseModel):
     # Section-level extraction progress (unstructured pipeline).
     progress_stage: str | None = None
     progress_detail: dict | None = None
+    # Durable per-file notices (e.g. an OCR provider refusal + fallback).
+    notices: list[Any] = []
 
 
 class UploadHistoryItem(BaseModel):
@@ -93,6 +95,8 @@ class PendingExtractionFile(BaseModel):
     # Section-level extraction progress (unstructured pipeline).
     progress_stage: str | None = None
     progress_detail: dict | None = None
+    # Durable per-file notices (e.g. an OCR provider refusal + fallback).
+    notices: list[Any] = []
 
 
 class CancelExtractionRequest(BaseModel):

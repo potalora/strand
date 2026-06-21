@@ -469,6 +469,7 @@ async def get_pending_extractions(
                 ingestion_status=f.ingestion_status,
                 progress_stage=f.progress_stage,
                 progress_detail=f.progress_detail,
+                notices=f.notices or [],
             ).model_dump()
             for f in files
         ],
@@ -703,6 +704,7 @@ async def get_upload_status(
         processing_completed_at=upload.processing_completed_at,
         progress_stage=upload.progress_stage,
         progress_detail=upload.progress_detail,
+        notices=upload.notices or [],
     )
 
 
@@ -1262,19 +1264,32 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
             from app.services.ai.llm import load_llm_config
             config = await load_llm_config(db, user_id)
 
-            # Step 1: Extract text (vision OCR for PDF/TIFF, local for RTF)
+            # Step 1: Extract text (vision OCR for PDF/TIFF, local for RTF).
+            # ocr_trace collects per-provider OCR attempts so a refusal/fallback
+            # can be surfaced to the user as a durable per-file notice.
+            ocr_trace: list = []
             file_type_enum = _detect_file_type(file_path)
             if file_type_enum == _FileType.RTF:
                 extracted_text, file_type = await extract_text(
-                    file_path, settings.gemini_api_key, config=config
+                    file_path, settings.gemini_api_key, config=config, trace=ocr_trace
                 )
             else:
                 async with sem:
                     extracted_text, file_type = await extract_text(
-                        file_path, settings.gemini_api_key, config=config
+                        file_path, settings.gemini_api_key, config=config, trace=ocr_trace
                     )
             text = extracted_text
             upload.extracted_text = text
+            # Surface any OCR provider refusal/fallback as a durable notice
+            # (best-effort: never fail extraction over a notice).
+            try:
+                from app.services.extraction.text_extractor import build_ocr_notice
+
+                _notice = build_ocr_notice(ocr_trace)
+                if _notice is not None:
+                    upload.notices = (upload.notices or []) + [_notice]
+            except Exception:  # noqa: BLE001 - notices are best-effort
+                logger.debug("failed to record OCR notice", exc_info=True)
             upload.progress_stage = "scrubbing_phi"
             await db.commit()
 

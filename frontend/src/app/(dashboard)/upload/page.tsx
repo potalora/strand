@@ -15,12 +15,13 @@ import {
 } from "lucide-react";
 import { useDirectoryUpload } from "@/hooks/useDirectoryUpload";
 import { getFilesFromDrop } from "@/lib/getFilesFromDrop";
-import { api } from "@/lib/api";
+import { api, type OcrNotice } from "@/lib/api";
 import type {
   UploadResponse,
   UnstructuredUploadResponse,
   TriggerExtractionResponse,
 } from "@/types/api";
+import { OcrNotices } from "@/components/retro/OcrNotices";
 import {
   deriveBatch,
   formatStage,
@@ -112,6 +113,8 @@ interface UploadHistoryItem {
     total_entries?: number;
   };
   ingestion_errors?: Array<Record<string, unknown>>;
+  // Per-file OCR provider notices (fallback/unreadable). Default [].
+  notices?: OcrNotice[];
 }
 
 function statusLabel(status: string): string {
@@ -1218,6 +1221,7 @@ export default function UploadPage() {
                                 (duplicate of an earlier upload)
                               </div>
                             )}
+                            <OcrNotices notices={upload.notices} />
                           </td>
                           <td>
                             <span className="tag" style={{ textTransform: "uppercase" }}>
