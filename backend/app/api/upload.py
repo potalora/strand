@@ -1257,13 +1257,22 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
 
             sem = _get_gemini_semaphore()
 
-            # Step 1: Extract text (Gemini for PDF/TIFF, local for RTF)
+            # Resolve the user's LLM config once so OCR (PDF/TIFF) routes through
+            # their configured `vision` provider (Gemini fallback). Falls back to .env.
+            from app.services.ai.llm import load_llm_config
+            config = await load_llm_config(db, user_id)
+
+            # Step 1: Extract text (vision OCR for PDF/TIFF, local for RTF)
             file_type_enum = _detect_file_type(file_path)
             if file_type_enum == _FileType.RTF:
-                extracted_text, file_type = await extract_text(file_path, settings.gemini_api_key)
+                extracted_text, file_type = await extract_text(
+                    file_path, settings.gemini_api_key, config=config
+                )
             else:
                 async with sem:
-                    extracted_text, file_type = await extract_text(file_path, settings.gemini_api_key)
+                    extracted_text, file_type = await extract_text(
+                        file_path, settings.gemini_api_key, config=config
+                    )
             text = extracted_text
             upload.extracted_text = text
             upload.progress_stage = "scrubbing_phi"
