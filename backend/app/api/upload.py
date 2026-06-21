@@ -444,12 +444,13 @@ async def upload_file(
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     file_path = _safe_file_path(upload_dir, user_id, file.filename)
-    # Structured ingestion reads the file in plaintext immediately below via the
-    # coordinator, so it is written plaintext (encrypt=False). The operator
-    # migration script encrypts these archives at rest after ingest (CRYPTO-02).
+    # CRYPTO-02 (issue #54): structured uploads (FHIR JSON / ZIP) are encrypted at
+    # rest as they stream. The ingestion coordinator stream-decrypts the file to a
+    # temp plaintext copy at the ingest entry (bounded memory; W9 caps preserved),
+    # so the bytes at rest never carry plaintext PHI.
     await _stream_upload_to_disk(
         file, file_path, settings.max_file_size_mb * 1024 * 1024, request=request,
-        encrypt=False,
+        encrypt=True,
     )
 
     # Run ingestion synchronously for now (small files)
@@ -498,16 +499,17 @@ async def upload_epic_export(
     # C6 + SEC-DOS-01: stream to disk under the Epic export ceiling instead of
     # buffering up to 5 GB into RAM, rejecting early on Content-Length.
     file_path = _safe_file_path(upload_dir, user_id, file.filename)
-    # Structured ingestion (coordinator) reads this ZIP in plaintext right after
-    # upload, so write it plaintext (encrypt=False); the migration script
-    # encrypts it at rest after ingest (CRYPTO-02).
+    # CRYPTO-02 (issue #54): the Epic EHI ZIP is encrypted at rest as it streams.
+    # The coordinator stream-decrypts it to a temp plaintext copy at the ingest
+    # entry (bounded memory under the 5 GB ceiling; W9 zip-bomb caps run on the
+    # decrypted temp), so the bytes at rest never carry plaintext PHI.
     await _stream_upload_to_disk(
         file,
         file_path,
         settings.max_epic_export_size_mb * 1024 * 1024,
         request=request,
         detail=f"Epic export too large. Maximum size: {settings.max_epic_export_size_mb}MB",
-        encrypt=False,
+        encrypt=True,
     )
 
     from app.services.ingestion.coordinator import ingest_file

@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 ENC_MAGIC = b"MTENC1\n"
 _NONCE_LEN = 12
 _LENGTH_PREFIX = 4  # big-endian uint32 frame length
+_COPY_CHUNK = 1024 * 1024  # 1 MiB streaming chunk for legacy pass-through
 
 # Log the legacy-plaintext warning once per process to avoid spamming when a
 # directory still holds many pre-encryption files (run encrypt_existing_uploads.py).
@@ -148,6 +149,55 @@ def decrypt_file(file_path: Path | str) -> bytes:
             nonce, ciphertext = payload[:_NONCE_LEN], payload[_NONCE_LEN:]
             out += aesgcm.decrypt(nonce, ciphertext, None)
     return bytes(out)
+
+
+def decrypt_file_to(src_path: Path | str, dst_path: Path | str) -> None:
+    """Stream-decrypt an at-rest upload to a plaintext file with BOUNDED memory.
+
+    Reads the encrypted ``src_path`` ONE frame at a time and writes the decrypted
+    plaintext straight to ``dst_path``, so the whole file is never materialized in
+    RAM — only a single frame's worth (<=1 MiB plaintext + GCM nonce/tag) is held
+    at any moment. This is the OOM-safety property the structured-ingest path
+    depends on: a 5 GB encrypted Epic export decrypts within the same bounded
+    memory the streaming parsers (ijson / member-by-member zip) already assume.
+
+    A source WITHOUT the magic header is legacy plaintext (written before
+    CRYPTO-02) and is stream-COPIED through verbatim (1 MiB chunks), so the
+    decrypt-to-temp entry works uniformly for both encrypted and legacy files.
+
+    Unlike ``decrypt_file`` (which returns the whole plaintext as ``bytes``), this
+    never builds a full in-memory buffer — use it for large structured archives.
+    """
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
+    with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
+        magic = src.read(len(ENC_MAGIC))
+        if magic != ENC_MAGIC:
+            _warn_legacy_once(src_path)
+            # Legacy plaintext: emit the header bytes we already consumed, then
+            # stream the remainder in bounded chunks (no whole-file buffering).
+            if magic:
+                dst.write(magic)
+            while True:
+                chunk = src.read(_COPY_CHUNK)
+                if not chunk:
+                    break
+                dst.write(chunk)
+            return
+
+        aesgcm = AESGCM(_get_key())
+        while True:
+            len_bytes = src.read(_LENGTH_PREFIX)
+            if not len_bytes:
+                break
+            if len(len_bytes) != _LENGTH_PREFIX:
+                raise ValueError("Corrupt encrypted file: truncated frame length")
+            (frame_len,) = struct.unpack(">I", len_bytes)
+            payload = src.read(frame_len)
+            if len(payload) != frame_len:
+                raise ValueError("Corrupt encrypted file: truncated frame payload")
+            nonce, ciphertext = payload[:_NONCE_LEN], payload[_NONCE_LEN:]
+            dst.write(aesgcm.decrypt(nonce, ciphertext, None))
 
 
 def compute_file_hash(file_path: Path) -> str:

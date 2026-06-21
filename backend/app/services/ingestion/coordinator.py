@@ -27,6 +27,7 @@ from app.services.ingestion.patient_demographics import (
     extract_fhir_demographics,
 )
 from app.services.ingestion.xdm_parser import parse_xdm_metadata
+from app.utils.file_utils import decrypt_file_to, is_encrypted_file
 
 logger = logging.getLogger(__name__)
 
@@ -239,74 +240,101 @@ async def ingest_file(
     mime_type: str = "application/octet-stream",
 ) -> dict:
     """Main ingestion entry point. Detects file type and routes to appropriate parser."""
-    file_type = detect_file_type(file_path)
-    file_hash = compute_file_hash(file_path) if file_path.is_file() else "directory"
-    file_size = file_path.stat().st_size if file_path.is_file() else 0
-
-    # Create upload record
-    upload = UploadedFile(
-        id=uuid4(),
-        user_id=user_id,
-        filename=original_filename,
-        mime_type=mime_type,
-        file_size_bytes=file_size,
-        file_hash=file_hash,
-        storage_path=str(file_path),
-        ingestion_status="processing",
-        processing_started_at=datetime.now(timezone.utc),
-    )
-    db.add(upload)
-    await db.commit()
-    await db.refresh(upload)
-
-    patient = await get_or_create_patient(db, user_id)
+    # CRYPTO-02 (issue #54): structured uploads are encrypted at rest in the
+    # framed AES-256-GCM format. The streaming parsers (ijson, member-by-member
+    # zip extraction with the W9 caps) need PLAINTEXT input, so an encrypted
+    # source is stream-decrypted ONCE to a temp file here and ALL downstream
+    # logic (detect_file_type, compute_file_hash, the _ingest_* dispatch) runs on
+    # that temp ``work_path``. ``decrypt_file_to`` streams frame-by-frame, so a
+    # multi-GB file decrypts with bounded memory (the W9 OOM guarantee is kept).
+    # ``storage_path`` stays the ORIGINAL encrypted path so future reads decrypt
+    # again; the temp is unlinked in the ``finally`` even on error. Legacy
+    # plaintext files and directory uploads skip the temp entirely.
+    work_path = file_path
+    temp_decrypted: Path | None = None
+    if file_path.is_file() and is_encrypted_file(file_path):
+        temp_dir = Path(settings.temp_extract_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        # Preserve the original suffix so detect_file_type routes correctly.
+        temp_decrypted = temp_dir / f"decrypt_{uuid4().hex}{file_path.suffix}"
+        decrypt_file_to(file_path, temp_decrypted)
+        work_path = temp_decrypted
 
     try:
-        if file_type == "fhir_r4":
-            stats = await _ingest_fhir(db, user_id, patient.id, upload.id, file_path)
-        elif file_type == "epic_ehi":
-            stats = await _ingest_epic_dir(db, user_id, patient.id, upload.id, file_path)
-        elif file_type == "zip":
-            stats = await _ingest_zip(db, user_id, patient.id, upload.id, file_path)
-        elif file_type == "cda_xml":
-            stats = await _ingest_cda_standalone(db, user_id, patient.id, upload.id, file_path)
-        else:
-            raise ValueError(f"Unsupported file type: {file_type}")
+        file_type = detect_file_type(work_path)
+        # Hash + size are computed on the PLAINTEXT work_path so the dedup hash is
+        # stable across re-uploads despite the random per-frame encryption nonces.
+        file_hash = compute_file_hash(work_path) if work_path.is_file() else "directory"
+        file_size = work_path.stat().st_size if work_path.is_file() else 0
 
-        # Set initial completion stats before dedup
-        upload.record_count = stats.get("records_inserted", 0)
-        upload.ingestion_errors = stats.get("errors", [])
-        upload.ingestion_progress = {
-            "total_entries": stats.get("total_entries", 0),
-            "records_inserted": stats.get("records_inserted", 0),
-            "records_skipped": stats.get("records_skipped", 0),
-            "records_updated": stats.get("records_updated", 0),
-            "records_unchanged": stats.get("records_unchanged", 0),
-        }
-
-        # Run dedup scan in background so the upload endpoint returns immediately
-        upload.ingestion_status = "dedup_scanning"
-        await db.commit()
-
-        asyncio.create_task(
-            _run_dedup_background(upload.id, patient.id, user_id)
+        # Create upload record — storage_path is the ORIGINAL (encrypted) path.
+        upload = UploadedFile(
+            id=uuid4(),
+            user_id=user_id,
+            filename=original_filename,
+            mime_type=mime_type,
+            file_size_bytes=file_size,
+            file_hash=file_hash,
+            storage_path=str(file_path),
+            ingestion_status="processing",
+            processing_started_at=datetime.now(timezone.utc),
         )
-
-        return {
-            "upload_id": str(upload.id),
-            "status": "dedup_scanning",
-            "records_inserted": stats.get("records_inserted", 0),
-            "errors": stats.get("errors", []),
-            "unstructured_uploads": stats.get("unstructured_files", []),
-        }
-
-    except Exception as e:
-        logger.error("Ingestion failed for %s: %s", original_filename, e)
-        upload.ingestion_status = "failed"
-        upload.ingestion_errors = [{"error": str(e)}]
-        upload.processing_completed_at = datetime.now(timezone.utc)
+        db.add(upload)
         await db.commit()
-        raise
+        await db.refresh(upload)
+
+        patient = await get_or_create_patient(db, user_id)
+
+        try:
+            if file_type == "fhir_r4":
+                stats = await _ingest_fhir(db, user_id, patient.id, upload.id, work_path)
+            elif file_type == "epic_ehi":
+                stats = await _ingest_epic_dir(db, user_id, patient.id, upload.id, work_path)
+            elif file_type == "zip":
+                stats = await _ingest_zip(db, user_id, patient.id, upload.id, work_path)
+            elif file_type == "cda_xml":
+                stats = await _ingest_cda_standalone(db, user_id, patient.id, upload.id, work_path)
+            else:
+                raise ValueError(f"Unsupported file type: {file_type}")
+
+            # Set initial completion stats before dedup
+            upload.record_count = stats.get("records_inserted", 0)
+            upload.ingestion_errors = stats.get("errors", [])
+            upload.ingestion_progress = {
+                "total_entries": stats.get("total_entries", 0),
+                "records_inserted": stats.get("records_inserted", 0),
+                "records_skipped": stats.get("records_skipped", 0),
+                "records_updated": stats.get("records_updated", 0),
+                "records_unchanged": stats.get("records_unchanged", 0),
+            }
+
+            # Run dedup scan in background so the upload endpoint returns immediately
+            upload.ingestion_status = "dedup_scanning"
+            await db.commit()
+
+            asyncio.create_task(
+                _run_dedup_background(upload.id, patient.id, user_id)
+            )
+
+            return {
+                "upload_id": str(upload.id),
+                "status": "dedup_scanning",
+                "records_inserted": stats.get("records_inserted", 0),
+                "errors": stats.get("errors", []),
+                "unstructured_uploads": stats.get("unstructured_files", []),
+            }
+
+        except Exception as e:
+            logger.error("Ingestion failed for %s: %s", original_filename, e)
+            upload.ingestion_status = "failed"
+            upload.ingestion_errors = [{"error": str(e)}]
+            upload.processing_completed_at = datetime.now(timezone.utc)
+            await db.commit()
+            raise
+    finally:
+        # Always drop the decrypted temp (it carries plaintext PHI), even on error.
+        if temp_decrypted is not None:
+            temp_decrypted.unlink(missing_ok=True)
 
 
 async def _run_dedup_background(

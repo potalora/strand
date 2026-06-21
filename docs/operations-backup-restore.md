@@ -15,7 +15,7 @@ PHI in this app is encrypted at rest with AES-256-GCM under `DATABASE_ENCRYPTION
 - `patients` demographic identifiers (name, MRN, DOB, contact)
 - stored per-user LLM API keys
 
-Uploaded source files on disk are partly encrypted: unstructured uploads (scanned PDFs, TIFFs, RTF) are encrypted at rest with the same key, while structured archives (FHIR bundles, Epic exports, ZIP, CDA) are still written in plaintext because the ingestion path reads them by streaming and a streaming decrypt is a separate change. So treat the uploads directory as a mix of ciphertext and plaintext, and back up `DATABASE_ENCRYPTION_KEY` regardless. Enabling OS full-disk encryption on the host covers the plaintext files until structured-upload encryption lands.
+Uploaded source files on disk are encrypted at rest with the same key, both unstructured uploads (scanned PDFs, TIFFs, RTF) and structured archives (FHIR bundles, Epic exports, ZIP, CDA). They use a framed AES-256-GCM format that the ingestion path stream-decrypts to a short-lived temp file during processing. So treat the uploads directory as ciphertext, and back up `DATABASE_ENCRYPTION_KEY` regardless: without it the uploaded files are unrecoverable too. Files uploaded before this was enabled stay readable and can be encrypted with `scripts/encrypt_existing_uploads.py`.
 
 What this means for backups:
 
