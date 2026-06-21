@@ -57,7 +57,7 @@ services:
       context: ./backend
       args:
         CLINICAL_NLP: ${CLINICAL_NLP:-false}
-    image: ghcr.io/potalora/medtimeline-backend:${APP_VERSION:-latest}
+    image: ghcr.io/potalora/strand-backend:${APP_VERSION:-latest}
     command: ["alembic", "upgrade", "head"]
     env_file: .env
     environment:
@@ -73,7 +73,7 @@ services:
       context: ./backend
       args:
         CLINICAL_NLP: ${CLINICAL_NLP:-false}
-    image: ghcr.io/potalora/medtimeline-backend:${APP_VERSION:-latest}
+    image: ghcr.io/potalora/strand-backend:${APP_VERSION:-latest}
     env_file: .env
     environment:
       # Container-internal hostnames (override anything in .env / env_file).
@@ -102,7 +102,7 @@ services:
       args:
         # Browser-visible API base, baked into the static build at image-build time.
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
-    image: ghcr.io/potalora/medtimeline-frontend:${APP_VERSION:-latest}
+    image: ghcr.io/potalora/strand-frontend:${APP_VERSION:-latest}
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:

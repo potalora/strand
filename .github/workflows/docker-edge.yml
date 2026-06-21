@@ -5,7 +5,7 @@
 # The paths filter means this only runs when container-relevant files change, so docs-only
 # or unrelated merges to main don't rebuild/republish images.
 #
-# Pushed tags: ghcr.io/<owner>/medtimeline-{backend,frontend}:edge and :sha-<short>.
+# Pushed tags: ghcr.io/<owner>/strand-{backend,frontend}:edge and :sha-<short>.
 name: Publish edge Docker images
 
 on:
@@ -56,7 +56,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/medtimeline-${{ matrix.name }}
+          images: ghcr.io/${{ github.repository_owner }}/strand-${{ matrix.name }}
           tags: |
             type=edge,branch=main
             type=sha,prefix=sha-,format=short

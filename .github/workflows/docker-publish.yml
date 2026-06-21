@@ -3,7 +3,7 @@
 #
 # Publishing requires the repo to allow GITHUB_TOKEN to write packages:
 # Settings → Actions → General → Workflow permissions → Read and write permissions.
-# The pushed packages land under ghcr.io/<owner>/medtimeline-{backend,frontend} and are
+# The pushed packages land under ghcr.io/<owner>/strand-{backend,frontend} and are
 # linked to this repo (set their visibility to public in the package settings if you
 # want a no-login pull).
 name: Publish Docker images
@@ -50,7 +50,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/medtimeline-${{ matrix.name }}
+          images: ghcr.io/${{ github.repository_owner }}/strand-${{ matrix.name }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
