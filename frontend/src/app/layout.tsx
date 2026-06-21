@@ -30,7 +30,7 @@ const plexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "MedTimeline · Personal Health Record",
+  title: "Strand · Personal Health Record",
   description: "Organize your health records and produce private, shareable summaries.",
 };
 

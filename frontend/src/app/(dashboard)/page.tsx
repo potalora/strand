@@ -2,7 +2,7 @@
 
 // Snapshot Overview — the committed home direction.
 //
-// Principle: MedTimeline surfaces what's in your record and how the recorded
+// Principle: Strand surfaces what's in your record and how the recorded
 // values have moved — and nothing more. It does NOT diagnose, judge, set
 // targets, or recommend. Metric selection is mechanical (every observation
 // code, newest first), and every value/range/flag is shown exactly as the
@@ -210,7 +210,7 @@ export default function OverviewPage() {
                 <h3 className="sec-title">Your most recent results</h3>
                 <span className="ov-sec-note">
                   Every observation on file, latest value first. Values, ranges and flags appear exactly as the
-                  source reported them — MedTimeline adds no interpretation.
+                  source reported them — Strand adds no interpretation.
                 </span>
               </div>
               <button className="ov-link" onClick={() => router.push("/labs")}>
@@ -266,7 +266,7 @@ export default function OverviewPage() {
               </div>
             </div>
 
-            {/* Recently added — ordered by when records landed in MedTimeline. */}
+            {/* Recently added — ordered by when records landed in Strand. */}
             <div className="card-surface pad">
               <div className="card-h">
                 <h3 className="sec-title">Recently added</h3>

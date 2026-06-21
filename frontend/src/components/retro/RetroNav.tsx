@@ -82,7 +82,7 @@ export function RetroNav() {
           <span className="brand-mark">
             <Activity size={19} strokeWidth={2} />
           </span>
-          <span className="brand-name">MedTimeline</span>
+          <span className="brand-name">Strand</span>
         </Link>
 
         <div className="top-links">

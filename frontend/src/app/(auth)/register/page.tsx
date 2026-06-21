@@ -188,7 +188,7 @@ export default function RegisterPage() {
           <span className="brand-mark" aria-hidden="true">
             <Activity size={19} strokeWidth={2.25} />
           </span>
-          <span className="brand-name">MedTimeline</span>
+          <span className="brand-name">Strand</span>
         </div>
 
         {/* Headline */}

@@ -1,260 +1,204 @@
-# MedTimeline
+# Strand
 
-Your medical records come scattered across formats and portals: a FHIR bundle from one system, an Epic EHI export from another, a CDA document from the hospital, a scanned PDF from the specialist who still faxes. MedTimeline ingests all of it, normalizes everything to FHIR R4 in a local PostgreSQL database, and lays it out on one timeline.
+**Every medical record you have, in any format, on one timeline — then out as a summary, a prompt, a FHIR export, or context for the AI of your choice.**
 
-It's local-first: your data stays on your machine. AI summaries are optional — prompt-only mode sends nothing anywhere, and live mode de-identifies every record before it reaches the API.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://img.shields.io/badge/tests-passing-brightgreen.svg)](#tests)
+[![ghcr.io](https://img.shields.io/badge/ghcr.io-strand-555.svg)](#quick-start-docker)
 
-## How data flows
+![Strand — your records, organized](docs/images/home.png)
+*Your records at a glance. All screenshots use synthetic [Synthea](https://synthetichealth.github.io/synthea/) data — no real records.*
+
+Your medical history arrives scattered across formats and portals: a FHIR bundle from one system, an Epic EHI export from another, a CDA document from the hospital, a scanned PDF from the specialist who still faxes. Strand ingests all of it — structured exports and unstructured documents alike, reading scans and notes into structured records with optional AI — normalizes everything to FHIR R4, removes the duplicates that pile up across exports, and lays it out on one interactive timeline.
+
+Then it's yours to use. Strand can write you a summary, hand you a de-identified prompt to paste into any LLM, export a standard FHIR bundle for another system, or give you clean context to drop into the AI of your choice. The AI is optional and privacy-preserving: every record is de-identified before it reaches a model, and a prompt-only mode sends nothing anywhere. Strand organizes and moves your records; it does not diagnose, interpret, or give medical advice.
+
+## A quick tour
+
+| | |
+|---|---|
+| ![Add records in any format](docs/images/upload.png) | ![One timeline](docs/images/timeline.png) |
+| **In:** add records in any format — FHIR, Epic, CDA, or a scanned PDF. | **Organized:** everything on one timeline, de-duplicated and coded. |
+| ![Take it out](docs/images/summarize.png) | ![A record opened up](docs/images/record-detail.png) |
+| **Out:** a de-identified summary, prompt, or FHIR export. | A record opened up, with its values, coding, and source. |
+
+## Quick start (Docker)
+
+You need Docker (Desktop, or Engine + Compose).
+
+```bash
+git clone https://github.com/potalora/strand && cd strand
+cp .env.docker.example .env
+just gen-secrets            # or: bash scripts/gen-secrets.sh
+docker compose up -d        # or: just up
+```
+
+Then open http://localhost:3000 (the API is at http://localhost:8000). Add a `GEMINI_API_KEY` to `.env` for the live AI summary; the prompt-only path works without one.
+
+Everything binds to `127.0.0.1`, so nothing is reachable from outside your machine. On-device clinical extraction is off by default to keep the image small; rebuild with `--build-arg CLINICAL_NLP=true` to turn it on. To upgrade, bump `APP_VERSION` in `.env` and run `docker compose pull && docker compose up -d`.
+
+## What it does
 
 ```mermaid
 flowchart LR
-    U["Upload<br/><small>FHIR · Epic EHI · CDA · PDF</small>"]
-    P["Normalize<br/><small>parse → FHIR R4, scrub PHI</small>"]
-    S["Store<br/><small>encrypted Postgres, deduped</small>"]
-    V["Explore<br/><small>timeline · summaries</small>"]
-    U --> P --> S --> V
+    I["Add records<br/><small>FHIR · Epic · CDA · PDF/scan</small>"]
+    N["Normalize + dedup<br/><small>→ FHIR R4, scrub PHI</small>"]
+    S["One timeline<br/><small>encrypted, on your machine</small>"]
+    O["Take it out<br/><small>summary · prompt · FHIR · AI context</small>"]
+    I --> N --> S --> O
 ```
 
-The formats and parsers behind that "Normalize" step are in [Ingestion formats](#ingestion-formats) below.
+Records go in as whatever you have. They come out as whatever you need.
 
-## Dedup pipeline
+## What goes in
 
-Records overlap. The same hypertension diagnosis shows up in an Epic export and again in a CDA document with slightly different wording. So every upload runs a two-tier dedup scan against what's already stored: a cheap heuristic scorer first, then a Gemini judge only for the ambiguous middle.
+Structured exports and unstructured documents go in the same way: Strand parses what it can, reads what it can't (scanned PDFs and notes) into structured records, codes them against standard vocabularies, de-duplicates against what you already have, and normalizes everything to FHIR R4.
+
+| Format | File type | What it produces |
+|--------|-----------|------------------|
+| FHIR R4 bundle | `.json` | 18 resource types |
+| Epic EHI Tables | `.zip` of `.tsv` | 14 table mappers → FHIR |
+| CDA XML | `.xml` | ClinicalDocument → FHIR |
+| IHE XDM | `.zip` | manifest → CDA docs → FHIR |
+| Unstructured | `.pdf` `.rtf` `.tiff` | OCR → entity extraction → FHIR |
+
+<details>
+<summary>Epic EHI table mappers (14) and FHIR resource types (18)</summary>
+
+**Epic TSV → FHIR:** PROBLEM_LIST / PROBLEM_LIST_ALL / MEDICAL_HX → Condition · PAT_ENC_DX → Condition (encounter dx) · ORDER_MED → MedicationRequest · ORDER_RESULTS → Observation · IP_FLWSHT_MEAS → Observation (vitals) · SOCIAL_HX → Observation (social) · PAT_ENC → Encounter · DOC_INFORMATION → DocumentReference · ALLERGY → AllergyIntolerance · IMMUNE → Immunization · ORDER_PROC → Procedure · REFERRAL → ServiceRequest · FAMILY_HX → FamilyMemberHistory
+
+**FHIR resource types:** Condition, Observation, MedicationRequest, MedicationStatement, AllergyIntolerance, Procedure, Encounter, Immunization, DiagnosticReport, DocumentReference, ImagingStudy, ServiceRequest, CarePlan, Communication, Appointment, CareTeam, ImmunizationRecommendation, QuestionnaireResponse
+
+</details>
+
+## What comes out
+
+Getting records out matters as much as getting them in. From your records you can produce:
+
+- **A summary** — Strand writes it for you (live AI mode).
+- **A copy-paste prompt** — a de-identified prompt, ready to run in any LLM, no API key needed.
+- **A FHIR R4 bundle** — a standard export for any other app or system.
+- **De-identified context** — the scrubbed records themselves, to drop into the AI chat of your choice.
+
+Anything that involves a model is de-identified first; the prompt and context paths never call one at all.
+
+## Privacy and AI
+
+- **AI is optional, and off the critical path.** Prompt-only mode builds a prompt you run yourself and sends nothing anywhere. Live mode calls a model directly, and de-identifies every record first.
+- **De-identification runs before every model call**, in three layers: regex identifiers, your own known identifiers (name, MRN, DOB), and a spaCy name model for the free-text names patterns miss.
+- **No medical advice.** Strand organizes, summarizes, and exports records. It never generates diagnoses, interpretations, or treatment suggestions.
+- **It runs on your machine.** The stack is self-hosted and binds to `127.0.0.1`, so nothing is exposed by default.
+- **Honest about limits.** Some things still slip through the scrubber (city names, for one), and there's no auto-update — with health data, you decide when to move to a new version.
+
+## How it works
+
+### De-duplication
+
+The same hypertension diagnosis shows up in an Epic export and again in a CDA document with slightly different wording. So every upload runs a two-tier scan against what's already stored: a cheap heuristic scorer first, then a Gemini judge only for the ambiguous middle.
 
 ```mermaid
 flowchart TD
     N["New records"] --> H{"Heuristic<br/>score"}
-    H -->|high| M["Merge automatically"]
+    H -->|high| M["Merge"]
     H -->|borderline| J{"Gemini<br/>judge"}
     H -->|low| K["Keep both"]
     J -->|confident| M
-    J -->|unsure| R["You decide in Admin<br/><small>merge · dismiss · cherry-pick · undo</small>"]
+    J -->|unsure| R["You decide in Admin"]
 ```
 
-**Heuristic scoring weights:**
+Score ≥ 0.95 merges on its own; 0.50–0.94 goes to the judge (which auto-resolves at ≥ 0.8 confidence); below that is left alone. Every merge keeps the originals and is reversible.
 
-| Signal | Weight |
-|--------|--------|
-| `code_value` match | 0.40 |
-| `display_text` similarity | 0.30 |
-| `effective_date` proximity | 0.20 |
-| `status` match | 0.10 |
-| Cross-source bonus | 0.10 |
-| `source_section` match | 0.15 |
+### Extraction from documents
 
-Score ≥ 0.95 merges automatically; 0.50–0.94 goes to the Gemini judge (which auto-resolves at ≥ 0.8 confidence); below 0.50 is left alone.
+A scanned note becomes structured records through OCR, then entity extraction (medications, conditions, procedures, labs, vitals, allergies, providers). Extraction runs one of three ways, set by `EXTRACTION_ENGINE`: `gemini` (cloud), `local` (on-device clinical NLP — medspaCy and scispaCy, nothing leaves the machine), or `hybrid`, the default, which runs local first and sends only the sections it's unsure about to Gemini. Local and hybrid need the optional `clinical-nlp` extra; without it, extraction falls back to the cloud path on its own.
 
-## Ingestion formats
+### Coding and cleanup
 
-| Format | File type | What it produces |
-|--------|-----------|------------------|
-| FHIR R4 Bundle | `.json` | 18 resource types → health_records |
-| Epic EHI Tables | `.zip` of `.tsv` | 14 table mappers → FHIR resources |
-| CDA XML | `.xml` | ClinicalDocument → FHIR via converter |
-| IHE XDM | `.zip` | METADATA.XML manifest → CDA docs → FHIR |
-| Unstructured | `.pdf` `.rtf` `.tiff` | Gemini OCR → entity extraction → FHIR |
+As records come in, Strand attaches standard codes where it can: RxNorm for medications, ICD-10-CM for conditions, LOINC for common labs. The vocabularies are bundled and matched locally, so no terminology lookups leave your machine, and a fuzzy match (RapidFuzz, on a tight threshold) catches typos and brand/generic variants without risking a wrong code. Anything it doesn't recognize stays uncoded rather than guessed. Extraction also drops obvious noise before anything is stored — bare measurements, procedures only mentioned in passing, scrubber leftovers — so the timeline is made of real records, not fragments.
 
-<details>
-<summary>Epic EHI table mappers (14)</summary>
-
-| Epic TSV table(s) | FHIR resource |
-|-------------------|---------------|
-| PROBLEM_LIST, PROBLEM_LIST_ALL, MEDICAL_HX | Condition |
-| PAT_ENC_DX | Condition (encounter diagnosis) |
-| ORDER_MED | MedicationRequest |
-| ORDER_RESULTS | Observation |
-| IP_FLWSHT_MEAS | Observation (vital signs) |
-| SOCIAL_HX | Observation (social history) |
-| PAT_ENC | Encounter |
-| DOC_INFORMATION | DocumentReference |
-| ALLERGY | AllergyIntolerance |
-| IMMUNE | Immunization |
-| ORDER_PROC | Procedure |
-| REFERRAL | ServiceRequest |
-| FAMILY_HX | FamilyMemberHistory |
-
-</details>
-
-<details>
-<summary>FHIR resource types (18)</summary>
-
-Condition, Observation, MedicationRequest, MedicationStatement, AllergyIntolerance, Procedure, Encounter, Immunization, DiagnosticReport, DocumentReference, ImagingStudy, ServiceRequest, CarePlan, Communication, Appointment, CareTeam, ImmunizationRecommendation, QuestionnaireResponse
-
-</details>
-
-## Coding and cleanup
-
-As records come in, MedTimeline tries to attach a standard code to each one: RxNorm for medications, ICD-10-CM for conditions, LOINC for the common labs. The vocabularies are bundled and matched locally, so no terminology lookups leave your machine. The medication list refreshes itself from RxNorm on startup and about once a week, and falls back to the copy committed in the repo when there's no network. SNOMED and CPT aren't included (they aren't freely redistributable), so procedures get a local label instead. Anything the vocabularies don't recognize stays uncoded rather than guessed. Close-but-not-exact names still resolve through a fuzzy match (RapidFuzz, on a tight threshold), so a typo or a brand/generic variant lands on the right code without risking a wrong one.
-
-Extraction from documents also drops obvious noise before anything is stored: bare measurements like "2mg", procedures only mentioned in passing rather than performed, PHI placeholders left behind by the scrubber. The point is to keep the timeline made of real records, not fragments.
-
-## Extraction engine
-
-Pulling clinical facts out of a document can run three ways, set by `EXTRACTION_ENGINE`: `gemini` (cloud), `local` (on-device clinical NLP: medspaCy for sections and negation, scispaCy for the named entities, nothing leaving the machine), or `hybrid`, the default, which runs local first and sends only the sections it's unsure about to Gemini. Local and hybrid need the optional `clinical-nlp` extra; without it, or with `EXTRACTION_ENGINE=gemini`, it falls back to the cloud path on its own. On structured documents the local pass is a lot faster and keeps PHI on the machine.
-
-## On the timeline
-
-Each row carries a small preview computed server-side: the value and unit, a neutral status chip, a reference gauge for labs, a couple of key facets, so a lab or a medication reads at a glance before you open it. Open an encounter and a "From this visit" panel lists the records pulled from the same note, the labs ordered, the meds started, each linking back to its own detail.
-
-## AI modes
-
-MedTimeline organizes records and produces summaries. It never diagnoses, recommends treatment, or gives medical advice — and either way, records are de-identified before any model sees them. There are two ways to run it:
-
-```mermaid
-flowchart TD
-    R["Records"] --> D["De-identify<br/><small>strip 18 HIPAA identifiers</small>"]
-    D --> M1["Mode 1 — copy a prompt<br/><small>paste into any LLM, no key needed</small>"]
-    D --> M2["Mode 2 — Gemini summary<br/><small>needs GEMINI_API_KEY</small>"]
-```
-
-The scrubber runs in three layers: regex patterns for the structured identifiers (SSN, MRN, phone, dates, addresses), a known-patient pass that redacts the record owner's own name and DOB, and spaCy NER to catch provider and family names the patterns miss.
-
-**Summary types:** full, category, date range, single record
-**Model:** `gemini-3.5-flash` (summaries, OCR, and entity extraction)
-
-## Database
+## Architecture and data
 
 ```mermaid
 erDiagram
     users ||--o{ patients : owns
     users ||--o{ uploaded_files : uploads
-    users ||--o{ audit_log : generates
     patients ||--o{ health_records : has
     uploaded_files ||--o{ health_records : produces
     health_records ||--o{ dedup_candidates : "compared in"
     health_records ||--o{ provenance : "tracked by"
 ```
 
-`health_records` is the core table — every clinical fact, stored as FHIR R4 JSONB. Every table uses UUID primary keys and `created_at`/`updated_at` timestamps; PII is encrypted at rest with AES-256/pgcrypto. Nothing is ever hard-deleted: `deleted_at` marks a row gone, and deleting an upload cascades that soft-delete to the records it produced. Full column-level schema lives in the Alembic migrations.
+`health_records` is the core table: every clinical fact, stored as FHIR R4 JSONB. UUID primary keys everywhere; PII encrypted at rest with AES-256/pgcrypto. Nothing is hard-deleted: `deleted_at` marks a row gone, and deleting an upload cascades that soft-delete to the records it produced. Full schema lives in the Alembic migrations.
 
-## HIPAA controls
+## Configuration
+
+Copy `.env.docker.example` to `.env` and run `just gen-secrets` to fill the required secrets (`DB_PASSWORD`, `JWT_SECRET_KEY`, `DATABASE_ENCRYPTION_KEY`). `GEMINI_API_KEY` is optional (live AI mode). See `.env.example` for the full list.
+
+## Develop
+
+`just` wraps the dev loop. `just setup` provisions the toolchain (uv for the backend, npm for the frontend) and brings up Postgres and Redis in Docker; `just dev` runs both servers with reload; `just test` runs the suites.
+
+<details>
+<summary>Native setup without Docker (macOS)</summary>
+
+```bash
+brew services start postgresql@16 && brew services start redis
+createdb strand && createdb strand_test
+psql strand < scripts/init-db.sql
+psql strand_test -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+
+cd backend && uv sync && uv run python -m spacy download en_core_web_md
+uv run alembic upgrade head
+uv run uvicorn app.main:app --reload --port 8000
+
+cd frontend && npm install && npm run dev
+```
+
+</details>
+
+## Tests
+
+```bash
+cd backend
+uv run pytest -m "not slow"     # fast suite
+uv run pytest                    # everything (slow tests hit the real Gemini API)
+uv run pytest tests/fidelity/    # real-data fidelity (skips without fixtures)
+```
+
+The fast suite runs against `strand_test` (auto-derived from `DATABASE_URL`). Fidelity tests need real-data fixtures and skip when they're absent; point `REAL_MEDICAL_FIXTURES_DIR` at a local corpus to run them.
+
+## API
+
+Full contract: [`docs/backend-handoff.md`](docs/backend-handoff.md) (base URL `/api/v1`).
+
+| Group | Endpoints |
+|-------|-----------|
+| **Auth** | `register` `login` `refresh` `logout` `me` |
+| **Records** | `GET /records` · `/records/:id` · `/records/:id/linked` · `/search` · `/series` · `/export` |
+| **Timeline** | `GET /timeline` |
+| **Upload** | `POST /upload` · `/upload/unstructured` · status + review endpoints |
+| **Dedup** | `/dedup/candidates` · `/merge` · `/dismiss` |
+| **Summary & export** | `/summary/build-prompt` · `/generate` · `/paste-response` · `GET /records/export` |
+
+## Security and HIPAA controls
 
 | Authentication | Data protection | Monitoring |
 |----------------|-----------------|------------|
 | bcrypt (cost 12+) | AES-256 at rest | Audit log on all data endpoints |
 | JWT 15-min access tokens | PHI scrub before any AI call | Rate limiting |
 | 7-day refresh tokens (rotated) | Soft delete only | Account lockout (5 fails) |
-| Token revocation (JTI blacklist) | User-scoped queries | 30-min idle timeout |
-| Password complexity enforcement | UUID upload filenames | CORS hardening |
-| HSTS + CSP + security headers | No PII in error responses | |
+| Token revocation (JTI) | User-scoped queries | 30-min idle timeout |
+| Password complexity | UUID upload filenames | CORS hardening |
+
+Strand is built to be HIPAA-minded for self-hosting; a single-user, self-hosted instance is not a covered entity, and "HIPAA controls" here describes the safeguards in the code, not a certification.
 
 ## Tech stack
 
-**Backend**: Python 3.12 / FastAPI / SQLAlchemy 2 async / PostgreSQL 16 / Alembic / Gemini API / LangExtract / spaCy (PHI NER) / RapidFuzz (fuzzy coding + dedup) / fhir.resources (structural validation) / python-fhir-converter. The optional `clinical-nlp` extra adds scispaCy + medspaCy for on-device extraction (no PyTorch).
+**Backend** — Python 3.11 / FastAPI / SQLAlchemy 2 async / PostgreSQL 16 / Alembic / Gemini API / LangExtract / spaCy / RapidFuzz / `fhir.resources`. Optional `clinical-nlp` extra adds scispaCy + medspaCy for on-device extraction (no PyTorch).
 
-**Frontend**: Next.js 15 / TypeScript / Tailwind CSS 4 / shadcn/ui / TanStack Query / Zustand. Auth is custom JWT — access + rotated refresh tokens in a Zustand store, with transparent 401 refresh in `lib/api.ts` (no auth framework).
+**Frontend** — Next.js / TypeScript / Tailwind CSS / shadcn/ui / TanStack Query / Zustand. Custom JWT auth with transparent refresh.
 
-**Infra**: PostgreSQL 16 + Redis 7, run in Docker for the containerized stack or via Homebrew for native macOS dev.
-
-## Project structure
-
-```
-backend/
-├── app/
-│   ├── main.py, config.py, database.py
-│   ├── middleware/          # auth, audit, encryption, security headers, rate limit
-│   ├── models/              # user, patient, record, uploaded_file, ai_summary, dedup, provenance, audit
-│   ├── api/                 # auth, records, timeline, upload, summary, dedup, review, dashboard, audit
-│   └── services/
-│       ├── ingestion/       # coordinator, fhir_parser, epic_parser, cda_parser, xdm_parser,
-│       │                    # cda_dedup, bulk_inserter, epic_mappers/ (14)
-│       ├── ai/              # prompt_builder, summarizer, phi_scrubber, patient_phi, phi_ner
-│       ├── extraction/      # text_extractor, entity_extractor, entity_validator, section_parser,
-│       │                    # entity_to_fhir, terminology (+ bundled terminology_data/)
-│       └── dedup/           # detector, orchestrator, llm_judge, field_merger
-├── tests/                   # ~69 files
-└── alembic/                 # migrations
-
-frontend/src/
-├── app/(dashboard)/         # overview, timeline, upload (+review), summaries, admin (4-tab), records/[id]
-├── components/retro/        # 18 components — Reimagined theme (Bloom / Prussian / Editorial)
-└── lib/                     # api.ts, utils.ts, constants.ts
-```
-
-The frontend theme is "Reimagined": warm paper, a deep ink-blue (Prussian) accent, and an italic serif display face (Source Serif 4 × Source Sans 3 × IBM Plex Mono). It reads as a records organizer, not a dashboard — values are shown neutrally, with no good/bad coloring.
-
-## Quick start (Docker)
-
-The quickest way to run the whole stack. You need Docker Desktop, or Docker Engine with the compose plugin.
-
-```bash
-git clone https://github.com/potalora/ai-clinical-uploads-exports.git
-cd ai-clinical-uploads-exports
-
-cp .env.docker.example .env
-just gen-secrets            # or: bash scripts/gen-secrets.sh
-# fills DB_PASSWORD, JWT_SECRET_KEY, DATABASE_ENCRYPTION_KEY
-# optional: add GEMINI_API_KEY for live AI summaries; prompt-only mode works without it
-
-docker compose up -d        # or: just up
-```
-
-Open http://localhost:3000. The API runs at http://localhost:8000.
-
-The stack binds to 127.0.0.1 only, so nothing is reachable from outside your machine. On-device clinical extraction is off by default to keep the image small; rebuild with `--build-arg CLINICAL_NLP=true` if you want it. To upgrade, bump `APP_VERSION` in `.env` and run `docker compose pull && docker compose up -d`. There's no auto-update, on purpose: with health data you decide when to move to a new version.
-
-## Develop
-
-If you're working on MedTimeline rather than just running it, the `justfile` wraps the dev loop. `just setup` provisions the toolchain (uv for the backend, npm for the frontend) and brings up Postgres and Redis in Docker; `just dev` runs both servers with reload; `just test` runs the suites. The native steps below still work if you'd rather manage the services yourself.
-
-## Manual setup (native, macOS)
-
-```bash
-# 1. infra
-brew services start postgresql@16 && brew services start redis
-createdb medtimeline && createdb medtimeline_test
-psql medtimeline < scripts/init-db.sql
-psql medtimeline_test -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
-
-# 2. env
-cp .env.example .env
-# edit: DATABASE_ENCRYPTION_KEY, JWT_SECRET_KEY
-# optional: GEMINI_API_KEY (for live AI features)
-
-# 3. backend
-cd backend && pip install -e ".[dev]"
-python -m spacy download en_core_web_md      # PHI name-redaction model
-pip install -e ".[clinical-nlp]"             # optional: on-device extraction (local/hybrid); skip for Gemini-only
-alembic upgrade head
-DATABASE_URL=postgresql+asyncpg://localhost:5432/medtimeline_test alembic upgrade head
-uvicorn app.main:app --reload --port 8000
-# the medication terminology index refreshes on startup; to build it up front:
-# python scripts/build_terminology_index.py --refresh-live
-
-# 4. frontend
-cd frontend && npm install && npm run dev
-# open http://localhost:3000
-```
-
-## Tests
-
-```bash
-cd backend
-python -m pytest -m "not slow"        # ~1200 fast tests
-python -m pytest                       # everything — plain pytest includes the slow tests
-python -m pytest -m slow               # just the slow ones (need GEMINI_API_KEY + real data)
-python -m pytest tests/test_hipaa_compliance.py
-python -m pytest tests/fidelity/       # Epic / FHIR / CDA fidelity (skip without real fixtures)
-```
-
-The fast suite is ~1200 tests across ~70 files, run against `medtimeline_test` (auto-derived from `DATABASE_URL`). There's no `--run-slow` flag; plain `pytest` already runs the slow tests, which hit the real Gemini API, so `-m "not slow"` is what you want day to day. Fidelity tests need real-data fixtures and skip when those are absent; point `REAL_MEDICAL_FIXTURES_DIR` at a local corpus to run them. A 120s per-test timeout backstops hangs in the fast suite; slow tests get a longer bound.
-
-## API
-
-Full contract: [`docs/backend-handoff.md`](docs/backend-handoff.md)
-
-| Group | Endpoints |
-|-------|-----------|
-| **Auth** | `POST /auth/register` `/login` `/refresh` `/logout` `GET /auth/me` |
-| **Records** | `GET /records` (`?status=` `?sort=` `?order=`) `/records/:id` `/records/:id/linked` `/records/search` `/records/series` `/records/export` `DELETE /records/:id` |
-| **Timeline** | `GET /timeline` |
-| **Dashboard** | `GET /dashboard/overview` `/labs` `/patients` `/sources` |
-| **Upload** | `POST /upload` `/upload/unstructured` `/unstructured-batch` `/trigger-extraction` `/upload/cancel` `DELETE /upload/:id` |
-| **Upload status** | `GET /upload/:id/status` `/errors` `/extraction` `/history` `/pending-extraction` `/extraction-progress` (`?ids=` to scope to one batch) |
-| **Upload review** | `POST /upload/:id/confirm-extraction` `GET /upload/:id/review` `POST /review/resolve` `/undo-merge` |
-| **Dedup** | `GET /dedup/candidates` `POST /dedup/merge` `/dismiss` |
-| **AI Summary** | `POST /summary/build-prompt` `/generate` `/paste-response` `GET /summary/prompts` `/prompts/:id` `/responses` |
-| **Audit** | `GET /audit-log` |
+**Infra** — PostgreSQL 16 + Redis 7, via Docker Compose or Homebrew. Container images published to GHCR (`:edge` on every merge, `:vX.Y.Z` on release tags).
 
 ## License
 
