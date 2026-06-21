@@ -981,7 +981,7 @@ async def _run_gemini_extraction_engine(db, upload, upload_id, user_id, text, se
     """
     from app.services.ai.llm import load_llm_config
     from app.services.extraction.entity_extractor import extract_entities_async
-    from app.services.ai.phi_scrubber import scrub_phi
+    from app.services.ai.phi_scrubber import scrub_phi_async
     from app.services.ai.patient_phi import patient_scrub_args
     from app.models.patient import Patient
     from app.services.extraction.section_parser import ParsedDocument, ParsedSection, SectionType
@@ -990,11 +990,15 @@ async def _run_gemini_extraction_engine(db, upload, upload_id, user_id, text, se
     # both section parsing and per-section entity extraction). Falls back to .env.
     config = await load_llm_config(db, user_id)
 
-    # Step 2: Scrub PHI before entity extraction — local, no semaphore.
+    # Step 2: Scrub PHI before entity extraction — local, no semaphore. The scrub
+    # (spaCy PERSON NER especially) is CPU-bound; run it off the event loop so the
+    # background worker doesn't freeze concurrent API requests (D3).
     patients = (
         await db.execute(select(Patient).where(Patient.user_id == user_id))
     ).scalars().all()
-    scrubbed_text, _deident_report = scrub_phi(text, **patient_scrub_args(list(patients)))
+    scrubbed_text, _deident_report = await scrub_phi_async(
+        text, **patient_scrub_args(list(patients))
+    )
 
     # Step 3: Section parsing (skip Gemini call for small docs)
     if len(scrubbed_text) < settings.small_doc_threshold:
@@ -1150,7 +1154,7 @@ async def _run_local_extraction_engine(db, upload, upload_id, user_id, text, eng
     ``(all_entities, parsed_doc)`` or ``None`` if cancelled.
     """
     from app.services.ai.llm import load_llm_config
-    from app.services.ai.phi_scrubber import scrub_phi
+    from app.services.ai.phi_scrubber import scrub_phi_async
     from app.services.ai.patient_phi import patient_scrub_args
     from app.services.extraction.entity_extractor import extract_entities_async
     from app.services.extraction.entity_validator import validate_entities
@@ -1171,7 +1175,10 @@ async def _run_local_extraction_engine(db, upload, upload_id, user_id, text, eng
     async def _gemini_section_extract(section_text: str):
         # Rule 2: de-identify before any Gemini call. Only escalated section text
         # is sent; the bulk local path is never scrubbed (it stays on-device).
-        scrubbed, _rep = scrub_phi(section_text, **patient_scrub_args(list(patients)))
+        # Offload the CPU-bound scrub so the event loop stays responsive (D3).
+        scrubbed, _rep = await scrub_phi_async(
+            section_text, **patient_scrub_args(list(patients))
+        )
         out: list = []
         for chunk in split_large_section(scrubbed):
             async with sem:
@@ -1225,6 +1232,34 @@ async def _run_local_extraction_engine(db, upload, upload_id, user_id, text, eng
     return result.entities, parsed_doc
 
 
+def _build_record_dicts(
+    entities, user_id, patient_id, source_file_id, document_date, document_provider
+):
+    """Map a batch of extracted entities to HealthRecord dicts (pure CPU).
+
+    Runs the terminology lookups (RapidFuzz fuzzy matching), FHIR resource build,
+    content hashing and structural validation for every entity — all GIL-bound
+    compute with no DB or async I/O. Pulled into a standalone function so the
+    whole batch can be offloaded with one ``asyncio.to_thread`` call, keeping the
+    event loop free for API requests while the mapping runs (D3).
+
+    Returns ``(entity, record_dict | None)`` pairs in input order — ``None`` for
+    entity classes that don't map to a storable record. The DB inserts stay on
+    the caller's event-loop thread (the AsyncSession is not thread-safe).
+    """
+    from app.services.extraction.entity_to_fhir import entity_to_health_record_dict
+
+    built: list[tuple[object, dict | None]] = []
+    for entity in entities:
+        record_dict = entity_to_health_record_dict(
+            entity, user_id, patient_id, source_file_id,
+            document_date=document_date,
+            document_provider=document_provider,
+        )
+        built.append((entity, record_dict))
+    return built
+
+
 async def _autoconfirm_and_finish(db, upload, upload_id, user_id, unique_entities, parsed_doc):
     """Auto-confirm extracted entities into HealthRecords and finalize the upload.
 
@@ -1233,7 +1268,6 @@ async def _autoconfirm_and_finish(db, upload, upload_id, user_id, unique_entitie
     scan. Lifted verbatim from the prior inline tail.
     """
     from app.services.extraction.entity_to_fhir import (
-        entity_to_health_record_dict,
         resolve_document_date,
         resolve_document_provider,
     )
@@ -1252,12 +1286,16 @@ async def _autoconfirm_and_finish(db, upload, upload_id, user_id, unique_entitie
         encounter_id = None
         created_records = []
 
-        for entity in unique_entities:
-            record_dict = entity_to_health_record_dict(
-                entity, user_id, patient.id, upload_id,
-                document_date=document_date,
-                document_provider=document_provider,
-            )
+        # Map all entities → FHIR record dicts off the event loop (CPU-bound:
+        # terminology lookups + FHIR build + hashing + validation). The DB adds
+        # below stay on the loop thread — the AsyncSession is not thread-safe.
+        built_records = await asyncio.to_thread(
+            _build_record_dicts,
+            unique_entities, user_id, patient.id, upload_id,
+            document_date, document_provider,
+        )
+
+        for entity, record_dict in built_records:
             if record_dict is None:
                 continue
             record_dict["source_section"] = entity.attributes.get("_source_section")

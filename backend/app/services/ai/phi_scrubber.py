@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import logging
 from typing import Any
@@ -230,3 +231,40 @@ def scrub_phi(
             report["ner_names_scrubbed"] = ner_report["names"]
 
     return scrubbed, report
+
+
+async def scrub_phi_async(
+    text: str,
+    patient_names: list[str] | None = None,
+    patient_dob: str | None = None,
+    patient_address: str | None = None,
+    patient_mrn: str | None = None,
+    enable_ner: bool | None = None,
+) -> tuple[str, dict[str, int]]:
+    """Async wrapper around :func:`scrub_phi` that runs it off the event loop.
+
+    ``scrub_phi`` is CPU-bound — the spaCy PERSON-NER pass in particular pins the
+    interpreter for hundreds of milliseconds to seconds on large documents. When
+    that runs directly inside the background extraction worker's coroutine it
+    blocks the single asyncio event-loop thread, so every concurrent API request
+    stalls until the scrub finishes (perf divergence D3).
+
+    Offloading to a worker thread keeps the event loop responsive: CPython
+    releases the GIL periodically and spaCy/BLAS release it during their heavy C
+    sections, so request handling interleaves with the scrub. The output is
+    byte-identical to calling :func:`scrub_phi` directly — only WHERE the work
+    runs changes, never WHAT it produces.
+
+    This does NOT speed the scrub up (the work is still GIL-bound); it only stops
+    it from freezing the loop. Use this from any ``async def`` on a hot path; the
+    plain ``scrub_phi`` stays for sync callers and tests.
+    """
+    return await asyncio.to_thread(
+        scrub_phi,
+        text,
+        patient_names=patient_names,
+        patient_dob=patient_dob,
+        patient_address=patient_address,
+        patient_mrn=patient_mrn,
+        enable_ner=enable_ner,
+    )

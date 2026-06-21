@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 from enum import Enum
@@ -308,7 +309,9 @@ async def extract_text_from_pdf(
 ) -> str:
     """Local-first PDF text extraction; fall back to vision OCR when untrustworthy."""
     try:
-        text, confidence = extract_text_from_pdf_local(file_path)
+        # pdfplumber parsing (+ decrypt) is CPU-bound; offload it so the
+        # background extraction worker doesn't block the event loop (D3).
+        text, confidence = await asyncio.to_thread(extract_text_from_pdf_local, file_path)
         if confidence >= LOCAL_TEXT_MIN_CHARS_PER_PAGE and text.strip():
             logger.info("PDF %s: used local text layer (%.0f chars/page)", file_path.name, confidence)
             return text
@@ -362,7 +365,8 @@ async def extract_text(
     logger.info("Extracting text from %s (type=%s)", file_path.name, file_type.value)
 
     if file_type == FileType.RTF:
-        text = extract_text_from_rtf(file_path)
+        # striprtf parsing (+ decrypt) is CPU-bound; offload to keep the loop free (D3).
+        text = await asyncio.to_thread(extract_text_from_rtf, file_path)
     elif file_type == FileType.PDF:
         text = await extract_text_from_pdf(file_path, api_key, config, trace=trace)
     elif file_type == FileType.TIFF:
