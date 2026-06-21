@@ -100,8 +100,10 @@ CLAUDE.private.md
 # Backend data directory
 backend/data/
 
-# Screenshots (dev artifacts)
+# Screenshots (dev artifacts) — may contain PHI, so ignored by default.
 *.png
+# Exception: README screenshots use synthetic Synthea data (no real records).
+!docs/images/*.png
 
 # Git worktrees
 .worktrees/
