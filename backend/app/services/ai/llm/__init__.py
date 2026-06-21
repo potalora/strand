@@ -9,6 +9,9 @@ from app.services.ai.llm.types import (
 # Imported last: the registry pulls in the provider modules (which depend on
 # base/types above), so this must follow the base/types imports to avoid a
 # circular import at package init.
+from app.services.ai.llm.config import (  # noqa: E402
+    LLMConfig, ProviderCreds, load_llm_config,
+)
 from app.services.ai.llm.registry import (  # noqa: E402
     available_providers, get_provider, provider_name_for, resolve_model,
     KNOWN_PROVIDERS,
@@ -20,5 +23,5 @@ __all__ = [
     "LLMRateLimitError", "LLMTimeoutError", "LLMBadRequestError",
     "LLMResponseError", "LLMProviderUnavailableError",
     "get_provider", "available_providers", "provider_name_for", "resolve_model",
-    "KNOWN_PROVIDERS",
+    "KNOWN_PROVIDERS", "LLMConfig", "ProviderCreds", "load_llm_config",
 ]
