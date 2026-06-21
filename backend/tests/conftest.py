@@ -121,10 +121,27 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
         yield db_session
 
     fastapi_app.dependency_overrides[get_db] = override_get_db
+
+    # The request-level audit middleware (W16) opens its OWN session via
+    # app.middleware.audit.async_session_factory (deliberately not get_db, so a
+    # request rollback can't drop the audit row). Point that factory at the test
+    # DB for the duration of the test, otherwise it writes api.access rows to the
+    # real database during the suite.
+    import app.middleware.audit as _audit
+
+    _audit_engine = create_async_engine(TEST_DB_URL, echo=False)
+    _orig_audit_factory = _audit.async_session_factory
+    _audit.async_session_factory = async_sessionmaker(
+        _audit_engine, class_=AsyncSession, expire_on_commit=False
+    )
+
     transport = ASGITransport(app=fastapi_app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+
     fastapi_app.dependency_overrides.clear()
+    _audit.async_session_factory = _orig_audit_factory
+    await _audit_engine.dispose()
 
 
 @pytest.fixture

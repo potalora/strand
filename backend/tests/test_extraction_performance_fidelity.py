@@ -39,17 +39,33 @@ async def test_router_textlayer_note_skips_gemini_vision():
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not _HAS_KEY or not (_SCANNED and _SCANNED.exists()),
-                    reason="GEMINI_API_KEY + scanned ibs_smart.pdf required")
+@pytest.mark.skipif(not (_SCANNED and _SCANNED.exists()),
+                    reason="scanned ibs_smart.pdf required")
 @pytest.mark.asyncio
-async def test_router_scanned_pdf_ocr_via_vision_fallback():
-    """A scanned PDF routes to vision OCR. Gemini RECITATION-blocks ibs_smart.pdf
-    (returns empty), so OCR must fall back to another configured vision provider
-    (e.g. Anthropic/OpenAI) and still return text. Requires at least one non-Gemini
-    vision key configured for the fallback to recover."""
+async def test_router_scanned_pdf_ocr_via_chosen_vision_provider():
+    """A scanned PDF routes to vision OCR via the CHOSEN vision provider.
+
+    Gemini RECITATION-blocks ibs_smart.pdf (returns empty). Under the W12
+    minimum-necessary egress policy the document is NOT re-sent across the whole
+    provider chain on that block — so reading it requires the user to have chosen
+    a vision provider that CAN read it (e.g. Anthropic/OpenAI). This points
+    ``vision`` at the first configured non-Gemini cloud vision provider and
+    asserts that single provider returns text. Skips when none is configured."""
+    from app.services.ai.llm.config import LLMConfig
+
     text, confidence = text_extractor.extract_text_from_pdf_local(_SCANNED)
     print(f"\nibs_smart.pdf local confidence: {confidence:.1f} chars/page (threshold={text_extractor.LOCAL_TEXT_MIN_CHARS_PER_PAGE})")
     if confidence >= text_extractor.LOCAL_TEXT_MIN_CHARS_PER_PAGE:
         pytest.skip(f"ibs_smart.pdf has a text layer (conf={confidence}); not a scanned fixture")
-    out = await text_extractor.extract_text_from_pdf(_SCANNED, settings.gemini_api_key)
+
+    cfg = LLMConfig.from_settings()
+    chosen = next(
+        (n for n in ("anthropic", "openai", "openrouter")
+         if cfg.providers.get(n) and cfg.providers[n].api_key),
+        None,
+    )
+    if chosen is None:
+        pytest.skip("no non-Gemini cloud vision provider configured to read a Gemini-blocked scan")
+    cfg.routing["vision"] = chosen
+    out = await text_extractor.extract_text_from_pdf(_SCANNED, settings.gemini_api_key, cfg)
     assert len(out.strip()) > 0

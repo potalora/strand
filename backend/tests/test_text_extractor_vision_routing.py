@@ -37,24 +37,26 @@ async def test_pdf_ocr_routes_a_document_part_to_vision_provider(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_ocr_falls_back_when_first_provider_returns_empty(tmp_path):
-    """Reproduces the Gemini-RECITATION case: the first provider returns no text,
-    so OCR must fall back to the next configured vision provider."""
+async def test_ocr_capability_gap_falls_back_once_to_gemini(tmp_path):
+    """A LOCAL capability gap (an on-machine model that can't do vision) is the
+    ONE case that falls back: the attempt never left the host, so OCR may try the
+    single documented Gemini cloud fallback. (Minimum-necessary egress, W12 —
+    a cloud refusal is NOT re-sent to another vendor; see test_ocr_egress.py.)"""
     pdf = tmp_path / "scan.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake")
     blocked = AsyncMock()
-    blocked.complete.return_value = _resp("")  # e.g. Gemini RECITATION block
+    blocked.complete.return_value = _resp("")  # local model can't do vision
     good = AsyncMock()
     good.complete.return_value = _resp("RECOVERED TEXT")
     with patch.object(text_extractor, "extract_text_from_pdf_local", return_value=("", 0.0)), \
          patch.object(
              text_extractor, "_vision_candidates",
-             return_value=[("gemini", blocked), ("anthropic", good)]):
+             return_value=[("ollama", blocked), ("gemini", good)]):
         out = await text_extractor.extract_text_from_pdf(
             pdf, api_key="gem", config=LLMConfig.from_settings())
     assert out == "RECOVERED TEXT"
-    blocked.complete.assert_awaited_once()  # tried the chosen provider first
-    good.complete.assert_awaited_once()     # then fell back
+    blocked.complete.assert_awaited_once()  # tried the chosen (local) provider first
+    good.complete.assert_awaited_once()     # then the single Gemini fallback
 
 
 @pytest.mark.asyncio

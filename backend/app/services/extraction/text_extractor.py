@@ -79,12 +79,22 @@ def extract_text_from_rtf(file_path: Path) -> str:
     return rtf_to_text(raw)
 
 
-# Order to try vision providers when the chosen one returns empty/blocked.
-# Anthropic + OpenAI read scanned PDFs that Gemini sometimes RECITATION-blocks,
-# so they lead the fallback order.
+# Enumeration order for vision candidates. The chosen provider always leads;
+# the rest only matter for locating the single documented capability fallback
+# (Gemini). They are NOT a chain the document gets fanned out across — see
+# ``_ocr_via_provider`` for the minimum-necessary egress policy (W12).
 _VISION_FALLBACK_ORDER = (
     "anthropic", "openai", "gemini", "openrouter", "vertex", "ollama", "lmstudio",
 )
+
+# On-machine providers. An OCR attempt against these never leaves the host, so a
+# capability gap (a local model that can't do vision) may fall back once to the
+# cloud. A CLOUD provider, by contrast, has already received the document, so it
+# must NOT trigger a re-send to a second cloud vendor.
+_LOCAL_PROVIDERS = frozenset({"ollama", "lmstudio"})
+
+# The single documented cloud fallback used ONLY for a local capability gap.
+_VISION_CAPABILITY_FALLBACK = "gemini"
 
 
 def _vision_candidates(config: LLMConfig, api_key: str) -> list:
@@ -125,6 +135,31 @@ def _vision_candidates(config: LLMConfig, api_key: str) -> list:
     return candidates
 
 
+async def _ocr_attempt(name, provider, req, trace: list | None) -> tuple[str, Exception | None]:
+    """Run a single OCR attempt against one provider and record its trace entry.
+
+    Returns ``(text, error)`` where ``text`` is the extracted OCR text (``""`` when
+    the provider returned nothing / refused / blocked) and ``error`` is the raised
+    exception (``None`` on a clean call). Appends ``{"provider", "status"}``
+    (``ok`` / ``refused`` / ``error``) to ``trace`` when provided.
+    """
+    try:
+        text = (await provider.complete(req)).text or ""
+    except Exception as exc:  # noqa: BLE001 - caller decides whether to fall back
+        if trace is not None:
+            trace.append({"provider": name, "status": "error"})
+        logger.warning("OCR via %s failed (%s)", name, exc)
+        return "", exc
+    if text.strip():
+        if trace is not None:
+            trace.append({"provider": name, "status": "ok"})
+        return text, None
+    if trace is not None:
+        trace.append({"provider": name, "status": "refused"})
+    logger.info("OCR via %s returned no text (blocked/empty)", name)
+    return "", None
+
+
 async def _ocr_via_provider(
     parts: list,
     config: LLMConfig | None,
@@ -133,13 +168,24 @@ async def _ocr_via_provider(
     *,
     trace: list | None = None,
 ) -> str:
-    """Run OCR over ``parts``, falling back across configured vision providers.
+    """Run OCR over ``parts`` with minimum-necessary cloud egress (W12).
 
-    Tries the user's chosen ``vision`` provider first; if it returns no text
-    (e.g. a Gemini RECITATION block) or fails, the next configured + enabled
-    vision provider is tried, in order. Returns the first non-empty OCR text;
-    ``""`` only when every candidate yields no text; raises only when no
-    candidate could be tried at all.
+    The raw (un-redacted) document is sent to the user's chosen ``vision``
+    provider first. If it produces no text we do NOT fan the document out across
+    every configured provider, because that would transmit a patient's full
+    document to multiple third-party processors (DEID-01/DEID-06, SEC-PHI-03):
+
+    * The chosen provider is a CLOUD vendor: it authenticated and then
+      refused/errored on the content, but it already received the document.
+      We STOP — the same document is never re-sent to a different cloud vendor.
+    * The chosen provider is LOCAL (ollama/lmstudio): the attempt stayed
+      on-machine, so a genuine capability gap (a local model that can't do
+      vision) may fall back EXACTLY ONCE to the documented Gemini cloud fallback.
+
+    Net effect: at most one third-party cloud provider ever receives the
+    document. Returns the OCR text; ``""`` when nothing could read it; raises
+    only when no candidate could be tried at all, or the single attempted
+    provider errored and nothing was recovered.
 
     When ``trace`` is provided, each attempt appends ``{"provider", "status"}``
     (``ok`` / ``refused`` / ``error``) so callers can surface a user-facing notice.
@@ -158,25 +204,30 @@ async def _ocr_via_provider(
     candidates = _vision_candidates(cfg, api_key)
     if not candidates:
         raise RuntimeError("No vision-capable provider is configured for OCR")
-    last_err: Exception | None = None
-    for name, provider in candidates:
-        try:
-            text = (await provider.complete(req)).text or ""
-        except Exception as exc:  # noqa: BLE001 - try the next provider
-            last_err = exc
-            if trace is not None:
-                trace.append({"provider": name, "status": "error"})
-            logger.warning("OCR via %s failed (%s); trying next vision provider", name, exc)
-            continue
-        if text.strip():
-            if trace is not None:
-                trace.append({"provider": name, "status": "ok"})
-            return text
-        if trace is not None:
-            trace.append({"provider": name, "status": "refused"})
-        logger.info("OCR via %s returned no text (blocked/empty); trying next", name)
-    if last_err is not None:
-        raise last_err
+
+    chosen_name, chosen_provider = candidates[0]
+    text, err = await _ocr_attempt(chosen_name, chosen_provider, req, trace)
+    if text:
+        return text
+
+    # Bounded capability fallback: ONLY when the chosen provider was on-machine
+    # (no third-party egress yet) do we try the single documented Gemini fallback.
+    # A cloud provider that refused/errored is NOT re-sent to another vendor.
+    if chosen_name in _LOCAL_PROVIDERS:
+        fallback = next(
+            (p for n, p in candidates if n == _VISION_CAPABILITY_FALLBACK), None
+        )
+        if fallback is not None:
+            text, fb_err = await _ocr_attempt(
+                _VISION_CAPABILITY_FALLBACK, fallback, req, trace)
+            if text:
+                return text
+            err = fb_err or err
+
+    # Surface a hard error only when nothing was read at all; a clean refusal
+    # (empty text, no exception) returns "" so callers can show an unreadable notice.
+    if err is not None:
+        raise err
     return ""
 
 

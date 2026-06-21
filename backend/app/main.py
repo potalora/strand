@@ -10,6 +10,7 @@ from sqlalchemy import text
 from app.api.router import api_router
 from app.config import settings
 from app.database import async_session_factory
+from app.middleware.audit import AuditMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 
 logging.basicConfig(
@@ -118,6 +119,12 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Request-level audit safety net (W16): a generic api.access row for every
+    # authenticated /api/v1 request so no PHI access goes silently un-logged.
+    # Added before CORS so it runs INSIDE the CORS layer — CORS short-circuits
+    # OPTIONS preflight above it (never audited), and this still sees the final
+    # route status for real requests.
+    app.add_middleware(AuditMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(
         CORSMiddleware,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import base64
 import hashlib
+import hmac
 import os
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -39,3 +39,19 @@ def decrypt_field(data: bytes) -> str:
 def hash_value(value: str) -> str:
     """Create a SHA-256 hash for deduplication checks."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def blind_index(value: str) -> str:
+    """Deterministic, keyed lookup token for an encrypted column.
+
+    Encrypting a column with AES-256-GCM uses a random nonce, so the ciphertext
+    is non-deterministic and cannot back an equality lookup (e.g. login by
+    email). A blind index is an HMAC-SHA256 of the *normalized* plaintext keyed
+    off the database encryption key: deterministic for the same input (so it can
+    be indexed and compared) but not reversible without the key.
+
+    The input is lowercased and stripped so lookups are stable regardless of
+    surrounding whitespace or case. Returns a 64-char lowercase hex digest.
+    """
+    normalized = value.strip().lower().encode("utf-8")
+    return hmac.new(_get_key(), normalized, hashlib.sha256).hexdigest()

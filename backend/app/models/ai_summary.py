@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, UUIDPrimaryKeyMixin
+from app.models.encrypted_types import EncryptedText
 
 
 class AISummaryPrompt(Base, UUIDPrimaryKeyMixin):
@@ -21,15 +22,17 @@ class AISummaryPrompt(Base, UUIDPrimaryKeyMixin):
     )
     summary_type: Mapped[str] = mapped_column(Text, nullable=False)
     scope_filter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
-    user_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    # Encrypted at rest (AES-256-GCM). Prompts + the model response can embed
+    # clinical context; stored ciphertext, fetch-and-render only.
+    system_prompt: Mapped[str] = mapped_column(EncryptedText, nullable=False)
+    user_prompt: Mapped[str] = mapped_column(EncryptedText, nullable=False)
     target_model: Mapped[str] = mapped_column(
         Text, nullable=False, server_default="gemini-3-flash-preview"
     )
     suggested_config: Mapped[dict] = mapped_column(JSONB, nullable=False)
     record_count: Mapped[int] = mapped_column(Integer, nullable=False)
     de_identification_log: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    response_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_text: Mapped[str | None] = mapped_column(EncryptedText, nullable=True)
     response_pasted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

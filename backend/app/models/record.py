@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+from app.models.encrypted_types import EncryptedJSON
 
 
 class HealthRecord(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -29,7 +30,10 @@ class HealthRecord(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     record_type: Mapped[str] = mapped_column(Text, nullable=False)
     fhir_resource_type: Mapped[str] = mapped_column(Text, nullable=False)
-    fhir_resource: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # Encrypted at rest (AES-256-GCM via EncryptedJSON). The clinical FHIR
+    # payload is fetch-and-render only — never SQL-queried — so encrypting it
+    # costs zero queryability. Reads back transparently as the same dict.
+    fhir_resource: Mapped[dict] = mapped_column(EncryptedJSON, nullable=False)
     source_format: Mapped[str] = mapped_column(Text, nullable=False)
     source_file_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("uploaded_files.id"), nullable=True
