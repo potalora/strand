@@ -2225,9 +2225,21 @@ const OP_COPY: Record<string, string> = {
   default: "Used for any operation without its own override below.",
   summary: "Writes your health summaries.",
   extraction: "Pulls clinical entities from uploaded documents.",
-  vision: "Reads text from scanned PDFs and images.",
+  vision:
+    "Reads text from scanned PDFs and images. If a provider declines a document " +
+    "(e.g. content policy), Strand automatically tries your next configured provider.",
   dedup: "Decides whether two records are the same.",
   section: "Splits long notes into sections before extraction.",
+};
+
+// Where each cloud provider issues API keys. Local providers (Ollama, LM Studio)
+// and Vertex (Google Cloud project, server-side) are intentionally absent — they
+// get bespoke help text instead of a key link.
+const PROVIDER_KEY_URLS: Record<string, string> = {
+  openai: "https://platform.openai.com/api-keys",
+  anthropic: "https://console.anthropic.com/settings/keys",
+  gemini: "https://aistudio.google.com/apikey",
+  openrouter: "https://openrouter.ai/keys",
 };
 
 // Per-operation routing exposed under the Advanced disclosure (the "default"
@@ -2370,10 +2382,13 @@ function LlmProvidersCard() {
       <h3 className="sec-title" style={{ marginBottom: 6 }}>
         AI providers
       </h3>
-      <p className="h-sub" style={{ margin: "0 0 6px" }}>
-        Choose which model runs each AI operation, and store your own API keys.
-        Cloud providers receive de-identified records over the network; local
-        providers (Ollama, LM Studio) keep your data on this machine.
+      <p className="muted" style={{ fontSize: 13, lineHeight: 1.55, margin: "0 0 10px" }}>
+        Strand can use different AI providers for the features below. Add an API key
+        (or point at a local server) for each provider you want, choose which one
+        runs each task, then Test the connection. Keys are encrypted and stored only
+        on this server — never shown again or sent anywhere except the provider you
+        pick. Cloud providers receive only de-identified records; local providers
+        (Ollama, LM Studio) keep everything on this machine.
       </p>
 
       {loading ? (
@@ -2602,6 +2617,31 @@ function LlmProvidersCard() {
                     {renderTest(p.name)}
                   </div>
 
+                  {/* Inline contextual help: where to get a key (cloud) or how to
+                      run it (local / Vertex). */}
+                  <p
+                    className="muted"
+                    style={{ fontSize: 12, lineHeight: 1.5, margin: "8px 0 0" }}
+                  >
+                    {p.is_local ? (
+                      "Runs locally — no API key. Start the server, set the base URL, " +
+                      "and a model you've pulled (Ollama: ollama pull <model>) or " +
+                      "loaded (LM Studio)."
+                    ) : p.name === "vertex" ? (
+                      "Uses a Google Cloud project (Vertex AI) — configured in the " +
+                      "server environment."
+                    ) : PROVIDER_KEY_URLS[p.name] ? (
+                      <a
+                        href={PROVIDER_KEY_URLS[p.name]}
+                        target="_blank"
+                        rel="noreferrer noopener"
+                        style={{ color: "var(--primary)", textDecoration: "underline" }}
+                      >
+                        Get an API key ↗
+                      </a>
+                    ) : null}
+                  </p>
+
                   {/* Endpoint + model for local / OpenRouter providers */}
                   {needsEndpoint && (
                     <div
@@ -2643,6 +2683,18 @@ function LlmProvidersCard() {
                       >
                         Save
                       </button>
+                      <p
+                        className="muted"
+                        style={{
+                          fontSize: 12,
+                          lineHeight: 1.5,
+                          margin: "4px 0 0",
+                          width: "100%",
+                        }}
+                      >
+                        Model — e.g. gpt-5.4-mini, claude-haiku-4-5, gemini-3.5-flash,
+                        or a local model name.
+                      </p>
                     </div>
                   )}
                 </div>

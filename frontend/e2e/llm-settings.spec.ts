@@ -232,6 +232,23 @@ test.describe("AI providers card (Admin → System)", () => {
     await expect(page.getByLabel("summary provider")).toBeVisible();
   });
 
+  test("renders the contextual intro and a 'Get an API key' link", async ({ page }) => {
+    await mockBackend(page);
+    await page.goto("/admin?tab=sys");
+
+    // The muted intro paragraph at the top of the card body.
+    await expect(
+      page.getByText(/Strand can use different AI providers/i)
+    ).toBeVisible();
+
+    // Cloud providers (openai/anthropic/gemini/openrouter) expose a key link
+    // that opens the provider's key page in a new tab.
+    const keyLinks = page.getByRole("link", { name: /Get an API key/i });
+    await expect(keyLinks.first()).toBeVisible();
+    await expect(keyLinks.first()).toHaveAttribute("target", "_blank");
+    await expect(keyLinks.first()).toHaveAttribute("rel", /noreferrer/);
+  });
+
   test("saving a key PUTs the provider with the key in the body", async ({ page }) => {
     await mockBackend(page);
     await page.goto("/admin?tab=sys");
