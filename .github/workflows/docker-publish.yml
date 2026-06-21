@@ -6,6 +6,11 @@
 # The pushed packages land under ghcr.io/<owner>/strand-{backend,frontend} and are
 # linked to this repo (set their visibility to public in the package settings if you
 # want a no-login pull).
+#
+# Multi-arch is built WITHOUT QEMU emulation: each platform builds on its own native
+# runner (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm — free for public repos),
+# pushes by digest, and a final job stitches the digests into one manifest per tag. This
+# avoids the emulated-arm64 OOM that made the memory-heavy frontend build flaky.
 name: Publish Docker images
 
 on:
@@ -18,23 +23,30 @@ permissions:
   contents: read
   packages: write
 
+env:
+  REGISTRY: ghcr.io
+
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  # One job per (image, architecture), each on its native runner. Builds and pushes the
+  # image by digest only (no tag yet) so the merge job can assemble the manifest list.
+  build:
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: backend
-            context: ./backend
-          - name: frontend
-            context: ./frontend
+          - { name: backend, context: ./backend, platform: linux/amd64, runner: ubuntu-latest }
+          - { name: backend, context: ./backend, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { name: frontend, context: ./frontend, platform: linux/amd64, runner: ubuntu-latest }
+          - { name: frontend, context: ./frontend, platform: linux/arm64, runner: ubuntu-24.04-arm }
     steps:
+      - name: Prepare platform slug
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -42,28 +54,84 @@ jobs:
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive image metadata
+      - name: Derive image labels
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/strand-${{ matrix.name }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/strand-${{ matrix.name }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/strand-${{ matrix.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=release-${{ matrix.name }}-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.name }}-${{ env.PLATFORM_PAIR }}
+
+      - name: Export digest
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-release-${{ matrix.name }}-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # One job per image: gather the per-arch digests and publish a single multi-arch
+  # manifest list under the semver and :latest tags.
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [backend, frontend]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-release-${{ matrix.name }}-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/strand-${{ matrix.name }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.context }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ github.repository_owner }}/strand-${{ matrix.name }}@sha256:%s ' *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ github.repository_owner }}/strand-${{ matrix.name }}:${{ steps.meta.outputs.version }}
