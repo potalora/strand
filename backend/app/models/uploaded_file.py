@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+from app.models.encrypted_types import EncryptedJSON, EncryptedText
 
 
 class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -37,10 +38,13 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     file_category: Mapped[str] = mapped_column(
         Text, default="structured", server_default="structured"
     )
-    extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    extraction_entities: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    extraction_sections: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    document_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Encrypted at rest (AES-256-GCM). These hold raw extracted document text
+    # and the entities/sections/metadata derived from it — all clinical PHI,
+    # fetch-and-render only, never SQL-queried.
+    extracted_text: Mapped[str | None] = mapped_column(EncryptedText, nullable=True)
+    extraction_entities: Mapped[list | None] = mapped_column(EncryptedJSON, nullable=True)
+    extraction_sections: Mapped[dict | None] = mapped_column(EncryptedJSON, nullable=True)
+    document_metadata: Mapped[dict | None] = mapped_column(EncryptedJSON, nullable=True)
     dedup_summary: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     deleted_at: Mapped[datetime | None] = mapped_column(

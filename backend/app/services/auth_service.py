@@ -13,6 +13,7 @@ from app.middleware.auth import (
     create_refresh_token,
     decode_token,
 )
+from app.middleware.encryption import blind_index
 from app.models.token_blacklist import RevokedToken
 from app.models.user import User
 from app.schemas.auth import TokenResponse
@@ -42,12 +43,16 @@ async def register_user(
     display_name: str | None = None,
 ) -> User:
     """Register a new user."""
-    existing = await db.execute(select(User).where(User.email == email))
+    # ``email`` is encrypted at rest and not directly queryable; look up the
+    # deterministic blind index instead.
+    email_hmac = blind_index(email)
+    existing = await db.execute(select(User).where(User.email_hmac == email_hmac))
     if existing.scalar_one_or_none():
         raise ValueError("Email already registered")
 
     user = User(
         email=email,
+        email_hmac=email_hmac,
         password_hash=hash_password(password),
         display_name=display_name,
     )
@@ -63,7 +68,7 @@ async def authenticate_user(
     password: str,
 ) -> TokenResponse:
     """Authenticate a user and return JWT tokens."""
-    result = await db.execute(select(User).where(User.email == email))
+    result = await db.execute(select(User).where(User.email_hmac == blind_index(email)))
     user = result.scalar_one_or_none()
 
     if not user:
