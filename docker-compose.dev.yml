@@ -1,0 +1,18 @@
+# Dev override — publishes db + redis on loopback so the app can run NATIVELY on
+# the host (uv / npm) while only Postgres + Redis run in Docker:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d db redis
+# (used by `just dev` / `just setup` / `just test`). Loopback-only — not exposed
+# to your network.
+#
+# NOTE: stop any Homebrew postgres/redis first (they'd hold 5432/6379), e.g.
+#   brew services stop postgresql@16 && brew services stop redis
+# Native tools must point DATABASE_URL at this password-protected db, e.g.
+#   postgresql+asyncpg://postgres:<DB_PASSWORD>@localhost:5432/medtimeline
+# (or just keep using your existing Homebrew Postgres/Redis instead of this override).
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"

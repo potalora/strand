@@ -1,0 +1,51 @@
+# BUILD-ONLY validation that the backend and frontend Dockerfiles still build on PRs.
+# It does NOT push anything (no GHCR login, no packages permission) and only builds the
+# fast single-arch (linux/amd64) image with the gha cache.
+#
+# This check is NON-REQUIRED by default — it won't block merge. Promote it to a required
+# status check in branch protection (Settings → Branches) if/when you want it to gate PRs.
+#
+# The paths filter mirrors docker-edge.yml so most PRs (docs, unrelated code) skip it
+# entirely, keeping it cheap.
+name: Validate Docker builds
+
+on:
+  pull_request:
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "**/Dockerfile"
+      - "**/.dockerignore"
+      - "docker-compose.yml"
+      - ".github/workflows/docker-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            context: ./backend
+          - name: frontend
+            context: ./frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,114 @@
+# MedTimeline — local-first containerized stack.
+#
+# Privacy / local-first: only `backend` and `frontend` publish ports, and they
+# bind to 127.0.0.1 (loopback) ONLY — nothing is reachable from your network.
+# `db` and `redis` have NO host port (internal-only on the compose network);
+# the app reaches them at db:5432 / redis:6379. To run the app natively against
+# these containers (uv/npm on the host), use the dev override which publishes
+# db/redis on loopback:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d db redis
+# (this is what `just dev` / `just setup` do).
+#
+# No auto-update: images are pinned by APP_VERSION. To upgrade:
+#   1. bump APP_VERSION in .env  (or `export APP_VERSION=vX.Y.Z`)
+#   2. docker compose pull && docker compose up -d
+#
+# First run:
+#   just gen-secrets         # fill DB_PASSWORD / JWT_SECRET_KEY / DATABASE_ENCRYPTION_KEY
+#   docker compose up -d --build      (or: just up)
+# URLs: frontend http://localhost:3000  ·  API http://localhost:8000
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-medtimeline}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required — run `just gen-secrets`}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # init-db.sql creates the pgcrypto / uuid-ossp / pg_trgm extensions on first boot.
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-medtimeline}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    # Internal-only by default. To inspect from the host with psql, either use the
+    # dev override (above) or uncomment:
+    #   ports: ["127.0.0.1:5432:5432"]
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    # Internal-only (reached at redis:6379). The dev override publishes it on loopback.
+
+  # One-shot schema migration. Shares the backend image (same build + tag) so the
+  # exact code that runs the app also runs the migrations. Exits 0 on success;
+  # backend waits for that via depends_on service_completed_successfully.
+  migrate:
+    build:
+      context: ./backend
+      args:
+        CLINICAL_NLP: ${CLINICAL_NLP:-false}
+    image: ghcr.io/potalora/medtimeline-backend:${APP_VERSION:-latest}
+    command: ["alembic", "upgrade", "head"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:${DB_PASSWORD}@db:5432/${POSTGRES_DB:-medtimeline}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build:
+      context: ./backend
+      args:
+        CLINICAL_NLP: ${CLINICAL_NLP:-false}
+    image: ghcr.io/potalora/medtimeline-backend:${APP_VERSION:-latest}
+    env_file: .env
+    environment:
+      # Container-internal hostnames (override anything in .env / env_file).
+      DATABASE_URL: postgresql+asyncpg://postgres:${DB_PASSWORD}@db:5432/${POSTGRES_DB:-medtimeline}
+      REDIS_URL: redis://redis:6379/0
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      APP_ENV: ${APP_ENV:-production}
+      UPLOAD_DIR: /data/uploads
+      TEMP_EXTRACT_DIR: /data/tmp
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - uploads:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Browser-visible API base, baked into the static build at image-build time.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+    image: ghcr.io/potalora/medtimeline-frontend:${APP_VERSION:-latest}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  uploads:

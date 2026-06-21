@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "FHIR-compliant personal health records API"
 license = "MIT"
 readme = "README.md"
-requires-python = ">=3.11.8"
+# Capped to 3.11: the clinical-nlp extra pins spaCy 3.7.5 (scispaCy's ceiling),
+# but medspaCy 1.3.1 requires spaCy>=3.8 on Python >=3.12, so the full stack
+# (incl. the clinical-nlp extra) only resolves on 3.11. This is the validated
+# environment (dev + CI run 3.11.8) and what the container image uses.
+requires-python = ">=3.11.8,<3.12"
 dependencies = [
     "alembic>=1.18.4",
     "arq>=0.27.0",
@@ -50,6 +54,14 @@ dependencies = [
 #   pip install -e ".[clinical-nlp]" && pip install <en_ner_bc5cdr_md 0.5.4 URL> \
 #     && python -m spacy download en_core_web_md  # (3.7.x to match spaCy 3.7.5)
 clinical-nlp = ["scispacy==0.6.2", "medspacy==1.3.1", "spacy==3.7.5"]
+
+[tool.uv]
+# python-fhir-converter==0.3.0 (latest) hard-pins typing-extensions==4.12.2, which
+# conflicts with our >=4.15 floor (required for google-genai's PEP 728 TypedDict —
+# `from google import genai` breaks on older typing_extensions). The converter works
+# fine with 4.15 in practice, so override its overly-strict pin. pip silently allowed
+# this; uv's resolver is strict, so the override is what makes the lock resolvable.
+override-dependencies = ["typing-extensions>=4.15"]
 
 [dependency-groups]
 dev = [

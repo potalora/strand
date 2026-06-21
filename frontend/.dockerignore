@@ -1,0 +1,19 @@
+node_modules
+.next
+out
+build
+.env
+.env.*
+.git
+.gitignore
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.DS_Store
+# Playwright / test output not needed for the build.
+e2e
+test-results
+playwright-report
+coverage

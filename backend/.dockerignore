@@ -1,0 +1,33 @@
+# Build artifacts / caches — never needed in the image, bloat context.
+.venv
+.venv-ws*
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Tests + fixtures (may carry real PHI; not needed at runtime).
+tests/
+tools/
+
+# Local runtime data (uploads, temp extraction, terminology live cache).
+data/
+
+# Secrets + env (never bake into the image).
+.env
+.env.*
+*.env
+
+# Logs.
+*.log
+
+# VCS + editor noise.
+.git/
+.gitignore
+.DS_Store
+
+# Docker files themselves.
+Dockerfile
+.dockerignore
