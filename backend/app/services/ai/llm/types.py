@@ -7,9 +7,42 @@ FinishReason = Literal["stop", "length", "content_filter", "other"]
 
 
 @dataclass
+class TextPart:
+    """A plain-text segment of a message."""
+
+    text: str
+
+
+@dataclass
+class ImagePart:
+    """An inline image (e.g. a scanned page) — raw bytes + MIME type."""
+
+    data: bytes
+    mime: str
+
+
+@dataclass
+class DocumentPart:
+    """An inline document (e.g. a PDF) — raw bytes + MIME type."""
+
+    data: bytes
+    mime: str
+
+
+ContentPart = "TextPart | ImagePart | DocumentPart"
+
+
+def as_parts(content: "str | list[TextPart | ImagePart | DocumentPart]") -> list:
+    """Normalize message content to a list of parts (a ``str`` becomes one TextPart)."""
+    if isinstance(content, str):
+        return [TextPart(content)]
+    return list(content)
+
+
+@dataclass
 class LLMMessage:
     role: Role
-    content: str
+    content: "str | list[TextPart | ImagePart | DocumentPart]"
 
 
 @dataclass

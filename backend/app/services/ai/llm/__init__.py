@@ -1,9 +1,10 @@
 from __future__ import annotations
 from app.services.ai.llm.base import LLMProvider
 from app.services.ai.llm.types import (
-    Capabilities, FinishReason, LLMAuthError, LLMBadRequestError, LLMError,
-    LLMMessage, LLMProviderUnavailableError, LLMRateLimitError, LLMRequest,
-    LLMResponse, LLMResponseError, LLMTimeoutError, LLMUsage, ReasoningConfig,
+    Capabilities, DocumentPart, FinishReason, ImagePart, LLMAuthError,
+    LLMBadRequestError, LLMError, LLMMessage, LLMProviderUnavailableError,
+    LLMRateLimitError, LLMRequest, LLMResponse, LLMResponseError, LLMTimeoutError,
+    LLMUsage, ReasoningConfig, TextPart, as_parts,
 )
 
 # Imported last: the registry pulls in the provider modules (which depend on
@@ -24,4 +25,5 @@ __all__ = [
     "LLMResponseError", "LLMProviderUnavailableError",
     "get_provider", "available_providers", "provider_name_for", "resolve_model",
     "KNOWN_PROVIDERS", "LLMConfig", "ProviderCreds", "load_llm_config",
+    "TextPart", "ImagePart", "DocumentPart", "as_parts",
 ]
