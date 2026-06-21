@@ -33,7 +33,7 @@ just gen-secrets            # or: bash scripts/gen-secrets.sh
 docker compose up -d        # or: just up
 ```
 
-Then open http://localhost:3000 (the API is at http://localhost:8000). Add a `GEMINI_API_KEY` to `.env` for the live AI summary, or use another provider — OpenAI, Anthropic, OpenRouter, or a local Ollama or LM Studio model (see `.env.example` for the keys and the `LLM_PROVIDER` switch). The prompt-only path needs no key at all.
+Then open http://localhost:3000 (the API is at http://localhost:8000). For live AI features, add a provider key (Gemini, OpenAI, Anthropic, or OpenRouter) or point at a local Ollama or LM Studio model — set this up in the app at Admin → AI providers, or see the [AI providers](#ai-providers) section. The prompt-only path needs no key at all.
 
 Everything binds to `127.0.0.1`, so nothing is reachable from outside your machine. On-device clinical extraction is off by default to keep the image small; rebuild with `--build-arg CLINICAL_NLP=true` to turn it on. To upgrade, bump `APP_VERSION` in `.env` and run `docker compose pull && docker compose up -d`.
 
@@ -90,17 +90,33 @@ Anything that involves a model is de-identified first; the prompt and context pa
 - **It runs on your machine.** The stack is self-hosted and binds to `127.0.0.1`, so nothing is exposed by default.
 - **Honest about limits.** Some things still slip through the scrubber (city names, for one), and there's no auto-update — with health data, you decide when to move to a new version.
 
+## AI providers
+
+Strand isn't tied to one model. Add a key for whichever provider you want, or run entirely on your own machine, and pick which one handles each task. You manage providers in the app at **Admin → System → AI providers**: paste a key, choose a model, test the connection. Keys are encrypted and stored only on your server.
+
+| Provider | How to use | Runs |
+|----------|------------|------|
+| Google Gemini | API key | Cloud |
+| OpenAI | API key | Cloud |
+| Anthropic (Claude) | API key | Cloud |
+| OpenRouter | API key | Cloud (aggregator) |
+| Ollama | local server, no key | On your machine |
+| LM Studio | local server, no key | On your machine |
+| Vertex AI | Google Cloud project | Cloud |
+
+Any OpenAI-compatible endpoint works through the OpenAI option — just point it at the base URL. You can route each task to a different provider (say, a local model for document extraction and a cloud model for summaries), and if one provider declines a scanned document during OCR, Strand falls back to the next one you've configured. Cloud providers only ever receive de-identified records; local models keep everything on your machine.
+
 ## How it works
 
 ### De-duplication
 
-The same hypertension diagnosis shows up in an Epic export and again in a CDA document with slightly different wording. So every upload runs a two-tier scan against what's already stored: a cheap heuristic scorer first, then a Gemini judge only for the ambiguous middle.
+The same hypertension diagnosis shows up in an Epic export and again in a CDA document with slightly different wording. So every upload runs a two-tier scan against what's already stored: a cheap heuristic scorer first, then an LLM judge — whichever provider you've configured — only for the ambiguous middle.
 
 ```mermaid
 flowchart TD
     N["New records"] --> H{"Heuristic<br/>score"}
     H -->|high| M["Merge"]
-    H -->|borderline| J{"Gemini<br/>judge"}
+    H -->|borderline| J{"LLM<br/>judge"}
     H -->|low| K["Keep both"]
     J -->|confident| M
     J -->|unsure| R["You decide in Admin"]
@@ -110,7 +126,7 @@ Score ≥ 0.95 merges on its own; 0.50–0.94 goes to the judge (which auto-reso
 
 ### Extraction from documents
 
-A scanned note becomes structured records through OCR, then entity extraction (medications, conditions, procedures, labs, vitals, allergies, providers). Extraction runs one of three ways, set by `EXTRACTION_ENGINE`: `gemini` (cloud), `local` (on-device clinical NLP — medspaCy and scispaCy, nothing leaves the machine), or `hybrid`, the default, which runs local first and sends only the sections it's unsure about to Gemini. Local and hybrid need the optional `clinical-nlp` extra; without it, extraction falls back to the cloud path on its own.
+A scanned note becomes structured records through OCR, then entity extraction (medications, conditions, procedures, labs, vitals, allergies, providers). Extraction runs one of three ways, set by `EXTRACTION_ENGINE`: `gemini` (the cloud path — routed to whichever provider you've configured, not just Gemini), `local` (on-device clinical NLP — medspaCy and scispaCy, nothing leaves the machine), or `hybrid`, the default, which runs local first and sends only the sections it's unsure about to the cloud. Local and hybrid need the optional `clinical-nlp` extra; without it, extraction falls back to the cloud path on its own. OCR itself goes through whichever vision provider you've picked, with automatic fallback if one declines a document.
 
 ### Coding and cleanup
 
@@ -132,7 +148,7 @@ erDiagram
 
 ## Configuration
 
-Copy `.env.docker.example` to `.env` and run `just gen-secrets` to fill the required secrets (`DB_PASSWORD`, `JWT_SECRET_KEY`, `DATABASE_ENCRYPTION_KEY`). `GEMINI_API_KEY` is optional (live AI mode). See `.env.example` for the full list.
+Copy `.env.docker.example` to `.env` and run `just gen-secrets` to fill the required secrets (`DB_PASSWORD`, `JWT_SECRET_KEY`, `DATABASE_ENCRYPTION_KEY`). An AI provider key is optional (live AI mode) — add one in the app or via `.env`. See `.env.example` for the full list.
 
 ## Develop
 
@@ -161,7 +177,7 @@ cd frontend && npm install && npm run dev
 ```bash
 cd backend
 uv run pytest -m "not slow"     # fast suite
-uv run pytest                    # everything (slow tests hit the real Gemini API)
+uv run pytest                    # everything (slow tests call a live AI provider)
 uv run pytest tests/fidelity/    # real-data fidelity (skips without fixtures)
 ```
 
