@@ -33,7 +33,7 @@ just gen-secrets            # or: bash scripts/gen-secrets.sh
 docker compose up -d        # or: just up
 ```
 
-Then open http://localhost:3000 (the API is at http://localhost:8000). Add a `GEMINI_API_KEY` to `.env` for the live AI summary; the prompt-only path works without one.
+Then open http://localhost:3000 (the API is at http://localhost:8000). Add a `GEMINI_API_KEY` to `.env` for the live AI summary, or use another provider — OpenAI, Anthropic, OpenRouter, or a local Ollama or LM Studio model (see `.env.example` for the keys and the `LLM_PROVIDER` switch). The prompt-only path needs no key at all.
 
 Everything binds to `127.0.0.1`, so nothing is reachable from outside your machine. On-device clinical extraction is off by default to keep the image small; rebuild with `--build-arg CLINICAL_NLP=true` to turn it on. To upgrade, bump `APP_VERSION` in `.env` and run `docker compose pull && docker compose up -d`.
 
@@ -75,7 +75,7 @@ Structured exports and unstructured documents go in the same way: Strand parses 
 
 Getting records out matters as much as getting them in. From your records you can produce:
 
-- **A summary** — Strand writes it for you (live AI mode).
+- **A summary** — Strand writes it for you in live AI mode, using whichever model you pick: Gemini, Claude, an OpenAI model, or one running locally.
 - **A copy-paste prompt** — a de-identified prompt, ready to run in any LLM, no API key needed.
 - **A FHIR R4 bundle** — a standard export for any other app or system.
 - **De-identified context** — the scrubbed records themselves, to drop into the AI chat of your choice.
@@ -194,7 +194,7 @@ Strand is built to be HIPAA-minded for self-hosting; a single-user, self-hosted 
 
 ## Tech stack
 
-**Backend** — Python 3.11 / FastAPI / SQLAlchemy 2 async / PostgreSQL 16 / Alembic / Gemini API / LangExtract / spaCy / RapidFuzz / `fhir.resources`. Optional `clinical-nlp` extra adds scispaCy + medspaCy for on-device extraction (no PyTorch).
+**Backend** — Python 3.11 / FastAPI / SQLAlchemy 2 async / PostgreSQL 16 / Alembic / LangExtract / spaCy / RapidFuzz / `fhir.resources`. Pluggable LLM layer over the Gemini, OpenAI, and Anthropic SDKs (one OpenAI-compatible client also covers OpenRouter, Ollama, and LM Studio). Optional `clinical-nlp` extra adds scispaCy + medspaCy for on-device extraction (no PyTorch).
 
 **Frontend** — Next.js / TypeScript / Tailwind CSS / shadcn/ui / TanStack Query / Zustand. Custom JWT auth with transparent refresh.
 
