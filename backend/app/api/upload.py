@@ -1297,6 +1297,7 @@ async def _autoconfirm_and_finish(
         resolve_document_date,
         resolve_document_provider,
     )
+    from app.services.extraction.intra_doc_dedup import dedup_within_document
 
     patient = await _ensure_patient(db, user_id)
 
@@ -1330,6 +1331,12 @@ async def _autoconfirm_and_finish(
         # A1: replace the de-identified (year-only) entity dates with the real
         # document date recovered from the original text (eligible records only).
         _prefer_document_date(built_records, real_document_date)
+
+        # A5: collapse intra-document over-extraction (encounter fragments from
+        # headers/facility/boilerplate; brand+generic medications resolving to
+        # the same RxNorm code) before insert. Per-document only — never merges
+        # across documents (that is the separate services/dedup pipeline).
+        built_records = dedup_within_document(built_records)
 
         for entity, record_dict in built_records:
             if record_dict is None:
