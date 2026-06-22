@@ -58,6 +58,12 @@ backend:
 frontend:
     cd frontend && npm run dev
 
+# Serve the dev stack over local HTTPS via portless (https://medtimeline.localhost)
+# so the backend sees an https scheme and emits HSTS. One-time setup (operator):
+#   npm install -g portless && portless trust   (see docs/operations-local-https.md)
+up-https:
+    bash scripts/run-https.sh
+
 # Fast backend test suite (excludes slow / live-Gemini)
 test:
     cd backend && uv run pytest -m "not slow"

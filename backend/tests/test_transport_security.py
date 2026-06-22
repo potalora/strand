@@ -79,6 +79,23 @@ async def test_no_hsts_header_in_dev_over_http(client: AsyncClient):
     assert "Strict-Transport-Security" not in resp.headers
 
 
+@pytest.mark.asyncio
+async def test_hsts_emitted_in_dev_behind_https_proxy(client: AsyncClient):
+    """Portless scenario: an https ``X-Forwarded-Proto`` makes the dev app emit HSTS.
+
+    portless fronts the loopback backend at ``https://api.medtimeline.localhost``
+    and injects ``X-Forwarded-Proto: https``. The dev app must then emit HSTS even
+    though it terminated plain http itself — the whole point of issue #57. This is
+    the http-vs-https assertion pair: same dev app, header present here, absent in
+    ``test_no_hsts_header_in_dev_over_http``.
+    """
+    resp = await client.get(
+        "/api/v1/health", headers={"X-Forwarded-Proto": "https"}
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("Strict-Transport-Security") == HSTS_VALUE
+
+
 # ---------------------------------------------------------------------------
 # 2. HTTPSRedirect / TrustedHost gating (production-only)
 # ---------------------------------------------------------------------------
@@ -147,6 +164,20 @@ def test_cors_wildcard_among_others_disables_credentials():
 def test_cors_normal_keeps_credentials():
     origins, allow_credentials = build_cors_config("http://localhost:3000")
     assert origins == ["http://localhost:3000"]
+    assert allow_credentials is True
+
+
+def test_cors_accepts_portless_https_origin():
+    """The portless https origin parses cleanly and keeps credentials enabled.
+
+    ``scripts/run-https.sh`` sets ``CORS_ORIGINS`` to the portless frontend origin
+    so the browser app at ``https://medtimeline.localhost`` can call the api
+    subdomain cross-origin with credentials.
+    """
+    origins, allow_credentials = build_cors_config(
+        "https://medtimeline.localhost, http://localhost:3000"
+    )
+    assert "https://medtimeline.localhost" in origins
     assert allow_credentials is True
 
 
