@@ -156,6 +156,98 @@ def test_a3_drops_directive_social_history():
 
 
 # ---------------------------------------------------------------------------
+# A6 — occupation / hobby / diet free-text leaking into observations
+# (real-data regression: LangExtract filed these as `observation` records)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # occupation / job titles
+        "business analyst",
+        "Software Engineer",
+        "Occupation: accountant",
+        # hobbies / sports
+        "avid tennis player",
+        "weight-lifting",
+        "weight lifting",
+        "plays golf on weekends",
+        # free-text diet / food-preference commentary
+        "low fodmap diet",
+        "spicy and acidic foods",
+        "Coffee is fine",
+        "vegetarian",
+    ],
+)
+def test_a6_drops_occupation_hobby_diet_observations(text):
+    """Occupation, hobbies/sports, and free-text diet/food commentary are not
+    clinical observations and must be dropped (they have no measured value)."""
+    out = validate_entities([_e("observation", text)])
+    assert out == [], f"expected {text!r} dropped, got {_texts(out)!r}"
+
+
+def test_a6_drops_lifestyle_noise_for_lab_and_vital_classes():
+    """The guard applies to every observation-family class, not just `observation`."""
+    out = validate_entities(
+        [_e("lab_result", "avid tennis player"), _e("vital", "business analyst")]
+    )
+    assert out == []
+
+
+def test_a6_drops_verbose_substance_commentary():
+    """Free-text substance commentary (no status qualifier, multi-clause) is noise."""
+    out = validate_entities([_e("observation", "Only vape no cigarette smoke")])
+    assert out == []
+
+
+# --- what MUST survive: real vitals/labs + concise social-history status ----
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "BP 120/80 mmHg",
+        "Weight 180 lbs",
+        "Heart rate 72 bpm",
+        "Glucose 95 mg/dL",
+        "HbA1c 6.8%",
+        "WBC 6.2",
+        # named-but-valueless panel tokens stay (downstream B8)
+        "CBC",
+        "A1c",
+        # a real lab whose name overlaps a diet keyword but carries a value
+        "Fasting glucose 95 mg/dL",
+    ],
+)
+def test_a6_keeps_real_vitals_and_labs(text):
+    out = validate_entities([_e("observation", text)])
+    assert _texts(out) == [text], f"expected {text!r} kept, got {_texts(out)!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "former smoker",
+        "never smoker",
+        "non-smoker",
+        "current smoker",
+        "tobacco use",
+        "denies tobacco use",
+    ],
+)
+def test_a6_keeps_concise_smoking_status(text):
+    """Concise smoking/tobacco STATUS is legitimate social history — keep it."""
+    out = validate_entities([_e("observation", text)])
+    assert len(out) == 1, f"expected {text!r} kept, got {_texts(out)!r}"
+
+
+def test_a6_keeps_alcohol_use_status():
+    out = validate_entities([_e("observation", "alcohol use: social")])
+    assert len(out) == 1
+
+
+# ---------------------------------------------------------------------------
 # A4 — Drug-class / abbreviation / garbage as medication
 # ---------------------------------------------------------------------------
 

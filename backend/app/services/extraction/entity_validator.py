@@ -102,10 +102,13 @@ _OBSERVATION_CLASSES = frozenset({"observation", "lab_result", "vital"})
 # --- A3: lifestyle / counseling --------------------------------------------
 # A leading "Word:" label that marks social/lifestyle content rather than a lab
 # or vital observation.
+# NOTE: "occupation" is deliberately NOT here. A job title is a drop category
+# (finding A6), not legitimate social history, so it must fall through to
+# ``_is_lifestyle_noise`` and be dropped rather than reclassified.
 _LIFESTYLE_LABELS = frozenset(
     {
         "exercise", "diet", "alcohol", "tobacco", "smoking", "smoke", "caffeine",
-        "sleep", "occupation", "drugs", "substance", "activity", "nutrition",
+        "sleep", "drugs", "substance", "activity", "nutrition",
         "recreational drugs", "physical activity",
     }
 )
@@ -121,6 +124,84 @@ _DIRECTIVE_VERBS = frozenset(
         "cut", "eliminate", "abstain", "minimize", "follow",
     }
 )
+
+# --- A6: occupation / hobby / diet free-text leaking into observations ------
+# Real-data regression: LangExtract files occupation ("business analyst"),
+# hobbies/sports ("avid tennis player", "weight-lifting"), and free-text
+# diet/food commentary ("low fodmap diet", "spicy and acidic foods", "Coffee is
+# fine") as ``observation`` records. None carry a measured value, so they can
+# never be a real lab or vital. The guard fires ONLY when the observation has
+# NO numeric value (so real vitals/labs are untouched) AND its text matches one
+# of these non-clinical keyword families. Matched as whole-word tokens (single
+# words) or as substrings of the space-normalized text (phrases).
+_OCCUPATION_WORDS = frozenset(
+    {
+        "occupation", "accountant", "attorney", "lawyer", "analyst", "engineer",
+        "manager", "consultant", "teacher", "professor", "developer",
+        "programmer", "technician", "administrator", "executive", "director",
+        "clerk", "cashier", "secretary", "salesman", "saleswoman", "salesperson",
+        "electrician", "plumber", "carpenter", "mechanic", "chef", "waiter",
+        "waitress", "pilot", "architect", "scientist", "researcher", "contractor",
+        "realtor", "banker", "broker", "designer", "writer", "editor",
+        "journalist", "retired", "unemployed", "homemaker", "student", "employed",
+        "businessman", "businesswoman", "business",
+    }
+)
+_OCCUPATION_PHRASES = (
+    "works as", "occupation is", "job title", "self employed", "employed as",
+    "business owner", "stay at home",
+)
+
+_HOBBY_WORDS = frozenset(
+    {
+        "tennis", "golf", "golfer", "soccer", "basketball", "baseball",
+        "football", "hockey", "yoga", "pilates", "crossfit", "marathon",
+        "triathlon", "skiing", "snowboarding", "surfing", "gardening", "fishing",
+        "hunting", "athlete", "weightlifting", "bodybuilding", "jogging",
+        "cycling", "avid", "player", "hobby", "hobbies",
+    }
+)
+_HOBBY_PHRASES = (
+    "weight lifting", "weight training", "lifts weights", "plays tennis",
+    "plays golf", "works out", "tennis player", "martial arts", "rock climbing",
+)
+
+_DIET_FOOD_WORDS = frozenset(
+    {
+        "diet", "fodmap", "vegetarian", "vegan", "pescatarian", "keto",
+        "ketogenic", "paleo", "spicy", "coffee", "snacks", "snacking", "food",
+        "foods",
+    }
+)
+_DIET_FOOD_PHRASES = (
+    "low fodmap", "gluten free", "dairy free", "low carb", "low fat",
+    "acidic foods", "acidic food", "spicy foods", "fatty foods",
+    "intermittent fasting", "food preference", "food preferences",
+    "small frequent meals", "balanced diet",
+)
+
+# Substance use (smoking/tobacco/vaping/etc.) IS legitimate social history when
+# expressed as a concise STATUS ("former smoker", "non-smoker", "tobacco use").
+# Only verbose free-text commentary with no status qualifier and no measured
+# value is noise ("Only vape no cigarette smoke"). Keep when in doubt.
+_SUBSTANCE_WORDS = frozenset(
+    {
+        "smoke", "smoking", "smoker", "smokes", "tobacco", "cigarette",
+        "cigarettes", "cigar", "cigars", "vape", "vapes", "vaping", "nicotine",
+        "marijuana", "cannabis",
+    }
+)
+_SUBSTANCE_STATUS_QUALIFIERS = frozenset(
+    {
+        "former", "never", "current", "currently", "non", "ex", "active",
+        "social", "occasional", "occasionally", "heavy", "light", "daily",
+        "denies", "denied", "quit", "none", "history", "past", "prior", "pack",
+        "packs", "ppd", "year", "years", "use", "used", "status",
+    }
+)
+# Verbose substance commentary needs at least this many words to be dropped, so
+# concise statuses ("former smoker", "tobacco use", bare "smoker") always survive.
+_SUBSTANCE_COMMENTARY_MIN_WORDS = 4
 
 # --- A4: medication quality -------------------------------------------------
 # Drug-class abbreviations and other non-drug tokens that are never a specific
@@ -280,6 +361,56 @@ def _reclassify_lifestyle(entity: ExtractedEntity) -> ExtractedEntity | None:
     return dataclasses.replace(entity, entity_class="social_history", attributes=attrs)
 
 
+def _norm_tokens(text: str) -> tuple[str, set[str]]:
+    """Lowercase + collapse non-alphanumerics to spaces; return (norm, token set)."""
+    norm = re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+    return norm, set(norm.split())
+
+
+def _match_terms(norm: str, tokens: set[str], words: frozenset[str], phrases: tuple) -> bool:
+    """True if any single-word keyword is a token, or any phrase is a substring."""
+    if tokens & words:
+        return True
+    padded = f" {norm} "
+    return any(f" {phrase} " in padded for phrase in phrases)
+
+
+def _is_lifestyle_noise(text: str) -> bool:
+    """A6: occupation / hobby / diet free-text misfiled as an observation.
+
+    Only fires for value-less text — any digit means it may be a real
+    measurement (lab/vital), so we keep it (prime directive: when uncertain,
+    KEEP).
+    """
+    if any(ch.isdigit() for ch in (text or "")):
+        return False
+    norm, tokens = _norm_tokens(text)
+    if not norm:
+        return False
+    return (
+        _match_terms(norm, tokens, _OCCUPATION_WORDS, _OCCUPATION_PHRASES)
+        or _match_terms(norm, tokens, _HOBBY_WORDS, _HOBBY_PHRASES)
+        or _match_terms(norm, tokens, _DIET_FOOD_WORDS, _DIET_FOOD_PHRASES)
+    )
+
+
+def _is_substance_commentary(text: str) -> bool:
+    """A6: verbose substance free-text with no status qualifier and no value.
+
+    Concise substance STATUS ("former smoker", "tobacco use") is legitimate
+    social history and is kept; only multi-word commentary with no qualifier and
+    no measured value ("Only vape no cigarette smoke") is dropped.
+    """
+    if any(ch.isdigit() for ch in (text or "")):
+        return False
+    norm, tokens = _norm_tokens(text)
+    if not (tokens & _SUBSTANCE_WORDS):
+        return False
+    if tokens & _SUBSTANCE_STATUS_QUALIFIERS:
+        return False
+    return len(norm.split()) >= _SUBSTANCE_COMMENTARY_MIN_WORDS
+
+
 def _is_value_only_fragment(text: str) -> bool:
     text = (text or "").strip()
     if not text:
@@ -300,6 +431,14 @@ def _validate_observation(entity: ExtractedEntity) -> ExtractedEntity | None:
         return None
     if reclassified.entity_class == "social_history":
         return reclassified
+    # A6 — occupation / hobby / diet free-text misfiled as an observation.
+    if _is_lifestyle_noise(entity.text):
+        logger.debug("A6 drop (occupation/hobby/diet noise): %r", entity.text)
+        return None
+    # A6 — verbose substance commentary (concise status is kept above/below).
+    if _is_substance_commentary(entity.text):
+        logger.debug("A6 drop (substance-use commentary): %r", entity.text)
+        return None
     # A2 — value-only fragment with no analyte/drug name.
     if _is_value_only_fragment(entity.text):
         logger.debug("A2 drop (value-only fragment): %r", entity.text)

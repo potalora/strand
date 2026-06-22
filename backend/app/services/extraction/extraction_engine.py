@@ -30,6 +30,7 @@ de-identified before any Gemini call).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -207,14 +208,19 @@ async def run_clinical_extraction(
     if engine not in ("local", "hybrid"):
         raise ValueError(f"run_clinical_extraction: unsupported engine {engine!r}")
 
-    sections = context.detect_sections(text)
+    # Section detection + NER + ConText are synchronous, CPU-bound spaCy/medspaCy
+    # inference. Offload them to a worker thread so this coroutine (run by the
+    # background extraction worker) doesn't pin the event loop and stall
+    # concurrent API requests (D3). The model objects are read-only during
+    # prediction; only WHERE the compute runs changes, not its result.
+    sections = await asyncio.to_thread(context.detect_sections, text)
     all_entities: list[ExtractedEntity] = []
     escalated_sections = 0
     local_entity_count = 0
     escalated_entity_count = 0
 
     for section in sections:
-        spans = ner.extract(section.text)
+        spans = await asyncio.to_thread(ner.extract, section.text)
         confidence = _section_confidence(spans)
         escalate = engine == "hybrid" and _should_escalate(
             section, spans, confidence, confidence_threshold
@@ -237,7 +243,8 @@ async def run_clinical_extraction(
             continue
 
         # Local path for this section: assert spans with ConText, convert, drop.
-        assertions = context.assert_spans(section.text, spans)
+        # ConText assertion is CPU-bound spaCy work — offload it too (D3).
+        assertions = await asyncio.to_thread(context.assert_spans, section.text, spans)
         local_entities: list[ExtractedEntity] = []
         for a in assertions:
             entity = _span_to_entity(

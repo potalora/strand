@@ -981,7 +981,7 @@ async def _run_gemini_extraction_engine(db, upload, upload_id, user_id, text, se
     """
     from app.services.ai.llm import load_llm_config
     from app.services.extraction.entity_extractor import extract_entities_async
-    from app.services.ai.phi_scrubber import scrub_phi
+    from app.services.ai.phi_scrubber import scrub_phi_async
     from app.services.ai.patient_phi import patient_scrub_args
     from app.models.patient import Patient
     from app.services.extraction.section_parser import ParsedDocument, ParsedSection, SectionType
@@ -990,11 +990,15 @@ async def _run_gemini_extraction_engine(db, upload, upload_id, user_id, text, se
     # both section parsing and per-section entity extraction). Falls back to .env.
     config = await load_llm_config(db, user_id)
 
-    # Step 2: Scrub PHI before entity extraction — local, no semaphore.
+    # Step 2: Scrub PHI before entity extraction — local, no semaphore. The scrub
+    # (spaCy PERSON NER especially) is CPU-bound; run it off the event loop so the
+    # background worker doesn't freeze concurrent API requests (D3).
     patients = (
         await db.execute(select(Patient).where(Patient.user_id == user_id))
     ).scalars().all()
-    scrubbed_text, _deident_report = scrub_phi(text, **patient_scrub_args(list(patients)))
+    scrubbed_text, _deident_report = await scrub_phi_async(
+        text, **patient_scrub_args(list(patients))
+    )
 
     # Step 3: Section parsing (skip Gemini call for small docs)
     if len(scrubbed_text) < settings.small_doc_threshold:
@@ -1150,7 +1154,7 @@ async def _run_local_extraction_engine(db, upload, upload_id, user_id, text, eng
     ``(all_entities, parsed_doc)`` or ``None`` if cancelled.
     """
     from app.services.ai.llm import load_llm_config
-    from app.services.ai.phi_scrubber import scrub_phi
+    from app.services.ai.phi_scrubber import scrub_phi_async
     from app.services.ai.patient_phi import patient_scrub_args
     from app.services.extraction.entity_extractor import extract_entities_async
     from app.services.extraction.entity_validator import validate_entities
@@ -1171,7 +1175,10 @@ async def _run_local_extraction_engine(db, upload, upload_id, user_id, text, eng
     async def _gemini_section_extract(section_text: str):
         # Rule 2: de-identify before any Gemini call. Only escalated section text
         # is sent; the bulk local path is never scrubbed (it stays on-device).
-        scrubbed, _rep = scrub_phi(section_text, **patient_scrub_args(list(patients)))
+        # Offload the CPU-bound scrub so the event loop stays responsive (D3).
+        scrubbed, _rep = await scrub_phi_async(
+            section_text, **patient_scrub_args(list(patients))
+        )
         out: list = []
         for chunk in split_large_section(scrubbed):
             async with sem:
@@ -1225,7 +1232,60 @@ async def _run_local_extraction_engine(db, upload, upload_id, user_id, text, eng
     return result.entities, parsed_doc
 
 
-async def _autoconfirm_and_finish(db, upload, upload_id, user_id, unique_entities, parsed_doc):
+def _build_record_dicts(
+    entities, user_id, patient_id, source_file_id, document_date, document_provider
+):
+    """Map a batch of extracted entities to HealthRecord dicts (pure CPU).
+
+    Runs the terminology lookups (RapidFuzz fuzzy matching), FHIR resource build,
+    content hashing and structural validation for every entity — all GIL-bound
+    compute with no DB or async I/O. Pulled into a standalone function so the
+    whole batch can be offloaded with one ``asyncio.to_thread`` call, keeping the
+    event loop free for API requests while the mapping runs (D3).
+
+    Returns ``(entity, record_dict | None)`` pairs in input order — ``None`` for
+    entity classes that don't map to a storable record. The DB inserts stay on
+    the caller's event-loop thread (the AsyncSession is not thread-safe).
+    """
+    from app.services.extraction.entity_to_fhir import entity_to_health_record_dict
+
+    built: list[tuple[object, dict | None]] = []
+    for entity in entities:
+        record_dict = entity_to_health_record_dict(
+            entity, user_id, patient_id, source_file_id,
+            document_date=document_date,
+            document_provider=document_provider,
+        )
+        built.append((entity, record_dict))
+    return built
+
+
+def _prefer_document_date(built_records, document_date) -> None:
+    """A1: prefer the real document date over the de-identified entity dates.
+
+    The de-id pass generalizes dates to year-only BEFORE entity extraction, so the
+    dates the LLM returns (and thus ``record_dict["effective_date"]``) collapse to
+    year boundaries (e.g. a 10/21/2020 report lands on 2020-01-01). ``document_date``
+    is recovered from the ORIGINAL, pre-de-id text — it is internal record data,
+    never sent to an LLM, so using the real date does not weaken de-identification.
+    Applied to every date-eligible record; dateless types (family_history) are left
+    untouched. No-op when no real document date was found.
+    """
+    if document_date is None:
+        return
+    from app.services.extraction.entity_to_fhir import _DOCUMENT_DATE_INELIGIBLE
+
+    for entity, record_dict in built_records:
+        if record_dict is None:
+            continue
+        if getattr(entity, "entity_class", None) in _DOCUMENT_DATE_INELIGIBLE:
+            continue
+        record_dict["effective_date"] = document_date
+
+
+async def _autoconfirm_and_finish(
+    db, upload, upload_id, user_id, unique_entities, parsed_doc, original_text=None
+):
     """Auto-confirm extracted entities into HealthRecords and finalize the upload.
 
     Shared across engines: ensures a patient exists, maps entities → FHIR records,
@@ -1233,14 +1293,21 @@ async def _autoconfirm_and_finish(db, upload, upload_id, user_id, unique_entitie
     scan. Lifted verbatim from the prior inline tail.
     """
     from app.services.extraction.entity_to_fhir import (
-        entity_to_health_record_dict,
+        _find_date_in_text,
         resolve_document_date,
         resolve_document_provider,
     )
+    from app.services.extraction.intra_doc_dedup import dedup_within_document
 
     patient = await _ensure_patient(db, user_id)
 
-    document_date = resolve_document_date(unique_entities, parsed_doc.primary_visit_date)
+    # A1: recover the real document date from the ORIGINAL (pre-de-id) text. The
+    # entity-derived date comes from de-identified (year-only) text and is
+    # unreliable for precision; prefer the real date when the original text has one.
+    real_document_date = _find_date_in_text(original_text) if original_text else None
+    document_date = real_document_date or resolve_document_date(
+        unique_entities, parsed_doc.primary_visit_date
+    )
     document_provider = resolve_document_provider(unique_entities)
 
     if patient:  # always true — _ensure_patient never returns None (defensive)
@@ -1252,12 +1319,26 @@ async def _autoconfirm_and_finish(db, upload, upload_id, user_id, unique_entitie
         encounter_id = None
         created_records = []
 
-        for entity in unique_entities:
-            record_dict = entity_to_health_record_dict(
-                entity, user_id, patient.id, upload_id,
-                document_date=document_date,
-                document_provider=document_provider,
-            )
+        # Map all entities → FHIR record dicts off the event loop (CPU-bound:
+        # terminology lookups + FHIR build + hashing + validation). The DB adds
+        # below stay on the loop thread — the AsyncSession is not thread-safe.
+        built_records = await asyncio.to_thread(
+            _build_record_dicts,
+            unique_entities, user_id, patient.id, upload_id,
+            document_date, document_provider,
+        )
+
+        # A1: replace the de-identified (year-only) entity dates with the real
+        # document date recovered from the original text (eligible records only).
+        _prefer_document_date(built_records, real_document_date)
+
+        # A5: collapse intra-document over-extraction (encounter fragments from
+        # headers/facility/boilerplate; brand+generic medications resolving to
+        # the same RxNorm code) before insert. Per-document only — never merges
+        # across documents (that is the separate services/dedup pipeline).
+        built_records = dedup_within_document(built_records)
+
+        for entity, record_dict in built_records:
             if record_dict is None:
                 continue
             record_dict["source_section"] = entity.attributes.get("_source_section")
@@ -1449,7 +1530,10 @@ async def _process_unstructured(upload_id: UUID, file_path: Path, user_id: UUID)
                 for e in unique_entities
             ]
             await db.commit()
-            await _autoconfirm_and_finish(db, upload, upload_id, user_id, unique_entities, parsed_doc)
+            await _autoconfirm_and_finish(
+                db, upload, upload_id, user_id, unique_entities, parsed_doc,
+                original_text=text,
+            )
             return
 
 

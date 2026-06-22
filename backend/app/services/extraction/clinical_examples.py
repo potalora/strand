@@ -12,6 +12,7 @@ STORABLE ENTITIES (create health records):
 - vital: Vital signs (BP, HR, Temp, SpO2, Weight, Height, BMI). Include: type, value, unit.
 - procedure: Medical procedures performed ON THIS PATIENT. Include: date, status.
 - allergy: Drug/food/substance allergies. Include: reaction, severity.
+- immunization: Vaccines/immunizations ADMINISTERED to the patient (COVID-19/SARS-CoV-2, influenza/flu, Tdap/Td, MMR, pneumococcal/Prevnar/Pneumovax, shingles/Zoster/Shingrix, hepatitis A/B, HPV/Gardasil, varicella, etc.). Emit ONE immunization entity PER DOSE, each carrying that dose's administration date. Include: vaccine (the vaccine/product name), date (administration date), cvx (CVX code if shown), manufacturer, lot, route, site. A vaccine is NOT a medication.
 - encounter: A clinical visit or encounter. Extract ONLY the PRIMARY visit (the visit this document is about). Include: visit_type (office, telehealth, emergency, inpatient), date, cpt_code, reason, facility/medical_center (the clinic, hospital, or medical-center name where the visit occurred), and summary (a one- to two-sentence synopsis of the visit / chief complaint, drawn from the note).
 - imaging_result: Diagnostic test/imaging results (EGD, MRI, CT, ultrasound, X-ray, breath test, gastric emptying, SBFT, colonoscopy, etc). Include: procedure_name, date, findings, interpretation, category (imaging, endoscopy, nuclear_medicine, pulmonary, laboratory_panel).
 - family_history: Health conditions of family members. Include: relationship (mother, father, grandmother, grandfather, sibling, etc.), condition, status, notes.
@@ -48,6 +49,7 @@ PRECISION RULES (do NOT invent records — false records erode trust):
 ENRICHMENT RULES (capture structured detail so records are not bare labels):
 17. MEDICATION DOSAGE — attach dose, route, and frequency AS ATTRIBUTES ON THE MEDICATION entity (keys `dose` e.g. "500mg", `route` e.g. "PO", `frequency` e.g. "BID"), or a single combined `dosage` sig (e.g. "500mg PO BID"). Inline attributes are preferred over separate dosage/route/frequency entities so a structured dosageInstruction can be built.
 18. CONDITION ONSET — when the text gives a diagnosis/onset/since date for a condition ("since 2015", "diagnosed 2018", "onset 03/2020"), attach it as an `onset_date` attribute on the condition entity.
+19. IMMUNIZATIONS vs MEDICATIONS — a vaccine is an immunization entity, NEVER a medication. An immunization/vaccine summary (e.g. on an After-Visit Summary) lists multiple dated doses; emit a SEPARATE immunization entity for EACH dose, preserving that dose's administration date. Do not collapse multiple doses into one entity and do not drop the dates.
 """
 
 CLINICAL_EXAMPLES = [
@@ -374,6 +376,54 @@ CLINICAL_EXAMPLES = [
                     "plan_items": "[\"Gastroparesis - continue metoclopramide, repeat gastric emptying in 6 months\", \"GERD - continue omeprazole 40mg daily\", \"Mild chronic gastritis - H. pylori negative, monitor\", \"Hepatic steatosis - dietary counseling recommended\", \"Preventive care - colonoscopy due for family history of colon cancer\"]",
                     "confidence": "0.90",
                 },
+            ),
+        ],
+    ),
+    # Immunization summary — one immunization entity PER DOSE, each keeping its
+    # own administration date (A7). Vaccines are NOT medications.
+    lx.data.ExampleData(
+        text=(
+            "Immunizations:\n"
+            "COVID-19 (Pfizer-BioNTech) - administered 12/15/2020\n"
+            "COVID-19 (Pfizer-BioNTech) - administered 01/05/2021\n"
+            "COVID-19 Booster (Moderna) - administered 10/01/2021\n"
+            "Influenza (flu shot) - administered 10/15/2021\n"
+            "Tdap - administered 06/15/2019"
+        ),
+        extractions=[
+            lx.data.Extraction(
+                extraction_class="immunization",
+                extraction_text="COVID-19 (Pfizer-BioNTech) - administered 12/15/2020",
+                attributes={
+                    "vaccine": "COVID-19", "manufacturer": "Pfizer-BioNTech",
+                    "date": "12/15/2020", "confidence": "0.95",
+                },
+            ),
+            lx.data.Extraction(
+                extraction_class="immunization",
+                extraction_text="COVID-19 (Pfizer-BioNTech) - administered 01/05/2021",
+                attributes={
+                    "vaccine": "COVID-19", "manufacturer": "Pfizer-BioNTech",
+                    "date": "01/05/2021", "confidence": "0.95",
+                },
+            ),
+            lx.data.Extraction(
+                extraction_class="immunization",
+                extraction_text="COVID-19 Booster (Moderna) - administered 10/01/2021",
+                attributes={
+                    "vaccine": "COVID-19 Booster", "manufacturer": "Moderna",
+                    "date": "10/01/2021", "confidence": "0.95",
+                },
+            ),
+            lx.data.Extraction(
+                extraction_class="immunization",
+                extraction_text="Influenza (flu shot) - administered 10/15/2021",
+                attributes={"vaccine": "Influenza", "date": "10/15/2021", "confidence": "0.9"},
+            ),
+            lx.data.Extraction(
+                extraction_class="immunization",
+                extraction_text="Tdap - administered 06/15/2019",
+                attributes={"vaccine": "Tdap", "date": "06/15/2019", "confidence": "0.9"},
             ),
         ],
     ),

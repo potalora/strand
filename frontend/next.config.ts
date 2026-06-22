@@ -72,13 +72,21 @@ const nextConfig: NextConfig = {
   // the Docker runtime image. See frontend/Dockerfile.
   output: "standalone",
 
-  // Emit security headers on every route. The app documents are what execute
-  // JS in the browser, so the CSP belongs here (the backend only guards API
-  // responses).
+  // Emit security headers on every real app route. The app documents are what
+  // execute JS in the browser, so the CSP belongs here (the backend only guards
+  // API responses).
+  //
+  // The source MUST exclude Next.js internals (`/_next/*`). A blanket
+  // `/:path*` also matched `/_next/webpack-hmr`, so the App Router answered the
+  // HMR websocket with a 404 HTML page + these headers instead of letting the
+  // dev server upgrade the socket — `next dev` HMR then died with
+  // `ERR_INVALID_HTTP_RESPONSE` and the dev app went non-interactive. The
+  // negative-lookahead leaves every real route covered (dev + prod) while
+  // letting the dev server own `_next/*` (and its static assets).
   async headers() {
     return [
       {
-        source: "/:path*",
+        source: "/((?!_next/).*)",
         headers: SECURITY_HEADERS,
       },
     ];

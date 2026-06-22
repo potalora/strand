@@ -88,6 +88,7 @@ ENTITY_TO_RECORD_TYPE: dict[str, tuple[str, str] | None] = {
     "family_history": ("family_history", "FamilyMemberHistory"),
     "assessment_plan": ("document", "DocumentReference"),
     "social_history": ("observation", "Observation"),
+    "immunization": ("immunization", "Immunization"),
     # Non-storable types (return None)
     "provider": None,
     "dosage": None,
@@ -96,6 +97,86 @@ ENTITY_TO_RECORD_TYPE: dict[str, tuple[str, str] | None] = {
     "duration": None,
     "date": None,
 }
+
+# CVX is the CDC vaccine-administered code system (FHIR-recommended for
+# Immunization.vaccineCode).
+_CVX_SYSTEM = "http://hl7.org/fhir/sid/cvx"
+
+# Robust vaccine/immunization name guard (A7). Word-boundary anchored so a real
+# drug that merely *starts with* a vaccine substring is never reclassified
+# (e.g. "Fluconazole"/"Fluoxetine" do NOT match ``\bflu\b``; "Toradol" does not
+# match ``\btd\b``). Scanned ONLY against the entity text + explicit
+# vaccine-name attributes — never an ``indication``/``reason`` — so an antiviral
+# whose indication mentions influenza (e.g. Oseltamivir) stays a medication.
+_VACCINE_RE = re.compile(
+    r"\b(?:"
+    r"vaccin\w*"  # vaccine / vaccination / vaccinated
+    r"|immuni[sz]\w*"  # immunization / immunisation
+    r"|booster"
+    r"|covid(?:-?19)?"
+    r"|sars[-\s]?cov[-\s]?2"
+    r"|influenza"
+    r"|flu(?:\s?shot|\svaccine)?"  # flu / flu shot / flu vaccine
+    r"|tdap|dtap|dtp|td"
+    r"|mmr"
+    r"|pneumococcal|prevnar|pneumovax|ppsv\d*|pcv\d*"
+    r"|shingles|zoster|shingrix|zostavax"
+    r"|hepatitis\s?[ab]|hep\s?[ab]"
+    r"|hpv|gardasil"
+    r"|varicella|chickenpox"
+    r"|tetanus"
+    r"|meningococcal|menactra|menveo|bexsero|menquadfi"
+    r"|rotavirus|rotateq|rotarix"
+    r"|hib"
+    r"|comirnaty|spikevax|moderna|pfizer|biontech|janssen|novavax"
+    r"|polio|ipv|opv"
+    r"|rsv\svaccine|arexvy|abrysvo"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Attribute keys that may carry an explicit vaccine name (scanned by the guard).
+# Deliberately excludes free-text clinical context (indication/reason/notes).
+_VACCINE_NAME_ATTR_KEYS = (
+    "vaccine",
+    "vaccine_name",
+    "immunization",
+    "name",
+    "drug_class",
+)
+# Attribute keys whose mere presence (truthy) signals a vaccine.
+_VACCINE_FLAG_ATTR_KEYS = ("cvx", "cvx_code", "is_vaccine")
+# Entity classes the guard may upgrade to immunization. Conservative: a vaccine
+# is most often mislabeled a medication, sometimes a procedure ("X vaccination").
+# Never reclassify conditions/labs/etc.
+_VACCINE_RECLASSIFIABLE = frozenset({"medication", "procedure"})
+
+
+def _looks_like_vaccine(entity: ExtractedEntity) -> bool:
+    """True when an entity's name/attributes name a vaccine (A7)."""
+    attrs = entity.attributes or {}
+    if any(attrs.get(k) for k in _VACCINE_FLAG_ATTR_KEYS):
+        return True
+    candidates = [entity.text or ""]
+    for key in _VACCINE_NAME_ATTR_KEYS:
+        val = attrs.get(key)
+        if isinstance(val, str):
+            candidates.append(val)
+    return bool(_VACCINE_RE.search(" ".join(candidates)))
+
+
+def _is_vaccine_entity(entity: ExtractedEntity) -> bool:
+    """Decide whether an entity should map to a FHIR Immunization (A7).
+
+    Always true for the ``immunization`` class. Otherwise the vaccine name guard
+    fires only on the medication/procedure classes a vaccine is mislabeled as,
+    so real oral/systemic medications are never reclassified.
+    """
+    if entity.entity_class == "immunization":
+        return True
+    if entity.entity_class not in _VACCINE_RECLASSIFIABLE:
+        return False
+    return _looks_like_vaccine(entity)
 
 
 def entity_to_health_record_dict(
@@ -120,11 +201,16 @@ def entity_to_health_record_dict(
     carries no provider of its own (B2). Both new params are optional with safe
     defaults so existing call sites keep working unchanged.
     """
-    mapping = ENTITY_TO_RECORD_TYPE.get(entity.entity_class)
-    if mapping is None:
-        return None
-
-    record_type, fhir_resource_type = mapping
+    # A7 — vaccines must become FHIR Immunization records (preserving each
+    # dose's administration date), whether extraction labeled them
+    # ``immunization`` or mislabeled them ``medication``/``procedure``.
+    if _is_vaccine_entity(entity):
+        record_type, fhir_resource_type = "immunization", "Immunization"
+    else:
+        mapping = ENTITY_TO_RECORD_TYPE.get(entity.entity_class)
+        if mapping is None:
+            return None
+        record_type, fhir_resource_type = mapping
 
     # B1 — standard terminology coding (None for unknown/uncodable terms).
     coding = _resolve_coding(entity)
@@ -288,6 +374,19 @@ def _extract_effective_date(
         return document_date
 
     return None
+
+
+def _resolve_occurrence_datetime(entity: ExtractedEntity) -> str | None:
+    """Resolve an ``Immunization.occurrenceDateTime`` ISO string for a dose (A7).
+
+    Reuses the same date resolution as the timeline effective date (explicit
+    date keys first, then a date embedded in any attribute value or the entity
+    text), serialized to ISO 8601. No document-date fallback: a dose with no
+    date of its own leaves ``occurrenceDateTime`` unset rather than borrowing the
+    visit date as an administration date.
+    """
+    parsed = _extract_effective_date(entity)
+    return parsed.isoformat() if parsed else None
 
 
 def resolve_document_date(
@@ -710,6 +809,46 @@ def _build_fhir_resource(
         if "reaction" in attrs:
             resource["reaction"] = [{"manifestation": [{"text": attrs["reaction"]}]}]
 
+    elif resource_type == "Immunization":
+        # A7 — AI-extracted vaccine. Mirrors the structured ImmuneMapper shape:
+        # status + vaccineCode + occurrenceDateTime (per dose), optional CVX
+        # coding / route / site / dose / manufacturer / lot.
+        status_raw = str(attrs.get("status", "") or "").lower()
+        if any(s in status_raw for s in ("not done", "not-done", "not_done", "refused", "declined")):
+            status = "not-done"
+        elif "entered-in-error" in status_raw or "entered in error" in status_raw:
+            status = "entered-in-error"
+        else:
+            status = "completed"
+        resource["status"] = status
+
+        vaccine_name = _first_attr(attrs, ("vaccine", "vaccine_name", "immunization")) or entity.text
+        vaccine_cc: dict = {"text": vaccine_name}
+        cvx = _first_attr(attrs, ("cvx", "cvx_code"))
+        if cvx:
+            vaccine_cc["coding"] = [{"system": _CVX_SYSTEM, "code": cvx}]
+        resource["vaccineCode"] = vaccine_cc
+
+        occurrence = _resolve_occurrence_datetime(entity)
+        if occurrence:
+            resource["occurrenceDateTime"] = occurrence
+
+        route = attrs.get("route")
+        if route:
+            resource["route"] = {"text": route}
+        site = attrs.get("site")
+        if site:
+            resource["site"] = {"text": site}
+        dose = _first_attr(attrs, ("dose", "dose_quantity", "dosage"))
+        if dose:
+            resource["doseQuantity"] = {"value": dose}
+        manufacturer = _first_attr(attrs, ("manufacturer", "mfg", "maker"))
+        if manufacturer:
+            resource["manufacturer"] = {"display": manufacturer}
+        lot = _first_attr(attrs, ("lot", "lot_number", "lotnumber"))
+        if lot:
+            resource["lotNumber"] = lot
+
     elif resource_type == "Encounter":
         visit_type = attrs.get("visit_type", "office")
         class_map = {
@@ -866,6 +1005,11 @@ def _build_display_text(entity: ExtractedEntity) -> str:
         if reaction:
             return f"{entity.text} — {reaction}"
         return entity.text
+
+    if cls == "immunization":
+        name = _first_attr(attrs, ("vaccine", "vaccine_name", "immunization")) or entity.text
+        date = attrs.get("date", "")
+        return f"{name} ({date})" if date else name
 
     if cls == "encounter":
         visit_type = attrs.get("visit_type", "visit")

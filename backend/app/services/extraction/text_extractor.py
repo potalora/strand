@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 from enum import Enum
@@ -308,7 +309,9 @@ async def extract_text_from_pdf(
 ) -> str:
     """Local-first PDF text extraction; fall back to vision OCR when untrustworthy."""
     try:
-        text, confidence = extract_text_from_pdf_local(file_path)
+        # pdfplumber parsing (+ decrypt) is CPU-bound; offload it so the
+        # background extraction worker doesn't block the event loop (D3).
+        text, confidence = await asyncio.to_thread(extract_text_from_pdf_local, file_path)
         if confidence >= LOCAL_TEXT_MIN_CHARS_PER_PAGE and text.strip():
             logger.info("PDF %s: used local text layer (%.0f chars/page)", file_path.name, confidence)
             return text
@@ -322,6 +325,35 @@ async def extract_text_from_pdf(
     return await _extract_text_from_pdf_gemini(file_path, api_key, config, trace=trace)
 
 
+# Bound multi-page TIFF OCR egress (W12): a scanned fax is normally 1-3 pages;
+# cap conversion so a pathological page count can't balloon the vision payload.
+_MAX_TIFF_PAGES = 25
+
+
+def _tiff_to_png_parts(tiff_bytes: bytes) -> list:
+    """Rasterize each page of a (possibly multi-page) TIFF to a PNG image part.
+
+    Vision providers (Gemini/Anthropic/OpenAI) accept PNG/JPEG/WEBP/PDF but NOT
+    image/tiff — sending raw TIFF bytes fails every scanned-TIFF OCR (A3). Pillow
+    converts each frame to PNG so the existing vision path works unchanged. Capped
+    at ``_MAX_TIFF_PAGES`` to bound egress.
+    """
+    from PIL import Image, ImageSequence
+
+    from app.services.ai.llm.types import ImagePart
+
+    parts: list = []
+    with Image.open(io.BytesIO(tiff_bytes)) as img:
+        for frame in ImageSequence.Iterator(img):
+            if len(parts) >= _MAX_TIFF_PAGES:
+                logger.warning("TIFF has >%d pages; OCR truncated", _MAX_TIFF_PAGES)
+                break
+            buf = io.BytesIO()
+            frame.convert("RGB").save(buf, format="PNG")
+            parts.append(ImagePart(buf.getvalue(), "image/png"))
+    return parts
+
+
 async def extract_text_from_tiff(
     file_path: Path, api_key: str, config: LLMConfig | None = None,
     *, trace: list | None = None,
@@ -330,8 +362,17 @@ async def extract_text_from_tiff(
     from app.services.ai.llm.types import ImagePart
 
     tiff_bytes = decrypt_file(file_path)  # CRYPTO-02: decrypt at-rest (legacy passthrough)
+    # A3: TIFF is not a vision-API-supported format — convert each page to PNG
+    # first. Fall back to raw bytes if Pillow can't read it (no worse than before).
+    try:
+        parts = _tiff_to_png_parts(tiff_bytes)
+    except Exception:
+        logger.warning("TIFF→PNG conversion failed for %s; sending raw bytes", file_path.name)
+        parts = []
+    if not parts:
+        parts = [ImagePart(tiff_bytes, "image/tiff")]
     return await _ocr_via_provider(
-        [ImagePart(tiff_bytes, "image/tiff")],
+        parts,
         config,
         api_key,
         "Extract all text from this scanned document. Preserve the original layout "
@@ -362,7 +403,8 @@ async def extract_text(
     logger.info("Extracting text from %s (type=%s)", file_path.name, file_type.value)
 
     if file_type == FileType.RTF:
-        text = extract_text_from_rtf(file_path)
+        # striprtf parsing (+ decrypt) is CPU-bound; offload to keep the loop free (D3).
+        text = await asyncio.to_thread(extract_text_from_rtf, file_path)
     elif file_type == FileType.PDF:
         text = await extract_text_from_pdf(file_path, api_key, config, trace=trace)
     elif file_type == FileType.TIFF:
