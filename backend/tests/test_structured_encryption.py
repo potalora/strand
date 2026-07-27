@@ -146,6 +146,80 @@ def test_same_content_encrypted_twice_yields_same_plaintext_hash(tmp_path):
     assert compute_file_hash(out_b) == plaintext_hash
 
 
+def test_mixed_zip_empty_child_still_finalizes_encrypted_header(tmp_path: Path) -> None:
+    import app.services.ingestion.coordinator as coord
+
+    source = tmp_path / "empty.pdf"
+    source.write_bytes(b"")
+    destination = tmp_path / "durable.pdf"
+
+    coord._encrypt_zip_child(source, destination)
+
+    assert destination.read_bytes() == ENC_MAGIC
+    assert decrypt_file(destination) == b""
+    assert destination.stat().st_mode & 0o777 == 0o600
+
+
+def test_mixed_zip_exclusive_create_failure_preserves_preexisting_file(
+    tmp_path: Path,
+) -> None:
+    import app.services.ingestion.coordinator as coord
+
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\nPHI")
+    destination = tmp_path / "durable.pdf"
+    destination.write_bytes(b"KEEP")
+
+    with pytest.raises(FileExistsError):
+        coord._encrypt_zip_child(source, destination)
+
+    assert destination.read_bytes() == b"KEEP"
+
+
+def test_mixed_zip_failure_has_no_public_check_then_unlink_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed writer never exposes a partial at the public destination name."""
+    import app.services.ingestion.coordinator as coord
+
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\nPHI")
+    upload_dir = tmp_path / "uploads"
+    destination = upload_dir / "durable.pdf"
+    real_lstat = Path.lstat
+    public_cleanup_window_seen = False
+
+    def swap_after_public_identity_check(path: Path):
+        nonlocal public_cleanup_window_seen
+        info = real_lstat(path)
+        if path == destination:
+            public_cleanup_window_seen = True
+            path.rename(upload_dir / "attacker-held-partial.pdf")
+            path.write_bytes(b"KEEP")
+        return info
+
+    class FailingWriter:
+        def __init__(self, _fileobj: object) -> None:
+            pass
+
+        def write_chunk(self, _plaintext: bytes) -> None:
+            raise OSError("injected writer failure")
+
+        def finalize(self) -> None:
+            raise AssertionError("finalize must not run")
+
+    monkeypatch.setattr(Path, "lstat", swap_after_public_identity_check)
+    monkeypatch.setattr(coord, "EncryptedFileWriter", FailingWriter)
+
+    with pytest.raises(OSError, match="writer failure"):
+        coord._encrypt_zip_child(source, destination)
+
+    assert public_cleanup_window_seen is False
+    assert not destination.exists()
+    assert list(upload_dir.iterdir()) == []
+
+
 # ---------------------------------------------------------------------------
 # coordinator.ingest_file — decrypt-to-temp at the ingest entry
 # ---------------------------------------------------------------------------
@@ -305,3 +379,201 @@ async def test_reupload_dedup_hash_matches_for_encrypted_copies(
     assert row_a.file_hash == plaintext_hash
     assert row_b.file_hash == plaintext_hash
     assert row_a.file_hash == row_b.file_hash
+
+
+@pytest.mark.asyncio
+async def test_encrypted_mixed_zip_child_is_ciphertext_and_inherits_parent_policy(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A PDF child never becomes durable plaintext and keeps its parent's policy."""
+    import app.services.ingestion.coordinator as coord
+    from app.services.ingestion.coordinator import ingest_file
+
+    _, uid_text = await auth_headers(client, "mixed-zip@example.com")
+    user_id = UUID(uid_text)
+    upload_dir = tmp_path / "uploads"
+    monkeypatch.setattr(coord.settings, "upload_dir", str(upload_dir))
+    monkeypatch.setattr(coord.settings, "temp_extract_dir", str(tmp_path / "extract"))
+
+    pdf = b"%PDF-1.7\n" + PLAINTEXT_MARKER + b"\n%%EOF"
+    encrypted_zip = tmp_path / "mixed.zip"
+    _encrypt_bytes_to(encrypted_zip, _make_zip({"clinical-note.pdf": pdf}))
+
+    original_ingest_zip = coord._ingest_zip
+    manifest = {"manifest_digest": "d" * 64, "pack_revision": "test-pack"}
+
+    async def stamp_parent_then_ingest(
+        db: AsyncSession,
+        scoped_user_id: UUID,
+        patient_id: UUID,
+        upload_id: UUID,
+        zip_path: Path,
+    ) -> dict:
+        parent = (
+            await db.execute(
+                select(UploadedFile).where(
+                    UploadedFile.id == upload_id,
+                    UploadedFile.user_id == scoped_user_id,
+                )
+            )
+        ).scalar_one()
+        parent.processing_mode = "validated_strict_local"
+        parent.processing_manifest = manifest
+        await db.commit()
+        return await original_ingest_zip(
+            db,
+            scoped_user_id,
+            patient_id,
+            upload_id,
+            zip_path,
+        )
+
+    monkeypatch.setattr(coord, "_ingest_zip", stamp_parent_then_ingest)
+
+    with patch(PATCH_DEDUP_BG, new_callable=AsyncMock):
+        result = await ingest_file(
+            db=db_session,
+            user_id=user_id,
+            file_path=encrypted_zip,
+            original_filename="mixed.zip",
+        )
+
+    assert len(result["unstructured_uploads"]) == 1
+    rows = (
+        await db_session.execute(
+            select(UploadedFile).where(UploadedFile.user_id == user_id)
+        )
+    ).scalars().all()
+    child = next(row for row in rows if row.file_category == "unstructured")
+    durable_bytes = Path(child.storage_path).read_bytes()
+    assert durable_bytes.startswith(ENC_MAGIC)
+    assert PLAINTEXT_MARKER not in durable_bytes
+    assert decrypt_file(child.storage_path) == pdf
+    assert child.file_size_bytes == len(pdf)
+    assert child.file_hash == hashlib.sha256(pdf).hexdigest()
+    assert child.processing_mode == "validated_strict_local"
+    assert child.processing_manifest == manifest
+
+
+@pytest.mark.asyncio
+async def test_mixed_zip_writer_failure_removes_partial_durable_child(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import app.services.ingestion.coordinator as coord
+
+    _, uid_text = await auth_headers(client, "mixed-zip-failure@example.com")
+    user_id = UUID(uid_text)
+    patient = await coord.get_or_create_patient(db_session, user_id)
+    parent = UploadedFile(
+        user_id=user_id,
+        filename="parent.zip",
+        mime_type="application/zip",
+        file_size_bytes=1,
+        file_hash="f" * 64,
+        storage_path=str(tmp_path / "parent.zip"),
+        ingestion_status="processing",
+        processing_mode="validated_strict_local",
+        processing_manifest={"manifest_digest": "d" * 64},
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    upload_dir = tmp_path / "uploads"
+    monkeypatch.setattr(coord.settings, "upload_dir", str(upload_dir))
+    monkeypatch.setattr(coord.settings, "temp_extract_dir", str(tmp_path / "extract"))
+    zip_path = tmp_path / "plain.zip"
+    zip_path.write_bytes(_make_zip({"clinical-note.pdf": b"%PDF-1.7\nPHI"}))
+
+    class FailingWriter:
+        def __init__(self, _fileobj: object) -> None:
+            pass
+
+        def write_chunk(self, _plaintext: bytes) -> None:
+            raise OSError("injected writer failure")
+
+        def finalize(self) -> None:
+            raise AssertionError("finalize should not run after write failure")
+
+    monkeypatch.setattr(coord, "EncryptedFileWriter", FailingWriter)
+    result = await coord._ingest_zip(
+        db_session,
+        user_id,
+        patient.id,
+        parent.id,
+        zip_path,
+    )
+
+    assert result["unstructured_files"] == []
+    assert result["errors"]
+    assert list(upload_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_zip_commit_failure_rolls_back_before_parent_failure_update(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import app.services.ingestion.coordinator as coord
+
+    _, uid_text = await auth_headers(client, "mixed-zip-commit@example.com")
+    user_id = UUID(uid_text)
+    patient = await coord.get_or_create_patient(db_session, user_id)
+    parent = UploadedFile(
+        user_id=user_id,
+        filename="parent.zip",
+        mime_type="application/zip",
+        file_size_bytes=1,
+        file_hash="e" * 64,
+        storage_path=str(tmp_path / "parent.zip"),
+        ingestion_status="processing",
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    upload_dir = tmp_path / "uploads"
+    monkeypatch.setattr(coord.settings, "upload_dir", str(upload_dir))
+    monkeypatch.setattr(coord.settings, "temp_extract_dir", str(tmp_path / "extract"))
+    zip_path = tmp_path / "plain.zip"
+    zip_path.write_bytes(_make_zip({"clinical-note.pdf": b"%PDF-1.7\nPHI"}))
+
+    original_commit = db_session.commit
+    original_rollback = db_session.rollback
+    rolled_back = False
+
+    async def failing_commit() -> None:
+        raise RuntimeError("injected commit failure")
+
+    async def tracking_rollback() -> None:
+        nonlocal rolled_back
+        rolled_back = True
+        await original_rollback()
+
+    monkeypatch.setattr(db_session, "commit", failing_commit)
+    monkeypatch.setattr(db_session, "rollback", tracking_rollback)
+    with pytest.raises(RuntimeError, match="commit failure"):
+        await coord._ingest_zip(
+            db_session,
+            user_id,
+            patient.id,
+            parent.id,
+            zip_path,
+        )
+
+    assert rolled_back
+    assert list(upload_dir.iterdir()) == []
+
+    monkeypatch.setattr(db_session, "commit", original_commit)
+    parent.ingestion_status = "failed"
+    await db_session.commit()
+    await db_session.refresh(parent)
+    assert parent.ingestion_status == "failed"

@@ -32,8 +32,12 @@ logger = logging.getLogger(__name__)
 
 ENC_MAGIC = b"MTENC1\n"
 _NONCE_LEN = 12
+_GCM_TAG_LEN = 16
 _LENGTH_PREFIX = 4  # big-endian uint32 frame length
-_COPY_CHUNK = 1024 * 1024  # 1 MiB streaming chunk for legacy pass-through
+_PLAINTEXT_CHUNK_MAX = 1024 * 1024
+_MIN_FRAME_PAYLOAD = _NONCE_LEN + _GCM_TAG_LEN
+_MAX_FRAME_PAYLOAD = _PLAINTEXT_CHUNK_MAX + _MIN_FRAME_PAYLOAD
+_COPY_CHUNK = _PLAINTEXT_CHUNK_MAX
 
 # Log the legacy-plaintext warning once per process to avoid spamming when a
 # directory still holds many pre-encryption files (run encrypt_existing_uploads.py).
@@ -47,6 +51,8 @@ def encrypt_chunk(plaintext: bytes) -> bytes:
     Each frame uses a fresh random nonce (AES-256-GCM via the database encryption
     key, matching ``encrypt_field`` semantics).
     """
+    if len(plaintext) > _PLAINTEXT_CHUNK_MAX:
+        raise ValueError("Encryption plaintext chunk exceeds 1 MiB")
     aesgcm = AESGCM(_get_key())
     nonce = os.urandom(_NONCE_LEN)
     ciphertext = aesgcm.encrypt(nonce, plaintext, None)
@@ -88,6 +94,8 @@ class EncryptedFileWriter:
 
     def write_chunk(self, plaintext: bytes) -> None:
         """Encrypt and write a single plaintext chunk as one frame."""
+        if len(plaintext) > _PLAINTEXT_CHUNK_MAX:
+            raise ValueError("Encryption plaintext chunk exceeds 1 MiB")
         self._ensure_header()
         if plaintext:
             self._f.write(encrypt_chunk(plaintext))
@@ -118,6 +126,22 @@ def _warn_legacy_once(file_path: Path | str) -> None:
         )
 
 
+def _read_encrypted_frame(src: BinaryIO) -> bytes | None:
+    """Read one validated encrypted frame without trusting its length prefix."""
+    len_bytes = src.read(_LENGTH_PREFIX)
+    if not len_bytes:
+        return None
+    if len(len_bytes) != _LENGTH_PREFIX:
+        raise ValueError("Corrupt encrypted file: truncated frame length")
+    (frame_len,) = struct.unpack(">I", len_bytes)
+    if not _MIN_FRAME_PAYLOAD <= frame_len <= _MAX_FRAME_PAYLOAD:
+        raise ValueError("Corrupt encrypted file: invalid frame length")
+    payload = src.read(frame_len)
+    if len(payload) != frame_len:
+        raise ValueError("Corrupt encrypted file: truncated frame payload")
+    return payload
+
+
 def decrypt_file(file_path: Path | str) -> bytes:
     """Read an uploaded file back as plaintext bytes.
 
@@ -137,18 +161,44 @@ def decrypt_file(file_path: Path | str) -> bytes:
         aesgcm = AESGCM(_get_key())
         out = bytearray()
         while True:
-            len_bytes = f.read(_LENGTH_PREFIX)
-            if not len_bytes:
+            payload = _read_encrypted_frame(f)
+            if payload is None:
                 break
-            if len(len_bytes) != _LENGTH_PREFIX:
-                raise ValueError("Corrupt encrypted file: truncated frame length")
-            (frame_len,) = struct.unpack(">I", len_bytes)
-            payload = f.read(frame_len)
-            if len(payload) != frame_len:
-                raise ValueError("Corrupt encrypted file: truncated frame payload")
             nonce, ciphertext = payload[:_NONCE_LEN], payload[_NONCE_LEN:]
             out += aesgcm.decrypt(nonce, ciphertext, None)
     return bytes(out)
+
+
+def decrypt_file_stream_to(
+    src: BinaryIO,
+    dst: BinaryIO,
+    *,
+    legacy_path: Path | str | None = None,
+) -> None:
+    """Stream-decrypt already-open files with bounded memory."""
+    src.seek(0)
+    dst.seek(0)
+    dst.truncate(0)
+    magic = src.read(len(ENC_MAGIC))
+    if magic != ENC_MAGIC:
+        if legacy_path is not None:
+            _warn_legacy_once(legacy_path)
+        if magic:
+            dst.write(magic)
+        while True:
+            chunk = src.read(_COPY_CHUNK)
+            if not chunk:
+                break
+            dst.write(chunk)
+        return
+
+    aesgcm = AESGCM(_get_key())
+    while True:
+        payload = _read_encrypted_frame(src)
+        if payload is None:
+            break
+        nonce, ciphertext = payload[:_NONCE_LEN], payload[_NONCE_LEN:]
+        dst.write(aesgcm.decrypt(nonce, ciphertext, None))
 
 
 def decrypt_file_to(src_path: Path | str, dst_path: Path | str) -> None:
@@ -171,33 +221,7 @@ def decrypt_file_to(src_path: Path | str, dst_path: Path | str) -> None:
     src_path = Path(src_path)
     dst_path = Path(dst_path)
     with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
-        magic = src.read(len(ENC_MAGIC))
-        if magic != ENC_MAGIC:
-            _warn_legacy_once(src_path)
-            # Legacy plaintext: emit the header bytes we already consumed, then
-            # stream the remainder in bounded chunks (no whole-file buffering).
-            if magic:
-                dst.write(magic)
-            while True:
-                chunk = src.read(_COPY_CHUNK)
-                if not chunk:
-                    break
-                dst.write(chunk)
-            return
-
-        aesgcm = AESGCM(_get_key())
-        while True:
-            len_bytes = src.read(_LENGTH_PREFIX)
-            if not len_bytes:
-                break
-            if len(len_bytes) != _LENGTH_PREFIX:
-                raise ValueError("Corrupt encrypted file: truncated frame length")
-            (frame_len,) = struct.unpack(">I", len_bytes)
-            payload = src.read(frame_len)
-            if len(payload) != frame_len:
-                raise ValueError("Corrupt encrypted file: truncated frame payload")
-            nonce, ciphertext = payload[:_NONCE_LEN], payload[_NONCE_LEN:]
-            dst.write(aesgcm.decrypt(nonce, ciphertext, None))
+        decrypt_file_stream_to(src, dst, legacy_path=src_path)
 
 
 def compute_file_hash(file_path: Path) -> str:

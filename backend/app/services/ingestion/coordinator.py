@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import logging
+import os
 import shutil
 import zipfile
 from datetime import datetime, timezone
@@ -27,7 +29,15 @@ from app.services.ingestion.patient_demographics import (
     extract_fhir_demographics,
 )
 from app.services.ingestion.xdm_parser import parse_xdm_metadata
-from app.utils.file_utils import decrypt_file_to, is_encrypted_file
+from app.services.ingestion.zip_child_sets import (
+    STAGING_EXTRACTION_STATUS,
+    ZipChildSet,
+)
+from app.utils.file_utils import (
+    EncryptedFileWriter,
+    decrypt_file_to,
+    is_encrypted_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +53,31 @@ _ZIP_MAX_MEMBER_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB / member
 _ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024 * 1024  # 50 GiB total
 _ZIP_MAX_COMPRESSION_RATIO = 100.0  # reject members inflating > 100x
 _ZIP_EXTRACT_CHUNK = 1024 * 1024  # 1 MiB streaming chunk
+
+
+def _encrypt_zip_child(source: Path, destination: Path) -> tuple[int, int]:
+    """Encrypt privately, then atomically publish one complete ZIP child."""
+    staging = ZipChildSet(
+        destination.parent,
+        writer_factory=EncryptedFileWriter,
+    )
+    try:
+        identity = staging.encrypt(source, destination.name)
+        staging.seal()
+        staging.publish()
+        published = staging.final_path / destination.name
+        try:
+            os.link(published, destination, follow_symlinks=False)
+        except BaseException:
+            staging.remove_published()
+            raise
+        published.unlink()
+        os.fsync(staging.pending_fd)
+        os.rmdir(staging.final_name, dir_fd=staging.root_fd)
+        os.fsync(staging.root_fd)
+        return identity
+    finally:
+        staging.close()
 
 
 def _zip_safe_target(temp_dir: Path, member_name: str) -> Path | None:
@@ -669,44 +704,95 @@ async def _ingest_zip(
 
         # Queue unstructured files for extraction
         if unstructured_files:
-            for uf in unstructured_files:
-                try:
-                    # Copy to upload dir with UUID filename
-                    dest_name = f"{uuid4()}{uf.suffix}"
-                    dest_path = Path(settings.upload_dir) / dest_name
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(uf, dest_path)
-
-                    # Determine mime type
-                    suffix = uf.suffix.lower()
-                    mime_map = {
-                        ".pdf": "application/pdf",
-                        ".rtf": "application/rtf",
-                        ".tif": "image/tiff",
-                        ".tiff": "image/tiff",
-                    }
-
-                    unstr_upload = UploadedFile(
-                        id=uuid4(),
-                        user_id=user_id,
-                        filename=uf.name,
-                        mime_type=mime_map.get(suffix, "application/octet-stream"),
-                        file_size_bytes=uf.stat().st_size,
-                        file_hash=compute_file_hash(uf),
-                        storage_path=str(dest_path),
-                        ingestion_status="pending_extraction",
-                        file_category="unstructured",
+            parent_upload = (
+                await db.execute(
+                    select(UploadedFile).where(
+                        UploadedFile.id == upload_id,
+                        UploadedFile.user_id == user_id,
                     )
-                    db.add(unstr_upload)
-                    stats["unstructured_files"].append({
-                        "upload_id": str(unstr_upload.id),
-                        "filename": uf.name,
-                        "status": "pending_extraction",
-                    })
-                except Exception as e:
-                    stats["errors"].append({"file": uf.name, "error": str(e)})
+                )
+            ).scalar_one_or_none()
+            if parent_upload is None:
+                raise ValueError("Parent upload is unavailable")
+            child_set = ZipChildSet(
+                Path(settings.upload_dir),
+                writer_factory=EncryptedFileWriter,
+            )
+            staged_uploads: list[UploadedFile] = []
+            staged_results: list[dict[str, str]] = []
+            staging_rows_committed = False
+            try:
+                for uf in unstructured_files:
+                    dest_name = f"{uuid4()}{uf.suffix}"
+                    try:
+                        # All ciphertext remains inside one owner-only pending
+                        # directory until the complete set is committed.
+                        dest_path = child_set.child_path(dest_name)
+                        child_set.encrypt(uf, dest_name)
 
-            await db.commit()
+                        suffix = uf.suffix.lower()
+                        mime_map = {
+                            ".pdf": "application/pdf",
+                            ".rtf": "application/rtf",
+                            ".tif": "image/tiff",
+                            ".tiff": "image/tiff",
+                        }
+
+                        unstr_upload = UploadedFile(
+                            id=uuid4(),
+                            user_id=user_id,
+                            filename=uf.name,
+                            mime_type=mime_map.get(
+                                suffix, "application/octet-stream"
+                            ),
+                            file_size_bytes=uf.stat().st_size,
+                            file_hash=compute_file_hash(uf),
+                            storage_path=str(dest_path),
+                            ingestion_status=STAGING_EXTRACTION_STATUS,
+                            file_category="unstructured",
+                            processing_mode=parent_upload.processing_mode,
+                            processing_manifest=copy.deepcopy(
+                                parent_upload.processing_manifest
+                            ),
+                        )
+                        db.add(unstr_upload)
+                        staged_uploads.append(unstr_upload)
+                        staged_results.append(
+                            {
+                                "upload_id": str(unstr_upload.id),
+                                "filename": uf.name,
+                                "status": "pending_extraction",
+                            }
+                        )
+                    except Exception as e:
+                        child_set.discard(dest_name)
+                        stats["errors"].append({"file": uf.name, "error": str(e)})
+
+                if staged_uploads:
+                    child_set.seal()
+                    try:
+                        await db.commit()
+                        staging_rows_committed = True
+                    except BaseException:
+                        await db.rollback()
+                        raise
+
+                    try:
+                        child_set.publish()
+                    except BaseException:
+                        await db.rollback()
+                        raise
+
+                    for staged_upload in staged_uploads:
+                        staged_upload.ingestion_status = "pending_extraction"
+                    try:
+                        await db.commit()
+                    except BaseException:
+                        await db.rollback()
+                        raise
+                    stats["unstructured_files"].extend(staged_results)
+            finally:
+                child_set.close(cleanup_pending=not staging_rows_committed)
 
         if not tsv_files and not json_files and not unstructured_files:
             raise ValueError("ZIP contains no processable files")

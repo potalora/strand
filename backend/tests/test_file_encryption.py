@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import struct
 
 import pytest
 
@@ -19,12 +20,16 @@ from app.utils.file_utils import (
     ENC_MAGIC,
     EncryptedFileWriter,
     decrypt_file,
+    decrypt_file_stream_to,
     encrypt_chunk,
     encrypt_stream,
     is_encrypted_file,
 )
 
 PLAINTEXT_MARKER = b"SECRET_PHI_MARKER_Jane_Q_Public_MRN_0001234567"
+MAX_PLAINTEXT_CHUNK = 1024 * 1024
+MIN_FRAME_PAYLOAD = 12 + 16
+MAX_FRAME_PAYLOAD = MAX_PLAINTEXT_CHUNK + MIN_FRAME_PAYLOAD
 
 
 def _chunks(data: bytes, size: int):
@@ -119,6 +124,39 @@ def test_empty_payload_round_trips(tmp_path):
         writer.finalize()
     assert is_encrypted_file(dest)
     assert decrypt_file(dest) == b""
+
+
+@pytest.mark.parametrize(
+    "frame_len",
+    [0, 1, MIN_FRAME_PAYLOAD - 1, MAX_FRAME_PAYLOAD + 1, 0xFFFFFFFF],
+)
+def test_stream_decrypt_rejects_impossible_frame_lengths_before_payload_read(frame_len):
+    """Untrusted frame lengths are rejected before they can request huge reads."""
+
+    class GuardedSource(io.BytesIO):
+        def read(self, size=-1):
+            assert size <= MAX_FRAME_PAYLOAD
+            return super().read(size)
+
+    src = GuardedSource(ENC_MAGIC + struct.pack(">I", frame_len))
+
+    with pytest.raises(ValueError, match="invalid frame length"):
+        decrypt_file_stream_to(src, io.BytesIO())
+
+
+def test_encrypt_chunk_rejects_plaintext_over_one_mib():
+    with pytest.raises(ValueError, match="plaintext chunk exceeds"):
+        encrypt_chunk(b"x" * (MAX_PLAINTEXT_CHUNK + 1))
+
+
+def test_streaming_writer_rejects_oversize_chunk_before_writing_header():
+    destination = io.BytesIO()
+    writer = EncryptedFileWriter(destination)
+
+    with pytest.raises(ValueError, match="plaintext chunk exceeds"):
+        writer.write_chunk(b"x" * (MAX_PLAINTEXT_CHUNK + 1))
+
+    assert destination.getvalue() == b""
 
 
 # ---------------------------------------------------------------------------

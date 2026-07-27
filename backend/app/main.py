@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +15,8 @@ from app.database import async_session_factory
 from app.middleware.audit import AuditMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.services.local_ai.model_manager import local_model_manager
+from app.services.local_ai.scratch import sweep_stale_scratch
+from app.services.ingestion.zip_child_sets import reconcile_zip_child_sets
 
 
 def resolve_log_level(log_level: str, is_production: bool) -> int:
@@ -38,6 +41,7 @@ logging.basicConfig(
 # Keep a reference to background fire-and-forget tasks so they aren't GC'd while
 # pending (asyncio only holds a weak reference to scheduled tasks).
 _background_tasks: set[asyncio.Task] = set()
+_STALE_LOCAL_AI_SCRATCH_SECONDS = 24 * 60 * 60
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +67,23 @@ async def lifespan(app: FastAPI):
     # A1: Recover files stuck in 'processing' from previous crash/restart
     try:
         async with async_session_factory() as db:
+            set_recovery = await reconcile_zip_child_sets(
+                db,
+                Path(settings.upload_dir),
+            )
+            if set_recovery is not None and (
+                set_recovery.recovered_groups
+                or set_recovery.failed_groups
+                or set_recovery.removed_orphans
+            ):
+                logger.info(
+                    "ZIP child set recovery: recovered=%d failed=%d orphans=%d",
+                    set_recovery.recovered_groups,
+                    set_recovery.failed_groups,
+                    set_recovery.removed_orphans,
+                )
+            if set_recovery is not None and set_recovery.bounded:
+                logger.warning("ZIP child set recovery reached its safety bound")
             result = await db.execute(text(
                 "UPDATE uploaded_files SET ingestion_status = 'pending_extraction', "
                 "processing_started_at = NULL "
@@ -146,9 +167,14 @@ async def lifespan(app: FastAPI):
 
     local_ai_started = False
     if settings.local_ai_enabled:
-        # Task 6 inserts strict-local scratch recovery immediately before this
-        # fail-closed start. start() validates owner-only state; it never loads a model.
         try:
+            removed = sweep_stale_scratch(
+                Path(settings.local_ai_scratch_dir),
+                stale_after_seconds=_STALE_LOCAL_AI_SCRATCH_SECONDS,
+                active_job_ids=(),
+            )
+            if removed:
+                logger.info("Removed %d stale strict-local scratch jobs", removed)
             await local_model_manager.start()
             local_ai_started = True
         except BaseException:
