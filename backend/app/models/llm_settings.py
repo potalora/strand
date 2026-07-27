@@ -60,3 +60,4 @@ class UserLLMPreferences(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     extraction_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     vision_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     extraction_engine: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    processing_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)

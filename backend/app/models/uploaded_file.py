@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -37,6 +37,18 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     file_category: Mapped[str] = mapped_column(
         Text, default="structured", server_default="structured"
+    )
+    processing_mode: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="cloud_assisted",
+        server_default="cloud_assisted",
+    )
+    # Immutable model identities, fixed revisions, hashes, and schema metadata.
+    processing_manifest: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    processing_schema_version: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
     )
     # Encrypted at rest (AES-256-GCM). These hold raw extracted document text
     # and the entities/sections/metadata derived from it — all clinical PHI,

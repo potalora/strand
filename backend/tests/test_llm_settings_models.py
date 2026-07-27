@@ -43,7 +43,11 @@ async def test_preferences_one_row_per_user(db_session):
     user = User(email="llm-models-b@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
-    pref = UserLLMPreferences(user_id=user.id, default_provider="anthropic")
+    pref = UserLLMPreferences(
+        user_id=user.id,
+        default_provider="anthropic",
+        processing_mode="validated_strict_local",
+    )
     db_session.add(pref)
     await db_session.commit()
 
@@ -55,3 +59,4 @@ async def test_preferences_one_row_per_user(db_session):
     assert got.default_provider == "anthropic"
     assert got.summary_provider is None
     assert got.extraction_engine is None
+    assert got.processing_mode == "validated_strict_local"
