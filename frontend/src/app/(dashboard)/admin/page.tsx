@@ -90,9 +90,10 @@ function resolveTabState(rawTab: string | null, rawSub: string | null): {
 export default function AdminPage() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const initial = resolveTabState(searchParams.get("tab"), searchParams.get("sub"));
-  const [activeTab, setActiveTab] = useState(initial.tab);
-  const [dedupSub, setDedupSub] = useState<DedupSub>(initial.sub);
+  const { tab: activeTab, sub: dedupSub } = resolveTabState(
+    searchParams.get("tab"),
+    searchParams.get("sub")
+  );
   const [shown, setShown] = useState(false);
 
   useEffect(() => {
@@ -100,20 +101,12 @@ export default function AdminPage() {
     return () => cancelAnimationFrame(id);
   }, []);
 
-  useEffect(() => {
-    const next = resolveTabState(searchParams.get("tab"), searchParams.get("sub"));
-    setActiveTab(next.tab);
-    setDedupSub(next.sub);
-  }, [searchParams]);
-
   const handleTabChange = (key: string) => {
-    setActiveTab(key);
     const url = key === "dedup" ? `/admin?tab=dedup&sub=${dedupSub}` : `/admin?tab=${key}`;
     router.replace(url, { scroll: false });
   };
 
   const handleSubChange = (sub: DedupSub) => {
-    setDedupSub(sub);
     router.replace(`/admin?tab=dedup&sub=${sub}`, { scroll: false });
   };
 

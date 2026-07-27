@@ -99,26 +99,27 @@ export default function RecordsPage() {
   }, [searchInput]);
 
   useEffect(() => {
-    setLoading(true);
-    const params = new URLSearchParams({
-      page: String(page),
-      page_size: String(PAGE_SIZE),
-      sort: sortKey,
-      order: sortOrder,
-    });
-    if (recordType) params.set("record_type", recordType);
-    if (search) params.set("search", search);
-    api
-      .get<RecordListResponse>(`/records?${params.toString()}`)
-      .then((data) => {
+    void (async () => {
+      setLoading(true);
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(PAGE_SIZE),
+        sort: sortKey,
+        order: sortOrder,
+      });
+      if (recordType) params.set("record_type", recordType);
+      if (search) params.set("search", search);
+      try {
+        const data = await api.get<RecordListResponse>(`/records?${params.toString()}`);
         setRecords(data.items || []);
         setTotal(data.total || 0);
-      })
-      .catch(() => {
+      } catch {
         setRecords([]);
         setTotal(0);
-      })
-      .finally(() => setLoading(false));
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, [page, search, recordType, sortKey, sortOrder]);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));

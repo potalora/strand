@@ -107,7 +107,7 @@ test.describe("Large-dataset pagination integrity (Admin → Records)", () => {
       const up = await api.uploadStructured(bundlePath, "pagination-seed.json");
       await api.pollUploadStatus(up.upload_id, 90_000);
     } finally {
-      fs.existsSync(bundlePath) && fs.unlinkSync(bundlePath);
+      if (fs.existsSync(bundlePath)) fs.unlinkSync(bundlePath);
     }
 
     // Ground-truth total from the API.

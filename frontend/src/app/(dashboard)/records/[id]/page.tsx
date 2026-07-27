@@ -7,7 +7,7 @@ import { ChevronLeft, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import type { HealthRecord } from "@/types/api";
 import { usePreferencesStore } from "@/stores/usePreferencesStore";
-import { RECORD_TYPE_ICONS, getObservationIcon } from "@/lib/record-icons";
+import { getRecordTypeIconElement } from "@/lib/record-icons";
 import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
 import { sourceLabel } from "@/lib/source-label";
 import { recordTitle } from "@/lib/record-title";
@@ -40,12 +40,17 @@ export default function RecordDetailPage() {
 
   useEffect(() => {
     if (!id) return;
-    setLoading(true);
-    api
-      .get<HealthRecord>(`/records/${id}`)
-      .then(setRecord)
-      .catch((err) => setError(err instanceof Error ? err.message : "Failed to load record"))
-      .finally(() => setLoading(false));
+    void (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        setRecord(await api.get<HealthRecord>(`/records/${id}`));
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to load record");
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, [id]);
 
   function handleDeleteClick() {
@@ -93,8 +98,7 @@ export default function RecordDetailPage() {
 
   // Resolve icon + colors for the header chip (record-TYPE hue — neutral, not value-judgement).
   const type = record.record_type.toLowerCase();
-  const IconComponent =
-    type === "observation" ? getObservationIcon(record.fhir_resource) : RECORD_TYPE_ICONS[type];
+  const icon = getRecordTypeIconElement(type, 22, record.fhir_resource);
   const colors = RECORD_TYPE_COLORS[type] ?? DEFAULT_RECORD_COLOR;
 
   return (
@@ -110,7 +114,7 @@ export default function RecordDetailPage() {
         {/* 1. Editorial header: kicker + icon chip + serif title + badge + status */}
         <p className="kicker">Record detail</p>
         <div className="flex items-start gap-3" style={{ marginTop: 6 }}>
-          {IconComponent && (
+          {icon && (
             <div
               className="flex items-center justify-center shrink-0"
               style={{
@@ -122,7 +126,7 @@ export default function RecordDetailPage() {
                 borderRadius: "var(--radius-sm)",
               }}
             >
-              <IconComponent size={22} />
+              {icon}
             </div>
           )}
           <div className="min-w-0 flex-1">

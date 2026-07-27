@@ -41,18 +41,19 @@ export default function MedicationsPage() {
   }, []);
 
   useEffect(() => {
-    setLoading(true);
-    api
-      .get<RecordListResponse>(`/records?record_type=${RECORD_TYPE}&page=${page}&page_size=${PAGE_SIZE}`)
-      .then((data) => {
+    void (async () => {
+      setLoading(true);
+      try {
+        const data = await api.get<RecordListResponse>(`/records?record_type=${RECORD_TYPE}&page=${page}&page_size=${PAGE_SIZE}`);
         setRecords(data.items || []);
         setTotal(data.total || 0);
-      })
-      .catch(() => {
+      } catch {
         setRecords([]);
         setTotal(0);
-      })
-      .finally(() => setLoading(false));
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, [page]);
 
   const dot = (RECORD_TYPE_COLORS[RECORD_TYPE] ?? DEFAULT_RECORD_COLOR).dot;

@@ -57,7 +57,7 @@ test.describe("Structured file uploads", () => {
 
     const history = await api.getUploadHistory();
     const fhirUpload = history.items.find(
-      (item: any) =>
+      (item) =>
         item.filename === "sample_fhir_bundle.json" &&
         ["completed", "completed_with_merges", "awaiting_review"].includes(
           item.ingestion_status

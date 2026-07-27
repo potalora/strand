@@ -2,6 +2,55 @@ import * as fs from "fs";
 
 const API_BASE = "http://localhost:8000/api/v1";
 
+type ApiRecord = {
+  id: string;
+  record_type: string;
+};
+
+type UploadStatus = {
+  ingestion_status?: string;
+  status?: string;
+};
+
+type UploadHistoryItem = {
+  id: string;
+  filename?: string;
+  ingestion_status?: string;
+  created_at?: string;
+  record_count?: number;
+};
+
+type UploadHistoryResponse = {
+  items: UploadHistoryItem[];
+};
+
+type RecordsResponse = {
+  items: ApiRecord[];
+  total: number;
+};
+
+type UploadReview = {
+  candidates: { candidate_id: string; status?: string }[];
+};
+
+type DedupResolution = {
+  resolved: number;
+};
+
+type AuthenticatedUser = {
+  email: string;
+};
+
+type DedupCandidatesResponse = {
+  items: { candidate_id: string }[];
+};
+
+type TimelineResponse = {
+  events: { id: string }[];
+};
+
+type EmptyApiResponse = Record<string, unknown>;
+
 export class ApiClient {
   private token: string = "";
 
@@ -108,7 +157,7 @@ export class ApiClient {
     uploadId: string,
     timeoutMs: number = 60_000,
     excludeTerminal: string[] = [],
-  ): Promise<any> {
+  ): Promise<UploadStatus> {
     const start = Date.now();
     const terminalStatuses = [
       "completed",
@@ -160,7 +209,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getUploadHistory(): Promise<any> {
+  async getUploadHistory(): Promise<UploadHistoryResponse> {
     const res = await fetch(`${API_BASE}/upload/history`, {
       headers: this.headers(),
     });
@@ -176,7 +225,7 @@ export class ApiClient {
     record_type?: string;
     page?: number;
     page_size?: number;
-  }): Promise<any> {
+  }): Promise<RecordsResponse> {
     const query = new URLSearchParams();
     if (params?.record_type) query.set("record_type", params.record_type);
     if (params?.page) query.set("page", String(params.page));
@@ -192,7 +241,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getUploadReview(uploadId: string): Promise<any> {
+  async getUploadReview(uploadId: string): Promise<UploadReview> {
     const res = await fetch(`${API_BASE}/upload/${uploadId}/review`, {
       headers: this.headers(),
     });
@@ -207,7 +256,7 @@ export class ApiClient {
   async resolveDedup(
     uploadId: string,
     resolutions: { candidate_id: string; action: "merge" | "dismiss" }[]
-  ): Promise<any> {
+  ): Promise<DedupResolution> {
     const res = await fetch(`${API_BASE}/upload/${uploadId}/review/resolve`, {
       method: "POST",
       headers: this.headers(),
@@ -221,7 +270,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getMe(): Promise<any> {
+  async getMe(): Promise<AuthenticatedUser> {
     const res = await fetch(`${API_BASE}/auth/me`, {
       headers: this.headers(),
     });
@@ -231,7 +280,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async scanDedup(): Promise<any> {
+  async scanDedup(): Promise<EmptyApiResponse> {
     const res = await fetch(`${API_BASE}/dedup/scan`, {
       method: "POST",
       headers: this.headers(),
@@ -242,7 +291,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getDedupCandidates(page = 1, limit = 20): Promise<any> {
+  async getDedupCandidates(page = 1, limit = 20): Promise<DedupCandidatesResponse> {
     const res = await fetch(
       `${API_BASE}/dedup/candidates?page=${page}&limit=${limit}`,
       { headers: this.headers() }
@@ -255,7 +304,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async mergeDedup(candidateId: string): Promise<any> {
+  async mergeDedup(candidateId: string): Promise<EmptyApiResponse> {
     const res = await fetch(`${API_BASE}/dedup/merge`, {
       method: "POST",
       headers: this.headers(),
@@ -267,7 +316,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async dismissDedup(candidateId: string): Promise<any> {
+  async dismissDedup(candidateId: string): Promise<EmptyApiResponse> {
     const res = await fetch(`${API_BASE}/dedup/dismiss`, {
       method: "POST",
       headers: this.headers(),
@@ -281,7 +330,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getDashboardOverview(): Promise<any> {
+  async getDashboardOverview(): Promise<EmptyApiResponse> {
     const res = await fetch(`${API_BASE}/dashboard/overview`, {
       headers: this.headers(),
     });
@@ -293,7 +342,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getTimeline(params?: { record_type?: string; limit?: number }): Promise<any> {
+  async getTimeline(params?: { record_type?: string; limit?: number }): Promise<TimelineResponse> {
     const query = new URLSearchParams();
     if (params?.record_type) query.set("record_type", params.record_type);
     if (params?.limit) query.set("limit", String(params.limit));

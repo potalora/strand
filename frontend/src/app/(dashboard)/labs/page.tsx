@@ -65,18 +65,19 @@ export default function LabsPage() {
   }, []);
 
   useEffect(() => {
-    setLoading(true);
-    api
-      .get<LabResponse>(`/dashboard/labs?page=${page}&page_size=${PAGE_SIZE}`)
-      .then((data) => {
+    void (async () => {
+      setLoading(true);
+      try {
+        const data = await api.get<LabResponse>(`/dashboard/labs?page=${page}&page_size=${PAGE_SIZE}`);
         setItems(data.items || []);
         setTotal(data.total || 0);
-      })
-      .catch(() => {
+      } catch {
         setItems([]);
         setTotal(0);
-      })
-      .finally(() => setLoading(false));
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, [page]);
 
   const dot = (RECORD_TYPE_COLORS.observation ?? DEFAULT_RECORD_COLOR).dot;

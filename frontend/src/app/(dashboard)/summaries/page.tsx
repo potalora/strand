@@ -340,7 +340,7 @@ export default function SummariesPage() {
               key={t.key}
               type="button"
               className="tab"
-              aria-selected={summaryType === t.key}
+              aria-pressed={summaryType === t.key}
               onClick={() => setSummaryType(t.key)}
             >
               {t.label}
@@ -501,7 +501,7 @@ export default function SummariesPage() {
                     key={t.key}
                     type="button"
                     className="tab"
-                    aria-selected={resultTab === t.key}
+                    aria-pressed={resultTab === t.key}
                     onClick={() => setResultTab(t.key)}
                   >
                     {t.label}

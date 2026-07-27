@@ -85,12 +85,16 @@ export default function TimelinePage() {
   }, []);
 
   useEffect(() => {
-    setLoading(true);
-    api
-      .get<TimelineResponse>("/timeline?limit=200" + (filter ? `&record_type=${filter}` : ""))
-      .then(setData)
-      .catch(() => setData(null))
-      .finally(() => setLoading(false));
+    void (async () => {
+      setLoading(true);
+      try {
+        setData(await api.get<TimelineResponse>("/timeline?limit=200" + (filter ? `&record_type=${filter}` : "")));
+      } catch {
+        setData(null);
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, [filter]);
 
   const events: TimelineEvent[] = useMemo(() => data?.events ?? [], [data]);

@@ -19,6 +19,7 @@ import {
   FileQuestion,
   type LucideIcon,
 } from "lucide-react";
+import { createElement, type ReactNode } from "react";
 
 export const RECORD_TYPE_ICONS: Record<string, LucideIcon> = {
   condition: Stethoscope,
@@ -136,4 +137,17 @@ export function getObservationSubTypeShort(
  *  label always agree. */
 export function getObservationIcon(fhirResource: Record<string, unknown>): LucideIcon {
   return OBS_SUBTYPE_ICONS[getObservationSubType(fhirResource)];
+}
+
+/** Return a ready-to-render icon so renderers do not create component factories. */
+export function getRecordTypeIconElement(
+  recordType: string,
+  size: number,
+  fhirResource?: Record<string, unknown>,
+): ReactNode {
+  const type = recordType.toLowerCase();
+  const Icon = type === "observation" && fhirResource
+    ? getObservationIcon(fhirResource)
+    : RECORD_TYPE_ICONS[type];
+  return Icon ? createElement(Icon, { size }) : null;
 }

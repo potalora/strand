@@ -5,7 +5,6 @@ import { ApiClient } from "./helpers/api-client";
 import { browserLogin } from "./helpers/browser-login";
 import {
   PATHS,
-  hasTestData,
   getRtfFiles,
   uniqueEmail,
   TEST_PASSWORD,
@@ -126,7 +125,7 @@ test.describe("Unstructured Upload", () => {
     // Check upload history for the batch results
     const history = await api.getUploadHistory();
     const recentUploads = (history.items || history).filter(
-      (item: any) =>
+      (item: { filename?: string; created_at?: string }) =>
         item.filename?.toLowerCase().endsWith(".rtf") &&
         new Date(item.created_at).getTime() > Date.now() - 120_000
     );
@@ -134,7 +133,7 @@ test.describe("Unstructured Upload", () => {
 
     // Poll all uploads concurrently (entity extraction uses Gemini, may be slow under load)
     const statuses = await Promise.all(
-      recentUploads.slice(0, rtfFiles.length).map((upload: any) =>
+      recentUploads.slice(0, rtfFiles.length).map((upload) =>
         api.pollUploadStatus(upload.id, 240_000)
       )
     );

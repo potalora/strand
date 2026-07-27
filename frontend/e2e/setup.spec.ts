@@ -26,7 +26,7 @@ test.describe("E2E Setup", () => {
 
   test("multiple record types were created", async () => {
     const records = await api.getRecords({ page: 1 });
-    const types = new Set(records.items.map((r: any) => r.record_type));
+    const types = new Set(records.items.map((record) => record.record_type));
     // We expect at least conditions, observations, medications, encounters
     expect(types.size).toBeGreaterThanOrEqual(4);
   });

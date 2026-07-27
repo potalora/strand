@@ -83,7 +83,7 @@ test.describe("Mixed content upload classification", () => {
     );
     expect(result.upload_id).toBeTruthy();
 
-    const status = await api.pollUploadStatus(result.upload_id, 60_000);
+    await api.pollUploadStatus(result.upload_id, 60_000);
     // Structured upload should insert records directly
     const records = await api.getRecords();
     expect(records.items.length).toBeGreaterThan(0);
