@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 HF_BASE_URL = "https://huggingface.co"
 MAX_HF_METADATA_BYTES = 8 * 1024 * 1024
 MAX_JSON_METADATA_BYTES = 128 * 1024 * 1024
+MAX_JSON_STRUCTURE_DEPTH = 64
+MAX_JSON_STRUCTURE_NODES = 100_000
 CHUNK_BYTES = 1024 * 1024
 MIN_FREE_BYTES_AFTER_CACHE = 15 * 1024 * 1024 * 1024
 
@@ -119,7 +121,7 @@ def _string(raw: dict[str, Any], key: str, context: str) -> str:
 def _load_catalog(path: Path) -> tuple[dict[str, Any], tuple[Candidate, ...]]:
     try:
         raw_value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise LocalValidationError("Candidate catalog could not be read as JSON") from exc
 
     raw = _object(raw_value, _CATALOG_KEYS, "root")
@@ -200,15 +202,23 @@ def _load_catalog(path: Path) -> tuple[dict[str, Any], tuple[Candidate, ...]]:
 
 
 def _contains_remote_code_requirement(value: Any) -> bool:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key in _REMOTE_CODE_KEYS and child not in (None, False, {}, []):
-                return True
-            if _contains_remote_code_requirement(child):
-                return True
-        return False
-    if isinstance(value, list):
-        return any(_contains_remote_code_requirement(child) for child in value)
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    nodes_seen = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes_seen += 1
+        if (
+            depth > MAX_JSON_STRUCTURE_DEPTH
+            or nodes_seen > MAX_JSON_STRUCTURE_NODES
+        ):
+            raise LocalValidationError("Repository JSON structure exceeds safe limits")
+        if isinstance(current, dict):
+            for key, child in current.items():
+                if key in _REMOTE_CODE_KEYS and child not in (None, False, {}, []):
+                    return True
+                stack.append((child, depth + 1))
+        elif isinstance(current, list):
+            stack.extend((child, depth + 1) for child in current)
     return False
 
 
@@ -250,7 +260,7 @@ def _metadata_json(
         raise LocalValidationError("Hugging Face metadata request failed") from exc
     try:
         value = json.loads(content)
-    except (UnicodeError, json.JSONDecodeError) as exc:
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise LocalValidationError("Hugging Face repository metadata is invalid") from exc
     if not isinstance(value, dict):
         raise LocalValidationError("Hugging Face repository metadata is invalid")
@@ -313,6 +323,10 @@ def _validate_repository_metadata(
             raise LocalValidationError("Repository file size metadata is unresolved")
         if size > MAX_MANIFEST_FILE_BYTES:
             raise LocalValidationError("Repository file exceeds the configured size limit")
+        if suffix == ".json" and size > MAX_JSON_METADATA_BYTES:
+            raise LocalValidationError(
+                "Repository JSON metadata exceeds the inspection limit"
+            )
 
         expected_sha256: str | None = None
         lfs_value = sibling_value.get("lfs")
@@ -449,7 +463,7 @@ def _inspect_downloaded_json(path: Path, expected_size: int) -> None:
         raise LocalValidationError("Repository JSON metadata exceeds the inspection limit")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise LocalValidationError("Repository JSON metadata is invalid") from exc
     if _contains_remote_code_requirement(value):
         raise LocalValidationError("Repository configuration requires remote code")

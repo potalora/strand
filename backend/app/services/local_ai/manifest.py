@@ -145,9 +145,12 @@ def safe_relative_manifest_path(raw_path: Any) -> str:
 
 
 def manifest_path_suffix(path: str) -> str:
-    """Return a lowercase final suffix for an already-normalized manifest path."""
+    """Return the final suffix, rejecting non-lowercase manifest file types."""
 
-    return PurePosixPath(path).suffix.lower()
+    suffix = PurePosixPath(path).suffix
+    if suffix != suffix.lower():
+        raise LocalValidationError("Manifest file suffix must be lowercase")
+    return suffix
 
 
 def _safe_manifest_file(raw_value: Any) -> ManifestFile:
@@ -242,7 +245,7 @@ def load_manifest(path: Path) -> LocalAIManifest:
 
     try:
         raw_value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise LocalValidationError("Manifest could not be read as JSON") from exc
 
     raw = _require_object(raw_value, keys=_TOP_LEVEL_KEYS, context="root")

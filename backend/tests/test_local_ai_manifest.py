@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,10 @@ from app.services.local_ai.types import ModelRole
 lock_script = importlib.import_module("scripts.lock_local_ai_manifest")
 
 ROLES = ("ocr", "extraction", "summary")
+
+
+def _pathological_json_nesting(depth: int = 2_000) -> bytes:
+    return b"[" * depth + b"0" + b"]" * depth
 
 
 def _manifest_file(path: str = "model.safetensors", *, size: int = 10) -> dict[str, Any]:
@@ -182,6 +187,30 @@ def test_manifest_normalizes_malformed_json_types_and_missing_keys(
         load_manifest(path)
 
 
+def test_manifest_normalizes_pathological_json_nesting(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    path.write_bytes(_pathological_json_nesting())
+
+    with pytest.raises(LocalValidationError, match="JSON"):
+        load_manifest(path)
+
+
+def test_manifest_and_schema_reject_uppercase_file_suffix(tmp_path: Path) -> None:
+    raw = _valid_manifest()
+    raw["artifacts"][0]["files"][0]["path"] = "model.JSON"
+
+    with pytest.raises(LocalValidationError, match="lowercase"):
+        load_manifest(_write_json(tmp_path / "manifest.json", raw))
+
+    schema_path = Path(__file__).parents[1] / "app/model_manifests/schema-v1.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    pattern = schema["properties"]["artifacts"]["items"]["properties"]["files"][
+        "items"
+    ]["properties"]["path"]["pattern"]
+    assert re.search(pattern, "model.JSON") is None
+    assert re.search(pattern, "model.json") is not None
+
+
 def test_manifest_enforces_file_count_and_byte_bounds(tmp_path: Path) -> None:
     too_many = _valid_manifest()
     too_many["artifacts"][0]["files"] = [
@@ -236,18 +265,32 @@ class _HFTransport:
         forbidden_role: str | None = None,
         auto_map_role: str | None = None,
         bad_weight_role: str | None = None,
+        oversized_json_role: str | None = None,
+        uppercase_json_role: str | None = None,
+        nested_config_role: str | None = None,
+        recursive_config_role: str | None = None,
     ) -> None:
         self.requests: list[str] = []
         self.forbidden_role = forbidden_role
         self.auto_map_role = auto_map_role
         self.bad_weight_role = bad_weight_role
+        self.oversized_json_role = oversized_json_role
+        self.uppercase_json_role = uppercase_json_role
         self.config_bytes: dict[str, bytes] = {}
         self.weight_bytes: dict[str, bytes] = {}
         for role in ROLES:
             config = {"architectures": [f"{role.title()}Model"]}
             if role == auto_map_role:
                 config["auto_map"] = {"AutoModel": "modeling_custom.CustomModel"}
-            self.config_bytes[role] = json.dumps(config).encode()
+            if role == nested_config_role:
+                nested: Any = "leaf"
+                for _ in range(80):
+                    nested = {"child": nested}
+                config["nested"] = nested
+            if role == recursive_config_role:
+                self.config_bytes[role] = _pathological_json_nesting()
+            else:
+                self.config_bytes[role] = json.dumps(config).encode()
             self.weight_bytes[role] = f"safe-{role}-weights".encode()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -257,10 +300,16 @@ class _HFTransport:
             role = parts[3]
             config = self.config_bytes[role]
             weights = self.weight_bytes[role]
+            config_path = "config.JSON" if role == self.uppercase_json_role else "config.json"
+            config_size = (
+                lock_script.MAX_JSON_METADATA_BYTES + 1
+                if role == self.oversized_json_role
+                else len(config)
+            )
             siblings: list[dict[str, Any]] = [
                 {
-                    "rfilename": "config.json",
-                    "size": len(config),
+                    "rfilename": config_path,
+                    "size": config_size,
                     "blobId": hashlib.sha1(config, usedforsecurity=False).hexdigest(),
                 },
                 {
@@ -347,6 +396,40 @@ def test_lock_catalog_preflights_all_metadata_before_any_file_download(
         lock_script.lock_catalog(_write_json(tmp_path / "catalog.json", _catalog()), output)
 
     assert not output.exists()
+    assert len(transport.requests) == 3
+    assert all("/api/models/" in request for request in transport.requests)
+
+
+def test_lock_catalog_rejects_oversized_repository_json_before_file_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _HFTransport(oversized_json_role="summary")
+    _install_mock_client(monkeypatch, transport)
+
+    with pytest.raises(LocalValidationError, match="JSON metadata"):
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", _catalog()),
+            tmp_path / "candidate.lock.json",
+        )
+
+    assert len(transport.requests) == 3
+    assert all("/api/models/" in request for request in transport.requests)
+
+
+def test_lock_catalog_rejects_uppercase_suffix_before_file_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _HFTransport(uppercase_json_role="summary")
+    _install_mock_client(monkeypatch, transport)
+
+    with pytest.raises(LocalValidationError, match="lowercase"):
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", _catalog()),
+            tmp_path / "candidate.lock.json",
+        )
+
     assert len(transport.requests) == 3
     assert all("/api/models/" in request for request in transport.requests)
 
@@ -469,6 +552,86 @@ def test_lock_catalog_rejects_invalid_pack_revision_before_network(
     assert network_called is False
 
 
+def test_lock_catalog_normalizes_pathological_catalog_nesting_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = tmp_path / "catalog.json"
+    catalog.write_bytes(_pathological_json_nesting())
+    network_called = False
+
+    def forbidden_client(*args: Any, **kwargs: Any) -> None:
+        nonlocal network_called
+        network_called = True
+        raise AssertionError("network must not be called")
+
+    monkeypatch.setattr(lock_script.httpx, "Client", forbidden_client)
+
+    with pytest.raises(LocalValidationError, match="JSON"):
+        lock_script.lock_catalog(catalog, tmp_path / "candidate.lock.json")
+
+    assert network_called is False
+
+
+def test_lock_catalog_normalizes_pathological_hf_metadata_nesting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[str] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(
+            200,
+            stream=httpx.ByteStream(_pathological_json_nesting()),
+            request=request,
+        )
+
+    _install_mock_client(monkeypatch, transport)  # type: ignore[arg-type]
+
+    with pytest.raises(LocalValidationError, match="metadata"):
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", _catalog()),
+            tmp_path / "candidate.lock.json",
+        )
+
+    assert len(requests) == 1
+
+
+def test_lock_catalog_normalizes_pathological_downloaded_json_nesting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _HFTransport(recursive_config_role="ocr")
+    _install_mock_client(monkeypatch, transport)
+
+    with pytest.raises(LocalValidationError, match="JSON metadata"):
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", _catalog()),
+            tmp_path / "candidate.lock.json",
+        )
+
+    assert len(transport.requests) == 4
+    assert transport.requests[-1].endswith("/config.json")
+
+
+def test_lock_catalog_bounds_downloaded_json_structure_depth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _HFTransport(nested_config_role="ocr")
+    _install_mock_client(monkeypatch, transport)
+
+    with pytest.raises(LocalValidationError, match="JSON structure"):
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", _catalog()),
+            tmp_path / "candidate.lock.json",
+        )
+
+    assert len(transport.requests) == 4
+    assert transport.requests[-1].endswith("/config.json")
+
+
 def test_lock_catalog_rejects_oversized_declared_metadata_before_json_decode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -521,6 +684,30 @@ def test_lock_catalog_rejects_oversized_actual_metadata_before_json_decode(
         )
 
     assert len(requests) == 1
+
+
+def test_local_ai_env_is_documented_only_in_canonical_example() -> None:
+    backend_root = Path(__file__).parents[1]
+    repository_root = backend_root.parent
+    canonical_example = (repository_root / ".env.example").read_text(encoding="utf-8")
+
+    assert not (backend_root / ".env.example").exists()
+    expected_lines = {
+        "LOCAL_AI_ENABLED=false",
+        "LOCAL_AI_MODEL_DIR=./data/local-ai/models",
+        "LOCAL_AI_SCRATCH_DIR=./data/local-ai/scratch",
+        "LOCAL_AI_MANIFEST_PATH=./app/model_manifests/apple-m4-16gb-v1.lock.json",
+        (
+            "LOCAL_AI_WORKER_COMMAND="
+            "../workers/local_ai/apple_mlx/.venv/bin/local-ai-mlx-worker"
+        ),
+        "LOCAL_AI_MAX_FILES=64",
+        "LOCAL_AI_MAX_FILE_BYTES=8589934592",
+        "LOCAL_AI_MAX_PACK_BYTES=21474836480",
+        "LOCAL_AI_WORKER_TIMEOUT_SECONDS=900",
+        "LOCAL_AI_MAX_PAGE_PIXELS=40000000",
+    }
+    assert expected_lines <= set(canonical_example.splitlines())
 
 
 def test_lock_script_is_directly_executable_from_backend() -> None:
