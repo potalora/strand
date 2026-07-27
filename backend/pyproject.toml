@@ -34,6 +34,7 @@ dependencies = [
     "striprtf>=0.0.28",
     "Pillow>=11.0.0",
     "pdfplumber>=0.11",
+    "pypdfium2==5.12.1",
     "python-fhir-converter>=0.3.0",
     # WS-C: fast C-backed fuzzy matching (dedup token_set_ratio + terminology fuzzy fallback).
     "rapidfuzz>=3.9",

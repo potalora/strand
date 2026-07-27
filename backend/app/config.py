@@ -202,6 +202,23 @@ class Settings(BaseSettings):
     # ingestion; default) | "strict" (never applied to AI-built partial resources).
     fhir_validation: str = "log"
 
+    # Validated strict-local model pack. Disabled until a candidate lock has
+    # passed runtime and fixture validation and Task 3 activates it.
+    local_ai_enabled: bool = False
+    local_ai_model_dir: str = "./data/local-ai/models"
+    local_ai_scratch_dir: str = "./data/local-ai/scratch"
+    local_ai_manifest_path: str = (
+        "./app/model_manifests/apple-m4-16gb-v1.lock.json"
+    )
+    local_ai_worker_command: str = (
+        "../workers/local_ai/apple_mlx/.venv/bin/local-ai-mlx-worker"
+    )
+    local_ai_max_files: int = 64
+    local_ai_max_file_bytes: int = 8 * 1024 * 1024 * 1024
+    local_ai_max_pack_bytes: int = 20 * 1024 * 1024 * 1024
+    local_ai_worker_timeout_seconds: int = 900
+    local_ai_max_page_pixels: int = 40_000_000
+
     # Redis
     redis_url: str = "redis://localhost:6379/0"
 

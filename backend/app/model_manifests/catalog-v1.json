@@ -1,0 +1,45 @@
+{
+  "candidates": [
+    {
+      "attribution": "https://huggingface.co/sahilchachra/ovisocr2-int4-mlx",
+      "decode_limits": {
+        "max_input_tokens": 32768,
+        "max_output_tokens": 4096
+      },
+      "license": "apache-2.0",
+      "quantization": "int4",
+      "repository": "sahilchachra/ovisocr2-int4-mlx",
+      "role": "ocr"
+    },
+    {
+      "attribution": "https://huggingface.co/numind/NuExtract3-mlx-4bits",
+      "decode_limits": {
+        "max_input_tokens": 32768,
+        "max_output_tokens": 8192
+      },
+      "license": "apache-2.0",
+      "quantization": "4bit",
+      "repository": "numind/NuExtract3-mlx-4bits",
+      "role": "extraction"
+    },
+    {
+      "attribution": "https://huggingface.co/mlx-community/Qwen3.5-9B-MLX-4bit",
+      "decode_limits": {
+        "max_input_tokens": 32768,
+        "max_output_tokens": 4096
+      },
+      "license": "apache-2.0",
+      "quantization": "4bit",
+      "repository": "mlx-community/Qwen3.5-9B-MLX-4bit",
+      "role": "summary"
+    }
+  ],
+  "pack_revision": "apple-m4-16gb-v1",
+  "platform": "apple_silicon",
+  "runtime": {
+    "name": "mlx-vlm",
+    "version": "0.5.0"
+  },
+  "schema_version": 1,
+  "validation_suite_version": "local-ai-fixtures-v1"
+}
