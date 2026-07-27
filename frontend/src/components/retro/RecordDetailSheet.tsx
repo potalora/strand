@@ -19,6 +19,10 @@ import { FhirResourceRenderer } from "./FhirResourceRenderer";
 import { Sparkline } from "./DataViz";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { AIExtractionBadge, AdvancedSection } from "./renderers/shared";
+import {
+  transitionRecordDetailNavigation,
+  type RecordDetailNavigation,
+} from "./record-detail-navigation";
 
 interface RecordDetailSheetProps {
   recordId: string | null;
@@ -40,10 +44,17 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
   // Records extracted from the same visit/note (encounters only).
   const [linked, setLinked] = useState<TimelineEvent[]>([]);
   // Lets a "From this visit" row navigate the sheet without touching the parent.
-  const [viewOverride, setViewOverride] = useState<{
-    rootRecordId: string;
-    viewId: string;
-  } | null>(null);
+  const [navigation, setNavigation] = useState<RecordDetailNavigation>({
+    previousOpen: open,
+    viewOverride: null,
+  });
+
+  // A parent can close this controlled sheet without Radix emitting
+  // onOpenChange. Reset the nested navigation during that prop transition so
+  // reopening the same root record never resumes a linked record.
+  if (open !== navigation.previousOpen) {
+    setNavigation(transitionRecordDetailNavigation(navigation, open));
+  }
 
   const { skipDeleteConfirm, setSkipDeleteConfirm } = usePreferencesStore();
   const setDetailOpen = useUIStore((s) => s.setDetailOpen);
@@ -55,8 +66,8 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
   }, [open, setDetailOpen]);
 
   const viewId =
-    open && viewOverride?.rootRecordId === recordId
-      ? viewOverride.viewId
+    open && navigation.viewOverride?.rootRecordId === recordId
+      ? navigation.viewOverride.viewId
       : recordId;
 
   useEffect(() => {
@@ -115,7 +126,7 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
           setSkipDeleteConfirm(true);
         }
         setConfirmOpen(false);
-        setViewOverride(null);
+        setNavigation((state) => ({ ...state, viewOverride: null }));
         onDelete?.();
         onClose();
       })
@@ -168,7 +179,7 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
 
   function handleSheetOpenChange(isOpen: boolean) {
     if (!isOpen) {
-      setViewOverride(null);
+      setNavigation((state) => ({ ...state, viewOverride: null }));
       onClose();
     }
   }
@@ -263,7 +274,10 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
                         className="dv-linked-row"
                         onClick={() => {
                           if (recordId) {
-                            setViewOverride({ rootRecordId: recordId, viewId: item.id });
+                            setNavigation((state) => ({
+                              ...state,
+                              viewOverride: { rootRecordId: recordId, viewId: item.id },
+                            }));
                           }
                         }}
                       >
