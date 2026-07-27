@@ -31,10 +31,15 @@ from app.services.local_ai.types import ProcessingMode
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _IMMUTABLE_JOB_FIELDS = (
+    "user_id",
+    "kind",
+    "upload_id",
+    "summary_prompt_id",
     "processing_mode",
     "manifest_snapshot",
     "manifest_sha256",
 )
+_IMMUTABLE_EVIDENCE_FIELDS = ("user_id", "upload_id")
 
 
 class LocalAIJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -272,5 +277,23 @@ def _reject_persisted_job_identity_changes(
     target.revalidate_manifest_snapshot()
 
 
+def _reject_persisted_evidence_scope_changes(
+    _mapper: Any,
+    _connection: Any,
+    target: ExtractionEvidence,
+) -> None:
+    state = inspect(target)
+    if any(
+        state.attrs[field].history.has_changes()
+        for field in _IMMUTABLE_EVIDENCE_FIELDS
+    ):
+        raise LocalValidationError("Extraction evidence scope is immutable")
+
+
 event.listen(LocalAIJob, "before_insert", _validate_new_job_identity)
 event.listen(LocalAIJob, "before_update", _reject_persisted_job_identity_changes)
+event.listen(
+    ExtractionEvidence,
+    "before_update",
+    _reject_persisted_evidence_scope_changes,
+)

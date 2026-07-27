@@ -54,6 +54,16 @@ def _valid_manifest() -> dict:
     }
 
 
+def _manifest_digest(manifest: dict) -> str:
+    canonical_json = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
+    return hashlib.sha256(canonical_json).hexdigest()
+
+
 def _upload_for(user: User) -> UploadedFile:
     return UploadedFile(
         user_id=user.id,
@@ -419,14 +429,26 @@ async def _persist_local_job(db_session) -> LocalAIJob:
 
 @pytest.mark.parametrize(
     "attribute",
-    ("processing_mode", "manifest_snapshot", "manifest_sha256"),
+    (
+        "user_id",
+        "kind",
+        "upload_id",
+        "summary_prompt_id",
+        "processing_mode",
+        "manifest_snapshot",
+        "manifest_sha256",
+    ),
 )
 async def test_persisted_local_job_identity_is_immutable_in_orm(
     db_session,
     attribute: str,
 ) -> None:
     job = await _persist_local_job(db_session)
-    if attribute == "processing_mode":
+    if attribute in {"user_id", "upload_id", "summary_prompt_id"}:
+        value: object = uuid.uuid4()
+    elif attribute == "kind":
+        value = "summary"
+    elif attribute == "processing_mode":
         value: object = "custom_local"
     elif attribute == "manifest_snapshot":
         value = _valid_manifest()
@@ -438,6 +460,81 @@ async def test_persisted_local_job_identity_is_immutable_in_orm(
     try:
         with pytest.raises(LocalValidationError, match="immutable"):
             await db_session.commit()
+    finally:
+        await db_session.rollback()
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "atomic_owner_and_upload",
+        "kind_and_target",
+        "upload_target",
+        "summary_target",
+    ),
+)
+async def test_database_rejects_raw_local_job_target_reassignment(
+    db_session,
+    case: str,
+) -> None:
+    user_a = User(email=f"job-move-{case}-a@example.com", password_hash="x")
+    user_b = User(email=f"job-move-{case}-b@example.com", password_hash="x")
+    db_session.add_all([user_a, user_b])
+    await db_session.flush()
+    upload_a = _upload_for(user_a)
+    upload_a_other = _upload_for(user_a)
+    upload_a_other.filename = "strict-local-note-other.pdf"
+    upload_a_other.file_hash = "b" * 64
+    upload_a_other.storage_path = "/private/strict-local-note-other.pdf"
+    upload_b = _upload_for(user_b)
+    patient_a = _patient_for(user_a, f"job-move-{case}-a")
+    db_session.add_all([upload_a, upload_a_other, upload_b, patient_a])
+    await db_session.flush()
+    summary_a = _summary_for(user_a, patient_a)
+    summary_a_other = _summary_for(user_a, patient_a)
+    db_session.add_all([summary_a, summary_a_other])
+    await db_session.flush()
+
+    is_summary = case == "summary_target"
+    job = LocalAIJob(
+        user_id=user_a.id,
+        upload_id=None if is_summary else upload_a.id,
+        summary_prompt_id=summary_a.id if is_summary else None,
+        kind="summary" if is_summary else "ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=_valid_manifest(),
+        status="queued",
+        stage="preflight",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    statement, parameters = {
+        "atomic_owner_and_upload": (
+            "UPDATE local_ai_jobs SET user_id = :user_id, upload_id = :upload_id "
+            "WHERE id = :job_id",
+            {"user_id": user_b.id, "upload_id": upload_b.id},
+        ),
+        "kind_and_target": (
+            "UPDATE local_ai_jobs SET kind = 'summary', upload_id = NULL, "
+            "summary_prompt_id = :summary_prompt_id WHERE id = :job_id",
+            {"summary_prompt_id": summary_a.id},
+        ),
+        "upload_target": (
+            "UPDATE local_ai_jobs SET upload_id = :upload_id WHERE id = :job_id",
+            {"upload_id": upload_a_other.id},
+        ),
+        "summary_target": (
+            "UPDATE local_ai_jobs SET summary_prompt_id = :summary_prompt_id "
+            "WHERE id = :job_id",
+            {"summary_prompt_id": summary_a_other.id},
+        ),
+    }[case]
+    parameters["job_id"] = job.id
+
+    try:
+        with pytest.raises(IntegrityError):
+            await db_session.execute(text(statement), parameters)
     finally:
         await db_session.rollback()
 
@@ -465,6 +562,178 @@ async def test_database_rejects_raw_local_job_identity_mutation(
             )
     finally:
         await db_session.rollback()
+
+
+async def test_persisted_evidence_scope_is_immutable_in_orm(db_session) -> None:
+    user = User(email="evidence-immutable-orm@example.com", password_hash="x")
+    db_session.add(user)
+    await db_session.flush()
+    upload = _upload_for(user)
+    db_session.add(upload)
+    await db_session.flush()
+    evidence = ExtractionEvidence(
+        user_id=user.id,
+        upload_id=upload.id,
+        excerpt="synthetic excerpt",
+        field_paths=["$.conditions[0]"],
+        source_metadata={"source_kind": "ocr_page"},
+    )
+    db_session.add(evidence)
+    await db_session.commit()
+
+    evidence.user_id = uuid.uuid4()
+    evidence.upload_id = uuid.uuid4()
+    try:
+        with pytest.raises(LocalValidationError, match="immutable"):
+            await db_session.commit()
+    finally:
+        await db_session.rollback()
+
+
+async def test_database_rejects_raw_evidence_scope_reassignment(db_session) -> None:
+    user_a = User(email="evidence-move-a@example.com", password_hash="x")
+    user_b = User(email="evidence-move-b@example.com", password_hash="x")
+    db_session.add_all([user_a, user_b])
+    await db_session.flush()
+    upload_a = _upload_for(user_a)
+    upload_b = _upload_for(user_b)
+    db_session.add_all([upload_a, upload_b])
+    await db_session.flush()
+    evidence = ExtractionEvidence(
+        user_id=user_a.id,
+        upload_id=upload_a.id,
+        excerpt="synthetic excerpt",
+        field_paths=["$.conditions[0]"],
+        source_metadata={"source_kind": "ocr_page"},
+    )
+    db_session.add(evidence)
+    await db_session.commit()
+
+    try:
+        with pytest.raises(IntegrityError):
+            await db_session.execute(
+                text(
+                    "UPDATE extraction_evidence "
+                    "SET user_id = :user_id, upload_id = :upload_id "
+                    "WHERE id = :evidence_id"
+                ),
+                {
+                    "user_id": user_b.id,
+                    "upload_id": upload_b.id,
+                    "evidence_id": evidence.id,
+                },
+            )
+    finally:
+        await db_session.rollback()
+
+
+async def _raw_insert_local_job(
+    db_session,
+    *,
+    user_id: uuid.UUID,
+    upload_id: uuid.UUID,
+    processing_mode: str,
+    manifest: dict,
+    digest: str,
+) -> uuid.UUID:
+    result = await db_session.execute(
+        text(
+            """
+            INSERT INTO local_ai_jobs (
+                user_id,
+                upload_id,
+                kind,
+                processing_mode,
+                manifest_snapshot,
+                manifest_sha256,
+                status,
+                stage
+            )
+            VALUES (
+                :user_id,
+                :upload_id,
+                'ingestion',
+                :processing_mode,
+                CAST(:manifest AS jsonb),
+                :digest,
+                'queued',
+                'preflight'
+            )
+            RETURNING id
+            """
+        ),
+        {
+            "user_id": user_id,
+            "upload_id": upload_id,
+            "processing_mode": processing_mode,
+            "manifest": json.dumps(manifest),
+            "digest": digest,
+        },
+    )
+    return result.scalar_one()
+
+
+@pytest.mark.parametrize("case", ("empty_manifest", "bad_digest", "invalid_mode"))
+async def test_database_rejects_invalid_raw_local_job_insert(
+    db_session,
+    case: str,
+) -> None:
+    user = User(email=f"raw-job-{case}@example.com", password_hash="x")
+    db_session.add(user)
+    await db_session.flush()
+    upload = _upload_for(user)
+    db_session.add(upload)
+    await db_session.flush()
+    manifest = {} if case == "empty_manifest" else _valid_manifest()
+    digest = "f" * 64 if case == "bad_digest" else _manifest_digest(manifest)
+    mode = "sometimes_local" if case == "invalid_mode" else "validated_strict_local"
+
+    try:
+        with pytest.raises(IntegrityError):
+            await _raw_insert_local_job(
+                db_session,
+                user_id=user.id,
+                upload_id=upload.id,
+                processing_mode=mode,
+                manifest=manifest,
+                digest=digest,
+            )
+    finally:
+        await db_session.rollback()
+
+
+async def test_database_accepts_canonical_raw_local_job_insert(db_session) -> None:
+    user = User(email="raw-job-canonical@example.com", password_hash="x")
+    db_session.add(user)
+    await db_session.flush()
+    upload = _upload_for(user)
+    db_session.add(upload)
+    await db_session.flush()
+    manifest = _valid_manifest()
+    manifest["artifacts"][0]["attribution"] = "Cliníc model 😀"
+    digest = _manifest_digest(manifest)
+
+    job_id = await _raw_insert_local_job(
+        db_session,
+        user_id=user.id,
+        upload_id=upload.id,
+        processing_mode="validated_strict_local",
+        manifest=manifest,
+        digest=digest,
+    )
+    await db_session.commit()
+
+    stored = (
+        await db_session.execute(
+            text(
+                "SELECT manifest_snapshot, manifest_sha256 "
+                "FROM local_ai_jobs WHERE id = :job_id"
+            ),
+            {"job_id": job_id},
+        )
+    ).one()
+    assert stored.manifest_snapshot == manifest
+    assert stored.manifest_sha256 == digest
 
 
 def test_local_job_revalidates_manifest_and_digest_before_use() -> None:
