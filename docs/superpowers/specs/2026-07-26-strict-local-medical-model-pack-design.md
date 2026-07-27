@@ -1,7 +1,7 @@
 # Strict-Local Medical Model Pack — Design Spec
 
 - **Date:** 2026-07-26
-- **Status:** Design approved; written specification pending final review
+- **Status:** Approved
 - **Target baseline:** Apple M4 MacBook Air with 16 GB unified memory
 - **Cross-platform target:** Linux with 16 GB system RAM; CPU-only supported,
   GPU acceleration optional
