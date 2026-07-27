@@ -171,6 +171,45 @@ def test_state_fsync_failure_after_replace_keeps_new_active_pack_present(
     assert (tmp_path / "packs" / "second").is_dir()
 
 
+def test_post_rename_verification_failure_does_not_update_activation_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    _install(store, "first")
+    original_state = (tmp_path / "activation-state.json").read_bytes()
+    manifest, contents = _manifest("second")
+    stage = store.stage("second")
+    _write_manifest_files(stage, manifest, contents)
+    destination = tmp_path / "packs" / "second"
+    outside = tmp_path / "outside.safetensors"
+    outside.write_bytes(contents[ModelRole.OCR])
+    original_replace = os.replace
+    replaced = False
+
+    def replace_then_mutate(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
+        nonlocal replaced
+        original_replace(source, target)
+        if Path(source) == stage and Path(target) == destination:
+            model = destination / "ocr" / "weights" / "model.safetensors"
+            model.unlink()
+            model.symlink_to(outside)
+            replaced = True
+
+    monkeypatch.setattr(os, "replace", replace_then_mutate)
+
+    with pytest.raises(LocalValidationError):
+        store.activate(stage, manifest)
+
+    assert replaced
+    assert store.active_revision() == "first"
+    assert (tmp_path / "activation-state.json").read_bytes() == original_state
+    assert destination.is_dir()
+
+
 def test_mutations_are_serialized_within_the_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -365,6 +404,40 @@ def test_verification_rejects_file_replaced_with_symlink_during_open(
     assert replaced
     assert store.active_revision() is None
     assert not (tmp_path / "packs" / "race").exists()
+
+
+def test_verification_rejects_entry_replaced_while_descriptor_is_hashed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    manifest, contents = _manifest("hash-race")
+    stage = store.stage("hash-race")
+    _write_manifest_files(stage, manifest, contents)
+    target = stage / "ocr" / "weights" / "model.safetensors"
+    target_inode = target.stat().st_ino
+    outside = tmp_path / "outside.safetensors"
+    outside.write_bytes(contents[ModelRole.OCR])
+    original_read = os.read
+    replaced = False
+
+    def read_then_replace(descriptor: int, length: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(descriptor, length)
+        if not replaced and os.fstat(descriptor).st_ino == target_inode:
+            target.unlink()
+            target.symlink_to(outside)
+            replaced = True
+        return chunk
+
+    monkeypatch.setattr(os, "read", read_then_replace)
+
+    with pytest.raises(LocalValidationError):
+        store.activate(stage, manifest)
+
+    assert replaced
+    assert store.active_revision() is None
+    assert not (tmp_path / "packs" / "hash-race").exists()
 
 
 def test_store_rejects_hardlinks_extras_missing_files_and_non_regular_files(

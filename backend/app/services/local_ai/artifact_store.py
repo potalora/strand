@@ -555,6 +555,23 @@ class ArtifactStore:
                         visit(child_fd, relative)
                     finally:
                         os.close(child_fd)
+                    try:
+                        after = os.stat(
+                            name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError as exc:
+                        raise LocalValidationError(
+                            "Model artifact changed during verification"
+                        ) from exc
+                    if not stat.S_ISDIR(after.st_mode) or (
+                        after.st_dev,
+                        after.st_ino,
+                    ) != (before.st_dev, before.st_ino):
+                        raise LocalValidationError(
+                            "Model artifact changed during verification"
+                        )
                     continue
                 if not stat.S_ISREG(before.st_mode):
                     raise LocalValidationError("Model artifact must be a regular file")
@@ -620,6 +637,26 @@ class ArtifactStore:
                             raise LocalValidationError(
                                 "Installed model manifest changed during verification"
                             )
+                    try:
+                        after = os.stat(
+                            name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError as exc:
+                        raise LocalValidationError(
+                            "Model artifact changed during verification"
+                        ) from exc
+                    if (
+                        not stat.S_ISREG(after.st_mode)
+                        or after.st_nlink != 1
+                        or after.st_size != opened.st_size
+                        or (after.st_dev, after.st_ino)
+                        != (opened.st_dev, opened.st_ino)
+                    ):
+                        raise LocalValidationError(
+                            "Model artifact changed during verification"
+                        )
                 except LocalValidationError:
                     raise
                 except OSError as exc:
@@ -629,6 +666,17 @@ class ArtifactStore:
                 finally:
                     if descriptor >= 0:
                         os.close(descriptor)
+            try:
+                if sorted(os.listdir(directory_fd)) != names:
+                    raise LocalValidationError(
+                        "Model artifact file set changed during verification"
+                    )
+            except LocalValidationError:
+                raise
+            except OSError as exc:
+                raise LocalValidationError(
+                    "Model artifact filesystem operation failed"
+                ) from exc
 
         visit(root_fd, Path())
         allowed_files = set(expected_files)
@@ -645,6 +693,7 @@ class ArtifactStore:
         manifest: LocalAIManifest,
         *,
         allow_manifest_metadata: bool,
+        expected_metadata: bytes | None = None,
     ) -> None:
         _validate_manifest(manifest)
         _assert_real_directory(root)
@@ -654,6 +703,7 @@ class ArtifactStore:
                 root_fd,
                 manifest,
                 allow_manifest_metadata=allow_manifest_metadata,
+                expected_metadata=expected_metadata,
             )
         finally:
             os.close(root_fd)
@@ -792,13 +842,21 @@ class ArtifactStore:
             "pack_revision": manifest.pack_revision,
             "manifest_sha256": digest,
         }
+        metadata_payload = _manifest_payload(manifest)
+        metadata = _canonical_json(metadata_payload)
         self._write_json_atomic(
             Path(staging_path) / _MANIFEST_METADATA,
-            _manifest_payload(manifest),
+            metadata_payload,
         )
         try:
             os.replace(staging_path, destination)
             _fsync_directory(self.packs_dir)
+            self._verify_tree(
+                destination,
+                manifest,
+                allow_manifest_metadata=True,
+                expected_metadata=metadata,
+            )
             self._write_state(active=new_pointer, previous=current)
         except (OSError, LocalValidationError) as exc:
             if isinstance(exc, LocalValidationError):
