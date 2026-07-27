@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import inspect
 import os
+import socket
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -23,6 +26,17 @@ from app.services.local_ai.manifest import (
 
 _DOWNLOAD_ORIGIN = "https://huggingface.co"
 _STREAM_CHUNK_BYTES = 1024 * 1024
+_MAX_REDIRECTS = 5
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_DOWNLOAD_HOSTS = frozenset(
+    {
+        "huggingface.co",
+        "cdn-lfs.huggingface.co",
+        "cdn-lfs-us-1.hf.co",
+        "cdn-lfs-eu-1.hf.co",
+        "cas-bridge.xethub.hf.co",
+    }
+)
 ProgressCallback = Callable[
     [dict[str, int | str]],
     None | Awaitable[None],
@@ -113,6 +127,69 @@ def _declared_content_length(response: httpx.Response) -> int | None:
     return value
 
 
+def _validate_download_target(url: httpx.URL) -> None:
+    try:
+        if (
+            url.scheme != "https"
+            or url.host not in _DOWNLOAD_HOSTS
+            or url.port not in {None, 443}
+            or bool(url.userinfo)
+        ):
+            raise LocalAIError("Model download redirect rejected")
+        addresses = socket.getaddrinfo(
+            url.host,
+            443,
+            type=socket.SOCK_STREAM,
+        )
+        if not addresses:
+            raise LocalAIError("Model download redirect rejected")
+        for address in addresses:
+            parsed = ipaddress.ip_address(address[4][0].split("%", 1)[0])
+            if not parsed.is_global:
+                raise LocalAIError("Model download redirect rejected")
+    except LocalAIError:
+        raise
+    except (OSError, TypeError, ValueError, IndexError) as exc:
+        raise LocalAIError("Model download redirect rejected") from exc
+
+
+@asynccontextmanager
+async def _validated_stream(
+    client: httpx.AsyncClient,
+    initial_url: str,
+) -> Any:
+    try:
+        current = httpx.URL(initial_url)
+    except (TypeError, ValueError) as exc:
+        raise LocalAIError("Model download redirect rejected") from exc
+
+    for redirect_count in range(_MAX_REDIRECTS + 1):
+        _validate_download_target(current)
+        response: httpx.Response | None = None
+        try:
+            request = client.build_request("GET", current)
+            response = await client.send(request, stream=True, follow_redirects=False)
+            if response.status_code not in _REDIRECT_STATUSES:
+                try:
+                    yield response
+                finally:
+                    await response.aclose()
+                return
+
+            location = response.headers.get("location")
+            if location is None or redirect_count >= _MAX_REDIRECTS:
+                raise LocalAIError("Model download redirect rejected")
+            try:
+                current = response.url.join(location)
+            except (TypeError, ValueError) as exc:
+                raise LocalAIError("Model download redirect rejected") from exc
+        finally:
+            if response is not None and response.status_code in _REDIRECT_STATUSES:
+                await response.aclose()
+
+    raise LocalAIError("Model download redirect rejected")
+
+
 async def download_manifest(
     manifest: LocalAIManifest,
     store: ArtifactStore,
@@ -134,7 +211,7 @@ async def download_manifest(
         observed_total = 0
 
         async with httpx.AsyncClient(
-            follow_redirects=True,
+            follow_redirects=False,
             timeout=httpx.Timeout(60.0, read=300.0),
         ) as client:
             for artifact in manifest.artifacts:
@@ -157,7 +234,7 @@ async def download_manifest(
                     )
 
                     try:
-                        async with client.stream("GET", url) as response:
+                        async with _validated_stream(client, url) as response:
                             response.raise_for_status()
                             content_length = _declared_content_length(response)
                             if (

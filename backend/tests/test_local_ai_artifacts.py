@@ -5,11 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import app.services.local_ai.artifact_store as artifact_store_module
 from app.services.local_ai.artifact_store import ArtifactStore
 from app.services.local_ai.errors import LocalValidationError
 from app.services.local_ai.manifest import (
@@ -101,12 +105,155 @@ def test_activation_is_atomic_and_preserves_previous_pack(tmp_path: Path) -> Non
     assert not (tmp_path / "packs" / "second").exists()
 
 
+def test_activation_uses_one_authoritative_atomic_state_file(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    _install(store, "first")
+    _install(store, "second")
+
+    state = json.loads((tmp_path / "activation-state.json").read_text())
+
+    assert state["active"]["pack_revision"] == "second"
+    assert state["previous"]["pack_revision"] == "first"
+    assert not (tmp_path / "active.json").exists()
+    assert not (tmp_path / "previous.json").exists()
+
+
+def test_state_failure_before_replace_leaves_verified_pack_as_inactive_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    _install(store, "first")
+    manifest, contents = _manifest("second")
+    stage = store.stage("second")
+    _write_manifest_files(stage, manifest, contents)
+
+    def fail_state(**_kwargs: object) -> None:
+        raise LocalValidationError("injected state failure")
+
+    monkeypatch.setattr(store, "_write_state", fail_state)
+
+    with pytest.raises(LocalValidationError, match="injected"):
+        store.activate(stage, manifest)
+
+    assert store.active_revision() == "first"
+    assert (tmp_path / "packs" / "first").is_dir()
+    assert (tmp_path / "packs" / "second").is_dir()
+
+
+def test_state_fsync_failure_after_replace_keeps_new_active_pack_present(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    _install(store, "first")
+    manifest, contents = _manifest("second")
+    stage = store.stage("second")
+    _write_manifest_files(stage, manifest, contents)
+    original_fsync = artifact_store_module._fsync_directory
+
+    def fail_after_state_replace(path: Path) -> None:
+        if path == tmp_path:
+            raise LocalValidationError("injected state fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(
+        artifact_store_module,
+        "_fsync_directory",
+        fail_after_state_replace,
+    )
+
+    with pytest.raises(LocalValidationError, match="injected"):
+        store.activate(stage, manifest)
+
+    assert store.active_revision() == "second"
+    assert (tmp_path / "packs" / "first").is_dir()
+    assert (tmp_path / "packs" / "second").is_dir()
+
+
+def test_mutations_are_serialized_within_the_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    second_store = ArtifactStore(tmp_path)
+    first_manifest, first_contents = _manifest("first")
+    first_stage = store.stage("first")
+    _write_manifest_files(first_stage, first_manifest, first_contents)
+    second_manifest, second_contents = _manifest("second")
+    second_stage = store.stage("second")
+    _write_manifest_files(second_stage, second_manifest, second_contents)
+    original_write = store._write_json_atomic
+    counter_lock = threading.Lock()
+    active_writers = 0
+    max_active_writers = 0
+
+    def observed_write(path: Path, payload: dict[str, object]) -> None:
+        nonlocal active_writers, max_active_writers
+        with counter_lock:
+            active_writers += 1
+            max_active_writers = max(max_active_writers, active_writers)
+        time.sleep(0.02)
+        try:
+            original_write(path, payload)
+        finally:
+            with counter_lock:
+                active_writers -= 1
+
+    monkeypatch.setattr(store, "_write_json_atomic", observed_write)
+    monkeypatch.setattr(second_store, "_write_json_atomic", observed_write)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(store.activate, first_stage, first_manifest),
+            executor.submit(
+                second_store.activate,
+                second_stage,
+                second_manifest,
+            ),
+        ]
+        for future in futures:
+            future.result()
+
+    state = json.loads((tmp_path / "activation-state.json").read_text())
+    revisions = {
+        state["active"]["pack_revision"],
+        state["previous"]["pack_revision"],
+    }
+    assert revisions == {"first", "second"}
+    assert max_active_writers == 1
+
+
+def test_mutations_take_owner_only_cross_process_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[int] = []
+
+    class FakeFcntl:
+        LOCK_EX = 2
+        LOCK_UN = 8
+
+        @staticmethod
+        def flock(_descriptor: int, operation: int) -> None:
+            events.append(operation)
+
+    monkeypatch.setattr(artifact_store_module, "fcntl", FakeFcntl, raising=False)
+    store = ArtifactStore(tmp_path)
+
+    store.remove()
+
+    assert events == [FakeFcntl.LOCK_EX, FakeFcntl.LOCK_UN]
+    assert (tmp_path / ".activation.lock").stat().st_mode & 0o777 == 0o600
+
+
 def test_activation_rejects_a_stale_active_pointer_without_replacing_it(
     tmp_path: Path,
 ) -> None:
     store = ArtifactStore(tmp_path)
     stale = {"pack_revision": "missing", "manifest_sha256": "a" * 64}
-    (tmp_path / "active.json").write_text(json.dumps(stale), encoding="utf-8")
+    stale_state = {"active": stale, "previous": None}
+    state_path = tmp_path / "activation-state.json"
+    state_path.write_text(json.dumps(stale_state), encoding="utf-8")
     manifest, contents = _manifest("new")
     stage = store.stage("new")
     _write_manifest_files(stage, manifest, contents)
@@ -114,8 +261,7 @@ def test_activation_rejects_a_stale_active_pointer_without_replacing_it(
     with pytest.raises(LocalValidationError, match="verified"):
         store.activate(stage, manifest)
 
-    assert json.loads((tmp_path / "active.json").read_text()) == stale
-    assert not (tmp_path / "previous.json").exists()
+    assert json.loads(state_path.read_text()) == stale_state
 
 
 def test_successive_activation_preserves_previous_and_rollback_verifies_it(
@@ -128,10 +274,8 @@ def test_successive_activation_preserves_previous_and_rollback_verifies_it(
     store.rollback()
 
     assert store.active_revision() == "first"
-    assert (
-        json.loads((tmp_path / "previous.json").read_text())["pack_revision"]
-        == "second"
-    )
+    state = json.loads((tmp_path / "activation-state.json").read_text())
+    assert state["previous"]["pack_revision"] == "second"
 
 
 def test_rollback_rejects_a_pack_changed_after_activation(tmp_path: Path) -> None:
@@ -171,6 +315,56 @@ def test_store_rejects_symlinked_artifact_and_symlinked_parent(tmp_path: Path) -
 
     with pytest.raises(LocalValidationError, match="symlink"):
         store.verify(stage, manifest)
+
+
+def test_verification_rejects_file_replaced_with_symlink_during_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    manifest, contents = _manifest("race")
+    stage = store.stage("race")
+    _write_manifest_files(stage, manifest, contents)
+    target = stage / "ocr" / "weights" / "model.safetensors"
+    outside = tmp_path / "outside.safetensors"
+    outside.write_bytes(contents[ModelRole.OCR])
+    original_path_open = Path.open
+    original_os_open = os.open
+    replaced = False
+
+    def replace_target() -> None:
+        nonlocal replaced
+        if replaced:
+            return
+        replaced = True
+        target.unlink()
+        target.symlink_to(outside)
+
+    def racing_path_open(path: Path, *args: object, **kwargs: object) -> object:
+        if path == target:
+            replace_target()
+        return original_path_open(path, *args, **kwargs)
+
+    def racing_os_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == "model.safetensors" and dir_fd is not None:
+            replace_target()
+        return original_os_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(Path, "open", racing_path_open)
+    monkeypatch.setattr(os, "open", racing_os_open)
+
+    with pytest.raises(LocalValidationError):
+        store.activate(stage, manifest)
+
+    assert replaced
+    assert store.active_revision() is None
+    assert not (tmp_path / "packs" / "race").exists()
 
 
 def test_store_rejects_hardlinks_extras_missing_files_and_non_regular_files(
@@ -338,9 +532,9 @@ def test_role_removal_clears_affected_pointer_and_preserves_other_pack(
     assert store.active_revision() is None
     assert not (tmp_path / "packs" / "second" / "summary").exists()
     assert (tmp_path / "packs" / "first" / "summary").is_dir()
-    assert (
-        json.loads((tmp_path / "previous.json").read_text())["pack_revision"] == "first"
-    )
+    state = json.loads((tmp_path / "activation-state.json").read_text())
+    assert state["active"] is None
+    assert state["previous"]["pack_revision"] == "first"
 
 
 def test_complete_removal_clears_only_model_store_content(tmp_path: Path) -> None:
@@ -355,6 +549,8 @@ def test_complete_removal_clears_only_model_store_content(tmp_path: Path) -> Non
 
     assert not (tmp_path / "active.json").exists()
     assert not (tmp_path / "previous.json").exists()
+    state = json.loads((tmp_path / "activation-state.json").read_text())
+    assert state == {"active": None, "previous": None}
     assert list((tmp_path / "packs").iterdir()) == []
     assert not abandoned.exists()
     assert (tmp_path / "operations" / "keep.json").exists()

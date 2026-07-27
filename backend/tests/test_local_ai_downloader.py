@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import socket
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,13 @@ def _install_transport(
     seen: list[httpx.Request] | None = None,
 ) -> None:
     real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if seen is not None:
@@ -93,6 +101,32 @@ def _install_transport(
             content=responses.get(str(request.url), b"missing"),
             request=request,
         )
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "app.services.local_ai.downloader.httpx.AsyncClient", client_factory
+    )
+
+
+def _install_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Any,
+    *,
+    addresses: list[str] | None = None,
+) -> None:
+    real_client = httpx.AsyncClient
+    resolved = addresses or ["93.184.216.34"]
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))
+            for address in resolved
+        ],
+    )
 
     def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
         kwargs["transport"] = httpx.MockTransport(handler)
@@ -155,6 +189,129 @@ async def test_downloader_derives_encoded_urls_from_immutable_manifest(
 
 
 @pytest.mark.asyncio
+async def test_downloader_follows_validated_allowlisted_public_redirect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, responses = _manifest()
+    first_url = next(iter(responses))
+    redirected_url = "https://cdn-lfs.huggingface.co/model.safetensors"
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        seen.append(url)
+        if url == first_url:
+            return httpx.Response(302, headers={"location": redirected_url})
+        if url == redirected_url:
+            return httpx.Response(200, content=responses[first_url])
+        return httpx.Response(200, content=responses[url])
+
+    _install_handler(monkeypatch, handler)
+
+    await download_manifest(manifest, ArtifactStore(tmp_path), None)
+
+    assert seen[:2] == [first_url, redirected_url]
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "http://cdn-lfs.huggingface.co/model.safetensors",
+        "https://cdn-lfs.huggingface.co:444/model.safetensors",
+        "https://user:secret@cdn-lfs.huggingface.co/model.safetensors",
+        "https://example.com/model.safetensors",
+        "https://127.0.0.1/model.safetensors",
+    ],
+)
+@pytest.mark.asyncio
+async def test_downloader_rejects_unsafe_redirect_before_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    destination: str,
+) -> None:
+    manifest, responses = _manifest()
+    first_url = next(iter(responses))
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": destination})
+
+    _install_handler(monkeypatch, handler)
+
+    with pytest.raises(LocalAIError, match="redirect"):
+        await download_manifest(manifest, ArtifactStore(tmp_path), None)
+
+    assert seen == [first_url]
+
+
+@pytest.mark.asyncio
+async def test_downloader_rejects_private_resolution_before_redirect_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, responses = _manifest()
+    first_url = next(iter(responses))
+    destination = "https://cdn-lfs.huggingface.co/model.safetensors"
+    seen: list[str] = []
+    resolutions = {
+        "huggingface.co": "93.184.216.34",
+        "cdn-lfs.huggingface.co": "10.0.0.8",
+    }
+    real_client = httpx.AsyncClient
+
+    def resolve(host: str, *_args: Any, **_kwargs: Any) -> list[Any]:
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                (resolutions[host], 443),
+            )
+        ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": destination})
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(
+        "app.services.local_ai.downloader.httpx.AsyncClient", client_factory
+    )
+
+    with pytest.raises(LocalAIError, match="redirect"):
+        await download_manifest(manifest, ArtifactStore(tmp_path), None)
+
+    assert seen == [first_url]
+
+
+@pytest.mark.asyncio
+async def test_downloader_rejects_redirect_loop_at_bounded_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, _ = _manifest()
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": str(request.url)})
+
+    _install_handler(monkeypatch, handler)
+
+    with pytest.raises(LocalAIError, match="redirect"):
+        await download_manifest(manifest, ArtifactStore(tmp_path), None)
+
+    assert len(seen) == 6
+
+
+@pytest.mark.asyncio
 async def test_downloader_rejects_observed_file_and_content_length_overruns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -201,7 +358,7 @@ async def test_downloader_rejects_hash_mismatch_and_cleans_partial_state(
         await download_manifest(manifest, ArtifactStore(tmp_path), None)
 
     assert list((tmp_path / ".staging").iterdir()) == []
-    assert not (tmp_path / "active.json").exists()
+    assert not (tmp_path / "activation-state.json").exists()
 
 
 @pytest.mark.asyncio
