@@ -339,7 +339,8 @@ def upgrade() -> None:
             ) THEN
                 RETURN false;
             END IF;
-            IF payload->'schema_version' <> '1'::jsonb
+            IF jsonb_typeof(payload->'schema_version') <> 'number'
+               OR payload->>'schema_version' <> '1'
                OR jsonb_typeof(payload->'pack_revision') <> 'string'
                OR NOT local_ai_manifest_string_is_valid(payload->>'pack_revision')
                OR payload->>'pack_revision'

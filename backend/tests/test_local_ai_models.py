@@ -633,9 +633,10 @@ async def _raw_insert_local_job(
     user_id: uuid.UUID,
     upload_id: uuid.UUID,
     processing_mode: str,
-    manifest: dict,
+    manifest: dict | str,
     digest: str,
 ) -> uuid.UUID:
+    manifest_json = json.dumps(manifest) if isinstance(manifest, dict) else manifest
     result = await db_session.execute(
         text(
             """
@@ -666,11 +667,32 @@ async def _raw_insert_local_job(
             "user_id": user_id,
             "upload_id": upload_id,
             "processing_mode": processing_mode,
-            "manifest": json.dumps(manifest),
+            "manifest": manifest_json,
             "digest": digest,
         },
     )
     return result.scalar_one()
+
+
+async def _database_manifest_digest(db_session, manifest_json: str) -> str:
+    return (
+        await db_session.execute(
+            text(
+                """
+                SELECT encode(
+                    sha256(
+                        convert_to(
+                            local_ai_canonical_json(CAST(:manifest AS jsonb)),
+                            'UTF8'
+                        )
+                    ),
+                    'hex'
+                )
+                """
+            ),
+            {"manifest": manifest_json},
+        )
+    ).scalar_one()
 
 
 @pytest.mark.parametrize("case", ("empty_manifest", "bad_digest", "invalid_mode"))
@@ -696,6 +718,88 @@ async def test_database_rejects_invalid_raw_local_job_insert(
                 upload_id=upload.id,
                 processing_mode=mode,
                 manifest=manifest,
+                digest=digest,
+            )
+    finally:
+        await db_session.rollback()
+
+
+@pytest.mark.parametrize(
+    ("field", "numeric_value"),
+    (
+        ("schema_version", 1.0),
+        ("decode_limit", 4096.0),
+        ("file_size", 10.0),
+    ),
+)
+async def test_database_rejects_float_manifest_integer_fields(
+    db_session,
+    field: str,
+    numeric_value: float,
+) -> None:
+    user = User(email=f"raw-job-float-{field}@example.com", password_hash="x")
+    db_session.add(user)
+    await db_session.flush()
+    upload = _upload_for(user)
+    db_session.add(upload)
+    await db_session.flush()
+    manifest = _valid_manifest()
+    if field == "schema_version":
+        manifest["schema_version"] = numeric_value
+    elif field == "decode_limit":
+        manifest["artifacts"][0]["decode_limits"]["max_input_tokens"] = numeric_value
+    else:
+        manifest["artifacts"][0]["files"][0]["size"] = numeric_value
+
+    try:
+        with pytest.raises(IntegrityError):
+            await _raw_insert_local_job(
+                db_session,
+                user_id=user.id,
+                upload_id=upload.id,
+                processing_mode="validated_strict_local",
+                manifest=manifest,
+                digest=_manifest_digest(manifest),
+            )
+    finally:
+        await db_session.rollback()
+
+
+@pytest.mark.parametrize(
+    ("field", "old_token", "exponent_token"),
+    (
+        ("schema_version", '"schema_version":1', '"schema_version":1.00e0'),
+        ("decode_limit", '"max_input_tokens":4096', '"max_input_tokens":4.0960e3'),
+        ("file_size", '"size":10', '"size":1.00e1'),
+    ),
+)
+async def test_database_rejects_noncanonical_exponent_manifest_integer_fields(
+    db_session,
+    field: str,
+    old_token: str,
+    exponent_token: str,
+) -> None:
+    user = User(email=f"raw-job-exponent-{field}@example.com", password_hash="x")
+    db_session.add(user)
+    await db_session.flush()
+    upload = _upload_for(user)
+    db_session.add(upload)
+    await db_session.flush()
+    manifest_json = json.dumps(
+        _valid_manifest(),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).replace(old_token, exponent_token, 1)
+    digest = await _database_manifest_digest(db_session, manifest_json)
+
+    try:
+        with pytest.raises(IntegrityError):
+            await _raw_insert_local_job(
+                db_session,
+                user_id=user.id,
+                upload_id=upload.id,
+                processing_mode="validated_strict_local",
+                manifest=manifest_json,
                 digest=digest,
             )
     finally:
