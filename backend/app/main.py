@@ -13,6 +13,7 @@ from app.config import settings
 from app.database import async_session_factory
 from app.middleware.audit import AuditMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.services.local_ai.model_manager import local_model_manager
 
 
 def resolve_log_level(log_level: str, is_production: bool) -> int:
@@ -143,19 +144,35 @@ async def lifespan(app: FastAPI):
     _background_tasks.add(purge_task)
     purge_task.add_done_callback(_background_tasks.discard)
 
-    # Start the extraction worker
-    from app.api.upload import start_extraction_worker
-    start_extraction_worker()
+    local_ai_started = False
+    if settings.local_ai_enabled:
+        # Task 6 inserts strict-local scratch recovery immediately before this
+        # fail-closed start. start() validates owner-only state; it never loads a model.
+        try:
+            await local_model_manager.start()
+            local_ai_started = True
+        except BaseException:
+            await local_model_manager.stop()
+            raise
 
-    import sys
-    if any("--reload" in arg for arg in sys.argv):
-        logger.warning(
-            "Server started with --reload: extraction worker may restart on file changes. "
-            "Use without --reload for stable extraction processing."
-        )
+    try:
+        # Start the extraction worker
+        from app.api.upload import start_extraction_worker
 
+        start_extraction_worker()
 
-    yield
+        import sys
+
+        if any("--reload" in arg for arg in sys.argv):
+            logger.warning(
+                "Server started with --reload: extraction worker may restart on file changes. "
+                "Use without --reload for stable extraction processing."
+            )
+
+        yield
+    finally:
+        if local_ai_started:
+            await local_model_manager.stop()
 
 
 def create_app() -> FastAPI:
