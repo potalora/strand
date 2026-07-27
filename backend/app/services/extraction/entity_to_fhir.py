@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import re
 from datetime import datetime
 from uuid import UUID, uuid4
 from xml.sax.saxutils import escape as _xml_escape
 
 from app.services.extraction import terminology
-from app.services.extraction.entity_extractor import ExtractedEntity
-from app.services.extraction.terminology import parse_dosage  # re-exported for callers/tests
+from app.services.extraction.clinical_numbers import parse_clinical_decimal
+from app.services.extraction.entity_types import ExtractedEntity
+from app.services.extraction.terminology import (
+    parse_dosage,
+)  # re-exported for callers/tests
 from app.services.ingestion.content_hash import content_hash
 from app.services.ingestion.fhir_validation import validate_and_log_fhir
 from app.utils.date_utils import parse_datetime
@@ -150,6 +154,65 @@ _VACCINE_FLAG_ATTR_KEYS = ("cvx", "cvx_code", "is_vaccine")
 # is most often mislabeled a medication, sometimes a procedure ("X vaccination").
 # Never reclassify conditions/labs/etc.
 _VACCINE_RECLASSIFIABLE = frozenset({"medication", "procedure"})
+_IMMUNIZATION_DOSE_RE = re.compile(
+    r"^\s*(?P<value>[+-]?\d+(?:[.,]\d+)?)"
+    r"(?:\s*(?P<unit>[^\d\s].*))?\s*$"
+)
+
+
+def _finite_float(value: object) -> float | None:
+    """Parse a finite source number without dropping decimal-comma forms."""
+    decimal_value = parse_clinical_decimal(value)
+    if decimal_value is None:
+        return None
+    parsed = float(decimal_value)
+    return parsed if math.isfinite(parsed) else None
+
+
+def _valid_provenance_text(value: object, limit: int) -> bool:
+    """Return whether a local provenance string is safe and bounded."""
+    return (
+        type(value) is str
+        and 0 < len(value) <= limit
+        and not any(
+            (ord(character) < 32 and character not in "\t\n\r")
+            or 127 <= ord(character) <= 159
+            for character in value
+        )
+    )
+
+
+def _metadata_attributes(attrs: dict) -> dict:
+    """Exclude caller-controlled underscore keys from persisted metadata."""
+    metadata = {key: value for key, value in attrs.items() if not key.startswith("_")}
+    source_section = attrs.get("_source_section")
+    if _valid_provenance_text(source_section, 512):
+        metadata["_source_section"] = source_section
+    local_ner = attrs.get("_local_ner")
+    if type(local_ner) is bool:
+        metadata["_local_ner"] = local_ner
+    return metadata
+
+
+def _immunization_dose_quantity(attrs: dict) -> dict | None:
+    """Split a numeric immunization dose from its optional unit safely."""
+    raw_value = _first_attr(attrs, ("dose", "dose_quantity", "dosage"))
+    if raw_value is None:
+        return None
+    unit = attrs.get("dose_unit")
+    value = _finite_float(raw_value)
+    if value is None:
+        match = _IMMUNIZATION_DOSE_RE.fullmatch(str(raw_value))
+        if match is None:
+            return None
+        value = _finite_float(match.group("value"))
+        unit = unit or match.group("unit")
+    if value is None:
+        return None
+    quantity: dict = {"value": value}
+    if unit:
+        quantity["unit"] = str(unit).strip()
+    return quantity
 
 
 def _looks_like_vaccine(entity: ExtractedEntity) -> bool:
@@ -370,7 +433,10 @@ def _extract_effective_date(
         return embedded
 
     # 4. Document/encounter fallback for eligible entity types.
-    if document_date is not None and entity.entity_class not in _DOCUMENT_DATE_INELIGIBLE:
+    if (
+        document_date is not None
+        and entity.entity_class not in _DOCUMENT_DATE_INELIGIBLE
+    ):
         return document_date
 
     return None
@@ -556,7 +622,7 @@ def parse_lab_measurement(text: str | None) -> dict:
             result["ref_high"] = float(m.group(2))
         except (ValueError, TypeError):
             pass
-        s = s[: m.start()] + " " + s[m.end():]
+        s = s[: m.start()] + " " + s[m.end() :]
 
     # 2. Interpretation flag (word form anywhere, else a trailing letter flag).
     interp = None
@@ -567,7 +633,7 @@ def parse_lab_measurement(text: str | None) -> dict:
             if token == word:
                 interp = code
                 break
-        s = s[: wm.start()] + " " + s[wm.end():]
+        s = s[: wm.start()] + " " + s[wm.end() :]
     if interp is None:
         lm = _INTERP_LETTER_RE.search(s)
         if lm:
@@ -615,7 +681,9 @@ def _lab_measurement(entity: ExtractedEntity) -> dict:
         "unit": coalesce(("unit", "units"), "unit"),
         "ref_low": coalesce(("ref_low", "reference_low", "low"), "ref_low"),
         "ref_high": coalesce(("ref_high", "reference_high", "high"), "ref_high"),
-        "interpretation": coalesce(("interpretation", "flag", "abnormal_flag"), "interpretation"),
+        "interpretation": coalesce(
+            ("interpretation", "flag", "abnormal_flag"), "interpretation"
+        ),
         "analyte": attrs.get("test") or parsed["analyte"] or entity.text,
     }
 
@@ -649,17 +717,18 @@ def _build_dosage_instruction(entity: ExtractedEntity) -> dict | None:
     if parsed and parsed["dose_value"] is not None:
         dose_value, dose_unit = parsed["dose_value"], parsed["dose_unit"]
     elif attrs.get("value"):
-        try:
-            dose_value = float(attrs["value"])
+        parsed_value = _finite_float(attrs["value"])
+        if parsed_value is not None:
+            dose_value = parsed_value
             dose_unit = attrs.get("unit") or None
-        except (ValueError, TypeError):
-            pass
     if dose_value is not None:
         dq: dict = {"value": dose_value}
         if dose_unit:
             dq["unit"] = dose_unit
         di["doseAndRate"] = [{"doseQuantity": dq}]
-        di.setdefault("text", f"{entity.text} {('%g' % dose_value)}{dose_unit or ''}".strip())
+        di.setdefault(
+            "text", f"{entity.text} {('%g' % dose_value)}{dose_unit or ''}".strip()
+        )
 
     route = attrs.get("route") or (parsed["route"] if parsed else None)
     if route:
@@ -720,7 +789,12 @@ def _build_fhir_resource(
         if status in ("negated", "ruled_out", "absent"):
             status = "inactive"  # FHIR-valid status for negated conditions
         resource["clinicalStatus"] = {
-            "coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-clinical", "code": status}]
+            "coding": [
+                {
+                    "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                    "code": status,
+                }
+            ]
         }
         code_obj: dict = {"text": entity.text}
         if coding:
@@ -728,8 +802,16 @@ def _build_fhir_resource(
         resource["code"] = code_obj
         onset = _first_attr(
             attrs,
-            ("onset_date", "onset", "onset_datetime", "since", "since_date",
-             "diagnosed", "diagnosis_date", "diagnosed_date"),
+            (
+                "onset_date",
+                "onset",
+                "onset_datetime",
+                "since",
+                "since_date",
+                "diagnosed",
+                "diagnosis_date",
+                "diagnosed_date",
+            ),
         )
         if onset:
             resource["onsetDateTime"] = onset
@@ -744,13 +826,17 @@ def _build_fhir_resource(
                 code_obj["coding"] = [coding.as_coding()]
             resource["code"] = code_obj
             if meas["value"] is not None:
-                try:
-                    vq: dict = {"value": float(meas["value"])}
+                parsed_value = _finite_float(meas["value"])
+                if parsed_value is not None:
+                    vq: dict = {"value": parsed_value}
                     if meas["unit"]:
                         vq["unit"] = meas["unit"]
                     resource["valueQuantity"] = vq
-                except (ValueError, TypeError):
-                    resource["valueString"] = str(meas["value"])
+                else:
+                    value_string = str(meas["value"])
+                    if meas["unit"]:
+                        value_string = f"{value_string} {meas['unit']}"
+                    resource["valueString"] = value_string
             ref_range = {}
             if meas["ref_low"] is not None:
                 try:
@@ -766,7 +852,14 @@ def _build_fhir_resource(
                 resource["referenceRange"] = [ref_range]
             if meas["interpretation"]:
                 resource["interpretation"] = [
-                    {"coding": [{"system": _INTERP_SYSTEM, "code": str(meas["interpretation"])}]}
+                    {
+                        "coding": [
+                            {
+                                "system": _INTERP_SYSTEM,
+                                "code": str(meas["interpretation"]),
+                            }
+                        ]
+                    }
                 ]
             if provider:
                 resource["performer"] = [{"display": provider}]
@@ -803,7 +896,12 @@ def _build_fhir_resource(
 
     elif resource_type == "AllergyIntolerance":
         resource["clinicalStatus"] = {
-            "coding": [{"system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical", "code": "active"}]
+            "coding": [
+                {
+                    "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
+                    "code": "active",
+                }
+            ]
         }
         resource["code"] = {"text": entity.text}
         if "reaction" in attrs:
@@ -814,7 +912,10 @@ def _build_fhir_resource(
         # status + vaccineCode + occurrenceDateTime (per dose), optional CVX
         # coding / route / site / dose / manufacturer / lot.
         status_raw = str(attrs.get("status", "") or "").lower()
-        if any(s in status_raw for s in ("not done", "not-done", "not_done", "refused", "declined")):
+        if any(
+            s in status_raw
+            for s in ("not done", "not-done", "not_done", "refused", "declined")
+        ):
             status = "not-done"
         elif "entered-in-error" in status_raw or "entered in error" in status_raw:
             status = "entered-in-error"
@@ -822,7 +923,10 @@ def _build_fhir_resource(
             status = "completed"
         resource["status"] = status
 
-        vaccine_name = _first_attr(attrs, ("vaccine", "vaccine_name", "immunization")) or entity.text
+        vaccine_name = (
+            _first_attr(attrs, ("vaccine", "vaccine_name", "immunization"))
+            or entity.text
+        )
         vaccine_cc: dict = {"text": vaccine_name}
         cvx = _first_attr(attrs, ("cvx", "cvx_code"))
         if cvx:
@@ -839,9 +943,9 @@ def _build_fhir_resource(
         site = attrs.get("site")
         if site:
             resource["site"] = {"text": site}
-        dose = _first_attr(attrs, ("dose", "dose_quantity", "dosage"))
-        if dose:
-            resource["doseQuantity"] = {"value": dose}
+        dose_quantity = _immunization_dose_quantity(attrs)
+        if dose_quantity:
+            resource["doseQuantity"] = dose_quantity
         manufacturer = _first_attr(attrs, ("manufacturer", "mfg", "maker"))
         if manufacturer:
             resource["manufacturer"] = {"display": manufacturer}
@@ -864,7 +968,9 @@ def _build_fhir_resource(
         # Visit type / title — a readable label for the visit. Prefer an explicit
         # description, else the extracted visit phrase (entity.text). Merge a CPT
         # code into the same CodeableConcept so the title and code travel together.
-        type_text = _first_attr(attrs, ("visit_description", "encounter_type", "visit_type_text"))
+        type_text = _first_attr(
+            attrs, ("visit_description", "encounter_type", "visit_type_text")
+        )
         if not type_text and entity.text and entity.text.strip():
             type_text = entity.text.strip()
         cpt_code = attrs.get("cpt_code")
@@ -887,7 +993,14 @@ def _build_fhir_resource(
         if provider:
             resource["participant"] = [{"individual": {"display": provider}}]
         facility = _first_attr(
-            attrs, ("facility", "medical_center", "location", "service_provider", "organization")
+            attrs,
+            (
+                "facility",
+                "medical_center",
+                "location",
+                "service_provider",
+                "organization",
+            ),
         )
         if facility:
             resource["serviceProvider"] = {"display": facility}
@@ -900,7 +1013,13 @@ def _build_fhir_resource(
     elif resource_type == "DiagnosticReport":
         category = attrs.get("category", "imaging")
         resource["status"] = "final"
-        resource["category"] = [{"coding": [{"code": category, "display": category.replace("_", " ").title()}]}]
+        resource["category"] = [
+            {
+                "coding": [
+                    {"code": category, "display": category.replace("_", " ").title()}
+                ]
+            }
+        ]
         resource["code"] = {"text": attrs.get("procedure_name", entity.text)}
         findings = attrs.get("findings")
         if findings:
@@ -930,10 +1049,18 @@ def _build_fhir_resource(
             "uncle": ("UNCLE", "Uncle"),
             "child": ("CHILD", "Child"),
         }
-        rel_code, rel_display = rel_map.get(relationship.lower(), ("FAMMEMB", relationship.title()))
+        rel_code, rel_display = rel_map.get(
+            relationship.lower(), ("FAMMEMB", relationship.title())
+        )
         resource["status"] = "completed"
         resource["relationship"] = {
-            "coding": [{"system": "http://terminology.hl7.org/CodeSystem/v3-RoleCode", "code": rel_code, "display": rel_display}],
+            "coding": [
+                {
+                    "system": "http://terminology.hl7.org/CodeSystem/v3-RoleCode",
+                    "code": rel_code,
+                    "display": rel_display,
+                }
+            ],
         }
         condition_text = attrs.get("condition", entity.text)
         condition_entry: dict = {"code": {"text": condition_text}}
@@ -944,13 +1071,23 @@ def _build_fhir_resource(
 
     elif resource_type == "DocumentReference":
         resource["status"] = "current"
-        resource["type"] = {"coding": [{"system": "http://loinc.org", "code": "51847-2", "display": "Assessment and Plan"}]}
-        resource["content"] = [{
-            "attachment": {
-                "contentType": "text/plain",
-                "data": base64.b64encode(entity.text.encode()).decode(),
-            },
-        }]
+        resource["type"] = {
+            "coding": [
+                {
+                    "system": "http://loinc.org",
+                    "code": "51847-2",
+                    "display": "Assessment and Plan",
+                }
+            ]
+        }
+        resource["content"] = [
+            {
+                "attachment": {
+                    "contentType": "text/plain",
+                    "data": base64.b64encode(entity.text.encode()).decode(),
+                },
+            }
+        ]
         plan_items = attrs.get("plan_items")
         if plan_items and isinstance(plan_items, list):
             resource["description"] = "; ".join(plan_items)
@@ -959,7 +1096,7 @@ def _build_fhir_resource(
     resource["_extraction_metadata"] = {
         "entity_class": entity.entity_class,
         "original_text": entity.text,
-        "attributes": attrs,
+        "attributes": _metadata_attributes(attrs),
         "start_pos": entity.start_pos,
         "end_pos": entity.end_pos,
         "confidence": entity.confidence,
@@ -1007,7 +1144,10 @@ def _build_display_text(entity: ExtractedEntity) -> str:
         return entity.text
 
     if cls == "immunization":
-        name = _first_attr(attrs, ("vaccine", "vaccine_name", "immunization")) or entity.text
+        name = (
+            _first_attr(attrs, ("vaccine", "vaccine_name", "immunization"))
+            or entity.text
+        )
         date = attrs.get("date", "")
         return f"{name} ({date})" if date else name
 
