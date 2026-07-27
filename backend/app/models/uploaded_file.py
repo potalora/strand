@@ -3,7 +3,16 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -77,3 +86,11 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # fallback, or a document no provider could read). Each entry:
     # {type, level, message, detail}. Surfaced in upload history + Extractions.
     notices: Mapped[list] = mapped_column(JSONB, server_default="[]")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "id",
+            "user_id",
+            name="uq_uploaded_files_id_user_id",
+        ),
+    )

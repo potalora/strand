@@ -11,6 +11,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -72,6 +73,12 @@ class HealthRecord(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     patient: Mapped[Patient] = relationship("Patient", back_populates="health_records")
 
     __table_args__ = (
+        UniqueConstraint(
+            "id",
+            "source_file_id",
+            "user_id",
+            name="uq_health_records_id_source_file_user",
+        ),
         Index("idx_health_records_patient_date", "patient_id", effective_date.desc()),
         Index("idx_health_records_type", "record_type"),
         Index("idx_health_records_code", "code_system", "code_value"),

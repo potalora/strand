@@ -39,6 +39,44 @@ async def _make_user(db_session, email: str = "enc-user@example.com"):
     return await register_user(db_session, email=email, password="SecurePass123!")
 
 
+def _local_ai_manifest() -> dict:
+    artifacts = []
+    for role, hash_character in (
+        ("ocr", "a"),
+        ("extraction", "b"),
+        ("summary", "c"),
+    ):
+        artifacts.append(
+            {
+                "role": role,
+                "repository": f"owner/{role}",
+                "revision": "0" * 40,
+                "quantization": "4bit",
+                "license": "apache-2.0",
+                "attribution": f"https://huggingface.co/owner/{role}",
+                "decode_limits": {
+                    "max_input_tokens": 4096,
+                    "max_output_tokens": 1024,
+                },
+                "files": [
+                    {
+                        "path": f"{role}/model.safetensors",
+                        "sha256": hash_character * 64,
+                        "size": 10,
+                    }
+                ],
+            }
+        )
+    return {
+        "schema_version": 1,
+        "pack_revision": "apple-m4-16gb-v1",
+        "platform": "apple_silicon",
+        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "validation_suite_version": "local-ai-fixtures-v1",
+        "artifacts": artifacts,
+    }
+
+
 # ---------------------------------------------------------------------------
 # (1) Transparent round-trip: a dict written reads back as the same dict.
 # ---------------------------------------------------------------------------
@@ -216,10 +254,7 @@ async def test_local_ai_checkpoints_and_evidence_are_encrypted(db_session):
         upload_id=upload.id,
         kind="ingestion",
         processing_mode="validated_strict_local",
-        manifest_snapshot={
-            "pack_revision": "apple-m4-16gb-v1",
-            "artifact_count": 3,
-        },
+        manifest_snapshot=_local_ai_manifest(),
         status="running",
         stage="ocr",
         progress={"pages_completed": 0, "pages_total": 1},
@@ -230,7 +265,6 @@ async def test_local_ai_checkpoints_and_evidence_are_encrypted(db_session):
 
     page = LocalAIPage(
         job_id=job.id,
-        upload_id=upload.id,
         page_number=1,
         checkpoint_key="c" * 64,
         image_sha256="d" * 64,

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -240,13 +242,8 @@ def _safe_artifact(raw_value: Any) -> ManifestArtifact:
     )
 
 
-def load_manifest(path: Path) -> LocalAIManifest:
-    """Load and fully validate a version-1 immutable local-AI manifest."""
-
-    try:
-        raw_value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
-        raise LocalValidationError("Manifest could not be read as JSON") from exc
+def parse_manifest(raw_value: Any) -> LocalAIManifest:
+    """Validate an in-memory version-1 immutable local-AI manifest payload."""
 
     raw = _require_object(raw_value, keys=_TOP_LEVEL_KEYS, context="root")
     schema_version = raw.get("schema_version")
@@ -302,3 +299,28 @@ def load_manifest(path: Path) -> LocalAIManifest:
         validation_suite_version=validation_suite_version,
         artifacts=artifacts,
     )
+
+
+def load_manifest(path: Path) -> LocalAIManifest:
+    """Load and fully validate a version-1 immutable local-AI manifest."""
+
+    try:
+        raw_value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise LocalValidationError("Manifest could not be read as JSON") from exc
+    return parse_manifest(raw_value)
+
+
+def canonicalize_manifest_snapshot(raw_value: Any) -> tuple[dict[str, Any], str]:
+    """Return a detached canonical schema-v1 snapshot and lowercase digest."""
+
+    manifest = parse_manifest(raw_value)
+    canonical_bytes = json.dumps(
+        asdict(manifest),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    snapshot = json.loads(canonical_bytes)
+    digest = hashlib.sha256(canonical_bytes).hexdigest()
+    return deepcopy(snapshot), digest

@@ -1,24 +1,40 @@
 from __future__ import annotations
 
+import hmac
+import re
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    event,
+    inspect,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 from app.models.encrypted_types import EncryptedJSON, EncryptedText
+from app.services.local_ai.errors import LocalValidationError
+from app.services.local_ai.manifest import canonicalize_manifest_snapshot
+from app.services.local_ai.types import ProcessingMode
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_IMMUTABLE_JOB_FIELDS = (
+    "processing_mode",
+    "manifest_snapshot",
+    "manifest_sha256",
+)
 
 
 class LocalAIJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -33,18 +49,17 @@ class LocalAIJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     upload_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("uploaded_files.id", ondelete="CASCADE"),
         nullable=True,
     )
     summary_prompt_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("ai_summary_prompts.id", ondelete="CASCADE"),
         nullable=True,
     )
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     processing_mode: Mapped[str] = mapped_column(String(32), nullable=False)
     # Model identities, fixed revisions, hashes, and runtime metadata only.
     manifest_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False)
     stage: Mapped[str] = mapped_column(String(32), nullable=False)
     # Stable stage codes and non-content counters only.
@@ -76,11 +91,76 @@ class LocalAIJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=True,
     )
 
+    def __init__(self, **kwargs: Any) -> None:
+        raw_manifest = kwargs.pop("manifest_snapshot", None)
+        supplied_digest = kwargs.pop("manifest_sha256", None)
+        if raw_manifest is None:
+            raise LocalValidationError("Local AI job manifest is invalid")
+        super().__init__(**kwargs)
+        self.manifest_snapshot = raw_manifest
+        if supplied_digest is not None:
+            if not isinstance(supplied_digest, str) or not hmac.compare_digest(
+                supplied_digest,
+                self.manifest_sha256,
+            ):
+                raise LocalValidationError("Local AI job manifest digest is invalid")
+
+    @validates("processing_mode")
+    def _validate_processing_mode(self, _key: str, value: Any) -> str:
+        try:
+            return ProcessingMode(value).value
+        except (TypeError, ValueError) as exc:
+            raise LocalValidationError("Local AI job processing mode is invalid") from exc
+
+    @validates("manifest_snapshot")
+    def _validate_manifest_snapshot(self, _key: str, value: Any) -> dict:
+        try:
+            snapshot, digest = canonicalize_manifest_snapshot(value)
+        except LocalValidationError as exc:
+            raise LocalValidationError("Local AI job manifest is invalid") from exc
+        self.manifest_sha256 = digest
+        return snapshot
+
+    @validates("manifest_sha256")
+    def _validate_manifest_sha256(self, _key: str, value: Any) -> str:
+        if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+            raise LocalValidationError("Local AI job manifest digest is invalid")
+        return value
+
+    def revalidate_manifest_snapshot(self) -> dict:
+        """Revalidate and detach the stored snapshot before worker use."""
+
+        try:
+            snapshot, digest = canonicalize_manifest_snapshot(self.manifest_snapshot)
+        except LocalValidationError as exc:
+            raise LocalValidationError("Stored local AI job manifest is invalid") from exc
+        if (
+            snapshot != self.manifest_snapshot
+            or not isinstance(self.manifest_sha256, str)
+            or not hmac.compare_digest(digest, self.manifest_sha256)
+        ):
+            raise LocalValidationError("Stored local AI job manifest is invalid")
+        return snapshot
+
     __table_args__ = (
         CheckConstraint(
-            "(upload_id IS NOT NULL AND summary_prompt_id IS NULL) "
-            "OR (upload_id IS NULL AND summary_prompt_id IS NOT NULL)",
-            name="ck_local_ai_jobs_exactly_one_target",
+            "(kind = 'ingestion' AND upload_id IS NOT NULL "
+            "AND summary_prompt_id IS NULL) "
+            "OR (kind = 'summary' AND upload_id IS NULL "
+            "AND summary_prompt_id IS NOT NULL)",
+            name="ck_local_ai_jobs_kind_target",
+        ),
+        ForeignKeyConstraint(
+            ["upload_id", "user_id"],
+            ["uploaded_files.id", "uploaded_files.user_id"],
+            name="fk_local_ai_jobs_upload_owner",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["summary_prompt_id", "user_id"],
+            ["ai_summary_prompts.id", "ai_summary_prompts.user_id"],
+            name="fk_local_ai_jobs_summary_owner",
+            ondelete="CASCADE",
         ),
         Index("ix_local_ai_jobs_user_status", "user_id", "status"),
         Index("ix_local_ai_jobs_upload_id", "upload_id"),
@@ -96,11 +176,6 @@ class LocalAIPage(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     job_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("local_ai_jobs.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    upload_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("uploaded_files.id", ondelete="CASCADE"),
         nullable=False,
     )
     page_number: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -137,12 +212,15 @@ class ExtractionEvidence(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     upload_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("uploaded_files.id", ondelete="CASCADE"),
         nullable=False,
     )
     health_record_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("health_records.id", ondelete="SET NULL"),
+        ForeignKey(
+            "health_records.id",
+            name="fk_extraction_evidence_health_record",
+            ondelete="SET NULL",
+        ),
         nullable=True,
     )
     page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -154,5 +232,45 @@ class ExtractionEvidence(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     source_metadata: Mapped[dict] = mapped_column(EncryptedJSON, nullable=False)
 
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["upload_id", "user_id"],
+            ["uploaded_files.id", "uploaded_files.user_id"],
+            name="fk_extraction_evidence_upload_owner",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["health_record_id", "upload_id", "user_id"],
+            [
+                "health_records.id",
+                "health_records.source_file_id",
+                "health_records.user_id",
+            ],
+            name="fk_extraction_evidence_record_lineage",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         Index("ix_extraction_evidence_health_record_id", "health_record_id"),
     )
+
+
+def _validate_new_job_identity(
+    _mapper: Any,
+    _connection: Any,
+    target: LocalAIJob,
+) -> None:
+    target.revalidate_manifest_snapshot()
+
+
+def _reject_persisted_job_identity_changes(
+    _mapper: Any,
+    _connection: Any,
+    target: LocalAIJob,
+) -> None:
+    state = inspect(target)
+    if any(state.attrs[field].history.has_changes() for field in _IMMUTABLE_JOB_FIELDS):
+        raise LocalValidationError("Local AI job identity is immutable")
+    target.revalidate_manifest_snapshot()
+
+
+event.listen(LocalAIJob, "before_insert", _validate_new_job_identity)
+event.listen(LocalAIJob, "before_update", _reject_persisted_job_identity_changes)
