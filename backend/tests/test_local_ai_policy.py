@@ -76,3 +76,9 @@ def test_unknown_processing_mode_is_rejected_fail_closed() -> None:
 def test_custom_local_rejects_invalid_url_syntax_or_port_range(url: str) -> None:
     with pytest.raises(LocalPolicyError, match="valid HTTP loopback URL"):
         require_loopback(url)
+
+
+@pytest.mark.parametrize("endpoint", [None, 123, object()])
+def test_custom_local_rejects_non_string_endpoint_values(endpoint: object) -> None:
+    with pytest.raises(LocalPolicyError, match="valid HTTP loopback URL"):
+        require_loopback(cast(str, endpoint))

@@ -11,6 +11,8 @@ from app.services.local_ai.types import ProcessingMode
 
 def require_loopback(endpoint: str) -> None:
     """Require an explicit HTTP(S) endpoint on a loopback interface."""
+    if not isinstance(endpoint, str):
+        raise LocalPolicyError("Custom local endpoint must be a valid HTTP loopback URL")
     try:
         parsed = urlparse(endpoint)
         host = parsed.hostname
