@@ -16,6 +16,7 @@ import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { FhirResourceRenderer } from "@/components/retro/FhirResourceRenderer";
 import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
 import { AIExtractionBadge, AdvancedSection } from "@/components/retro/renderers/shared";
+import { ExtractionEvidencePanel } from "@/components/retro/ExtractionEvidencePanel";
 
 export default function RecordDetailPage() {
   const params = useParams();
@@ -159,6 +160,9 @@ export default function RecordDetailPage() {
             <p className="muted text-xs" style={{ marginTop: 8 }}>
               This record was extracted from an unstructured document using AI.
             </p>
+            <div style={{ marginTop: 14 }}>
+              <ExtractionEvidencePanel recordId={record.id} enabled />
+            </div>
           </div>
         )}
 

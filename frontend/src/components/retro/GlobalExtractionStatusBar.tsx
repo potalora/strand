@@ -11,6 +11,7 @@ import {
   useExtractionStore,
 } from "@/stores/useExtractionStore";
 import { useUIStore } from "@/stores/useUIStore";
+import { LocalProcessingDetails } from "./LocalProcessingDetails";
 
 /* ==========================================================================
    GlobalExtractionStatusBar — ambient, cross-page extraction monitor.
@@ -113,14 +114,17 @@ export function GlobalExtractionStatusBar() {
   const batchKey = batchIds.join(",");
   const pollable = batchIsPollable(files);
 
-  // --- The one polling loop. `batchIds` identity changes only when a new batch
-  //     starts (startBatch makes a fresh array), so the interval re-arms only on
-  //     a batch change, dismissal, or a pollability flip — never every tick. ---
+  // --- The one polling loop. A completed tick schedules the next one, so slow
+  //     requests cannot overlap or apply an older response after a newer tick. ---
   useEffect(() => {
     if (batchIds.length === 0 || dismissed || !pollable) return;
     let active = true;
+    let inFlight = false;
+    let timer: number | null = null;
 
     const tick = async () => {
+      if (!active || inFlight) return;
+      inFlight = true;
       try {
         const [prog, statusList] = await Promise.all([
           api.getExtractionProgress(batchIds),
@@ -134,18 +138,24 @@ export function GlobalExtractionStatusBar() {
             ingestion_status: f.ingestion_status,
             progress_stage: f.progress_stage,
             progress_detail: f.progress_detail,
+            local_run: f.local_run,
+            local_failure: f.local_failure,
           }))
         );
       } catch {
         /* transient — keep polling */
+      } finally {
+        inFlight = false;
+        if (active) {
+          timer = window.setTimeout(() => void tick(), 2000);
+        }
       }
     };
 
     void tick();
-    const timer = setInterval(tick, 2000);
     return () => {
       active = false;
-      clearInterval(timer);
+      if (timer !== null) window.clearTimeout(timer);
     };
   }, [batchIds, dismissed, pollable, setProgress, mergeFileStatuses]);
 
@@ -255,6 +265,12 @@ export function GlobalExtractionStatusBar() {
                         <span className="mono medtl-esb-stage">{stage}</span>
                       )}
                     </div>
+                    <LocalProcessingDetails
+                      compact
+                      localRun={f.local_run}
+                      failure={f.local_failure}
+                      progressDetail={f.progress_detail}
+                    />
                   </li>
                 );
               })}

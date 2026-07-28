@@ -1,3 +1,12 @@
+import type {
+  CloudSummaryModelProvenance,
+  CustomLocalSummaryModelProvenance,
+  GroundedSummaryDocument,
+  ProcessingMode,
+  SummaryModelProvenance,
+  StrictLocalSummaryModelProvenance,
+} from "@/types/local-ai";
+
 export interface TokenResponse {
   access_token: string;
   refresh_token: string;
@@ -171,6 +180,18 @@ export interface PromptResponse {
   de_identification_report: Record<string, number> | null;
   copyable_payload: string;
   generated_at: string;
+  /** Present on summaries saved after processing-mode provenance shipped. */
+  processing_mode?: ProcessingMode | null;
+  model_provenance?: SummaryModelProvenance | null;
+}
+
+export type OutputFormat = "natural_language" | "json" | "both";
+
+export interface PromptDetailResponse extends PromptResponse {
+  response_text: string | null;
+  response_format: OutputFormat | null;
+  /** Nullable only for prompt-only and legacy history rows. */
+  typed_response: GroundedSummaryDocument | null;
 }
 
 export interface ExtractedEntity {
@@ -203,18 +224,47 @@ export interface DuplicateWarning {
   message: string | null;
 }
 
-export interface GenerateSummaryRequest {
+interface GenerateSummaryRequestBase {
   patient_id: string;
   summary_type: string;
   category?: string;
   date_from?: string;
   date_to?: string;
-  output_format: string;
-  custom_system_prompt?: string;
-  custom_user_prompt?: string;
+  output_format: OutputFormat;
+  record_ids?: string[];
 }
 
-export interface GenerateSummaryResponse {
+export type StrictLocalGenerateSummaryRequest = GenerateSummaryRequestBase & {
+  processing_mode: "validated_strict_local";
+  provider?: never;
+  model?: never;
+  custom_system_prompt?: never;
+  custom_user_prompt?: never;
+};
+
+export type CustomLocalGenerateSummaryRequest = GenerateSummaryRequestBase & {
+  processing_mode: "custom_local";
+  provider?: never;
+  model?: never;
+  custom_system_prompt?: string;
+  custom_user_prompt?: string;
+};
+
+export type CloudGenerateSummaryRequest = GenerateSummaryRequestBase & {
+  processing_mode: "cloud_assisted";
+  provider?: string;
+  model?: string;
+  custom_system_prompt?: string;
+  custom_user_prompt?: string;
+};
+
+/** Generate-only modes; prompt-only requests use POST /summary/build-prompt. */
+export type GenerateSummaryRequest =
+  | StrictLocalGenerateSummaryRequest
+  | CustomLocalGenerateSummaryRequest
+  | CloudGenerateSummaryRequest;
+
+interface GenerateSummaryResponseBase {
   id: string;
   natural_language: string | null;
   json_data: Record<string, unknown> | null;
@@ -224,6 +274,33 @@ export interface GenerateSummaryResponse {
   model_used: string;
   generated_at: string;
 }
+
+/**
+ * Legacy display projection used when loading an older saved response. New
+ * POST /summary/generate callers should use GenerateSummaryApiResponse.
+ */
+export type GenerateSummaryResponse = GenerateSummaryResponseBase & {
+  /** Older saved summaries may not carry either field. Never infer them. */
+  processing_mode?: ProcessingMode | null;
+  model_provenance?: SummaryModelProvenance | null;
+};
+
+export type GenerateSummaryApiResponse =
+  | (GenerateSummaryResponseBase & {
+      processing_mode: "validated_strict_local";
+      model_provenance: StrictLocalSummaryModelProvenance | null;
+      typed_response: GroundedSummaryDocument;
+    })
+  | (GenerateSummaryResponseBase & {
+      processing_mode: "custom_local";
+      model_provenance: CustomLocalSummaryModelProvenance | null;
+      typed_response: GroundedSummaryDocument;
+    })
+  | (GenerateSummaryResponseBase & {
+      processing_mode: "cloud_assisted";
+      model_provenance: CloudSummaryModelProvenance | null;
+      typed_response: GroundedSummaryDocument;
+    });
 
 export interface PatientInfo {
   id: string;

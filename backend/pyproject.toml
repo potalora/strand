@@ -87,4 +87,6 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "fidelity: marks tests requiring real user-provided data",
+    "local_model: marks tests requiring the exact installed local model pack",
+    "hardware: marks tests requiring measured execution on target hardware",
 ]

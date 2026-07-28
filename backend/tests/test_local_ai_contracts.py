@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, asdict
 from typing import get_type_hints
+from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
+from app.schemas.local_ai import (
+    ExtractionModelIdentityResponse,
+    RecordExtractionEvidenceResponse,
+)
+from app.schemas.upload import LocalModelInfo, LocalRunInfo
 from app.services.local_ai.errors import (
     LocalAIError,
     LocalPolicyError,
@@ -65,17 +72,20 @@ def test_worker_contracts_are_async_and_keep_results_serializable() -> None:
     assert get_type_hints(OCRBackend.parse_page)["return"] is OCRPageResult
     assert get_type_hints(ExtractionBackend.extract)["return"] is ClinicalExtraction
     assert get_type_hints(SummaryBackend.summarize)["return"] is GroundedSummary
-    assert asdict(
-        OCRPageResult(
-            page_number=1,
-            markdown="# Page one",
-            width=100,
-            height=200,
-            warnings=[],
-            content_sha256="b" * 64,
-            model=_ocr_model(),
-        )
-    )["page_number"] == 1
+    assert (
+        asdict(
+            OCRPageResult(
+                page_number=1,
+                markdown="# Page one",
+                width=100,
+                height=200,
+                warnings=[],
+                content_sha256="b" * 64,
+                model=_ocr_model(),
+            )
+        )["page_number"]
+        == 1
+    )
 
 
 def test_local_ai_errors_have_stable_safe_codes_and_retryability() -> None:
@@ -86,3 +96,57 @@ def test_local_ai_errors_have_stable_safe_codes_and_retryability() -> None:
     assert LocalValidationError.code == "local_validation_error"
     assert LocalWorkerTimeout.retryable is True
     assert LocalPolicyError.retryable is False
+
+
+def test_upload_provenance_rejects_summary_models_and_more_than_two_models() -> None:
+    model = {
+        "repository": "owner/model",
+        "revision": "0" * 40,
+    }
+
+    with pytest.raises(ValidationError):
+        LocalModelInfo(
+            role="summary",
+            repository="mlx-community/Qwen3.5-9B-MLX-4bit",
+            revision="9" * 40,
+        )
+
+    with pytest.raises(ValidationError):
+        LocalRunInfo(
+            privacy_mode="validated_strict_local",
+            models=[
+                LocalModelInfo(role="ocr", **model),
+                LocalModelInfo(role="extraction", **model),
+                LocalModelInfo(role="ocr", **model),
+            ],
+        )
+
+
+def test_record_evidence_rejects_summary_models_and_more_than_two_models() -> None:
+    model = {
+        "repository": "owner/model",
+        "revision": "0" * 40,
+        "quantization": "4bit",
+        "runtime": "mlx-vlm 0.5.0",
+    }
+
+    with pytest.raises(ValidationError):
+        ExtractionModelIdentityResponse(
+            role="summary",
+            repository="mlx-community/Qwen3.5-9B-MLX-4bit",
+            revision="9" * 40,
+            quantization="4bit",
+            runtime="mlx-vlm 0.5.0",
+        )
+
+    valid_model = ExtractionModelIdentityResponse(role="ocr", **model)
+    with pytest.raises(ValidationError):
+        RecordExtractionEvidenceResponse(
+            record_id=uuid4(),
+            processing_mode="validated_strict_local",
+            schema_version="clinical-document-extraction.v1",
+            evidence=[],
+            unresolved_fields=[],
+            rejected_fields=[],
+            models=[valid_model, valid_model, valid_model],
+        )

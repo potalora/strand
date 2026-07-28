@@ -1,10 +1,14 @@
 import * as fs from "fs";
+import { isTerminalStatus } from "../../src/lib/extraction-progress";
 
 const API_BASE = "http://localhost:8000/api/v1";
 
 type ApiRecord = {
   id: string;
   record_type: string;
+  category: string[] | null;
+  ai_extracted: boolean;
+  confidence_score: number | null;
 };
 
 type UploadStatus = {
@@ -30,7 +34,9 @@ type RecordsResponse = {
 };
 
 type UploadReview = {
-  candidates: { candidate_id: string; status?: string }[];
+  upload: Record<string, unknown>;
+  auto_merged: { candidate_id: string }[];
+  needs_review: Record<string, { candidate_id: string }[]>;
 };
 
 type DedupResolution = {
@@ -159,16 +165,6 @@ export class ApiClient {
     excludeTerminal: string[] = [],
   ): Promise<UploadStatus> {
     const start = Date.now();
-    const terminalStatuses = [
-      "completed",
-      "completed_with_errors",
-      "completed_with_merges",
-      "failed",
-      "awaiting_confirmation",
-      "awaiting_review",
-      "dedup_scanning",
-      "duplicate_file", // idempotent re-upload of identical content (Phase 2a)
-    ].filter((s) => !excludeTerminal.includes(s));
 
     while (Date.now() - start < timeoutMs) {
       const res = await fetch(`${API_BASE}/upload/${uploadId}/status`, {
@@ -181,7 +177,11 @@ export class ApiClient {
       }
       const data = await res.json();
       const st = data.ingestion_status ?? data.status;
-      if (terminalStatuses.includes(st)) {
+      if (
+        typeof st === "string" &&
+        isTerminalStatus(st) &&
+        !excludeTerminal.includes(st)
+      ) {
         return data;
       }
       await new Promise((r) => setTimeout(r, 2000));

@@ -28,7 +28,9 @@ def _encrypt_bytes(path: Path, plaintext: bytes) -> Path:
 
 def _pdf_bytes(tmp_path: Path, pages: int = 2) -> bytes:
     path = tmp_path / "plain.pdf"
-    images = [Image.new("RGB", (64, 48), (index * 40, 20, 100)) for index in range(pages)]
+    images = [
+        Image.new("RGB", (64, 48), (index * 40, 20, 100)) for index in range(pages)
+    ]
     try:
         images[0].save(path, format="PDF", save_all=True, append_images=images[1:])
         return path.read_bytes()
@@ -131,7 +133,9 @@ def test_rasterizer_rejects_oversized_page_or_frame(
     tmp_path: Path,
     suffix: str,
 ) -> None:
-    plaintext = _pdf_bytes(tmp_path, 1) if suffix == ".pdf" else _tiff_bytes(tmp_path, 1)
+    plaintext = (
+        _pdf_bytes(tmp_path, 1) if suffix == ".pdf" else _tiff_bytes(tmp_path, 1)
+    )
     encrypted = _encrypt_bytes(tmp_path / f"source{suffix}", plaintext)
     with ScratchJob(tmp_path / "scratch", "job-1") as scratch:
         with pytest.raises(LocalValidationError, match="pixel limit"):

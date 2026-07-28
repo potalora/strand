@@ -34,6 +34,115 @@ def _validate(raw: object, page: str = "Metformin 500 mg oral twice daily"):
     return validate_clinical_extraction(raw, pages={1: page}, upload_id="upload-1")
 
 
+@pytest.mark.parametrize(
+    ("category", "fact", "page"),
+    [
+        (
+            "conditions",
+            {
+                "name": "pneumonia",
+                "assertion": "negated",
+                "verbatim": "No evidence of pneumonia.",
+                "page_number": 1,
+                "evidence_excerpt": "No evidence of pneumonia.",
+            },
+            "No evidence of pneumonia.",
+        ),
+        (
+            "conditions",
+            {
+                "name": "pulmonary embolism",
+                "assertion": "uncertain",
+                "verbatim": "Possible pulmonary embolism.",
+                "page_number": 1,
+                "evidence_excerpt": "Possible pulmonary embolism.",
+            },
+            "Possible pulmonary embolism.",
+        ),
+        (
+            "procedures",
+            {
+                "name": "Colonoscopy",
+                "assertion": "mentioned_not_performed",
+                "verbatim": "Colonoscopy cancelled.",
+                "page_number": 1,
+                "evidence_excerpt": "Colonoscopy cancelled.",
+            },
+            "Colonoscopy cancelled.",
+        ),
+    ],
+)
+def test_strict_local_rejects_non_promotable_facts(
+    category: str,
+    fact: dict[str, object],
+    page: str,
+) -> None:
+    """Strict-local validation must not rely only on worker-side filtering."""
+
+    # The shared validator retains supported qualifiers for non-strict callers.
+    _validate({category: [fact]}, page=page)
+
+    with pytest.raises(LocalValidationError, match=rf"{category}\[0\].*not promotable"):
+        validate_clinical_extraction(
+            {category: [fact]},
+            pages={1: page},
+            upload_id="upload-1",
+            strict_local=True,
+        )
+
+
+def test_strict_local_rejects_weak_diagnostic_report() -> None:
+    raw = {
+        "diagnostic_reports": [
+            {
+                "name": "Laboratory results",
+                "assertion": "present",
+                "status": "unknown",
+                "verbatim": "Laboratory results: potassium 4.1 mmol/L.",
+                "page_number": 1,
+                "evidence_excerpt": "Laboratory results: potassium 4.1 mmol/L.",
+            }
+        ]
+    }
+    page = "Laboratory results: potassium 4.1 mmol/L."
+
+    _validate(raw, page=page)
+
+    with pytest.raises(
+        LocalValidationError, match=r"diagnostic_reports\[0\].*not promotable"
+    ):
+        validate_clinical_extraction(
+            raw,
+            pages={1: page},
+            upload_id="upload-1",
+            strict_local=True,
+        )
+
+
+def test_strict_local_keeps_grounded_diagnostic_report() -> None:
+    page = "Final CT chest report: no acute findings."
+    validated = validate_clinical_extraction(
+        {
+            "diagnostic_reports": [
+                {
+                    "name": "CT chest",
+                    "findings": "no acute findings",
+                    "assertion": "present",
+                    "status": "final",
+                    "verbatim": page,
+                    "page_number": 1,
+                    "evidence_excerpt": page,
+                }
+            ]
+        },
+        pages={1: page},
+        upload_id="upload-1",
+        strict_local=True,
+    )
+
+    assert validated.diagnostic_reports[0].name == "CT chest"
+
+
 def test_critical_fact_requires_verbatim_evidence_and_valid_page() -> None:
     raw = {"medications": [_medication(page_number=3)]}
 
@@ -380,6 +489,26 @@ def test_assertion_state_is_preserved_for_negation_and_family_history() -> None:
         "negated",
         "family_history",
     ]
+
+
+def test_no_recurrence_is_an_explicit_subject_negation() -> None:
+    text = "No recurrence of palpitations."
+    validated = _validate(
+        {
+            "conditions": [
+                {
+                    "name": "palpitations",
+                    "assertion": "negated",
+                    "verbatim": text,
+                    "page_number": 1,
+                    "evidence_excerpt": text,
+                }
+            ]
+        },
+        page=text,
+    )
+
+    assert validated.conditions[0].assertion.value == "negated"
 
 
 def test_omitted_assertion_cannot_promote_negated_allergy() -> None:
@@ -2525,6 +2654,51 @@ def test_numeric_value_and_unit_must_be_exact_and_adjacent(
 ) -> None:
     with pytest.raises(LocalValidationError, match=rf"{category}\[0\].*(?:value|unit)"):
         _validate({category: [fact]}, page=text)
+
+
+def test_numeric_value_and_unit_accept_markdown_table_cell_boundaries() -> None:
+    text = "Potassium | 4.1 | mmol/L"
+    result = _validate(
+        {
+            "labs": [
+                {
+                    "name": "Potassium",
+                    "value": "4.1",
+                    "unit": "mmol/L",
+                    "verbatim": text,
+                    "page_number": 1,
+                    "evidence_excerpt": text,
+                }
+            ]
+        },
+        page=text,
+    )
+
+    assert result.labs[0].value == "4.1"
+    assert result.labs[0].unit == "mmol/L"
+
+
+def test_html_table_entities_are_decoded_only_for_semantic_grounding() -> None:
+    text = "<tr><td>TSH</td><td>&lt; 0.05</td><td>mIU/L</td></tr>"
+    result = _validate(
+        {
+            "labs": [
+                {
+                    "name": "TSH",
+                    "value": "< 0.05",
+                    "unit": "mIU/L",
+                    "verbatim": text,
+                    "page_number": 1,
+                    "evidence_excerpt": text,
+                }
+            ]
+        },
+        page=text,
+    )
+
+    assert result.labs[0].value == "< 0.05"
+    assert result.labs[0].verbatim == text
+    assert result.evidence[0].start_offset == 0
 
 
 def test_duplicate_fact_comparison_is_case_insensitive_across_pages() -> None:

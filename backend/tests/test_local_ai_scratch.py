@@ -30,7 +30,9 @@ def _abandon_job(root: Path, job_id: str) -> Path:
     return scratch.path
 
 
-def test_scratch_enforces_owner_only_modes_under_permissive_umask(tmp_path: Path) -> None:
+def test_scratch_enforces_owner_only_modes_under_permissive_umask(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "scratch"
     previous = os.umask(0)
     try:
@@ -95,7 +97,9 @@ def test_scratch_refuses_symlink_job_and_file_targets(tmp_path: Path) -> None:
         assert outside_file.read_bytes() == b"outside"
 
 
-def test_existing_real_job_collision_preserves_preexisting_canary(tmp_path: Path) -> None:
+def test_existing_real_job_collision_preserves_preexisting_canary(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "scratch"
     existing = root / "job-1"
     existing.mkdir(parents=True, mode=0o700)
@@ -261,7 +265,11 @@ def test_cleanup_revalidates_regular_file_identity_before_unlink(
 
     def replace_before_final_stat(path, *args, **kwargs):
         nonlocal swapped
-        if path == "plain.txt" and kwargs.get("dir_fd") == scratch._job_fd and not swapped:
+        if (
+            path == "plain.txt"
+            and kwargs.get("dir_fd") == scratch._job_fd
+            and not swapped
+        ):
             swapped = True
             original.rename(scratch.path / "moved-original.txt")
             original.write_bytes(b"KEEP")
@@ -693,7 +701,9 @@ async def test_enabled_startup_sweeps_immediately_before_model_manager_start(
         events.append("reconcile")
 
     monkeypatch.setattr(main_module.settings, "local_ai_enabled", True)
-    monkeypatch.setattr(main_module.settings, "local_ai_scratch_dir", str(tmp_path / "scratch"))
+    monkeypatch.setattr(
+        main_module.settings, "local_ai_scratch_dir", str(tmp_path / "scratch")
+    )
     monkeypatch.setattr(main_module.settings, "phi_ner_enabled", False)
     monkeypatch.setattr(main_module.settings, "extraction_engine", "gemini")
     monkeypatch.setattr(main_module, "local_model_manager", FakeManager())

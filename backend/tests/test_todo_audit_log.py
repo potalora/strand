@@ -6,7 +6,7 @@ Powers the Admin → System audit log table.
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 from httpx import AsyncClient
@@ -16,8 +16,18 @@ from app.models.audit import AuditLog
 from tests.conftest import auth_headers
 
 
-async def _seed_audit(db: AsyncSession, user_id: UUID, action: str, when: datetime, ip: str = "9.9.9.9"):
-    db.add(AuditLog(user_id=user_id, action=action, resource_type="health_record", ip_address=ip, created_at=when))
+async def _seed_audit(
+    db: AsyncSession, user_id: UUID, action: str, when: datetime, ip: str = "9.9.9.9"
+):
+    db.add(
+        AuditLog(
+            user_id=user_id,
+            action=action,
+            resource_type="health_record",
+            ip_address=ip,
+            created_at=when,
+        )
+    )
     await db.commit()
 
 
@@ -28,11 +38,15 @@ async def test_audit_log_requires_auth(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_audit_log_lists_user_events_newest_first(client: AsyncClient, db_session: AsyncSession):
+async def test_audit_log_lists_user_events_newest_first(
+    client: AsyncClient, db_session: AsyncSession
+):
     headers, uid = await auth_headers(client)
     base = datetime(2024, 5, 1, tzinfo=timezone.utc)
     await _seed_audit(db_session, UUID(uid), "records.view", base)
-    await _seed_audit(db_session, UUID(uid), "dashboard.overview", base + timedelta(minutes=5))
+    await _seed_audit(
+        db_session, UUID(uid), "dashboard.overview", base + timedelta(minutes=5)
+    )
 
     resp = await client.get("/api/v1/audit-log", headers=headers)
     assert resp.status_code == 200
@@ -53,7 +67,9 @@ async def test_audit_log_is_user_scoped(client: AsyncClient, db_session: AsyncSe
     _, other_uid = await auth_headers(client, email="other@example.com")
     base = datetime(2024, 5, 1, tzinfo=timezone.utc)
     await _seed_audit(db_session, UUID(uid), "records.view", base)
-    await _seed_audit(db_session, UUID(other_uid), "someone.else.secret", base + timedelta(minutes=1))
+    await _seed_audit(
+        db_session, UUID(other_uid), "someone.else.secret", base + timedelta(minutes=1)
+    )
 
     resp = await client.get("/api/v1/audit-log", headers=headers)
     assert resp.status_code == 200
@@ -66,7 +82,9 @@ async def test_audit_log_pagination(client: AsyncClient, db_session: AsyncSessio
     headers, uid = await auth_headers(client)
     base = datetime(2024, 5, 1, tzinfo=timezone.utc)
     for i in range(5):
-        await _seed_audit(db_session, UUID(uid), f"action.{i}", base + timedelta(minutes=i))
+        await _seed_audit(
+            db_session, UUID(uid), f"action.{i}", base + timedelta(minutes=i)
+        )
 
     resp = await client.get("/api/v1/audit-log?page=1&limit=2", headers=headers)
     assert resp.status_code == 200

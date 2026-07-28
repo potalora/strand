@@ -12,12 +12,11 @@ Two categories:
 """
 from __future__ import annotations
 
-import csv
 from pathlib import Path
 
 import pytest
 
-from tests.fidelity.column_specs import ALL_TABLE_SPECS, TableSpec
+from tests.fidelity.column_specs import ALL_TABLE_SPECS
 from tests.fidelity.helpers import (
     get_mapper_for_table,
     load_tsv_rows,
@@ -446,7 +445,6 @@ class TestRealEpicCompleteness:
 
         total = len(mapped)
         has_date = sum(1 for r in mapped if r["effective_date"] is not None)
-        has_status = sum(1 for r in mapped if r["status"] is not None)
         has_display = sum(1 for r in mapped if r["display_text"] and r["display_text"] != spec.resource_type)
 
         # display_text should always be populated (build_display_text fallback)

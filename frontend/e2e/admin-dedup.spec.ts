@@ -102,7 +102,11 @@ async function mockDedup(page: Page): Promise<void> {
       return json({ items, total: items.length });
     }
 
-    if (url.includes("/dedup/merge") || url.includes("/dedup/dismiss")) {
+    const pathname = new URL(url).pathname;
+    if (
+      pathname.endsWith("/dedup/merge") ||
+      pathname.endsWith("/dedup/dismiss")
+    ) {
       const body = req.postDataJSON?.() ?? {};
       candidates = candidates.filter((c) => c.id !== body.candidate_id);
       return json({ ok: true });

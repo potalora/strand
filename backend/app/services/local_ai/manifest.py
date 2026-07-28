@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
@@ -22,9 +23,7 @@ MAX_DECODE_TOKENS = 1_000_000
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 PACK_REVISION_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
-REPOSITORY_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
-)
+REPOSITORY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 ALLOWED_SUFFIXES = frozenset(
     {
         ".safetensors",
@@ -68,6 +67,46 @@ _ARTIFACT_KEYS = frozenset(
 _FILE_KEYS = frozenset({"path", "sha256", "size"})
 _RUNTIME_KEYS = frozenset({"name", "version"})
 _DECODE_KEYS = frozenset({"max_input_tokens", "max_output_tokens"})
+_SECRET_PREFIX_RE = re.compile(
+    r"(?:\A|[/@:=\s])(?:"
+    r"(?:AKIA|ASIA)[A-Z0-9]{16}|"
+    r"AIza[0-9A-Za-z_-]{8,}|"
+    r"gh[pousr]_[0-9A-Za-z_-]{8,}|github_pat_[0-9A-Za-z_-]{8,}|"
+    r"glpat-[0-9A-Za-z_-]{8,}|"
+    r"sk-(?:proj-)?[0-9A-Za-z_-]{4,}|"
+    r"sk_(?:live|test)_[0-9A-Za-z_-]{4,}|"
+    r"xox[baprs]-[0-9A-Za-z_-]{8,}"
+    r")",
+    re.IGNORECASE,
+)
+_SECRET_LABEL_RE = re.compile(
+    r"(?:\A|[-_.:/])(?:"
+    r"access[-_]?(?:key|token)|api[-_]?(?:key|token)|auth[-_]?(?:key|token)|"
+    r"authorization|bearer|credential|password|passwd|private[-_]?key|secret|token"
+    r")(?:[-_.:=/]|$)",
+    re.IGNORECASE,
+)
+_CONCATENATED_SECRET_LABEL_RE = re.compile(
+    r"(?:\A|[-_.:/])"
+    r"(?:access(?:key|token)|api(?:key|token)|auth(?:key|token)|"
+    r"password|passwd|privatekey|secret|token(?!izer(?:[-_.:/]|\Z)))"
+    r"(?=[A-Za-z0-9_-]{4,}(?:\Z|[-_.:/]))"
+    r"(?=[A-Za-z0-9_-]*(?:[0-9_-]))"
+    r"[A-Za-z0-9_-]{4,}(?:\Z|[-_.:/])",
+    re.IGNORECASE,
+)
+_JWT_RE = re.compile(
+    r"(?:\A|[\s=:/])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\."
+    r"[A-Za-z0-9_-]{8,}(?:\Z|[\s,;])"
+)
+_OPAQUE_SECRET_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"(?=[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-]))"
+    r"(?=[A-Za-z0-9_-]*[A-Z])"
+    r"(?=[A-Za-z0-9_-]*[a-z])"
+    r"(?=[A-Za-z0-9_-]*[0-9])"
+    r"[A-Za-z0-9_-]{32,}"
+)
 
 
 @dataclass(frozen=True)
@@ -105,7 +144,24 @@ class LocalAIManifest:
     artifacts: tuple[ManifestArtifact, ...]
 
 
-def _require_object(value: Any, *, keys: frozenset[str], context: str) -> dict[str, Any]:
+def is_secret_shaped_manifest_text(value: object) -> bool:
+    """Return whether public manifest metadata resembles a credential."""
+
+    if not isinstance(value, str):
+        return False
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    return bool(
+        _SECRET_PREFIX_RE.search(normalized)
+        or _SECRET_LABEL_RE.search(normalized)
+        or _CONCATENATED_SECRET_LABEL_RE.search(normalized)
+        or _JWT_RE.search(normalized)
+        or _OPAQUE_SECRET_RE.search(normalized)
+    )
+
+
+def _require_object(
+    value: Any, *, keys: frozenset[str], context: str
+) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != keys:
         raise LocalValidationError(f"Manifest {context} has an invalid structure")
     return value
@@ -120,6 +176,8 @@ def _require_string(raw: dict[str, Any], key: str, *, context: str) -> str:
         or any(ord(character) < 32 for character in value)
     ):
         raise LocalValidationError(f"Manifest {context} must be a nonempty string")
+    if is_secret_shaped_manifest_text(value):
+        raise LocalValidationError(f"Manifest {context} metadata is invalid")
     return value
 
 
@@ -131,6 +189,7 @@ def safe_relative_manifest_path(raw_path: Any) -> str:
         or not raw_path
         or "\\" in raw_path
         or "\x00" in raw_path
+        or is_secret_shaped_manifest_text(raw_path)
     ):
         raise LocalValidationError("Manifest path is invalid")
     path = PurePosixPath(raw_path)
@@ -281,9 +340,13 @@ def parse_manifest(raw_value: Any) -> LocalAIManifest:
     artifacts = tuple(_safe_artifact(value) for value in artifacts_value)
     roles = [artifact.role for artifact in artifacts]
     if len(artifacts) != 3 or frozenset(roles) != EXPECTED_ROLES:
-        raise LocalValidationError("Manifest must contain exactly one artifact per role")
+        raise LocalValidationError(
+            "Manifest must contain exactly one artifact per role"
+        )
     if len(roles) != len(set(roles)):
-        raise LocalValidationError("Manifest must contain exactly one artifact per role")
+        raise LocalValidationError(
+            "Manifest must contain exactly one artifact per role"
+        )
 
     files = [file for artifact in artifacts for file in artifact.files]
     if len(files) > MAX_MANIFEST_FILES:

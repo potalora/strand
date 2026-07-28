@@ -33,6 +33,21 @@ Three things, and all three are needed for a working restore:
 2. **The uploads directory** (native: `data/uploads`, the `UPLOAD_DIR` setting; containerized: the `uploads` named volume mounted at `/data`). Holds the original uploaded files.
 3. **The secrets**, above all `DATABASE_ENCRYPTION_KEY`. Stored separately, with its own protection.
 
+Strict-local page checkpoints, extraction evidence, typed summaries, and their
+immutable processing provenance are stored in Postgres. They are covered by
+item 1 and require the same `DATABASE_ENCRYPTION_KEY` as the other encrypted
+clinical fields.
+
+The optional local model directory (`LOCAL_AI_MODEL_DIR`) is not a required
+backup. Model artifacts contain no PHI and can be downloaded again from the
+exact immutable lock. Excluding them keeps the 9.02 GiB shipped Apple pack out
+of each backup. After a restore, reinstall and verify that exact pack before
+enabling validated strict-local processing.
+
+Do not back up `LOCAL_AI_SCRATCH_DIR`. It contains short-lived plaintext only
+while a local job runs. Stop processing before a backup and let startup cleanup
+remove any abandoned job directories.
+
 The Redis instance does not need backing up. It holds transient job state, not source data.
 
 ## Backup procedure

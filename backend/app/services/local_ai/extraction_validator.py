@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import json
 import re
 import weakref
@@ -92,6 +93,7 @@ _TOKEN_RE = re.compile(
     """,
     re.UNICODE | re.VERBOSE,
 )
+_HTML_MARKUP_RE = re.compile(r"(?:</?[A-Za-z][^>]*>\s*)+")
 _FAMILY_RE = re.compile(
     r"\b(?:family history|family hx|fhx|mother|father|sister|brother|"
     r"daughters?|sons?|child|children|husbands?|spouses?|wife|wives|"
@@ -124,6 +126,18 @@ _PERFORMED_RE = re.compile(
     r"(?:\b(?:s/p|status post|underwent|performed|post-?op|history of|removed|"
     r"resection|excision|completed|done on|biopsy)\b|"
     r"\b\w+(?:ectomy|otomy|ostomy|oplasty|plasty)\b)",
+    re.IGNORECASE,
+)
+_STRICT_LOCAL_NON_PROMOTABLE_ASSERTIONS = frozenset(
+    {
+        AssertionState.NEGATED,
+        AssertionState.UNCERTAIN,
+        AssertionState.MENTIONED_NOT_PERFORMED,
+    }
+)
+_STRICT_LOCAL_DIAGNOSTIC_ANCHOR_RE = re.compile(
+    r"\b(?:report|study|imaging|radiology|pathology|impression|findings?|"
+    r"interpretation|ct|mri|ultrasound|x[- ]?ray)\b",
     re.IGNORECASE,
 )
 _NON_FACTUAL_CLAIM_RE = re.compile(
@@ -163,7 +177,7 @@ _NUMERIC_UNIT_PAIRS: dict[str, tuple[tuple[str, str], ...]] = {
     "vital_signs": (("value", "unit"),),
 }
 _UNIT_SUFFIX_RE = re.compile(
-    r"\s*(?P<unit>%|[^\W\d_][\w%./\u00b5\u03bc\u00b7^+-]*)",
+    r"\s*(?:\|\s*)?(?P<unit>%|[^\W\d_][\w%./\u00b5\u03bc\u00b7^+-]*)",
     re.UNICODE,
 )
 _NON_UNIT_WORDS = frozenset(
@@ -554,6 +568,13 @@ def _locator_text(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
+def _semantic_source_text(value: str) -> str:
+    """Decode OCR HTML markup for grounding without changing stored evidence."""
+
+    without_tags = _HTML_MARKUP_RE.sub(" | ", value)
+    return html.unescape(without_tags)
+
+
 def _tokens(value: str) -> list[str]:
     replacements = str.maketrans(
         {
@@ -566,7 +587,7 @@ def _tokens(value: str) -> list[str]:
     )
     return [
         re.sub(r"\s+", "", token.translate(replacements)).casefold()
-        for token in _TOKEN_RE.findall(value)
+        for token in _TOKEN_RE.findall(_semantic_source_text(value))
     ]
 
 
@@ -618,7 +639,7 @@ def _unit_pattern(unit: str) -> re.Pattern[str]:
         for piece in pieces
         if piece
     )
-    return re.compile(rf"\s*{body}(?![\w%])", re.IGNORECASE)
+    return re.compile(rf"\s*(?:\|\s*)?{body}(?![\w%])", re.IGNORECASE)
 
 
 def _validate_numeric_unit_pair(
@@ -631,20 +652,23 @@ def _validate_numeric_unit_pair(
     value = getattr(fact, value_field, None)
     if value is None or _NUMERIC_VALUE_RE.fullmatch(value) is None:
         return
-    matches = list(_iter_exact_numeric_matches(fact.verbatim, value))
+    semantic_verbatim = _semantic_source_text(fact.verbatim)
+    matches = list(_iter_exact_numeric_matches(semantic_verbatim, value))
     if not matches:
         _fail(f"{path}.{value_field}", "numeric form is not exactly grounded")
     unit = getattr(fact, unit_field, None)
     if unit is not None:
         unit_pattern = _unit_pattern(unit)
-        if not any(unit_pattern.match(fact.verbatim, match.end()) for match in matches):
+        if not any(
+            unit_pattern.match(semantic_verbatim, match.end()) for match in matches
+        ):
             _fail(
                 f"{path}.{unit_field}",
                 "unit must be adjacent to its numeric source value",
             )
         return
     for match in matches:
-        suffix = _UNIT_SUFFIX_RE.match(fact.verbatim, match.end())
+        suffix = _UNIT_SUFFIX_RE.match(semantic_verbatim, match.end())
         if suffix is None:
             continue
         candidate = suffix.group("unit")
@@ -898,7 +922,7 @@ def _subject_is_negated(source: str, subject: str) -> bool:
     if subject_pattern is None:
         return False
     before = re.compile(
-        rf"\b(?:no(?:\s+evidence\s+of)?|without|denies?|denied|"
+        rf"\b(?:no(?:\s+(?:evidence|recurrence)\s+of)?|without|denies?|denied|"
         rf"negative\s+for|ruled?\s+out|absence\s+of)\s+(?:the\s+)?"
         rf"{subject_pattern}",
         re.IGNORECASE,
@@ -937,7 +961,7 @@ def _subject_has_prefix_negation(source: str, subject: str) -> bool:
         return False
     return (
         re.search(
-            rf"\b(?:no(?:\s+evidence\s+of)?|without|denies?|denied|"
+            rf"\b(?:no(?:\s+(?:evidence|recurrence)\s+of)?|without|denies?|denied|"
             rf"negative\s+for|ruled?\s+out|absence\s+of)\s+(?:the\s+)?"
             rf"{subject_pattern}",
             source,
@@ -1130,6 +1154,41 @@ def _validate_local_precision_guards(
         )
 
 
+def _validate_strict_local_promotion(
+    fact: EvidenceFact,
+    category: str,
+    path: str,
+) -> None:
+    """Reject worker output that is grounded but not promotable as a local record."""
+
+    assertion = getattr(fact, "assertion", None)
+    if assertion in _STRICT_LOCAL_NON_PROMOTABLE_ASSERTIONS:
+        _fail(
+            f"{path}.assertion", "grounded fact is not promotable in strict-local mode"
+        )
+    if category != "diagnostic_reports":
+        return
+    findings = getattr(fact, "findings", None)
+    interpretation = getattr(fact, "interpretation", None)
+    context = " ".join(
+        item
+        for item in (
+            getattr(fact, "name", None),
+            fact.verbatim,
+            fact.evidence_excerpt,
+        )
+        if isinstance(item, str)
+    )
+    if (
+        not any(
+            isinstance(item, str) and item.strip()
+            for item in (findings, interpretation)
+        )
+        or _STRICT_LOCAL_DIAGNOSTIC_ANCHOR_RE.search(context) is None
+    ):
+        _fail(path, "diagnostic report is not promotable in strict-local mode")
+
+
 def _unit_is_truncated(source: str, unit: str) -> bool:
     normalized_source = _locator_text(source)
     normalized_unit = _locator_text(unit)
@@ -1287,6 +1346,7 @@ def _validate_clinical_extraction(
     pages: Mapping[int, str],
     *,
     upload_id: str,
+    strict_local: bool = False,
 ) -> ClinicalDocumentExtraction:
     """Strictly parse and ground a complete NuExtract clinical document result."""
     if (
@@ -1352,6 +1412,8 @@ def _validate_clinical_extraction(
                     )
             _validate_assertion_guards(fact, category, path)
             _validate_local_precision_guards(fact, category, path)
+            if strict_local:
+                _validate_strict_local_promotion(fact, category, path)
             _validate_lifecycle_status(fact, category, path)
             fact._evidence_id = record.id
             fact._evidence_start_offset = record.start_offset
@@ -1376,11 +1438,13 @@ def _make_validation_api():
         pages: Mapping[int, str],
         *,
         upload_id: str,
+        strict_local: bool = False,
     ) -> ClinicalDocumentExtraction:
         extraction = _validate_clinical_extraction(
             raw,
             pages,
             upload_id=upload_id,
+            strict_local=strict_local,
         )
         object_id = id(extraction)
 

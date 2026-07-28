@@ -1,11 +1,11 @@
 """Tests for CDA-to-FHIR parser."""
+
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-import pytest
 
 from app.services.ingestion.cda_parser import parse_cda_document
 
@@ -17,6 +17,7 @@ DOC0002 = FIXTURES_DIR / "DOC0002.XML"
 @dataclass
 class FakeXDMDocument:
     """Stand-in for XDMDocument used in tests."""
+
     uri: str
     hash: str
     size: int

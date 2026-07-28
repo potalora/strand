@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
@@ -33,6 +40,14 @@ import {
   type ProviderTestResult,
   type OcrNotice,
 } from "@/lib/api";
+import {
+  completeEffectiveRouting,
+  completeProviderRouting,
+  createSerializedRoutingSaver,
+  isConfiguredCloudProvider,
+  isCustomLocalProvider,
+  selectProviderForMode,
+} from "@/lib/llm-routing";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { useUserStore } from "@/stores/useUserStore";
 import { usePreferencesStore } from "@/stores/usePreferencesStore";
@@ -58,6 +73,13 @@ import { RetroBadge } from "@/components/retro/RetroBadge";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
 import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
 import { OcrNotices } from "@/components/retro/OcrNotices";
+import { AiSettingsCard } from "@/components/admin/AiSettingsCard";
+import { LocalProcessingDetails } from "@/components/retro/LocalProcessingDetails";
+import type { ProgressDetail } from "@/lib/extraction-progress";
+import type {
+  LocalProcessingFailure,
+  LocalRunInfo,
+} from "@/types/local-ai";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const fmtDate = (s: string | null | undefined) => {
@@ -203,8 +225,12 @@ interface ExtractionFile {
   file_size_bytes: number | null;
   created_at: string | null;
   ingestion_status?: string;
+  progress_stage?: string | null;
+  progress_detail?: ProgressDetail | null;
   // Per-file OCR provider notices (fallback/unreadable). Default [].
   notices?: OcrNotice[];
+  local_run?: LocalRunInfo | null;
+  local_failure?: LocalProcessingFailure | null;
 }
 
 const EXTRACTION_STATUS_HUE: Record<string, string> = {
@@ -389,6 +415,12 @@ function ExtractionsTab() {
                   <td className="desc">
                     {file.filename}
                     <OcrNotices notices={file.notices} />
+                    <LocalProcessingDetails
+                      compact
+                      localRun={file.local_run}
+                      failure={file.local_failure}
+                      progressDetail={file.progress_detail}
+                    />
                   </td>
                   <td className="num" style={{ textTransform: "uppercase" }}>
                     {ext || "—"}
@@ -2124,8 +2156,10 @@ function SystemTab() {
         </div>
       </div>
 
-      {/* AI providers */}
-      <LlmProvidersCard />
+      {/* Local pack plus custom/cloud providers */}
+      <AiSettingsCard>
+        <LlmProvidersCard />
+      </AiSettingsCard>
 
       {/* Your data, your control */}
       <div className="card-surface pad" style={{ marginBottom: 18 }}>
@@ -2133,9 +2167,15 @@ function SystemTab() {
           Your data, your control
         </h3>
         <p className="h-sub" style={{ margin: "0 0 16px" }}>
-          Export everything in an open format, or sign out of this device. All health data is stored
-          locally and encrypted at rest; it only leaves your device when you explicitly request an AI
-          summary or document extraction, and only after de-identification.
+          Export everything in an open format, or sign out of this device. Patient
+          identifiers, clinical records, source files, and stored AI payloads use
+          application-layer encryption. Keep full-disk encryption enabled because
+          plaintext exists in process memory and short-lived processing files.
+          Validated strict-local processing does not construct or call a cloud
+          provider, and it has no cloud fallback. In cloud-assisted mode, PDF and
+          TIFF OCR sends the original unredacted document or pages to the selected
+          vision provider before text exists to scrub. Later cloud calls receive
+          best-effort de-identified text or records.
         </p>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <button className="btn" onClick={handleExport} disabled={exporting}>
@@ -2219,11 +2259,24 @@ const OP_COPY: Record<string, string> = {
   default: "Used for any operation without its own override below.",
   summary: "Writes your health summaries.",
   extraction: "Pulls clinical entities from uploaded documents.",
-  vision:
-    "Reads text from scanned PDFs and images. If a provider declines a document " +
-    "(e.g. content policy), Strand automatically tries your next configured provider.",
+  vision: "Reads text from scanned PDFs and images in cloud-assisted mode.",
   dedup: "Decides whether two records are the same.",
   section: "Splits long notes into sections before extraction.",
+};
+
+const MODE_COPY: Record<string, string> = {
+  validated_strict_local:
+    "Uses only the downloaded, hash-verified OvisOCR2, NuExtract3, and Qwen pack. " +
+    "A local failure stays local; there is no cloud fallback.",
+  custom_local:
+    "Uses your loopback Ollama or LM Studio server. This route is local but is not " +
+    "part of the validated model pack or its fidelity and memory gates.",
+  cloud_assisted:
+    "Scanned PDF and TIFF pages are sent to the vision provider before text can be " +
+    "de-identified. Later provider calls use best-effort de-identification. Medical " +
+    "content leaves this machine in this mode.",
+  prompt_only:
+    "Builds a de-identified prompt for you to copy. Strand does not call a model.",
 };
 
 // Where each cloud provider issues API keys. Local providers (Ollama, LM Studio)
@@ -2240,7 +2293,9 @@ const PROVIDER_KEY_URLS: Record<string, string> = {
 // select sits above it). `vision` and `section` are model-only knobs.
 const ADVANCED_OPS = ["summary", "extraction", "vision", "dedup", "section"] as const;
 
-type RoutingOp = "default" | "extraction_engine" | (typeof ADVANCED_OPS)[number];
+type RoutingOp =
+  | "default"
+  | (typeof ADVANCED_OPS)[number];
 type TestState = ProviderTestResult | { pending: true };
 
 function LlmProvidersCard() {
@@ -2251,14 +2306,30 @@ function LlmProvidersCard() {
   const [urlDrafts, setUrlDrafts] = useState<Record<string, string>>({});
   const [modelDrafts, setModelDrafts] = useState<Record<string, string>>({});
   const [tests, setTests] = useState<Record<string, TestState>>({});
+  const [strictPackReady, setStrictPackReady] = useState(false);
+  const [routingError, setRoutingError] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const routingSaves = useRef(createSerializedRoutingSaver(saveRouting));
+  const processingMode = settings?.routing?.processing_mode ?? null;
 
   const reload = useCallback(async () => {
+    setLoading(true);
+    setSettingsError(null);
+    setSettings(null);
     try {
       const data = await getLlmSettings();
+      if (
+        !data?.routing ||
+        !Array.isArray(data.providers) ||
+        !MODE_COPY[data.routing.processing_mode]
+      ) {
+        throw new Error("Invalid AI provider settings response.");
+      }
+      routingSaves.current.reset();
       setSettings(data);
     } catch {
-      // Fail soft: leave whatever we had; the card degrades to a note.
-      setSettings((prev) => prev);
+      setSettings(null);
+      setSettingsError("AI provider settings are unavailable right now.");
     } finally {
       setLoading(false);
     }
@@ -2268,13 +2339,94 @@ function LlmProvidersCard() {
     void reload();
   }, [reload]);
 
-  const onRoutingChange = async (op: RoutingOp, value: string) => {
-    setSettings((s) => (s ? { ...s, routing: { ...s.routing, [op]: value } } : s));
+  useEffect(() => {
+    const onPackStatus = (event: Event) => {
+      const pack = (event as CustomEvent<{ state?: string }>).detail;
+      setStrictPackReady(pack?.state === "ready");
+    };
+    window.addEventListener("medtimeline:local-pack-status", onPackStatus);
+    api
+      .getLocalPackStatus()
+      .then((pack) => setStrictPackReady(pack.state === "ready"))
+      .catch(() => setStrictPackReady(false));
+    return () =>
+      window.removeEventListener("medtimeline:local-pack-status", onPackStatus);
+  }, []);
+
+  const persistRouting = async (
+    body: ReturnType<typeof completeEffectiveRouting>
+  ) => {
+    setRoutingError(null);
+    setSettings((current) =>
+      current
+        ? {
+            ...current,
+            routing: { ...current.routing, ...body } as LlmRouting,
+          }
+        : current
+    );
+    const ticket = routingSaves.current.enqueue(body);
     try {
-      await saveRouting({ [op]: value });
+      await ticket.promise;
     } catch {
-      void reload();
+      if (!ticket.isLatest()) return;
+      setRoutingError("Could not save the selected AI processing routes.");
+      setSettings(null);
+      setSettingsError(
+        "AI provider settings are unavailable right now."
+      );
     }
+  };
+
+  const onModeChange = async (mode: string) => {
+    if (!settings) return;
+    if (mode === "custom_local" || mode === "cloud_assisted") {
+      const selected = selectProviderForMode(
+        settings.providers,
+        settings.routing,
+        mode
+      );
+      if (!selected) {
+        setRoutingError(
+          mode === "custom_local"
+            ? "Configure an enabled loopback Ollama or LM Studio provider first."
+            : "Configure and enable a cloud provider first."
+        );
+        return;
+      }
+      await persistRouting(
+        completeProviderRouting(settings.routing, selected.name, mode)
+      );
+      return;
+    }
+    await persistRouting({
+      ...completeEffectiveRouting(settings.routing, {}),
+      processing_mode: mode as LlmRouting["processing_mode"],
+    });
+  };
+
+  const onRoutingChange = async (op: RoutingOp, value: string) => {
+    if (!settings) return;
+    const selected = settings.providers.find(
+      (provider) => provider.name === value
+    );
+    const validForMode =
+      processingMode === "custom_local"
+        ? selected && isCustomLocalProvider(selected)
+        : processingMode === "cloud_assisted"
+          ? selected && isConfiguredCloudProvider(selected)
+          : selected;
+    if (!validForMode) {
+      setRoutingError("The selected provider is not valid for this processing mode.");
+      return;
+    }
+    const body =
+      op === "default" &&
+      (processingMode === "custom_local" ||
+        processingMode === "cloud_assisted")
+        ? completeProviderRouting(settings.routing, value, processingMode)
+        : completeEffectiveRouting(settings.routing, { [op]: value });
+    await persistRouting(body);
   };
 
   const onSaveKey = async (name: string) => {
@@ -2343,9 +2495,18 @@ function LlmProvidersCard() {
   };
 
   const providerOptions = (providers: LlmProviderInfo[]) =>
-    providers.map((p) => (
-      // Cloud options without a key are unselectable; local options always work.
-      <option key={p.name} value={p.name} disabled={!p.is_local && !p.configured}>
+    providers
+      .filter((provider) => {
+        if (processingMode === "custom_local") {
+          return isCustomLocalProvider(provider);
+        }
+        if (processingMode === "cloud_assisted") {
+          return isConfiguredCloudProvider(provider);
+        }
+        return provider.enabled;
+      })
+      .map((p) => (
+      <option key={p.name} value={p.name}>
         {p.name} · {p.model || "(default)"}
       </option>
     ));
@@ -2371,31 +2532,85 @@ function LlmProvidersCard() {
     );
   };
 
+  const providerRoutingDisabled =
+    processingMode === "validated_strict_local" ||
+    processingMode === "prompt_only";
+
   return (
     <div className="card-surface pad" style={{ marginBottom: 18 }}>
       <h3 className="sec-title" style={{ marginBottom: 6 }}>
         AI providers
       </h3>
       <p className="muted" style={{ fontSize: 13, lineHeight: 1.55, margin: "0 0 10px" }}>
-        Strand can use different AI providers for the features below. Add an API key
-        (or point at a local server) for each provider you want, choose which one
-        runs each task, then Test the connection. Keys are encrypted and stored only
-        on this server — never shown again or sent anywhere except the provider you
-        pick. Cloud providers receive only de-identified records; local providers
-        (Ollama, LM Studio) keep everything on this machine.
+        Choose how medical content is processed first. Cloud vision OCR receives
+        original scanned PDF and TIFF pages; later cloud calls receive best-effort
+        de-identified text. Ollama and LM Studio are loopback-only custom routes and
+        are not covered by the validated pack&apos;s model, fidelity, or memory checks.
+        Stored API keys use application-layer encryption and are never shown again.
       </p>
 
       {loading ? (
         <RetroLoadingState text="Loading AI providers" />
-      ) : !settings || !settings.routing || !settings.providers ? (
+      ) : settingsError || !settings || !settings.routing || !settings.providers ? (
         // Guard against a partial/malformed /settings/llm response (e.g. a
         // degraded backend returning {}): a missing routing/providers must
         // degrade to this note, never throw and take down the whole Admin page.
-        <p className="muted" style={{ fontSize: 13.5, padding: "12px 0", margin: 0 }}>
-          AI provider settings are unavailable right now.
-        </p>
+        <div role="alert" style={{ padding: "12px 0" }}>
+          <p className="muted" style={{ fontSize: 13.5, margin: 0 }}>
+            {settingsError ?? "AI provider settings are unavailable right now."}
+          </p>
+          <button
+            type="button"
+            className="btn ghost sm"
+            style={{ marginTop: 12 }}
+            onClick={() => void reload()}
+          >
+            Retry AI provider settings
+          </button>
+        </div>
       ) : (
         <>
+          <div
+            className="field"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 16,
+            }}
+          >
+            <div>
+              <div className="field-l" style={{ marginBottom: 6 }}>
+                Processing mode
+              </div>
+              <div className="field-v" style={{ padding: 0, maxWidth: 620 }}>
+                {MODE_COPY[settings.routing.processing_mode]}
+              </div>
+            </div>
+            <select
+              className="selectbox"
+              aria-label="Processing mode"
+              value={settings.routing.processing_mode}
+              onChange={(e) => void onModeChange(e.target.value)}
+            >
+              <option
+                value="validated_strict_local"
+                disabled={!strictPackReady}
+              >
+                Validated strict local
+              </option>
+              <option value="custom_local">Custom local (unverified)</option>
+              <option value="cloud_assisted">Cloud assisted</option>
+              <option value="prompt_only">Prompt only</option>
+            </select>
+          </div>
+
+          {routingError && (
+            <p role="alert" style={{ color: "var(--danger)", fontSize: 13 }}>
+              {routingError}
+            </p>
+          )}
+
           {/* Routing — default provider */}
           <div
             className="field"
@@ -2418,6 +2633,7 @@ function LlmProvidersCard() {
               className="selectbox"
               aria-label="Default AI provider"
               value={settings.routing.default}
+              disabled={providerRoutingDisabled}
               onChange={(e) => onRoutingChange("default", e.target.value)}
             >
               {providerOptions(settings.providers)}
@@ -2468,6 +2684,7 @@ function LlmProvidersCard() {
                     className="selectbox"
                     aria-label={`${op} provider`}
                     value={settings.routing[op as keyof LlmRouting]}
+                    disabled={providerRoutingDisabled}
                     onChange={(e) => onRoutingChange(op, e.target.value)}
                   >
                     {providerOptions(settings.providers)}
@@ -2475,39 +2692,6 @@ function LlmProvidersCard() {
                 </div>
               ))}
 
-              {/* Extraction engine — local vs cloud, paired with the extraction
-                  provider select above (engine = local-vs-cloud; provider = which
-                  cloud). */}
-              <div
-                className="field"
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 16,
-                }}
-              >
-                <div>
-                  <div className="field-l" style={{ marginBottom: 6 }}>
-                    Extraction engine
-                  </div>
-                  <div className="field-v" style={{ padding: 0 }}>
-                    On-device keeps records on this machine. Hybrid sends only the
-                    hard sections to the cloud extraction provider. Cloud sends
-                    de-identified text to it.
-                  </div>
-                </div>
-                <select
-                  className="selectbox"
-                  aria-label="Extraction engine"
-                  value={settings.routing.extraction_engine || "hybrid"}
-                  onChange={(e) => onRoutingChange("extraction_engine", e.target.value)}
-                >
-                  <option value="local">On-device (private)</option>
-                  <option value="hybrid">Hybrid (local + cloud escalation)</option>
-                  <option value="gemini">Cloud</option>
-                </select>
-              </div>
             </div>
           </details>
 
@@ -2534,7 +2718,9 @@ function LlmProvidersCard() {
                     >
                       {p.name}
                     </span>
-                    <span className="tag">{p.is_local ? "local" : "cloud"}</span>
+                    <span className="tag">
+                      {p.is_local ? "Custom local (unverified)" : "cloud"}
+                    </span>
                     {p.supports_vision && (
                       <span
                         className="tag"
@@ -2621,9 +2807,9 @@ function LlmProvidersCard() {
                     style={{ fontSize: 12, lineHeight: 1.5, margin: "8px 0 0" }}
                   >
                     {p.is_local ? (
-                      "Runs locally — no API key. Start the server, set the base URL, " +
-                      "and a model you've pulled (Ollama: ollama pull <model>) or " +
-                      "loaded (LM Studio)."
+                      "Loopback only. No API key is required. Start the server, set " +
+                      "its loopback base URL, and choose a model you've pulled in " +
+                      "Ollama or loaded in LM Studio. This custom route is unverified."
                     ) : p.name === "vertex" ? (
                       "Uses a Google Cloud project (Vertex AI) — configured in the " +
                       "server environment."

@@ -285,7 +285,7 @@ export default function RegisterPage() {
         <div className="auth-trust">
           <span className="secure mono">
             <Lock size={12} strokeWidth={2.25} />
-            End-to-end encrypted
+            Application-layer encrypted at rest
           </span>
           <span className="muted auth-trust-note">
             Only you can view your records.

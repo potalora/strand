@@ -33,6 +33,7 @@ from app.services.local_ai.manifest import (
     PACK_REVISION_RE,
     REPOSITORY_RE,
     SHA256_RE,
+    is_secret_shaped_manifest_text,
     load_manifest,
     manifest_path_suffix,
     safe_relative_manifest_path,
@@ -46,6 +47,9 @@ MAX_HF_METADATA_BYTES = 8 * 1024 * 1024
 MAX_JSON_METADATA_BYTES = 128 * 1024 * 1024
 MAX_JSON_STRUCTURE_DEPTH = 64
 MAX_JSON_STRUCTURE_NODES = 100_000
+MAX_STATIC_JSON_CONTAINERS = 500_000
+MAX_STATIC_JSON_ENTRIES = 2_000_000
+MAX_LICENSE_SOURCE_BYTES = 1024 * 1024
 CHUNK_BYTES = 1024 * 1024
 MIN_FREE_BYTES_AFTER_CACHE = 15 * 1024 * 1024 * 1024
 
@@ -63,27 +67,40 @@ _CANDIDATE_KEYS = frozenset(
     {
         "role",
         "repository",
+        "revision",
         "quantization",
         "license",
         "attribution",
         "decode_limits",
     }
 )
+_CANDIDATE_KEYS_WITH_LICENSE_SOURCE = _CANDIDATE_KEYS | {"license_source"}
+_LICENSE_SOURCE_KEYS = frozenset({"repository", "revision", "path", "sha256", "size"})
 _RUNTIME_KEYS = frozenset({"name", "version"})
 _DECODE_KEYS = frozenset({"max_input_tokens", "max_output_tokens"})
-_REMOTE_CODE_KEYS = frozenset(
-    {"auto_map", "requires_remote_code", "trust_remote_code"}
-)
+_REMOTE_CODE_KEYS = frozenset({"auto_map", "requires_remote_code", "trust_remote_code"})
+_STATIC_TOKENIZER_JSON_FILES = frozenset({"tokenizer.json", "vocab.json"})
+
+
+@dataclass(frozen=True)
+class LicenseSource:
+    repository: str
+    revision: str
+    path: str
+    sha256: str
+    size: int
 
 
 @dataclass(frozen=True)
 class Candidate:
     role: ModelRole
     repository: str
+    revision: str
     quantization: str
     license: str
     attribution: str
     decode_limits: dict[str, int]
+    license_source: LicenseSource | None
 
 
 @dataclass(frozen=True)
@@ -115,6 +132,8 @@ def _string(raw: dict[str, Any], key: str, context: str) -> str:
         or any(ord(character) < 32 for character in value)
     ):
         raise LocalValidationError(f"Candidate catalog {context} is invalid")
+    if is_secret_shaped_manifest_text(value):
+        raise LocalValidationError(f"Candidate catalog {context} is invalid")
     return value
 
 
@@ -122,7 +141,9 @@ def _load_catalog(path: Path) -> tuple[dict[str, Any], tuple[Candidate, ...]]:
     try:
         raw_value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
-        raise LocalValidationError("Candidate catalog could not be read as JSON") from exc
+        raise LocalValidationError(
+            "Candidate catalog could not be read as JSON"
+        ) from exc
 
     raw = _object(raw_value, _CATALOG_KEYS, "root")
     schema_version = raw.get("schema_version")
@@ -148,23 +169,90 @@ def _load_catalog(path: Path) -> tuple[dict[str, Any], tuple[Candidate, ...]]:
         raise LocalValidationError("Candidate catalog candidates are invalid")
     candidates: list[Candidate] = []
     for candidate_value in candidate_values:
-        item = _object(candidate_value, _CANDIDATE_KEYS, "candidate")
+        if not isinstance(candidate_value, dict) or set(candidate_value) not in {
+            _CANDIDATE_KEYS,
+            _CANDIDATE_KEYS_WITH_LICENSE_SOURCE,
+        }:
+            raise LocalValidationError("Candidate catalog candidate is invalid")
+        item = candidate_value
         role_value = item.get("role")
         if not isinstance(role_value, str):
             raise LocalValidationError("Candidate catalog model role is invalid")
         try:
             role = ModelRole(role_value)
         except ValueError as exc:
-            raise LocalValidationError("Candidate catalog model role is invalid") from exc
+            raise LocalValidationError(
+                "Candidate catalog model role is invalid"
+            ) from exc
 
         repository = _string(item, "repository", "repository")
         if REPOSITORY_RE.fullmatch(repository) is None:
             raise LocalValidationError("Candidate catalog repository is invalid")
+        revision = item.get("revision")
+        if not isinstance(revision, str) or COMMIT_RE.fullmatch(revision) is None:
+            raise LocalValidationError(
+                "Candidate catalog candidate revision is invalid"
+            )
         quantization = _string(item, "quantization", "quantization")
         license_name = _string(item, "license", "license").lower()
         if license_name not in ALLOWED_LICENSES:
             raise LocalValidationError("Candidate catalog license is not allowlisted")
         attribution = _string(item, "attribution", "attribution")
+        license_source: LicenseSource | None = None
+        if "license_source" in item:
+            source = _object(
+                item.get("license_source"),
+                _LICENSE_SOURCE_KEYS,
+                "license source",
+            )
+            source_repository = _string(
+                source,
+                "repository",
+                "license source repository",
+            )
+            if REPOSITORY_RE.fullmatch(source_repository) is None:
+                raise LocalValidationError(
+                    "Candidate catalog license source repository is invalid"
+                )
+            source_revision = source.get("revision")
+            if (
+                not isinstance(source_revision, str)
+                or COMMIT_RE.fullmatch(source_revision) is None
+            ):
+                raise LocalValidationError(
+                    "Candidate catalog license source revision is invalid"
+                )
+            try:
+                source_path = safe_relative_manifest_path(source.get("path"))
+            except LocalValidationError as exc:
+                raise LocalValidationError(
+                    "Candidate catalog license source path is invalid"
+                ) from exc
+            source_sha256 = source.get("sha256")
+            if (
+                not isinstance(source_sha256, str)
+                or SHA256_RE.fullmatch(source_sha256) is None
+            ):
+                raise LocalValidationError(
+                    "Candidate catalog license source SHA-256 is invalid"
+                )
+            source_size = source.get("size")
+            if (
+                not isinstance(source_size, int)
+                or isinstance(source_size, bool)
+                or source_size <= 0
+                or source_size > MAX_LICENSE_SOURCE_BYTES
+            ):
+                raise LocalValidationError(
+                    "Candidate catalog license source size is invalid"
+                )
+            license_source = LicenseSource(
+                repository=source_repository,
+                revision=source_revision,
+                path=source_path,
+                sha256=source_sha256,
+                size=source_size,
+            )
 
         decode_raw = _object(item.get("decode_limits"), _DECODE_KEYS, "decode limits")
         decode_limits: dict[str, int] = {}
@@ -176,16 +264,20 @@ def _load_catalog(path: Path) -> tuple[dict[str, Any], tuple[Candidate, ...]]:
                 or value <= 0
                 or value > 1_000_000
             ):
-                raise LocalValidationError("Candidate catalog decode limits are invalid")
+                raise LocalValidationError(
+                    "Candidate catalog decode limits are invalid"
+                )
             decode_limits[key] = value
         candidates.append(
             Candidate(
                 role=role,
                 repository=repository,
+                revision=revision,
                 quantization=quantization,
                 license=license_name,
                 attribution=attribution,
                 decode_limits=decode_limits,
+                license_source=license_source,
             )
         )
 
@@ -207,10 +299,7 @@ def _contains_remote_code_requirement(value: Any) -> bool:
     while stack:
         current, depth = stack.pop()
         nodes_seen += 1
-        if (
-            depth > MAX_JSON_STRUCTURE_DEPTH
-            or nodes_seen > MAX_JSON_STRUCTURE_NODES
-        ):
+        if depth > MAX_JSON_STRUCTURE_DEPTH or nodes_seen > MAX_JSON_STRUCTURE_NODES:
             raise LocalValidationError("Repository JSON structure exceeds safe limits")
         if isinstance(current, dict):
             for key, child in current.items():
@@ -222,11 +311,52 @@ def _contains_remote_code_requirement(value: Any) -> bool:
     return False
 
 
+def _static_json_contains_remote_code_requirement(value: Any) -> bool:
+    """Inspect static tokenizer data without counting every scalar as a node."""
+
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    containers_seen = 0
+    entries_seen = 0
+    while stack:
+        current, depth = stack.pop()
+        containers_seen += 1
+        if (
+            depth > MAX_JSON_STRUCTURE_DEPTH
+            or containers_seen > MAX_STATIC_JSON_CONTAINERS
+        ):
+            raise LocalValidationError("Repository JSON structure exceeds safe limits")
+        if isinstance(current, dict):
+            entries_seen += len(current)
+            if entries_seen > MAX_STATIC_JSON_ENTRIES:
+                raise LocalValidationError(
+                    "Repository JSON structure exceeds safe limits"
+                )
+            for key, child in current.items():
+                if key in _REMOTE_CODE_KEYS and child not in (None, False, {}, []):
+                    return True
+                if isinstance(child, (dict, list)):
+                    stack.append((child, depth + 1))
+        elif isinstance(current, list):
+            entries_seen += len(current)
+            if entries_seen > MAX_STATIC_JSON_ENTRIES:
+                raise LocalValidationError(
+                    "Repository JSON structure exceeds safe limits"
+                )
+            stack.extend(
+                (child, depth + 1)
+                for child in current
+                if isinstance(child, (dict, list))
+            )
+    return False
+
+
 def _metadata_json(
     client: httpx.Client,
     candidate: Candidate,
 ) -> dict[str, Any]:
-    url = f"{HF_BASE_URL}/api/models/{candidate.repository}/revision/main"
+    url = (
+        f"{HF_BASE_URL}/api/models/{candidate.repository}/revision/{candidate.revision}"
+    )
     try:
         with client.stream("GET", url, params={"blobs": "true"}) as response:
             response.raise_for_status()
@@ -261,7 +391,9 @@ def _metadata_json(
     try:
         value = json.loads(content)
     except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
-        raise LocalValidationError("Hugging Face repository metadata is invalid") from exc
+        raise LocalValidationError(
+            "Hugging Face repository metadata is invalid"
+        ) from exc
     if not isinstance(value, dict):
         raise LocalValidationError("Hugging Face repository metadata is invalid")
     return value
@@ -271,7 +403,9 @@ def _metadata_path(value: Any) -> str:
     try:
         return safe_relative_manifest_path(value)
     except LocalValidationError as exc:
-        raise LocalValidationError("Repository metadata contains an unsafe path") from exc
+        raise LocalValidationError(
+            "Repository metadata contains an unsafe path"
+        ) from exc
 
 
 def _validate_repository_metadata(
@@ -280,18 +414,27 @@ def _validate_repository_metadata(
 ) -> RepositoryPlan:
     revision = metadata.get("sha")
     if not isinstance(revision, str) or COMMIT_RE.fullmatch(revision) is None:
-        raise LocalValidationError("Repository did not resolve to an immutable revision")
+        raise LocalValidationError(
+            "Repository did not resolve to an immutable revision"
+        )
+    if revision != candidate.revision:
+        raise LocalValidationError(
+            "Repository does not match the pinned candidate revision"
+        )
     if _contains_remote_code_requirement(metadata):
         raise LocalValidationError("Repository metadata requires remote code")
 
     card_data = metadata.get("cardData")
-    if not isinstance(card_data, dict):
+    metadata_license = card_data.get("license") if isinstance(card_data, dict) else None
+    if not isinstance(metadata_license, str) and candidate.license_source is None:
         raise LocalValidationError("Repository license metadata is missing")
-    metadata_license = card_data.get("license")
-    if not isinstance(metadata_license, str):
-        raise LocalValidationError("Repository license metadata is missing")
-    if metadata_license.lower() != candidate.license:
-        raise LocalValidationError("Repository license metadata does not match the catalog")
+    if (
+        isinstance(metadata_license, str)
+        and metadata_license.lower() != candidate.license
+    ):
+        raise LocalValidationError(
+            "Repository license metadata does not match the catalog"
+        )
 
     siblings = metadata.get("siblings")
     if not isinstance(siblings, list) or not siblings:
@@ -322,7 +465,9 @@ def _validate_repository_metadata(
         if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
             raise LocalValidationError("Repository file size metadata is unresolved")
         if size > MAX_MANIFEST_FILE_BYTES:
-            raise LocalValidationError("Repository file exceeds the configured size limit")
+            raise LocalValidationError(
+                "Repository file exceeds the configured size limit"
+            )
         if suffix == ".json" and size > MAX_JSON_METADATA_BYTES:
             raise LocalValidationError(
                 "Repository JSON metadata exceeds the inspection limit"
@@ -375,7 +520,9 @@ def _resolve_all_metadata(
     )
     files = [file for plan in plans for file in plan.files]
     if len(files) > MAX_MANIFEST_FILES:
-        raise LocalValidationError("Candidate pack file count exceeds the configured limit")
+        raise LocalValidationError(
+            "Candidate pack file count exceeds the configured limit"
+        )
     if sum(file.size for file in files) > MAX_MANIFEST_PACK_BYTES:
         raise LocalValidationError("Candidate pack size exceeds the configured limit")
     return plans
@@ -393,12 +540,65 @@ def _require_validation_cache_capacity(
         )
 
 
+def _license_source_url(source: LicenseSource) -> str:
+    path = quote(source.path, safe="/")
+    return f"{HF_BASE_URL}/{source.repository}/resolve/{source.revision}/{path}"
+
+
+def _verify_license_source(
+    client: httpx.Client,
+    candidate: Candidate,
+) -> None:
+    source = candidate.license_source
+    if source is None:
+        return
+    digest = hashlib.sha256()
+    count = 0
+    try:
+        with client.stream("GET", _license_source_url(source)) as response:
+            response.raise_for_status()
+            declared_length = response.headers.get("Content-Length")
+            if declared_length is not None:
+                try:
+                    declared_bytes = int(declared_length)
+                except ValueError as exc:
+                    raise LocalValidationError(
+                        "License attestation Content-Length is invalid"
+                    ) from exc
+                if declared_bytes != source.size:
+                    raise LocalValidationError(
+                        "License attestation size does not match the catalog"
+                    )
+            for chunk in response.iter_bytes(CHUNK_BYTES):
+                if not chunk:
+                    continue
+                count += len(chunk)
+                if count > source.size or count > MAX_LICENSE_SOURCE_BYTES:
+                    raise LocalValidationError(
+                        "License attestation exceeds the catalog size"
+                    )
+                digest.update(chunk)
+    except LocalValidationError:
+        raise
+    except httpx.HTTPError as exc:
+        raise LocalValidationError("License attestation request failed") from exc
+    if count != source.size or digest.hexdigest() != source.sha256:
+        raise LocalValidationError("License attestation does not match the catalog")
+
+
+def _locked_attribution(candidate: Candidate) -> str:
+    source = candidate.license_source
+    if source is None:
+        return candidate.attribution
+    return (
+        f"{candidate.attribution}; license-source={_license_source_url(source)}; "
+        f"license-sha256={source.sha256}"
+    )
+
+
 def _download_url(plan: RepositoryPlan, file: RepositoryFile) -> str:
     path = quote(file.path, safe="/")
-    return (
-        f"{HF_BASE_URL}/{plan.candidate.repository}/resolve/"
-        f"{plan.revision}/{path}"
-    )
+    return f"{HF_BASE_URL}/{plan.candidate.repository}/resolve/{plan.revision}/{path}"
 
 
 def _stream_file(
@@ -451,7 +651,9 @@ def _stream_file(
     return {"path": file.path, "sha256": sha256, "size": count}
 
 
-def _json_metadata_files(plans: tuple[RepositoryPlan, ...]) -> Iterator[tuple[int, int]]:
+def _json_metadata_files(
+    plans: tuple[RepositoryPlan, ...],
+) -> Iterator[tuple[int, int]]:
     for plan_index, plan in enumerate(plans):
         for file_index, file in enumerate(plan.files):
             if manifest_path_suffix(file.path) == ".json":
@@ -460,12 +662,25 @@ def _json_metadata_files(plans: tuple[RepositoryPlan, ...]) -> Iterator[tuple[in
 
 def _inspect_downloaded_json(path: Path, expected_size: int) -> None:
     if expected_size > MAX_JSON_METADATA_BYTES:
-        raise LocalValidationError("Repository JSON metadata exceeds the inspection limit")
+        raise LocalValidationError(
+            "Repository JSON metadata exceeds the inspection limit"
+        )
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise LocalValidationError("Repository JSON metadata is invalid") from exc
-    if _contains_remote_code_requirement(value):
+    # Tokenizer/vocabulary tables commonly contain hundreds of thousands of
+    # static data nodes. They remain byte-bounded, hash-pinned, and JSON-decoded
+    # above, but recursively walking them as executable configuration would
+    # reject current safe tokenizers. Configuration and model-index JSON
+    # (including tokenizer_config.json) still receive the full remote-code and
+    # structural inspection below.
+    contains_remote_code = (
+        _static_json_contains_remote_code_requirement(value)
+        if path.name in _STATIC_TOKENIZER_JSON_FILES
+        else _contains_remote_code_requirement(value)
+    )
+    if contains_remote_code:
         raise LocalValidationError("Repository configuration requires remote code")
 
 
@@ -518,6 +733,8 @@ def lock_catalog(catalog_path: Path, output_path: Path) -> int:
         # Phase 1 inspects every repository listing before requesting any file.
         plans = _resolve_all_metadata(client, candidates)
         _require_validation_cache_capacity(output_path.parent, plans)
+        for candidate in candidates:
+            _verify_license_source(client, candidate)
         bytes_seen = [0]
         with tempfile.TemporaryDirectory(
             prefix=".local-ai-lock-",
@@ -565,7 +782,7 @@ def lock_catalog(catalog_path: Path, output_path: Path) -> int:
                         "revision": plan.revision,
                         "quantization": plan.candidate.quantization,
                         "license": plan.candidate.license,
-                        "attribution": plan.candidate.attribution,
+                        "attribution": _locked_attribution(plan.candidate),
                         "decode_limits": plan.candidate.decode_limits,
                         "files": files,
                     }

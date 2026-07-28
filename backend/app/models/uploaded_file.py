@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    DDL,
+    event,
     ForeignKey,
+    inspect,
     Integer,
     String,
     Text,
@@ -18,6 +22,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 from app.models.encrypted_types import EncryptedJSON, EncryptedText
+from app.services.local_ai.errors import LocalValidationError
+
+_IMMUTABLE_PROCESSING_SNAPSHOT_FIELDS = (
+    "processing_mode",
+    "processing_manifest",
+    "processing_schema_version",
+)
 
 
 class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -37,7 +48,9 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     ingestion_progress: Mapped[dict] = mapped_column(JSONB, server_default="{}")
     ingestion_errors: Mapped[list] = mapped_column(JSONB, server_default="[]")
     record_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    total_file_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    total_file_count: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1"
+    )
     processing_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -63,8 +76,12 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # and the entities/sections/metadata derived from it — all clinical PHI,
     # fetch-and-render only, never SQL-queried.
     extracted_text: Mapped[str | None] = mapped_column(EncryptedText, nullable=True)
-    extraction_entities: Mapped[list | None] = mapped_column(EncryptedJSON, nullable=True)
-    extraction_sections: Mapped[dict | None] = mapped_column(EncryptedJSON, nullable=True)
+    extraction_entities: Mapped[list | None] = mapped_column(
+        EncryptedJSON, nullable=True
+    )
+    extraction_sections: Mapped[dict | None] = mapped_column(
+        EncryptedJSON, nullable=True
+    )
     document_metadata: Mapped[dict | None] = mapped_column(EncryptedJSON, nullable=True)
     dedup_summary: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
@@ -94,3 +111,73 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             name="uq_uploaded_files_id_user_id",
         ),
     )
+
+
+def _reject_persisted_processing_snapshot_changes(
+    _mapper: Any,
+    _connection: Any,
+    target: UploadedFile,
+) -> None:
+    """Keep the privacy mode and processing revision fixed after enqueue."""
+
+    state = inspect(target)
+    if any(
+        state.attrs[field].history.has_changes()
+        for field in _IMMUTABLE_PROCESSING_SNAPSHOT_FIELDS
+    ):
+        raise LocalValidationError("Upload processing snapshot is immutable")
+
+
+event.listen(
+    UploadedFile,
+    "before_update",
+    _reject_persisted_processing_snapshot_changes,
+)
+event.listen(
+    UploadedFile.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION enforce_uploaded_file_processing_snapshot()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NEW.processing_mode NOT IN (
+                'cloud_assisted',
+                'validated_strict_local'
+            ) THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    MESSAGE = 'upload processing mode is invalid';
+            END IF;
+            IF TG_OP = 'UPDATE'
+               AND (
+                    NEW.processing_mode IS DISTINCT FROM OLD.processing_mode
+                    OR NEW.processing_manifest IS DISTINCT FROM OLD.processing_manifest
+                    OR NEW.processing_schema_version
+                       IS DISTINCT FROM OLD.processing_schema_version
+               ) THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    MESSAGE = 'upload processing snapshot is immutable';
+            END IF;
+            RETURN NEW;
+        END;
+        $$
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    UploadedFile.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_uploaded_files_immutable_processing_snapshot
+        BEFORE INSERT OR UPDATE
+        ON uploaded_files
+        FOR EACH ROW
+        EXECUTE FUNCTION enforce_uploaded_file_processing_snapshot()
+        """
+    ).execute_if(dialect="postgresql"),
+)

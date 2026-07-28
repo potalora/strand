@@ -18,6 +18,7 @@ import { RetroLoadingState } from "./RetroLoadingState";
 import { FhirResourceRenderer } from "./FhirResourceRenderer";
 import { Sparkline } from "./DataViz";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { ExtractionEvidencePanel } from "./ExtractionEvidencePanel";
 import { AIExtractionBadge, AdvancedSection } from "./renderers/shared";
 import {
   transitionRecordDetailNavigation,
@@ -299,7 +300,10 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
 
               {/* 3. AI extraction info (conditional) */}
               {record.ai_extracted && (
-                <AIExtractionBadge aiExtracted={record.ai_extracted} confidenceScore={record.confidence_score} />
+                <>
+                  <AIExtractionBadge aiExtracted={record.ai_extracted} confidenceScore={record.confidence_score} />
+                  <ExtractionEvidencePanel recordId={record.id} enabled />
+                </>
               )}
 
               {/* 4. Metadata fields */}

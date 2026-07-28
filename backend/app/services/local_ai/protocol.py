@@ -82,6 +82,8 @@ class ProgressPayload(_StrictMessage):
     stage: ProgressStage
     current: Annotated[StrictInt, Field(ge=0)]
     total: Annotated[StrictInt, Field(ge=0)]
+    active_memory_bytes: Annotated[StrictInt, Field(ge=0, le=2**63 - 1)] | None = None
+    peak_memory_bytes: Annotated[StrictInt, Field(ge=0, le=2**63 - 1)] | None = None
 
     @model_validator(mode="after")
     def current_does_not_exceed_total(self) -> ProgressPayload:

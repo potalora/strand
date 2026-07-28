@@ -1,0 +1,122 @@
+{
+  "content_free": true,
+  "machine": {
+    "model": "Mac16,13",
+    "os_version": "27.0",
+    "physical_memory_bytes": 17179869184,
+    "platform_profile": "apple_silicon"
+  },
+  "manifest": {
+    "pack_revision": "apple-m4-16gb-v1",
+    "runtime_name": "mlx-vlm",
+    "runtime_version": "0.5.0",
+    "sha256": "d229b1e033539d3d4a537f178e318b2bc3c8aab26115f9704995e6dea265f27b"
+  },
+  "processes": {
+    "max_live_models": 1,
+    "roles_started": 9
+  },
+  "reclamation": {
+    "baseline_active_memory_bytes": 0,
+    "final_active_memory_bytes": 26,
+    "final_active_memory_ratio": 3.6610428944623497e-09,
+    "peak_active_memory_bytes": 7101801522
+  },
+  "roles": {
+    "extraction": [
+      {
+        "cold_start_seconds": 0.052076457999646664,
+        "duration_seconds": 14.543562750011915,
+        "mlx_active_memory_after_bytes": 10,
+        "mlx_peak_memory_bytes": 4726871414,
+        "peak_rss_bytes": 2313027584,
+        "run": 1,
+        "throughput_per_second": 0.13751788570502516
+      },
+      {
+        "cold_start_seconds": 0.052057541004614905,
+        "duration_seconds": 14.031898957997328,
+        "mlx_active_memory_after_bytes": 10,
+        "mlx_peak_memory_bytes": 4726871414,
+        "peak_rss_bytes": 3646193664,
+        "run": 2,
+        "throughput_per_second": 0.14253238324953316
+      },
+      {
+        "cold_start_seconds": 0.05206083299708553,
+        "duration_seconds": 14.077831875008997,
+        "mlx_active_memory_after_bytes": 10,
+        "mlx_peak_memory_bytes": 4726871414,
+        "peak_rss_bytes": 3684106240,
+        "run": 3,
+        "throughput_per_second": 0.14206733094677776
+      }
+    ],
+    "ocr": [
+      {
+        "cold_start_seconds": 0.052181333012413234,
+        "duration_seconds": 2.629985500010662,
+        "mlx_active_memory_after_bytes": 26,
+        "mlx_peak_memory_bytes": 857271090,
+        "peak_rss_bytes": 1213612032,
+        "run": 1,
+        "throughput_per_second": 7.2243744309324045
+      },
+      {
+        "cold_start_seconds": 0.05197641599806957,
+        "duration_seconds": 2.457199374999618,
+        "mlx_active_memory_after_bytes": 26,
+        "mlx_peak_memory_bytes": 864040434,
+        "peak_rss_bytes": 1212645376,
+        "run": 2,
+        "throughput_per_second": 7.732380283550639
+      },
+      {
+        "cold_start_seconds": 0.05119441598071717,
+        "duration_seconds": 2.524942332995124,
+        "mlx_active_memory_after_bytes": 26,
+        "mlx_peak_memory_bytes": 864040434,
+        "peak_rss_bytes": 1223000064,
+        "run": 3,
+        "throughput_per_second": 7.52492433261314
+      }
+    ],
+    "summary": [
+      {
+        "cold_start_seconds": 0.05206349998479709,
+        "duration_seconds": 31.165254333987832,
+        "mlx_active_memory_after_bytes": 10,
+        "mlx_peak_memory_bytes": 7101801522,
+        "peak_rss_bytes": 3002957824,
+        "run": 1,
+        "throughput_per_second": 0.03208701553606228
+      },
+      {
+        "cold_start_seconds": 0.052067415992496535,
+        "duration_seconds": 31.829169874981744,
+        "mlx_active_memory_after_bytes": 10,
+        "mlx_peak_memory_bytes": 7101801522,
+        "peak_rss_bytes": 2971631616,
+        "run": 2,
+        "throughput_per_second": 0.03141772166625108
+      },
+      {
+        "cold_start_seconds": 0.05208324998966418,
+        "duration_seconds": 31.232021417003125,
+        "mlx_active_memory_after_bytes": 10,
+        "mlx_peak_memory_bytes": 7101801522,
+        "peak_rss_bytes": 3011280896,
+        "run": 3,
+        "throughput_per_second": 0.0320184206666683
+      }
+    ]
+  },
+  "schema_version": 1,
+  "system": {
+    "memory_pressure_termination": false,
+    "sustained_swap_thrashing": false,
+    "swap_after_bytes": 5479270973,
+    "swap_before_bytes": 7273971712,
+    "swap_delta_bytes": 0
+  }
+}

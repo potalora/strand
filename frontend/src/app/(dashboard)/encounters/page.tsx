@@ -21,7 +21,7 @@ const fmtDate = (s: string | null) => {
 function SecureChip() {
   return (
     <span className="secure">
-      <Lock size={13} strokeWidth={1.9} /> End-to-end encrypted
+      <Lock size={13} strokeWidth={1.9} /> Application-layer encrypted at rest
     </span>
   );
 }

@@ -21,7 +21,9 @@ _SAFE_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 _SUPPORTED_SOURCE_SUFFIXES = frozenset({".pdf", ".rtf", ".tif", ".tiff"})
 _JOB_MARKER_NAME = ".medtimeline-local-ai-job-v1"
 _JOB_MARKER_CONTENT = b"MEDTIMELINE_LOCAL_AI_SCRATCH_V1\n"
-_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
 _FILE_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 _OPEN_FILE_FLAGS = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
 _DEFAULT_MAX_ACTIVE_JOBS = 10_000
@@ -58,10 +60,9 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
 
 
 def _same_entry(left: os.stat_result, right: os.stat_result) -> bool:
-    return (
-        _identity(left) == _identity(right)
-        and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
-    )
+    return _identity(left) == _identity(right) and stat.S_IFMT(
+        left.st_mode
+    ) == stat.S_IFMT(right.st_mode)
 
 
 def _open_secure_root(root: Path, *, create: bool) -> tuple[int, tuple[int, int]]:
@@ -129,7 +130,9 @@ def _remove_tree_contents(
                     continue
                 try:
                     opened = os.fstat(child_fd)
-                    if not stat.S_ISDIR(opened.st_mode) or not _same_entry(opened, info):
+                    if not stat.S_ISDIR(opened.st_mode) or not _same_entry(
+                        opened, info
+                    ):
                         complete = False
                         continue
                     child_complete = _remove_tree_contents(
@@ -299,7 +302,9 @@ class ScratchJob:
                 created = True
             except FileExistsError:
                 try:
-                    existing = os.stat(self.job_id, dir_fd=root_fd, follow_symlinks=False)
+                    existing = os.stat(
+                        self.job_id, dir_fd=root_fd, follow_symlinks=False
+                    )
                 except OSError:
                     existing = None
                 message = (
@@ -480,7 +485,9 @@ class ScratchJob:
         try:
             source_info = source.lstat()
         except OSError:
-            raise LocalValidationError("Local encrypted source is unavailable.") from None
+            raise LocalValidationError(
+                "Local encrypted source is unavailable."
+            ) from None
         if not stat.S_ISREG(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
             raise LocalValidationError("Local encrypted source is unsafe.")
 
@@ -494,10 +501,13 @@ class ScratchJob:
             opened_source = os.fstat(source_fd)
             if _identity(opened_source) != _identity(source_info):
                 os.close(source_fd)
-                raise LocalValidationError("Local encrypted source changed unexpectedly.")
-            with os.fdopen(source_fd, "rb", closefd=True) as encrypted, self.open_file(
-                filename
-            ) as plain:
+                raise LocalValidationError(
+                    "Local encrypted source changed unexpectedly."
+                )
+            with (
+                os.fdopen(source_fd, "rb", closefd=True) as encrypted,
+                self.open_file(filename) as plain,
+            ):
                 decrypt_file_stream_to(encrypted, plain)
                 plain.flush()
                 os.fsync(plain.fileno())
@@ -540,7 +550,9 @@ class ScratchJob:
             except FileNotFoundError:
                 current = None
             except OSError:
-                raise LocalValidationError("Local scratch cleanup is incomplete.") from None
+                raise LocalValidationError(
+                    "Local scratch cleanup is incomplete."
+                ) from None
             if current is None or _identity(current) != self._job_identity:
                 os.close(job_fd)
                 self._job_fd = None
@@ -550,7 +562,9 @@ class ScratchJob:
             try:
                 os.rmdir(self.job_id, dir_fd=root_fd)
             except OSError:
-                raise LocalValidationError("Local scratch cleanup is incomplete.") from None
+                raise LocalValidationError(
+                    "Local scratch cleanup is incomplete."
+                ) from None
             os.close(job_fd)
             self._job_fd = None
             self._files.clear()
@@ -578,7 +592,11 @@ def sweep_stale_scratch(
         or stale_after_seconds <= 0
     ):
         raise LocalValidationError("Scratch recovery age must be positive and finite.")
-    if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries <= 0:
+    if (
+        isinstance(max_entries, bool)
+        or not isinstance(max_entries, int)
+        or max_entries <= 0
+    ):
         raise LocalValidationError("Scratch recovery bound must be positive.")
     if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes <= 0:
         raise LocalValidationError("Scratch recovery node bound must be positive.")
@@ -597,7 +615,9 @@ def sweep_stale_scratch(
     ):
         raise LocalValidationError("Scratch recovery time must be finite.")
     if isinstance(active_job_ids, (str, bytes)):
-        raise LocalValidationError("Scratch active job identifiers must be an iterable.")
+        raise LocalValidationError(
+            "Scratch active job identifiers must be an iterable."
+        )
     try:
         active_iterator = iter(active_job_ids)
     except TypeError:

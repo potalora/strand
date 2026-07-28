@@ -8,6 +8,7 @@ import ipaddress
 import inspect
 import os
 import socket
+import stat
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ from app.services.local_ai.manifest import (
 _DOWNLOAD_ORIGIN = "https://huggingface.co"
 _STREAM_CHUNK_BYTES = 1024 * 1024
 _MAX_REDIRECTS = 5
+_MAX_STREAM_RESUME_RETRIES = 2
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _DOWNLOAD_HOSTS = frozenset(
     {
@@ -35,6 +37,7 @@ _DOWNLOAD_HOSTS = frozenset(
         "cdn-lfs-us-1.hf.co",
         "cdn-lfs-eu-1.hf.co",
         "cas-bridge.xethub.hf.co",
+        "us.aws.cdn.hf.co",
     }
 )
 ProgressCallback = Callable[
@@ -80,6 +83,34 @@ def _open_partial(path: Path) -> Any:
         )
         return os.fdopen(descriptor, "wb")
     except OSError as exc:
+        raise LocalAIError("Model artifact download failed") from exc
+
+
+def _open_partial_append(path: Path, expected_size: int) -> Any:
+    """Open an existing owner-only regular partial without following links."""
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+        )
+        details = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_size != expected_size
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+        ):
+            raise LocalAIError("Model artifact download failed")
+        return os.fdopen(descriptor, "ab")
+    except LocalAIError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
         raise LocalAIError("Model artifact download failed") from exc
 
 
@@ -157,6 +188,7 @@ def _validate_download_target(url: httpx.URL) -> None:
 async def _validated_stream(
     client: httpx.AsyncClient,
     initial_url: str,
+    headers: dict[str, str] | None = None,
 ) -> Any:
     try:
         current = httpx.URL(initial_url)
@@ -167,7 +199,7 @@ async def _validated_stream(
         _validate_download_target(current)
         response: httpx.Response | None = None
         try:
-            request = client.build_request("GET", current)
+            request = client.build_request("GET", current, headers=headers)
             response = await client.send(request, stream=True, follow_redirects=False)
             if response.status_code not in _REDIRECT_STATUSES:
                 try:
@@ -190,12 +222,44 @@ async def _validated_stream(
     raise LocalAIError("Model download redirect rejected")
 
 
-async def download_manifest(
+def _validate_resume_response(
+    response: httpx.Response,
+    *,
+    start: int,
+    expected_size: int,
+) -> None:
+    """Require an exact, bounded byte-range response before appending a partial."""
+
+    content_range = response.headers.get("content-range")
+    if response.status_code != 206 or content_range is None:
+        raise LocalValidationError("Model download resume range is invalid")
+    try:
+        unit, values = content_range.split(" ", maxsplit=1)
+        byte_range, raw_total = values.split("/", maxsplit=1)
+        raw_start, raw_end = byte_range.split("-", maxsplit=1)
+        range_start, range_end, total = int(raw_start), int(raw_end), int(raw_total)
+    except (TypeError, ValueError) as exc:
+        raise LocalValidationError("Model download resume range is invalid") from exc
+    if (
+        unit != "bytes"
+        or range_start != start
+        or range_end != expected_size - 1
+        or total != expected_size
+        or range_end < range_start
+    ):
+        raise LocalValidationError("Model download resume range is invalid")
+
+    content_length = _declared_content_length(response)
+    if content_length is not None and content_length != expected_size - start:
+        raise LocalValidationError("Model download resume range is invalid")
+
+
+async def download_manifest_to_stage(
     manifest: LocalAIManifest,
     store: ArtifactStore,
     progress_callback: ProgressCallback | None,
-) -> None:
-    """Download, verify, and activate only files named by an immutable manifest."""
+) -> Path:
+    """Download and hash-verify a manifest without activating it."""
 
     staging: Path | None = None
     try:
@@ -234,44 +298,73 @@ async def download_manifest(
                     )
 
                     try:
-                        async with _validated_stream(client, url) as response:
-                            response.raise_for_status()
-                            content_length = _declared_content_length(response)
-                            if (
-                                content_length is not None
-                                and content_length > file.size
-                            ):
-                                raise LocalValidationError(
-                                    "Model download file byte limit exceeded"
-                                )
-                            with _open_partial(partial) as stream:
-                                async for chunk in response.aiter_bytes(
-                                    _STREAM_CHUNK_BYTES
-                                ):
-                                    file_done += len(chunk)
-                                    observed_total += len(chunk)
-                                    if (
-                                        file_done > file.size
-                                        or observed_total > declared_total
-                                        or observed_total > MAX_MANIFEST_PACK_BYTES
-                                    ):
-                                        raise LocalValidationError(
-                                            "Model download byte limit exceeded"
+                        for attempt in range(_MAX_STREAM_RESUME_RETRIES + 1):
+                            resuming = attempt > 0 and partial.exists()
+                            headers = (
+                                {"Range": f"bytes={file_done}-"} if resuming else None
+                            )
+                            try:
+                                async with _validated_stream(
+                                    client, url, headers=headers
+                                ) as response:
+                                    if resuming:
+                                        _validate_resume_response(
+                                            response,
+                                            start=file_done,
+                                            expected_size=file.size,
                                         )
-                                    stream.write(chunk)
-                                    digest.update(chunk)
-                                    await _publish_progress(
-                                        store=store,
-                                        operation_id=operation_id,
-                                        progress=DownloadProgress(
-                                            role=artifact.role.value,
-                                            bytes_done=role_done + file_done,
-                                            bytes_total=role_total,
-                                        ),
-                                        callback=progress_callback,
+                                    else:
+                                        response.raise_for_status()
+                                        content_length = _declared_content_length(
+                                            response
+                                        )
+                                        if (
+                                            content_length is not None
+                                            and content_length > file.size
+                                        ):
+                                            raise LocalValidationError(
+                                                "Model download file byte limit exceeded"
+                                            )
+                                    stream = (
+                                        _open_partial_append(partial, file_done)
+                                        if resuming
+                                        else _open_partial(partial)
                                     )
-                                stream.flush()
-                                os.fsync(stream.fileno())
+                                    with stream:
+                                        # Avoid a fixed coalescing size: a buffered short
+                                        # prefix must remain durable after a stream failure.
+                                        async for chunk in response.aiter_bytes():
+                                            file_done += len(chunk)
+                                            observed_total += len(chunk)
+                                            if (
+                                                file_done > file.size
+                                                or observed_total > declared_total
+                                                or observed_total
+                                                > MAX_MANIFEST_PACK_BYTES
+                                            ):
+                                                raise LocalValidationError(
+                                                    "Model download byte limit exceeded"
+                                                )
+                                            stream.write(chunk)
+                                            digest.update(chunk)
+                                            await _publish_progress(
+                                                store=store,
+                                                operation_id=operation_id,
+                                                progress=DownloadProgress(
+                                                    role=artifact.role.value,
+                                                    bytes_done=role_done + file_done,
+                                                    bytes_total=role_total,
+                                                ),
+                                                callback=progress_callback,
+                                            )
+                                        stream.flush()
+                                        os.fsync(stream.fileno())
+                                break
+                            except httpx.TransportError as exc:
+                                if attempt >= _MAX_STREAM_RESUME_RETRIES:
+                                    raise LocalAIError(
+                                        "Model artifact download failed"
+                                    ) from exc
 
                         if file_done != file.size:
                             raise LocalValidationError(
@@ -295,33 +388,18 @@ async def download_manifest(
             raise LocalValidationError(
                 "Model download aggregate size does not match manifest"
             )
-        store.activate(staging, manifest)
+        store.verify(staging, manifest)
+        result = staging
         staging = None
-    except asyncio.CancelledError:
+        return result
+    except BaseException as exc:
         if staging is not None:
             try:
                 store.discard_staging(staging)
             except LocalAIError:
                 pass
-        raise
-    except LocalAIError:
-        if staging is not None:
-            try:
-                store.discard_staging(staging)
-            except LocalAIError:
-                pass
-        raise
-    except httpx.HTTPError as exc:
-        if staging is not None:
-            try:
-                store.discard_staging(staging)
-            except LocalAIError:
-                pass
-        raise LocalAIError("Model artifact download failed") from exc
-    except Exception as exc:
-        if staging is not None:
-            try:
-                store.discard_staging(staging)
-            except LocalAIError:
-                pass
+        if isinstance(exc, (asyncio.CancelledError, LocalAIError)):
+            raise
+        if not isinstance(exc, Exception):
+            raise
         raise LocalAIError("Model artifact download failed") from exc

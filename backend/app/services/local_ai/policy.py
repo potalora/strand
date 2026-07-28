@@ -12,13 +12,17 @@ from app.services.local_ai.types import ProcessingMode
 def require_loopback(endpoint: str) -> None:
     """Require an explicit HTTP(S) endpoint on a loopback interface."""
     if not isinstance(endpoint, str):
-        raise LocalPolicyError("Custom local endpoint must be a valid HTTP loopback URL")
+        raise LocalPolicyError(
+            "Custom local endpoint must be a valid HTTP loopback URL"
+        )
     try:
         parsed = urlparse(endpoint)
         host = parsed.hostname
         _ = parsed.port
     except ValueError as exc:
-        raise LocalPolicyError("Custom local endpoint must be a valid HTTP loopback URL") from exc
+        raise LocalPolicyError(
+            "Custom local endpoint must be a valid HTTP loopback URL"
+        ) from exc
     if parsed.scheme not in {"http", "https"} or not host:
         raise LocalPolicyError("Custom local endpoint must be an HTTP loopback URL")
     if host == "localhost":
@@ -27,7 +31,9 @@ def require_loopback(endpoint: str) -> None:
         if ip_address(host).is_loopback:
             return
     except ValueError as exc:
-        raise LocalPolicyError("Custom local endpoint must resolve to loopback") from exc
+        raise LocalPolicyError(
+            "Custom local endpoint must resolve to loopback"
+        ) from exc
     raise LocalPolicyError("Custom local endpoint must use loopback")
 
 

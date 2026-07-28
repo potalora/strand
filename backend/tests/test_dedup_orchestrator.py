@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
+from types import SimpleNamespace
 from uuid import uuid4
 from datetime import datetime, timezone
 
 from app.services.dedup.detector import (
-    detect_upload_duplicates,
     _apply_merge,
     _compare_records,
     _fuzzy_match,
@@ -61,8 +61,14 @@ class TestCompareRecordsUpgraded:
     def test_source_section_no_bonus_when_different(self):
         """Different source_section does not add bonus."""
         # Distinct display_text so only the code match (0.4) contributes.
-        a = FakeRecord(code_value="R14.0", source_section="medications", display_text="Hypertension")
-        b = FakeRecord(code_value="R14.0", source_section="assessment", display_text="Diabetes")
+        a = FakeRecord(
+            code_value="R14.0",
+            source_section="medications",
+            display_text="Hypertension",
+        )
+        b = FakeRecord(
+            code_value="R14.0", source_section="assessment", display_text="Diabetes"
+        )
         score, reasons = _compare_records(a, b)
         assert score == 0.4
         assert "section_match" not in reasons
@@ -70,16 +76,32 @@ class TestCompareRecordsUpgraded:
     def test_source_section_no_bonus_when_none(self):
         """None source_section does not add bonus."""
         # Distinct display_text so only the code match (0.4) contributes.
-        a = FakeRecord(code_value="R14.0", source_section=None, display_text="Hypertension")
-        b = FakeRecord(code_value="R14.0", source_section="medications", display_text="Diabetes")
+        a = FakeRecord(
+            code_value="R14.0", source_section=None, display_text="Hypertension"
+        )
+        b = FakeRecord(
+            code_value="R14.0", source_section="medications", display_text="Diabetes"
+        )
         score, reasons = _compare_records(a, b)
         assert score == 0.4
 
     def test_exact_match_scores_above_0_95(self):
         """Exact match with all signals should score >= 0.95."""
         now = datetime.now(timezone.utc)
-        a = FakeRecord(code_value="R14.0", display_text="Abdominal distension", effective_date=now, status="active", source_section="assessment")
-        b = FakeRecord(code_value="R14.0", display_text="Abdominal distension", effective_date=now, status="active", source_section="assessment")
+        a = FakeRecord(
+            code_value="R14.0",
+            display_text="Abdominal distension",
+            effective_date=now,
+            status="active",
+            source_section="assessment",
+        )
+        b = FakeRecord(
+            code_value="R14.0",
+            display_text="Abdominal distension",
+            effective_date=now,
+            status="active",
+            source_section="assessment",
+        )
         score, reasons = _compare_records(a, b)
         # code(0.4) + text_exact(0.3) + date(0.2) + status(0.1) + section(0.15) = 1.0 (capped)
         assert score >= 0.95
@@ -126,7 +148,9 @@ class TestFuzzyMatch:
 
     def test_reordered_tokens_score_high(self):
         # Identical token set, reordered — an order-insensitive matcher returns 1.0.
-        assert _fuzzy_match("type 2 diabetes mellitus", "diabetes mellitus type 2") == 1.0
+        assert (
+            _fuzzy_match("type 2 diabetes mellitus", "diabetes mellitus type 2") == 1.0
+        )
 
     def test_reordered_with_split_dose_clears_gate(self):
         # Reordered + split dose token. The old Jaccard scored this 0.4 (a miss);
@@ -172,8 +196,12 @@ class TestDateDistancePenalty:
     def test_same_day_duplicate_preserved(self):
         """A genuine same-day duplicate must still score for review/merge."""
         day = datetime(2026, 6, 7, tzinfo=timezone.utc)
-        a = FakeRecord(code_value="39156-5", display_text="BMI", status="final", effective_date=day)
-        b = FakeRecord(code_value="39156-5", display_text="BMI", status="final", effective_date=day)
+        a = FakeRecord(
+            code_value="39156-5", display_text="BMI", status="final", effective_date=day
+        )
+        b = FakeRecord(
+            code_value="39156-5", display_text="BMI", status="final", effective_date=day
+        )
         score, reasons = _compare_records(a, b)
         assert score >= 0.7
         assert reasons.get("date_proximity") is True
@@ -190,7 +218,9 @@ class TestDateDistancePenalty:
             display_text="Vitamin D deficiency",
             effective_date=datetime(2023, 10, 5, tzinfo=timezone.utc),
         )
-        b = FakeRecord(code_value="E55.9", display_text="Vitamin D deficiency", effective_date=None)
+        b = FakeRecord(
+            code_value="E55.9", display_text="Vitamin D deficiency", effective_date=None
+        )
         score, reasons = _compare_records(a, b)
         assert score == pytest.approx(0.7)  # code 0.4 + text 0.3, no date signal
         assert "date_distant" not in reasons
@@ -221,16 +251,138 @@ class TestRunUploadDedup:
     """Tests for the full dedup orchestration flow."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "processing_mode",
+        ["validated_strict_local", "custom_local", "prompt_only"],
+    )
+    async def test_non_cloud_modes_persist_fuzzy_matches_without_loading_an_llm(
+        self,
+        processing_mode,
+    ):
+        """Non-cloud dedup keeps fuzzy pairs for manual review."""
+        mock_db = AsyncMock()
+        mock_db.get.return_value = FakeRecord(record_type="medication")
+        auto_candidate = {
+            "id": uuid4(),
+            "record_a_id": uuid4(),
+            "record_b_id": uuid4(),
+            "similarity_score": 0.98,
+            "match_reasons": {"code_match": True, "text_exact_match": True},
+            "status": "pending",
+            "source_upload_id": uuid4(),
+        }
+        fuzzy_candidate = {
+            "id": uuid4(),
+            "record_a_id": uuid4(),
+            "record_b_id": uuid4(),
+            "similarity_score": 0.72,
+            "match_reasons": {"code_match": True, "text_fuzzy_match": True},
+            "status": "pending",
+            "source_upload_id": uuid4(),
+        }
+
+        with (
+            patch(
+                "app.services.dedup.orchestrator.load_llm_config",
+                new_callable=AsyncMock,
+            ) as mock_load_config,
+            patch(
+                "app.services.dedup.orchestrator.detect_upload_duplicates",
+                new_callable=AsyncMock,
+                return_value=([auto_candidate], [fuzzy_candidate]),
+            ),
+            patch(
+                "app.services.dedup.orchestrator._run_llm_judge",
+                new_callable=AsyncMock,
+            ) as mock_judge,
+            patch(
+                "app.services.dedup.orchestrator._apply_auto_merges",
+                new_callable=AsyncMock,
+            ) as mock_apply,
+            patch(
+                "app.services.dedup.orchestrator._save_candidates",
+                new_callable=AsyncMock,
+            ) as mock_save,
+        ):
+            summary = await run_upload_dedup(
+                uuid4(),
+                uuid4(),
+                uuid4(),
+                mock_db,
+                processing_mode=processing_mode,
+            )
+
+        mock_load_config.assert_not_awaited()
+        mock_judge.assert_not_awaited()
+        mock_apply.assert_awaited_once()
+        assert mock_save.await_count == 2
+        assert fuzzy_candidate["status"] == "pending"
+        assert fuzzy_candidate["auto_resolved"] is False
+        assert "llm_classification" not in fuzzy_candidate
+        assert summary.total_candidates == 2
+        assert summary.auto_merged == 1
+        assert summary.needs_review == 1
+        assert summary.dismissed == 0
+
+    @pytest.mark.asyncio
+    async def test_background_dedup_forwards_persisted_processing_mode(self):
+        """A restarted background pass uses the upload's immutable mode."""
+        from app.services.ingestion import coordinator
+
+        upload_id = uuid4()
+        patient_id = uuid4()
+        user_id = uuid4()
+        upload = SimpleNamespace(
+            processing_mode="validated_strict_local",
+            dedup_summary=None,
+            ingestion_status="dedup_scanning",
+            processing_completed_at=None,
+        )
+        mock_db = AsyncMock()
+        mock_db.get.return_value = upload
+
+        class SessionFactory:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                return mock_db
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        with (
+            patch("app.database.async_session_factory", new=SessionFactory()),
+            patch(
+                "app.services.dedup.orchestrator.run_upload_dedup",
+                new_callable=AsyncMock,
+                return_value=DedupSummary(),
+            ) as mock_run,
+        ):
+            await coordinator._run_dedup_background(upload_id, patient_id, user_id)
+
+        mock_run.assert_awaited_once_with(
+            upload_id,
+            patient_id,
+            user_id,
+            mock_db,
+            processing_mode="validated_strict_local",
+        )
+
+    @pytest.mark.asyncio
     async def test_no_candidates_returns_empty_summary(self):
         mock_db = AsyncMock()
-        with patch(
-            "app.services.dedup.orchestrator.load_llm_config",
-            new_callable=AsyncMock,
-            return_value=None,
-        ), patch(
-            "app.services.dedup.orchestrator.detect_upload_duplicates",
-            new_callable=AsyncMock,
-            return_value=([], []),
+        with (
+            patch(
+                "app.services.dedup.orchestrator.load_llm_config",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.dedup.orchestrator.detect_upload_duplicates",
+                new_callable=AsyncMock,
+                return_value=([], []),
+            ),
         ):
             summary = await run_upload_dedup(uuid4(), uuid4(), uuid4(), mock_db)
 
@@ -243,23 +395,33 @@ class TestRunUploadDedup:
     async def test_auto_merge_exact_matches(self):
         mock_db = AsyncMock()
         auto_candidates = [
-            {"id": uuid4(), "record_a_id": uuid4(), "record_b_id": uuid4(),
-             "similarity_score": 0.98, "match_reasons": {"code_match": True, "text_exact_match": True},
-             "status": "pending", "source_upload_id": uuid4()},
+            {
+                "id": uuid4(),
+                "record_a_id": uuid4(),
+                "record_b_id": uuid4(),
+                "similarity_score": 0.98,
+                "match_reasons": {"code_match": True, "text_exact_match": True},
+                "status": "pending",
+                "source_upload_id": uuid4(),
+            },
         ]
 
-        with patch(
-            "app.services.dedup.orchestrator.load_llm_config",
-            new_callable=AsyncMock,
-            return_value=None,
-        ), patch(
-            "app.services.dedup.orchestrator.detect_upload_duplicates",
-            new_callable=AsyncMock,
-            return_value=(auto_candidates, []),
-        ), patch(
-            "app.services.dedup.orchestrator._apply_auto_merges",
-            new_callable=AsyncMock,
-        ) as mock_apply:
+        with (
+            patch(
+                "app.services.dedup.orchestrator.load_llm_config",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.dedup.orchestrator.detect_upload_duplicates",
+                new_callable=AsyncMock,
+                return_value=(auto_candidates, []),
+            ),
+            patch(
+                "app.services.dedup.orchestrator._apply_auto_merges",
+                new_callable=AsyncMock,
+            ) as mock_apply,
+        ):
             summary = await run_upload_dedup(uuid4(), uuid4(), uuid4(), mock_db)
 
         assert summary.auto_merged == 1
@@ -270,32 +432,45 @@ class TestRunUploadDedup:
     async def test_llm_judge_called_for_fuzzy_matches(self):
         mock_db = AsyncMock()
         fuzzy_candidates = [
-            {"id": uuid4(), "record_a_id": uuid4(), "record_b_id": uuid4(),
-             "similarity_score": 0.72, "match_reasons": {"code_match": True, "text_fuzzy_match": True},
-             "status": "pending", "source_upload_id": uuid4()},
+            {
+                "id": uuid4(),
+                "record_a_id": uuid4(),
+                "record_b_id": uuid4(),
+                "similarity_score": 0.72,
+                "match_reasons": {"code_match": True, "text_fuzzy_match": True},
+                "status": "pending",
+                "source_upload_id": uuid4(),
+            },
         ]
 
         mock_judgment = MagicMock()
         mock_judgment.classification = "update"
         mock_judgment.confidence = 0.85
         mock_judgment.explanation = "Dose changed"
-        mock_judgment.field_diff = {"dosageInstruction": {"old": "500mg", "new": "1000mg"}}
+        mock_judgment.field_diff = {
+            "dosageInstruction": {"old": "500mg", "new": "1000mg"}
+        }
 
-        with patch(
-            "app.services.dedup.orchestrator.load_llm_config",
-            new_callable=AsyncMock,
-            return_value=None,
-        ), patch(
-            "app.services.dedup.orchestrator.detect_upload_duplicates",
-            new_callable=AsyncMock,
-            return_value=([], fuzzy_candidates),
-        ), patch(
-            "app.services.dedup.orchestrator._run_llm_judge",
-            new_callable=AsyncMock,
-            return_value=[mock_judgment],
-        ), patch(
-            "app.services.dedup.orchestrator._save_candidates",
-            new_callable=AsyncMock,
+        with (
+            patch(
+                "app.services.dedup.orchestrator.load_llm_config",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.dedup.orchestrator.detect_upload_duplicates",
+                new_callable=AsyncMock,
+                return_value=([], fuzzy_candidates),
+            ),
+            patch(
+                "app.services.dedup.orchestrator._run_llm_judge",
+                new_callable=AsyncMock,
+                return_value=[mock_judgment],
+            ),
+            patch(
+                "app.services.dedup.orchestrator._save_candidates",
+                new_callable=AsyncMock,
+            ),
         ):
             summary = await run_upload_dedup(uuid4(), uuid4(), uuid4(), mock_db)
 
@@ -306,9 +481,15 @@ class TestRunUploadDedup:
         """LLM judge returning 'duplicate' with high confidence auto-merges."""
         mock_db = AsyncMock()
         fuzzy_candidates = [
-            {"id": uuid4(), "record_a_id": uuid4(), "record_b_id": uuid4(),
-             "similarity_score": 0.72, "match_reasons": {}, "status": "pending",
-             "source_upload_id": uuid4()},
+            {
+                "id": uuid4(),
+                "record_a_id": uuid4(),
+                "record_b_id": uuid4(),
+                "similarity_score": 0.72,
+                "match_reasons": {},
+                "status": "pending",
+                "source_upload_id": uuid4(),
+            },
         ]
 
         mock_judgment = MagicMock()
@@ -317,24 +498,30 @@ class TestRunUploadDedup:
         mock_judgment.explanation = "Same record"
         mock_judgment.field_diff = None
 
-        with patch(
-            "app.services.dedup.orchestrator.load_llm_config",
-            new_callable=AsyncMock,
-            return_value=None,
-        ), patch(
-            "app.services.dedup.orchestrator.detect_upload_duplicates",
-            new_callable=AsyncMock,
-            return_value=([], fuzzy_candidates),
-        ), patch(
-            "app.services.dedup.orchestrator._run_llm_judge",
-            new_callable=AsyncMock,
-            return_value=[mock_judgment],
-        ), patch(
-            "app.services.dedup.orchestrator._apply_auto_merges",
-            new_callable=AsyncMock,
-        ) as mock_apply, patch(
-            "app.services.dedup.orchestrator._save_candidates",
-            new_callable=AsyncMock,
+        with (
+            patch(
+                "app.services.dedup.orchestrator.load_llm_config",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.dedup.orchestrator.detect_upload_duplicates",
+                new_callable=AsyncMock,
+                return_value=([], fuzzy_candidates),
+            ),
+            patch(
+                "app.services.dedup.orchestrator._run_llm_judge",
+                new_callable=AsyncMock,
+                return_value=[mock_judgment],
+            ),
+            patch(
+                "app.services.dedup.orchestrator._apply_auto_merges",
+                new_callable=AsyncMock,
+            ) as mock_apply,
+            patch(
+                "app.services.dedup.orchestrator._save_candidates",
+                new_callable=AsyncMock,
+            ),
         ):
             summary = await run_upload_dedup(uuid4(), uuid4(), uuid4(), mock_db)
 
@@ -346,9 +533,15 @@ class TestRunUploadDedup:
         """LLM judge returning 'distinct' with high confidence auto-dismisses."""
         mock_db = AsyncMock()
         fuzzy_candidates = [
-            {"id": uuid4(), "record_a_id": uuid4(), "record_b_id": uuid4(),
-             "similarity_score": 0.65, "match_reasons": {}, "status": "pending",
-             "source_upload_id": uuid4()},
+            {
+                "id": uuid4(),
+                "record_a_id": uuid4(),
+                "record_b_id": uuid4(),
+                "similarity_score": 0.65,
+                "match_reasons": {},
+                "status": "pending",
+                "source_upload_id": uuid4(),
+            },
         ]
 
         mock_judgment = MagicMock()
@@ -357,21 +550,26 @@ class TestRunUploadDedup:
         mock_judgment.explanation = "Different concepts"
         mock_judgment.field_diff = None
 
-        with patch(
-            "app.services.dedup.orchestrator.load_llm_config",
-            new_callable=AsyncMock,
-            return_value=None,
-        ), patch(
-            "app.services.dedup.orchestrator.detect_upload_duplicates",
-            new_callable=AsyncMock,
-            return_value=([], fuzzy_candidates),
-        ), patch(
-            "app.services.dedup.orchestrator._run_llm_judge",
-            new_callable=AsyncMock,
-            return_value=[mock_judgment],
-        ), patch(
-            "app.services.dedup.orchestrator._save_candidates",
-            new_callable=AsyncMock,
+        with (
+            patch(
+                "app.services.dedup.orchestrator.load_llm_config",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "app.services.dedup.orchestrator.detect_upload_duplicates",
+                new_callable=AsyncMock,
+                return_value=([], fuzzy_candidates),
+            ),
+            patch(
+                "app.services.dedup.orchestrator._run_llm_judge",
+                new_callable=AsyncMock,
+                return_value=[mock_judgment],
+            ),
+            patch(
+                "app.services.dedup.orchestrator._save_candidates",
+                new_callable=AsyncMock,
+            ),
         ):
             summary = await run_upload_dedup(uuid4(), uuid4(), uuid4(), mock_db)
 

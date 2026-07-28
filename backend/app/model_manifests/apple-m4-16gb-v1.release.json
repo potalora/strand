@@ -1,0 +1,26 @@
+{
+  "benchmark_sha256": "01e0ffe005c0772d52edcf2490a2caa6cd9e4b739bf515d2be29785181b4a05b",
+  "fidelity": {
+    "fixture_suite_sha256": "5654f214d4fb0a404d3abf3572812f209e05b20be0deb379dddd7db663d1a826",
+    "fixture_suite_version": "local-ai-fidelity-v1",
+    "required_thresholds": {
+      "accepted_facts_without_evidence_max": 0,
+      "accepted_output_schema_validity_min": 1.0,
+      "critical_numeric_exact_min": 0.99,
+      "critical_precision_min": 0.98,
+      "critical_recall_min": 0.95,
+      "forbidden_extraction_facts_max": 0,
+      "summary_fact_recall_min": 1.0,
+      "summary_typed_field_recall_min": 1.0,
+      "unsupported_summary_facts_max": 0
+    }
+  },
+  "fidelity_sha256": "60ff3ac27803acec5560dacbf013812e6c87e59eb6d77ff82f0874eee3bcfe6a",
+  "manifest_sha256": "d229b1e033539d3d4a537f178e318b2bc3c8aab26115f9704995e6dea265f27b",
+  "roles": {
+    "extraction": 5234491392,
+    "ocr": 1409286144,
+    "summary": 7851737088
+  },
+  "schema_version": 2
+}

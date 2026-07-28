@@ -98,7 +98,9 @@ def _iter_pdf(
         document = pdfium.PdfDocument(source)
     except PdfiumError as exc:
         if exc.err_code in {raw.FPDF_ERR_PASSWORD, raw.FPDF_ERR_SECURITY}:
-            raise LocalValidationError("PDF is encrypted or password-protected.") from None
+            raise LocalValidationError(
+                "PDF is encrypted or password-protected."
+            ) from None
         raise LocalValidationError("PDF document is malformed.") from None
     except Exception:
         raise LocalValidationError("PDF document is malformed.") from None

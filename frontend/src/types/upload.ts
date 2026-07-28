@@ -5,6 +5,10 @@
  */
 import type { ProgressDetail } from "@/lib/extraction-progress";
 import type { OcrNotice } from "@/lib/api";
+import type {
+  LocalProcessingFailure,
+  LocalRunInfo,
+} from "@/types/local-ai";
 
 export type { ExtractionProgressResponse } from "@/types/api";
 
@@ -28,4 +32,43 @@ export interface ExtractionFileStatus {
   // Per-file OCR provider notices (fallback/unreadable). Default [] — older
   // payloads omit it, so consumers must treat missing as no notices.
   notices?: OcrNotice[];
+  local_run?: LocalRunInfo | null;
+  local_failure?: LocalProcessingFailure | null;
+}
+
+/** Detailed GET /upload/{id}/status payload. */
+export interface UploadStatusResponse {
+  upload_id: string;
+  filename: string;
+  ingestion_status: string;
+  record_count: number;
+  total_file_count: number;
+  ingestion_progress: Record<string, unknown>;
+  ingestion_errors: unknown[];
+  processing_started_at: string | null;
+  processing_completed_at: string | null;
+  progress_stage: string | null;
+  progress_detail: ProgressDetail | null;
+  notices: OcrNotice[];
+  local_run: LocalRunInfo | null;
+  local_failure: LocalProcessingFailure | null;
+}
+
+/** Local provenance/failure fields are intentionally content-free. */
+export interface UploadHistoryItem {
+  id: string;
+  filename: string;
+  ingestion_status: string;
+  record_count: number;
+  file_size_bytes: number | null;
+  created_at: string | null;
+  ingestion_progress: Record<string, unknown>;
+  ingestion_errors: unknown[];
+  local_run: LocalRunInfo | null;
+  local_failure: LocalProcessingFailure | null;
+}
+
+export interface UploadHistoryResponse {
+  items: UploadHistoryItem[];
+  total: number;
 }

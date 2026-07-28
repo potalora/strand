@@ -60,10 +60,11 @@ test.describe("Structured file uploads", () => {
       (item) =>
         item.filename === "sample_fhir_bundle.json" &&
         ["completed", "completed_with_merges", "awaiting_review"].includes(
-          item.ingestion_status
+          item.ingestion_status ?? ""
         )
     );
-    expect(fhirUpload).toBeTruthy();
+    expect(fhirUpload).toBeDefined();
+    if (!fhirUpload) throw new Error("FHIR upload missing from history");
     expect(fhirUpload.record_count).toBeGreaterThan(0);
   });
 
@@ -145,10 +146,12 @@ test.describe("Structured file uploads", () => {
       .readdirSync(cdaDir)
       .filter((f) => f.toLowerCase().endsWith(".xml"));
     test.skip(xmlFiles.length === 0, "No XML files found in CDA export dir");
+    const xmlFile = xmlFiles[0];
+    if (!xmlFile) throw new Error("No XML files found in CDA export dir");
 
-    const xmlPath = path.join(cdaDir, xmlFiles[0]);
+    const xmlPath = path.join(cdaDir, xmlFile);
 
-    const uploadData = await api.uploadStructured(xmlPath, xmlFiles[0]);
+    const uploadData = await api.uploadStructured(xmlPath, xmlFile);
     expect(uploadData.upload_id).toBeTruthy();
 
     // Poll for completion
@@ -160,7 +163,7 @@ test.describe("Structured file uploads", () => {
         "completed_with_errors",
         "awaiting_review",
         "dedup_scanning",
-      ].includes(status.ingestion_status ?? status.status)
+      ].includes(status.ingestion_status ?? status.status ?? "")
     ).toBeTruthy();
 
     const records = await api.getRecords();

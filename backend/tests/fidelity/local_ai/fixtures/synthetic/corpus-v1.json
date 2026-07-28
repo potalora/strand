@@ -1,0 +1,193 @@
+{
+  "schema_version": 1,
+  "suite_version": "local-ai-fidelity-v1",
+  "documents": [
+    {
+      "id": "medication-lab-negation",
+      "render": {
+        "format": "pdf",
+        "style": "clean",
+        "lines": [
+          "Clinical record",
+          "Medication: Metformin 500 mg by mouth twice daily; active.",
+          "Laboratory: Hemoglobin A1c 6.8 % on 2026-07-01.",
+          "No evidence of pneumonia."
+        ]
+      },
+      "critical_numeric_tokens": ["500", "mg", "6.8", "%", "2026-07-01"],
+      "expected_facts": [
+        {
+          "category": "medications",
+          "name": "Metformin",
+          "value": "500",
+          "unit": "mg"
+        },
+        {
+          "category": "labs",
+          "name": "Hemoglobin A1c",
+          "value": "6.8",
+          "unit": "%"
+        }
+      ],
+      "forbidden_facts": [
+        {
+          "category": "conditions",
+          "name": "pneumonia"
+        }
+      ]
+    },
+    {
+      "id": "table-and-operators",
+      "render": {
+        "format": "tiff",
+        "style": "table",
+        "lines": [
+          "RESULTS",
+          "Test | Result | Unit",
+          "Potassium | 4.1 | mmol/L",
+          "Blood pressure | 120/80 | mmHg",
+          "TSH | < 0.05 | mIU/L"
+        ]
+      },
+      "critical_numeric_tokens": ["4.1", "mmol/L", "120/80", "mmHg", "< 0.05", "mIU/L"],
+      "expected_facts": [
+        {
+          "category": "labs",
+          "name": "Potassium",
+          "value": "4.1",
+          "unit": "mmol/L"
+        },
+        {
+          "category": "vital_signs",
+          "name": "Blood pressure",
+          "value": "120/80",
+          "unit": "mmHg"
+        },
+        {
+          "category": "labs",
+          "name": "TSH",
+          "value": "< 0.05",
+          "unit": "mIU/L"
+        }
+      ],
+      "forbidden_facts": []
+    },
+    {
+      "id": "skew-low-contrast-lifecycle",
+      "render": {
+        "format": "pdf",
+        "style": "skew-low-contrast",
+        "lines": [
+          "PATIENT SUMMARY",
+          "PATIENT SUMMARY",
+          "Warfarin 2.5 mg was stopped on 2026-06-30.",
+          "FHx: colon cancer.",
+          "Colonoscopy cancelled 2026-05-12."
+        ]
+      },
+      "critical_numeric_tokens": ["2.5", "mg", "2026-06-30", "2026-05-12"],
+      "expected_facts": [
+        {
+          "category": "medications",
+          "name": "Warfarin",
+          "value": "2.5",
+          "unit": "mg",
+          "status": "stopped"
+        },
+        {
+          "category": "conditions",
+          "name": "colon cancer",
+          "assertion": "family_history"
+        }
+      ],
+      "forbidden_facts": [
+        {
+          "category": "procedures",
+          "name": "Colonoscopy",
+          "assertion": "present"
+        }
+      ]
+    },
+    {
+      "id": "handwriting-medication-negation",
+      "render": {
+        "format": "tiff",
+        "style": "handwriting",
+        "lines": [
+          "Handwritten follow-up",
+          "Insulin glargine 12 units nightly started 2026-07-14.",
+          "Denies dizziness."
+        ]
+      },
+      "critical_numeric_tokens": ["12", "units", "2026-07-14"],
+      "expected_facts": [
+        {
+          "category": "medications",
+          "name": "Insulin glargine",
+          "value": "12",
+          "unit": "units"
+        }
+      ],
+      "forbidden_facts": [
+        {
+          "category": "conditions",
+          "name": "dizziness"
+        }
+      ]
+    },
+    {
+      "id": "poor-illumination-laboratory",
+      "render": {
+        "format": "pdf",
+        "style": "poor-illumination",
+        "lines": [
+          "Laboratory addendum",
+          "Glucose 104 mg/dL collected 2026-07-16.",
+          "No evidence of ketones."
+        ]
+      },
+      "critical_numeric_tokens": ["104", "mg/dL", "2026-07-16"],
+      "expected_facts": [
+        {
+          "category": "labs",
+          "name": "Glucose",
+          "value": "104",
+          "unit": "mg/dL"
+        }
+      ],
+      "forbidden_facts": [
+        {
+          "category": "conditions",
+          "name": "ketones"
+        }
+      ]
+    },
+    {
+      "id": "poor-scan-follow-up",
+      "render": {
+        "format": "tiff",
+        "style": "poor-scan",
+        "lines": [
+          "Follow-up scan",
+          "Levothyroxine 75 mcg daily on 2026-07-18.",
+          "No recurrence of palpitations."
+        ]
+      },
+      "critical_numeric_tokens": ["75", "mcg", "2026-07-18"],
+      "expected_facts": [
+        {
+          "category": "medications",
+          "name": "Levothyroxine",
+          "value": "75",
+          "unit": "mcg"
+        }
+      ],
+      "forbidden_facts": [
+        {
+          "category": "conditions",
+          "name": "palpitations"
+        }
+      ]
+    }
+  ]
+}

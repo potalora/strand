@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from app.services.extraction.entity_extractor import ExtractedEntity, ExtractionResult
@@ -10,7 +10,6 @@ from app.services.extraction.section_parser import (
     ParsedDocument,
     ParsedSection,
     SectionType,
-    parse_sections,
     split_large_section,
 )
 
@@ -26,9 +25,25 @@ class TestEntityToFhirRoundTrip:
         ("procedure", "Colonoscopy", {"date": "2024-03-15"}),
         ("allergy", "Penicillin", {"reaction": "rash", "severity": "moderate"}),
         ("encounter", "Office visit", {"visit_type": "office", "date": "2026-03-30"}),
-        ("imaging_result", "CT Abdomen", {"procedure_name": "CT Abdomen", "findings": "normal", "category": "imaging"}),
-        ("family_history", "Father: DM2", {"relationship": "father", "condition": "DM2"}),
-        ("assessment_plan", "#1: Continue meds.", {"plan_items": ["Continue medications"]}),
+        (
+            "imaging_result",
+            "CT Abdomen",
+            {
+                "procedure_name": "CT Abdomen",
+                "findings": "normal",
+                "category": "imaging",
+            },
+        ),
+        (
+            "family_history",
+            "Father: DM2",
+            {"relationship": "father", "condition": "DM2"},
+        ),
+        (
+            "assessment_plan",
+            "#1: Continue meds.",
+            {"plan_items": ["Continue medications"]},
+        ),
         ("social_history", "Alcohol: none", {"category": "alcohol", "value": "none"}),
     ]
 
@@ -37,8 +52,28 @@ class TestEntityToFhirRoundTrip:
         entity = ExtractedEntity(entity_class=entity_class, text=text, attributes=attrs)
         result = entity_to_health_record_dict(entity, uuid4(), uuid4(), uuid4())
         assert result is not None
-        assert result["record_type"] in ("medication", "condition", "observation", "procedure", "allergy", "encounter", "diagnostic_report", "family_history", "document")
-        assert result["fhir_resource"]["resourceType"] in ("MedicationRequest", "Condition", "Observation", "Procedure", "AllergyIntolerance", "Encounter", "DiagnosticReport", "FamilyMemberHistory", "DocumentReference")
+        assert result["record_type"] in (
+            "medication",
+            "condition",
+            "observation",
+            "procedure",
+            "allergy",
+            "encounter",
+            "diagnostic_report",
+            "family_history",
+            "document",
+        )
+        assert result["fhir_resource"]["resourceType"] in (
+            "MedicationRequest",
+            "Condition",
+            "Observation",
+            "Procedure",
+            "AllergyIntolerance",
+            "Encounter",
+            "DiagnosticReport",
+            "FamilyMemberHistory",
+            "DocumentReference",
+        )
         assert result["display_text"]
         assert result["ai_extracted"] is True
         assert result["confidence_score"] == 0.8
@@ -64,7 +99,9 @@ class TestSectionParserToEntityPipeline:
             provider="Dr. Test",
             facility="Test Clinic",
             sections=[
-                ParsedSection(SectionType.MEDICATIONS, "Medications", "aspirin 81mg daily"),
+                ParsedSection(
+                    SectionType.MEDICATIONS, "Medications", "aspirin 81mg daily"
+                ),
                 ParsedSection(SectionType.LABS, "Labs", "HbA1c 6.5%"),
             ],
         )
@@ -72,12 +109,20 @@ class TestSectionParserToEntityPipeline:
         mock_entities_meds = ExtractionResult(
             source_file="test.pdf",
             source_text="aspirin 81mg daily",
-            entities=[ExtractedEntity("medication", "aspirin 81mg", {"medication_group": "aspirin"})],
+            entities=[
+                ExtractedEntity(
+                    "medication", "aspirin 81mg", {"medication_group": "aspirin"}
+                )
+            ],
         )
         mock_entities_labs = ExtractionResult(
             source_file="test.pdf",
             source_text="HbA1c 6.5%",
-            entities=[ExtractedEntity("lab_result", "HbA1c 6.5", {"test": "HbA1c", "value": "6.5"})],
+            entities=[
+                ExtractedEntity(
+                    "lab_result", "HbA1c 6.5", {"test": "HbA1c", "value": "6.5"}
+                )
+            ],
         )
 
         with patch(
@@ -89,7 +134,9 @@ class TestSectionParserToEntityPipeline:
 
             all_entities = []
             for section in doc.sections:
-                result = await extract_entities_async(section.text, "test.pdf", "fake-key")
+                result = await extract_entities_async(
+                    section.text, "test.pdf", "fake-key"
+                )
                 for entity in result.entities:
                     entity.attributes["_source_section"] = section.section_type.value
                     all_entities.append(entity)
@@ -109,7 +156,9 @@ class TestSectionParserToEntityPipeline:
         # Every paragraph should appear in at least one chunk
         for para in paragraphs:
             found = any(para[:50] in chunk for chunk in chunks)
-            assert found, f"Paragraph starting with '{para[:50]}' not found in any chunk"
+            assert found, (
+                f"Paragraph starting with '{para[:50]}' not found in any chunk"
+            )
 
     def test_document_dedup_removes_same_entity_from_overlapping_chunks(self):
         """Duplicate entities across chunks are removed by text+type dedup."""
@@ -129,7 +178,11 @@ class TestSectionParserToEntityPipeline:
 
     def test_encounter_record_links_to_other_records(self):
         """Encounter record ID can be used as linked_encounter_id."""
-        encounter_entity = ExtractedEntity("encounter", "Visit 03/30", attributes={"visit_type": "office", "date": "2026-03-30"})
+        encounter_entity = ExtractedEntity(
+            "encounter",
+            "Visit 03/30",
+            attributes={"visit_type": "office", "date": "2026-03-30"},
+        )
         med_entity = ExtractedEntity("medication", "aspirin 81mg")
 
         user_id, patient_id = uuid4(), uuid4()

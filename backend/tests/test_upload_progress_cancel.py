@@ -1,8 +1,10 @@
 """Tests for extraction-progress batch scoping, cooperative cancel, and
 section-level progress (remediation summary items 2a-iii and 2a-iv, backend).
 """
+
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
@@ -13,7 +15,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.models.uploaded_file import UploadedFile
+from app.models.local_ai import LocalAIJob
+from app.services.local_ai.manifest import canonicalize_manifest_snapshot
 from tests.conftest import TEST_DB_URL, auth_headers
+from tests.test_strict_local_pipeline import _manifest_payload
 
 
 def _mk_upload(user_id, status: str, **kw) -> UploadedFile:
@@ -37,7 +42,9 @@ def _mk_upload(user_id, status: str, **kw) -> UploadedFile:
 
 
 @pytest.mark.asyncio
-async def test_extraction_progress_scoped_to_ids(client: AsyncClient, db_session: AsyncSession):
+async def test_extraction_progress_scoped_to_ids(
+    client: AsyncClient, db_session: AsyncSession
+):
     headers, user_id = await auth_headers(client)
 
     a = _mk_upload(user_id, "completed", record_count=3)
@@ -66,10 +73,14 @@ async def test_extraction_progress_without_ids_counts_all(
 ):
     headers, user_id = await auth_headers(client)
     for status in ("completed", "processing", "pending_extraction"):
-        db_session.add(_mk_upload(user_id, status, record_count=1 if status == "completed" else 0))
+        db_session.add(
+            _mk_upload(user_id, status, record_count=1 if status == "completed" else 0)
+        )
     await db_session.commit()
 
-    data = (await client.get("/api/v1/upload/extraction-progress", headers=headers)).json()
+    data = (
+        await client.get("/api/v1/upload/extraction-progress", headers=headers)
+    ).json()
     assert data["total"] == 3
 
 
@@ -98,7 +109,8 @@ async def test_extraction_progress_ids_still_user_scoped(
 
     data = (
         await client.get(
-            f"/api/v1/upload/extraction-progress?ids={mine.id},{theirs.id}", headers=headers
+            f"/api/v1/upload/extraction-progress?ids={mine.id},{theirs.id}",
+            headers=headers,
         )
     ).json()
     assert data["total"] == 1
@@ -116,7 +128,9 @@ async def test_extraction_progress_counts_cancelled_as_terminal(
     db_session.add(_mk_upload(user_id, "cancelled"))
     await db_session.commit()
 
-    data = (await client.get("/api/v1/upload/extraction-progress", headers=headers)).json()
+    data = (
+        await client.get("/api/v1/upload/extraction-progress", headers=headers)
+    ).json()
     assert data["total"] == 1
     assert data["processing"] == 0
     assert data["pending"] == 0
@@ -129,7 +143,9 @@ async def test_extraction_progress_counts_cancelled_as_terminal(
 
 
 @pytest.mark.asyncio
-async def test_cancel_sets_flag_on_active_files(client: AsyncClient, db_session: AsyncSession):
+async def test_cancel_sets_flag_on_active_files(
+    client: AsyncClient, db_session: AsyncSession
+):
     headers, user_id = await auth_headers(client)
     pending = _mk_upload(user_id, "pending_extraction")
     processing = _mk_upload(user_id, "processing")
@@ -153,6 +169,247 @@ async def test_cancel_sets_flag_on_active_files(client: AsyncClient, db_session:
         assert u.cancel_requested is True
     await db_session.refresh(completed)
     assert completed.cancel_requested is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_terminates_active_strict_local_worker(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    headers, user_id = await auth_headers(client)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = _mk_upload(
+        user_id,
+        "processing",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user_id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="ocr",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    with (
+        patch(
+            "app.services.local_ai.model_manager.local_model_manager.cancel_registered",
+            new_callable=AsyncMock,
+            create=True,
+            return_value=True,
+        ) as cancel_registered,
+        patch(
+            "app.services.local_ai.model_manager.local_model_manager.cancel",
+            new_callable=AsyncMock,
+        ) as cancel,
+    ):
+        response = await client.post(
+            "/api/v1/upload/cancel",
+            json={"upload_ids": [str(upload.id)]},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    cancel_registered.assert_awaited_once_with(str(job.id))
+    cancel.assert_not_awaited()
+    await db_session.refresh(job)
+    assert job.cancel_requested is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_finishes_queued_strict_job_without_reserving_worker_cancel(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    headers, user_id = await auth_headers(client)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = _mk_upload(
+        user_id,
+        "pending_extraction",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user_id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="queued",
+        stage="preflight",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    with (
+        patch(
+            "app.services.local_ai.model_manager.local_model_manager.cancel_registered",
+            new_callable=AsyncMock,
+            create=True,
+        ) as cancel_registered,
+        patch(
+            "app.services.local_ai.model_manager.local_model_manager.cancel",
+            new_callable=AsyncMock,
+        ) as cancel,
+    ):
+        response = await client.post(
+            "/api/v1/upload/cancel",
+            json={"upload_ids": [str(upload.id)]},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    cancel_registered.assert_not_awaited()
+    cancel.assert_not_awaited()
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert upload.ingestion_status == "cancelled"
+    assert upload.progress_stage is None
+    assert upload.progress_detail is None
+    assert job.status == "cancelled"
+    assert job.stage == "cancelled"
+    assert job.cancel_requested is True
+
+
+@pytest.mark.asyncio
+async def test_strict_cancel_check_reloads_flags_from_database(
+    db_session: AsyncSession,
+) -> None:
+    from app.api.upload import _lock_strict_terminal_state
+    from app.models.user import User
+
+    user = User(
+        email=f"strict-cancel-{uuid4().hex}@example.com",
+        password_hash="x",
+    )
+    db_session.add(user)
+    await db_session.flush()
+    user_id = user.id
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = _mk_upload(
+        user_id,
+        "processing",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user_id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="ocr",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    engine = create_async_engine(TEST_DB_URL)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with factory() as other:
+            other_upload = await other.get(UploadedFile, upload.id)
+            other_job = await other.get(LocalAIJob, job.id)
+            assert other_upload is not None and other_job is not None
+            other_upload.cancel_requested = True
+            other_job.cancel_requested = True
+            await other.commit()
+    finally:
+        await engine.dispose()
+
+    assert upload.cancel_requested is False
+    assert job.cancel_requested is False
+    assert await _lock_strict_terminal_state(db_session, upload.id, job.id) is True
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_completion_lock_linearizes_before_late_cancel(
+    db_session: AsyncSession,
+) -> None:
+    from app.api.upload import (
+        _lock_strict_terminal_state,
+        cancel_extraction,
+    )
+    from app.models.user import User
+    from app.schemas.upload import CancelExtractionRequest
+
+    user = User(
+        email=f"terminal-lock-{uuid4().hex}@example.com",
+        password_hash="x",
+    )
+    db_session.add(user)
+    await db_session.flush()
+    user_id = user.id
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = _mk_upload(
+        user_id,
+        "processing",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user_id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="extraction",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    engine = create_async_engine(TEST_DB_URL)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    assert not await _lock_strict_terminal_state(db_session, upload.id, job.id)
+    try:
+
+        async def late_cancel():
+            async with factory() as cancel_db:
+                return await cancel_extraction(
+                    CancelExtractionRequest(upload_ids=[str(upload.id)]),
+                    user_id,
+                    cancel_db,
+                )
+
+        cancel_task = asyncio.create_task(late_cancel())
+        await asyncio.sleep(0.05)
+        assert not cancel_task.done()
+
+        upload.ingestion_status = "completed"
+        job.status = "completed"
+        job.stage = "completed"
+        await db_session.commit()
+
+        response = await asyncio.wait_for(cancel_task, timeout=2)
+        assert response.cancelled == []
+        assert response.skipped == [str(upload.id)]
+        await db_session.refresh(upload)
+        await db_session.refresh(job)
+        assert upload.cancel_requested is False
+        assert job.cancel_requested is False
+        assert upload.ingestion_status == "completed"
+        assert job.status == "completed"
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -199,8 +456,9 @@ async def test_trigger_extraction_rejects_cancelled(
     db_session.add(cancelled)
     await db_session.commit()
 
-    with patch("app.api.upload._process_unstructured", new_callable=AsyncMock), patch(
-        "app.api.upload.start_extraction_worker"
+    with (
+        patch("app.api.upload._process_unstructured", new_callable=AsyncMock),
+        patch("app.api.upload.start_extraction_worker"),
     ):
         resp = await client.post(
             "/api/v1/upload/trigger-extraction",
@@ -239,6 +497,65 @@ async def test_status_payload_exposes_progress_fields(
     data = resp.json()
     assert data["progress_stage"] == "extracting_entities"
     assert data["progress_detail"] == {"section_index": 3, "section_total": 8}
+
+
+@pytest.mark.asyncio
+async def test_status_payload_exposes_typed_strict_local_failure(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    headers, user_id = await auth_headers(client)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = _mk_upload(
+        user_id,
+        "failed",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user_id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="failed",
+        stage="extraction",
+        failure={
+            "stage": "extraction",
+            "code": "local_worker_error",
+            "message": "Strict-local processing did not complete.",
+            "model_role": "extraction",
+            "repository": "owner/extraction",
+            "revision": "b" * 40,
+            "retryable": False,
+            "checkpoint_preserved": True,
+            "cloud_fallback_attempted": False,
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/v1/upload/{upload.id}/status",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["local_run"]["privacy_mode"] == "validated_strict_local"
+    assert {model["role"] for model in payload["local_run"]["models"]} == {
+        "ocr",
+        "extraction",
+    }
+    assert all(
+        model["repository"] != "mlx-community/Qwen3.5-9B-MLX-4bit"
+        for model in payload["local_run"]["models"]
+    )
+    assert payload["local_failure"] == job.failure
+    assert payload["local_failure"]["cloud_fallback_attempted"] is False
 
 
 @pytest.mark.asyncio
@@ -295,8 +612,11 @@ async def test_worker_aborts_when_cancel_requested(db_session: AsyncSession):
 
     extract_text_mock = AsyncMock()
     try:
-        with patch.object(upload_module, "async_session_factory", factory), patch(
-            "app.services.extraction.text_extractor.extract_text", extract_text_mock
+        with (
+            patch.object(upload_module, "async_session_factory", factory),
+            patch(
+                "app.services.extraction.text_extractor.extract_text", extract_text_mock
+            ),
         ):
             await upload_module._process_unstructured(
                 upload.id, Path("/tmp/does-not-matter.rtf"), user.id
@@ -316,12 +636,76 @@ async def test_worker_aborts_when_cancel_requested(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_strict_worker_early_cancel_terminalizes_upload_and_job(
+    db_session: AsyncSession,
+) -> None:
+    from app.api import upload as upload_module
+    from app.models.user import User
+
+    user = User(
+        id=uuid4(),
+        email=f"strict-worker-cancel-{uuid4().hex}@example.com",
+        password_hash="x",
+        is_active=True,
+    )
+    db_session.add(user)
+    await db_session.flush()
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = _mk_upload(
+        user.id,
+        "pending_extraction",
+        cancel_requested=True,
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user.id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="queued",
+        stage="preflight",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    engine = create_async_engine(TEST_DB_URL)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        with patch.object(upload_module, "async_session_factory", factory):
+            await upload_module._process_unstructured(
+                upload.id,
+                Path("/tmp/does-not-matter.rtf"),
+                user.id,
+            )
+
+        async with factory() as verify:
+            persisted_upload = await verify.get(UploadedFile, upload.id)
+            persisted_job = await verify.get(LocalAIJob, job.id)
+            assert persisted_upload is not None and persisted_job is not None
+            assert persisted_upload.ingestion_status == "cancelled"
+            assert persisted_job.status == "cancelled"
+            assert persisted_job.stage == "cancelled"
+            assert persisted_job.cancel_requested is True
+            assert persisted_job.completed_at is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_worker_writes_section_progress(db_session: AsyncSession):
     """A normal extraction run records progress_stage / progress_detail as it
     advances through the pipeline (verified mid-flight at the entity stage)."""
     from app.api import upload as upload_module
     from app.models.user import User
-    from app.services.extraction.entity_extractor import ExtractedEntity, ExtractionResult
+    from app.services.extraction.entity_extractor import (
+        ExtractedEntity,
+        ExtractionResult,
+    )
 
     user = User(
         id=uuid4(),
@@ -333,7 +717,9 @@ async def test_worker_writes_section_progress(db_session: AsyncSession):
     await db_session.flush()
 
     rtf_path = Path("/tmp") / f"progress_{uuid4().hex}.rtf"
-    rtf_path.write_bytes(rb"{\rtf1\ansi Patient has hypertension. Plan: continue Lisinopril.}")
+    rtf_path.write_bytes(
+        rb"{\rtf1\ansi Patient has hypertension. Plan: continue Lisinopril.}"
+    )
 
     upload = _mk_upload(user.id, "pending_extraction", storage_path=str(rtf_path))
     db_session.add(upload)
@@ -344,11 +730,15 @@ async def test_worker_writes_section_progress(db_session: AsyncSession):
 
     seen_stage: dict[str, str | None] = {}
 
-    async def fake_extract(text, source_file, api_key, progress_callback=None, config=None):
+    async def fake_extract(
+        text, source_file, api_key, progress_callback=None, config=None
+    ):
         # Capture the DB stage at the moment entity extraction runs.
         async with factory() as s:
             row = (
-                await s.execute(select(UploadedFile).where(UploadedFile.id == upload.id))
+                await s.execute(
+                    select(UploadedFile).where(UploadedFile.id == upload.id)
+                )
             ).scalar_one()
             seen_stage["stage"] = row.progress_stage
         if progress_callback is not None:
@@ -356,17 +746,26 @@ async def test_worker_writes_section_progress(db_session: AsyncSession):
         return ExtractionResult(
             source_file=source_file,
             source_text=text,
-            entities=[ExtractedEntity(entity_class="condition", text="Hypertension",
-                                      attributes={"status": "active"})],
+            entities=[
+                ExtractedEntity(
+                    entity_class="condition",
+                    text="Hypertension",
+                    attributes={"status": "active"},
+                )
+            ],
         )
 
     try:
-        with patch.object(upload_module, "async_session_factory", factory), patch(
-            "app.services.extraction.entity_extractor.extract_entities_async",
-            side_effect=fake_extract,
-        ), patch(
-            "app.services.ingestion.coordinator._run_dedup_background",
-            new_callable=AsyncMock,
+        with (
+            patch.object(upload_module, "async_session_factory", factory),
+            patch(
+                "app.services.extraction.entity_extractor.extract_entities_async",
+                side_effect=fake_extract,
+            ),
+            patch(
+                "app.services.ingestion.coordinator._run_dedup_background",
+                new_callable=AsyncMock,
+            ),
         ):
             await upload_module._process_unstructured(upload.id, rtf_path, user.id)
 
@@ -374,10 +773,16 @@ async def test_worker_writes_section_progress(db_session: AsyncSession):
 
         async with factory() as verify:
             row = (
-                await verify.execute(select(UploadedFile).where(UploadedFile.id == upload.id))
+                await verify.execute(
+                    select(UploadedFile).where(UploadedFile.id == upload.id)
+                )
             ).scalar_one()
             # Terminal-ish: handed off to dedup or completed, never failed.
-            assert row.ingestion_status in ("dedup_scanning", "completed", "awaiting_review")
+            assert row.ingestion_status in (
+                "dedup_scanning",
+                "completed",
+                "awaiting_review",
+            )
             assert row.progress_detail is not None
             assert row.progress_detail.get("section_total", 0) >= 1
     finally:

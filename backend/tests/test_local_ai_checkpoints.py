@@ -81,7 +81,9 @@ def test_page_number_rejects_bool_non_integer_and_non_positive_values(
         ocr_checkpoint_key(_A, bad_page, "raster-v1", _D)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("bad_version", ["", " ", "x" * 129, True, 1, float("nan"), None])
+@pytest.mark.parametrize(
+    "bad_version", ["", " ", "x" * 129, True, 1, float("nan"), None]
+)
 def test_version_inputs_reject_empty_unbounded_and_non_scalar_values(
     bad_version: object,
 ) -> None:

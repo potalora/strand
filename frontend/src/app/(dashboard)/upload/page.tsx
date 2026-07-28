@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { useDropzone } from "react-dropzone";
 import {
   FolderUp,
@@ -15,7 +16,7 @@ import {
 } from "lucide-react";
 import { useDirectoryUpload } from "@/hooks/useDirectoryUpload";
 import { getFilesFromDrop } from "@/lib/getFilesFromDrop";
-import { api, type OcrNotice } from "@/lib/api";
+import { api, getLlmSettings, type OcrNotice } from "@/lib/api";
 import type {
   UploadResponse,
   UnstructuredUploadResponse,
@@ -34,6 +35,12 @@ import {
 } from "@/stores/useExtractionStore";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
+import { LocalProcessingDetails } from "@/components/retro/LocalProcessingDetails";
+import type {
+  LocalProcessingFailure,
+  LocalRunInfo,
+  ProcessingMode,
+} from "@/types/local-ai";
 
 /* ==========================================
    FILE CLASSIFICATION HELPERS
@@ -41,6 +48,22 @@ import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
 
 const STRUCTURED_EXTENSIONS = new Set([".json", ".zip", ".tsv"]);
 const UNSTRUCTURED_EXTENSIONS = new Set([".pdf", ".rtf", ".tif", ".tiff"]);
+const PROCESSING_MODES = new Set<ProcessingMode>([
+  "validated_strict_local",
+  "custom_local",
+  "cloud_assisted",
+  "prompt_only",
+]);
+const UPLOAD_PROCESSING_MODES = new Set<ProcessingMode>([
+  "validated_strict_local",
+  "cloud_assisted",
+]);
+
+function uploadBlockedModeLabel(mode: ProcessingMode): string {
+  if (mode === "custom_local") return "Custom local (unverified)";
+  if (mode === "prompt_only") return "Prompt only";
+  return mode;
+}
 
 function getExtension(filename: string): string {
   const dot = filename.lastIndexOf(".");
@@ -115,6 +138,8 @@ interface UploadHistoryItem {
   ingestion_errors?: Array<Record<string, unknown>>;
   // Per-file OCR provider notices (fallback/unreadable). Default [].
   notices?: OcrNotice[];
+  local_run?: LocalRunInfo | null;
+  local_failure?: LocalProcessingFailure | null;
 }
 
 function statusLabel(status: string): string {
@@ -160,7 +185,7 @@ interface UploadResult {
 function SecureChip() {
   return (
     <span className="secure">
-      <Lock size={13} strokeWidth={1.9} /> End-to-end encrypted
+      <Lock size={13} strokeWidth={1.9} /> Application-layer encrypted at rest
     </span>
   );
 }
@@ -184,6 +209,48 @@ export default function UploadPage() {
   const [uploading, setUploading] = useState(false);
   const [uploadResults, setUploadResults] = useState<UploadResult[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [processingMode, setProcessingMode] =
+    useState<ProcessingMode | null>(null);
+  const [processingModeLoading, setProcessingModeLoading] = useState(true);
+  const [processingModeError, setProcessingModeError] =
+    useState<string | null>(null);
+  const [blockedProcessingMode, setBlockedProcessingMode] =
+    useState<ProcessingMode | null>(null);
+
+  const loadProcessingMode = useCallback(async () => {
+    setProcessingModeLoading(true);
+    setProcessingModeError(null);
+    setProcessingMode(null);
+    setBlockedProcessingMode(null);
+    try {
+      const settings = await getLlmSettings();
+      const mode = settings?.routing?.processing_mode;
+      if (!mode || !PROCESSING_MODES.has(mode)) {
+        throw new Error("invalid processing mode");
+      }
+      if (!UPLOAD_PROCESSING_MODES.has(mode)) {
+        setBlockedProcessingMode(mode);
+        return;
+      }
+      setProcessingMode(mode);
+    } catch {
+      setProcessingModeError(
+        "Privacy settings are unavailable. Uploads are blocked until the processing mode can be verified."
+      );
+    } finally {
+      setProcessingModeLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      if (active) await loadProcessingMode();
+    })();
+    return () => {
+      active = false;
+    };
+  }, [loadProcessingMode]);
 
   // --- Upload history ---
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -331,11 +398,18 @@ export default function UploadPage() {
   // --- Upload all files ---
   const handleUploadAll = useCallback(async () => {
     if (selectedFiles.length === 0) return;
+    if (!processingMode || !UPLOAD_PROCESSING_MODES.has(processingMode)) {
+      setUploadError(
+        "Upload blocked because ingestion does not support the saved processing mode."
+      );
+      return;
+    }
     setUploading(true);
     setUploadError(null);
     setUploadResults([]);
 
     const results: UploadResult[] = [];
+    const uploadProcessingMode = processingMode;
     // Every unstructured upload ID produced by THIS action — direct files,
     // batch files, and ZIP-extracted children — becomes the new batch.
     const batchInputs: TrackedFileInput[] = [];
@@ -349,6 +423,7 @@ export default function UploadPage() {
       try {
         const formData = new FormData();
         formData.append("file", file);
+        formData.append("processing_mode", uploadProcessingMode);
         const resp = await api.postForm<UploadResponse>("/upload", formData);
         results.push({ type: "structured", filename: file.name, response: resp });
         if (resp.unstructured_uploads && resp.unstructured_uploads.length > 0) {
@@ -378,6 +453,7 @@ export default function UploadPage() {
       try {
         const formData = new FormData();
         formData.append("file", file);
+        formData.append("processing_mode", uploadProcessingMode);
         const resp = await api.postForm<UnstructuredUploadResponse>(
           "/upload/unstructured",
           formData
@@ -402,6 +478,7 @@ export default function UploadPage() {
         for (const file of unstructured) {
           formData.append("files", file);
         }
+        formData.append("processing_mode", uploadProcessingMode);
         const resp = await api.postForm<{
           uploads: UnstructuredUploadResponse[];
         }>("/upload/unstructured-batch", formData);
@@ -438,7 +515,7 @@ export default function UploadPage() {
     setSelectedFiles([]);
     setUploading(false);
     setHistoryLoaded(false);
-  }, [selectedFiles, startBatch]);
+  }, [processingMode, selectedFiles, startBatch]);
 
   // --- Trigger extraction for the selected ZIP children ---
   const handleTriggerExtraction = useCallback(async () => {
@@ -588,6 +665,64 @@ export default function UploadPage() {
         <SecureChip />
       </div>
 
+      {(processingModeLoading ||
+        processingModeError ||
+        blockedProcessingMode) && (
+        <div
+          className="card-surface pad"
+          role={processingModeError || blockedProcessingMode ? "alert" : "status"}
+          style={{ marginBottom: 16 }}
+        >
+          <div
+            className="between"
+            style={{ alignItems: "center", gap: 12 }}
+          >
+            <p
+              className="dim"
+              style={{ fontSize: 13, lineHeight: 1.5, margin: 0 }}
+            >
+              {blockedProcessingMode
+                ? `Uploads do not support ${uploadBlockedModeLabel(
+                    blockedProcessingMode
+                  )} processing. Choose Cloud assisted or Validated strict local in Admin > System before uploading. No upload was sent.`
+                : processingModeError ??
+                  "Loading privacy settings before uploads are enabled…"}
+            </p>
+            {processingModeError && (
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => void loadProcessingMode()}
+                disabled={processingModeLoading}
+              >
+                Retry privacy settings
+              </button>
+            )}
+            {blockedProcessingMode && (
+              <Link className="btn ghost sm" href="/admin?tab=sys">
+                Open AI settings
+              </Link>
+            )}
+          </div>
+        </div>
+      )}
+
+      {processingMode === "cloud_assisted" && (
+        <div
+          className="card-surface pad"
+          role="note"
+          aria-label="Cloud-assisted OCR privacy"
+          style={{ marginBottom: 16 }}
+        >
+          <p className="dim" style={{ fontSize: 13, lineHeight: 1.5, margin: 0 }}>
+            Scanned PDF and TIFF pages are sent in their original, unredacted form
+            to the selected vision provider so it can read them. Text sent for later
+            extraction is de-identified first. Choose the strict-local mode if the
+            original document must stay on this machine.
+          </p>
+        </div>
+      )}
+
       {/* ==========================================
           HERO DROPZONE
           ========================================== */}
@@ -728,7 +863,11 @@ export default function UploadPage() {
 
           {/* Upload All button */}
           <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
-            <button className="btn" onClick={handleUploadAll} disabled={uploading}>
+            <button
+              className="btn"
+              onClick={handleUploadAll}
+              disabled={uploading || processingMode === null}
+            >
               {uploading ? "Uploading…" : "Upload all"}
             </button>
           </div>
@@ -976,6 +1115,12 @@ export default function UploadPage() {
                                 {stage}
                               </div>
                             )}
+                            <LocalProcessingDetails
+                              compact
+                              localRun={f.local_run}
+                              failure={f.local_failure}
+                              progressDetail={f.progress_detail}
+                            />
                           </td>
                           <td>
                             <span className="tag">
@@ -1222,6 +1367,11 @@ export default function UploadPage() {
                               </div>
                             )}
                             <OcrNotices notices={upload.notices} />
+                            <LocalProcessingDetails
+                              compact
+                              localRun={upload.local_run}
+                              failure={upload.local_failure}
+                            />
                           </td>
                           <td>
                             <span className="tag" style={{ textTransform: "uppercase" }}>

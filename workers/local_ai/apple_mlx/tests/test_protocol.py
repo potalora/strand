@@ -1,0 +1,1373 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from collections.abc import Iterator
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+PROTOCOL_VERSION = 1
+SAFETY_RULES = [
+    "Select only server-supplied fact fields and their linked evidence.",
+    "Do not emit free-text clinical claims, headings, or uncertainties.",
+    "Do not create, correct, infer, or repair clinical facts.",
+    "Do not provide diagnoses, treatment recommendations, medical advice, "
+    "or clinical decision support.",
+]
+
+
+class _Tokenizer:
+    model_max_length = 65_536
+
+    def encode(self, value: str, **_kwargs: object) -> list[str]:
+        return list(value)
+
+
+class _Processor:
+    tokenizer = _Tokenizer()
+
+
+class _Config:
+    max_position_embeddings = 65_536
+
+
+class _Model:
+    config = _Config()
+
+
+def _loaded(role: str, *, max_input_tokens: int = 32_768) -> object:
+    from local_ai_mlx_worker.common import LoadedRole
+
+    return LoadedRole(
+        role=role,  # type: ignore[arg-type]
+        model=_Model(),
+        processor=_Processor(),
+        model_path=f"/verified-pack/{role}",
+        decode_limits={
+            "max_input_tokens": max_input_tokens,
+            "max_output_tokens": 8192 if role == "extraction" else 4096,
+        },
+        repository_files_used=frozenset({"config.json", "model.safetensors"}),
+    )
+
+
+def _png(scratch: Path, name: str = "page.png", *, size: tuple[int, int] = (10, 10)) -> Path:
+    path = scratch / name
+    Image.new("RGB", size, color="white").save(path, format="PNG")
+    return path
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _summary_payload() -> dict[str, object]:
+    content_json = json.dumps(
+        {"name": "Metformin", "record_type": "medication"},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    evidence_snapshot = json.dumps(
+        {
+            "excerpt": "Metformin is listed as active.",
+            "field_paths": ["/name"],
+            "page_number": 1,
+            "section": "Medications",
+            "source_id": "source-evidence-1",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    evidence_id = "evidence1_" + hashlib.sha256(evidence_snapshot.encode()).hexdigest()[:40]
+    fact_snapshot = json.dumps(
+        {
+            "content_json": content_json,
+            "evidence_ids": [evidence_id],
+            "record_id": "record-1",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    fact_id = "fact1_" + hashlib.sha256(fact_snapshot.encode()).hexdigest()[:40]
+    uncertainty_snapshot = json.dumps(
+        {
+            "evidence_ids": [evidence_id],
+            "fact_ids": [fact_id],
+            "template_id": "medication_end_date_missing",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    uncertainty_id = (
+        "uncertainty1_" + hashlib.sha256(uncertainty_snapshot.encode()).hexdigest()[:40]
+    )
+    return {
+        "requested_scope": {
+            "summary_type": "full_health",
+            "category": None,
+            "date_from": None,
+            "date_to": None,
+            "record_ids": [],
+        },
+        "facts": [
+            {
+                "fact_id": fact_id,
+                "record_id": "record-1",
+                "content_json": content_json,
+                "fields": [
+                    {"path": "/name", "value_json": '"Metformin"'},
+                    {"path": "/record_type", "value_json": '"medication"'},
+                ],
+                "evidence_ids": [evidence_id],
+            }
+        ],
+        "evidence": [
+            {
+                "evidence_id": evidence_id,
+                "source_id": "source-evidence-1",
+                "excerpt": "Metformin is listed as active.",
+                "page_number": 1,
+                "section": "Medications",
+                "fact_ids": [fact_id],
+                "field_paths": ["/name"],
+            }
+        ],
+        "uncertainty_labels": [
+            {
+                "uncertainty_id": uncertainty_id,
+                "template_id": "medication_end_date_missing",
+                "label": "Medication end date is not available.",
+                "fact_ids": [fact_id],
+                "evidence_ids": [evidence_id],
+            }
+        ],
+        "safety_rules": SAFETY_RULES,
+    }
+
+
+def _replace_summary_fact_content(
+    payload: dict[str, object],
+    content: dict[str, object],
+) -> None:
+    content_json = json.dumps(
+        content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    fact = payload["facts"][0]  # type: ignore[index]
+    old_fact_id = fact["fact_id"]
+    fact_snapshot = json.dumps(
+        {
+            "content_json": content_json,
+            "evidence_ids": sorted(fact["evidence_ids"]),
+            "record_id": fact["record_id"],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    fact_id = "fact1_" + hashlib.sha256(fact_snapshot.encode()).hexdigest()[:40]
+    fact["content_json"] = content_json
+    fact["fact_id"] = fact_id
+    fields: list[dict[str, str]] = []
+
+    def visit(value: object, path: str) -> None:
+        if type(value) is dict and value:
+            for key in sorted(value):
+                visit(value[key], f"{path}/{key}")
+            return
+        fields.append(
+            {
+                "path": path,
+                "value_json": json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+        )
+
+    for key, value in sorted(content.items()):
+        visit(value, f"/{key}")
+    fact["fields"] = fields
+    evidence = payload["evidence"][0]  # type: ignore[index]
+    evidence["fact_ids"] = [fact_id]
+    uncertainty = payload["uncertainty_labels"][0]  # type: ignore[index]
+    uncertainty["fact_ids"] = [fact_id]
+    uncertainty_snapshot = json.dumps(
+        {
+            "evidence_ids": uncertainty["evidence_ids"],
+            "fact_ids": [fact_id],
+            "template_id": uncertainty["template_id"],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    uncertainty["uncertainty_id"] = (
+        "uncertainty1_" + hashlib.sha256(uncertainty_snapshot.encode()).hexdigest()[:40]
+    )
+    assert old_fact_id != fact_id
+
+
+@pytest.fixture
+def worker_process() -> Iterator[subprocess.Popen[str]]:
+    environment = {
+        **os.environ,
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-m", "local_ai_mlx_worker"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
+def _send(
+    process: subprocess.Popen[str],
+    *,
+    command: str,
+    payload: dict[str, object],
+    request_id: str = "test-1",
+) -> None:
+    assert process.stdin is not None
+    process.stdin.write(
+        json.dumps(
+            {
+                "version": PROTOCOL_VERSION,
+                "request_id": request_id,
+                "job_id": "job-1",
+                "command": command,
+                "payload": payload,
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    process.stdin.flush()
+
+
+def _read(process: subprocess.Popen[str]) -> dict[str, object]:
+    assert process.stdout is not None
+    line = process.stdout.readline()
+    assert line
+    return json.loads(line)
+
+
+def test_worker_stdout_is_protocol_only(worker_process: subprocess.Popen[str]) -> None:
+    _send(worker_process, command="health", payload={})
+
+    assert _read(worker_process) == {
+        "version": 1,
+        "request_id": "test-1",
+        "kind": "ready",
+        "payload": {"role": None},
+    }
+    assert _read(worker_process) == {
+        "version": 1,
+        "request_id": "test-1",
+        "kind": "result",
+        "payload": {
+            "data": {
+                "status": "ready",
+                "runtime": "mlx-vlm-0.5.0",
+            }
+        },
+    }
+
+    _send(worker_process, command="shutdown", payload={})
+    assert worker_process.stdin is not None
+    worker_process.stdin.close()
+    assert worker_process.wait(timeout=5) == 0
+    assert worker_process.stdout is not None
+    assert worker_process.stdout.read() == ""
+
+
+def test_invalid_role_payload_maps_to_fixed_non_content_error(
+    worker_process: subprocess.Popen[str],
+) -> None:
+    sentinel = "patient-content-must-not-be-logged"
+    _send(
+        worker_process,
+        command="ocr",
+        payload={"prompt": sentinel},
+    )
+
+    assert _read(worker_process) == {
+        "version": 1,
+        "request_id": "test-1",
+        "kind": "ready",
+        "payload": {"role": "ocr"},
+    }
+    assert _read(worker_process) == {
+        "version": 1,
+        "request_id": "test-1",
+        "kind": "error",
+        "payload": {
+            "code": "invalid_request",
+            "message": "Local worker request was rejected.",
+        },
+    }
+
+    _send(worker_process, command="shutdown", payload={})
+    assert worker_process.stdin is not None
+    worker_process.stdin.close()
+    assert worker_process.wait(timeout=5) == 0
+    assert worker_process.stderr is not None
+    assert sentinel not in worker_process.stderr.read()
+
+
+def test_role_runtime_output_is_suppressed_from_protocol_and_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    from local_ai_mlx_worker import __main__ as worker_main
+
+    sentinel = "clinical-content-must-not-leak"
+
+    def noisy_dispatch(_request: object) -> dict[str, object]:
+        print(sentinel)
+        print(sentinel, file=sys.stderr)
+        os.write(1, f"{sentinel}\n".encode())
+        os.write(2, f"{sentinel}\n".encode())
+        return {"ok": True}
+
+    monkeypatch.setattr(worker_main, "_dispatch", noisy_dispatch)
+    request = worker_main.Request(
+        request_id="request-1",
+        job_id="job-1",
+        command="summarize",
+        payload={},
+    )
+
+    assert worker_main._quiet_dispatch(request) == {"ok": True}
+    captured = capfd.readouterr()
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
+
+
+def test_memory_progress_payload_contains_only_bounded_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_mlx_worker import __main__ as worker_main
+
+    monkeypatch.setattr(
+        worker_main,
+        "_mlx_memory_counters",
+        lambda: (512 * 1024**2, 6 * 1024**3),
+    )
+
+    assert worker_main._memory_progress_payload("summary") == {
+        "role": "summary",
+        "stage": "finalizing",
+        "current": 1,
+        "total": 1,
+        "active_memory_bytes": 512 * 1024**2,
+        "peak_memory_bytes": 6 * 1024**3,
+    }
+
+
+def test_ocr_uses_fixed_greedy_decode_options(tmp_path: Path) -> None:
+    from local_ai_mlx_worker.ovisocr2 import run_ocr
+
+    calls: list[dict[str, object]] = []
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return "faithful markdown"
+
+    loaded = _loaded("ocr")
+    image = _png(tmp_path, "page-2.png")
+    result = run_ocr(
+        {
+            "page_number": 2,
+            "scratch_dir": str(tmp_path),
+            "image_path": str(image),
+            "image_sha256": _sha256(image),
+            "max_output_tokens": 9000,
+        },
+        loaded=loaded,  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert result == {"markdown": "faithful markdown", "page_number": 2}
+    assert calls == [
+        {
+            "model": loaded.model,
+            "processor": loaded.processor,
+            "prompt": (
+                "Extract this page faithfully as Markdown. "
+                "Preserve reading order, tables, and formulas."
+            ),
+            "images": [str(image)],
+            "max_tokens": 4096,
+            "temperature": 0.0,
+            "do_sample": False,
+            "input_token_limit": 32768,
+        }
+    ]
+
+
+def test_extraction_retries_duplicate_json_keys_once_with_non_thinking_template(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    outputs = iter(
+        [
+            '{"schema_version":"bad","schema_version":"duplicate"}',
+            '{"schema_version":"clinical-document-extraction.v1"}',
+        ]
+    )
+    calls: list[dict[str, object]] = []
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return next(outputs)
+
+    loaded = _loaded("extraction")
+    image = _png(tmp_path, "selected-page.png")
+    result = run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": "bounded OCR"}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {"1": str(image)},
+            "schema": {
+                "type": "object",
+                "required": ["schema_version"],
+            },
+        },
+        loaded=loaded,  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert result == {"schema_version": "clinical-document-extraction.v1"}
+    assert len(calls) == 2
+    assert all(call["temperature"] == 0.0 for call in calls)
+    assert all(call["do_sample"] is False for call in calls)
+    assert all(call["enable_thinking"] is False for call in calls)
+    assert all(call["mode"] == "structured" for call in calls)
+    assert all(
+        json.loads(str(call["template"]))
+        == {
+            "required": ["schema_version"],
+            "type": "object",
+        }
+        for call in calls
+    )
+    assert all(call["images"] == [str(image)] for call in calls)
+    assert all(call["input_token_limit"] == 32768 for call in calls)
+    assert all(
+        "Never use JSON null for enum-valued fields." in str(call["instructions"]) for call in calls
+    )
+    assert all("Use null, empty lists" not in str(call["instructions"]) for call in calls)
+    assert all(
+        "Set assertion to negated for explicit no, denies, absent, or negative evidence."
+        in str(call["instructions"])
+        for call in calls
+    )
+    assert all(
+        "Set assertion to family_history only for explicit family-history context."
+        in str(call["instructions"])
+        for call in calls
+    )
+
+
+def test_extraction_deterministically_grounds_explicit_assertion_phrases(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    calls: list[dict[str, object]] = []
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "medications": [
+                    {
+                        "name": "Warfarin",
+                        "status": "active",
+                        "verbatim": "Warfarin 2.5 mg was stopped.",
+                        "page_number": 1,
+                        "evidence_excerpt": "Warfarin 2.5 mg was stopped.",
+                    }
+                ],
+                "conditions": [
+                    {
+                        "name": "pneumonia",
+                        "assertion": "present",
+                        "verbatim": "No evidence of pneumonia.",
+                        "page_number": 1,
+                        "evidence_excerpt": "No evidence of pneumonia.",
+                    },
+                    {
+                        "name": "colon cancer",
+                        "assertion": "present",
+                        "verbatim": "FHx: colon cancer.",
+                        "page_number": 1,
+                        "evidence_excerpt": "FHx: colon cancer.",
+                    },
+                    {
+                        "name": "pulmonary embolism",
+                        "assertion": "present",
+                        "verbatim": "Possible pulmonary embolism.",
+                        "page_number": 1,
+                        "evidence_excerpt": "Possible pulmonary embolism.",
+                    },
+                    {
+                        "name": "dizziness",
+                        "assertion": "present",
+                        "verbatim": "Denles dizziness.",
+                        "page_number": 1,
+                        "evidence_excerpt": "Denles dizziness.",
+                    },
+                ],
+                "procedures": [
+                    {
+                        "name": "Colonoscopy",
+                        "assertion": "present",
+                        "verbatim": "Colonoscopy cancelled.",
+                        "page_number": 1,
+                        "evidence_excerpt": "Colonoscopy cancelled.",
+                    }
+                ],
+                "diagnostic_reports": [
+                    {
+                        "name": "Laboratory report",
+                        "findings": "A1c 6.8%",
+                        "assertion": "present",
+                        "status": "final",
+                        "verbatim": (
+                            "Laboratory report findings: A1c 6.8%. No evidence of pneumonia."
+                        ),
+                        "page_number": 1,
+                        "evidence_excerpt": (
+                            "Laboratory report findings: A1c 6.8%. No evidence of pneumonia."
+                        ),
+                    }
+                ],
+            }
+        )
+
+    result = run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": "No evidence of pneumonia."}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {"conditions": []},
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert result["medications"][0]["status"] == "stopped"  # type: ignore[index]
+    assert result["conditions"] == [  # type: ignore[index]
+        {
+            "name": "colon cancer",
+            "assertion": "family_history",
+            "verbatim": "FHx: colon cancer.",
+            "page_number": 1,
+            "evidence_excerpt": "FHx: colon cancer.",
+        }
+    ]
+    assert result["procedures"] == []
+    assert result["diagnostic_reports"][0]["assertion"] == "present"  # type: ignore[index]
+    assert result["diagnostic_reports"][0]["status"] == "unknown"  # type: ignore[index]
+    assert result["rejected_fields"] == [
+        "conditions[0]",
+        "conditions[2]",
+        "conditions[3]",
+        "procedures[0]",
+    ]
+    assert len(calls) == 1
+
+
+def test_extraction_binds_missing_table_evidence_to_exact_source_row(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    row = "<tr><td>Potassium</td><td>4.1</td><td>mmol/L</td></tr>"
+    result = run_extraction(
+        {
+            "page_markdown": [
+                {
+                    "page_number": 1,
+                    "markdown": f"<table><tbody>{row}</tbody></table>",
+                }
+            ],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {"labs": []},
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: json.dumps(
+            {
+                "labs": [
+                    {
+                        "name": "Potassium",
+                        "value": "4.1",
+                        "unit": "mmol/L",
+                        "verbatim": None,
+                        "page_number": 1,
+                        "evidence_excerpt": None,
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert result["labs"][0]["verbatim"] == row  # type: ignore[index]
+    assert result["labs"][0]["evidence_excerpt"] == row  # type: ignore[index]
+
+
+def test_extraction_discards_fact_with_missing_required_subject(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    result = run_extraction(
+        {
+            "page_markdown": [
+                {
+                    "page_number": 1,
+                    "markdown": "Insulin glargine 12 units nightly.",
+                }
+            ],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {"care_plans": []},
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: json.dumps(
+            {
+                "care_plans": [
+                    {
+                        "title": None,
+                        "plan_items": [{"type": "Insulin glargine nightly"}],
+                        "status": "active",
+                        "verbatim": "Insulin glargine 12 units nightly.",
+                        "page_number": 1,
+                        "evidence_excerpt": "Insulin glargine 12 units nightly.",
+                    }
+                ],
+                "rejected_fields": [],
+            }
+        ),
+    )
+
+    assert result["care_plans"] == []
+    assert result["rejected_fields"] == ["care_plans[0].title"]
+
+
+def test_extraction_binds_missing_adjacent_numeric_unit(tmp_path: Path) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    sentence = "Insulin glargine 12 units nightly."
+    result = run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": sentence}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {"medications": []},
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: json.dumps(
+            {
+                "medications": [
+                    {
+                        "name": "Insulin glargine",
+                        "dose_value": "12",
+                        "dose_unit": None,
+                        "status": "active",
+                        "verbatim": sentence,
+                        "page_number": 1,
+                        "evidence_excerpt": sentence,
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert result["medications"][0]["dose_unit"] == "units"  # type: ignore[index]
+
+
+def test_extraction_filters_wrappers_and_prefers_vital_category(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    table_row = "Blood pressure | 120/80 | mmHg"
+    ct_evidence = "CT chest report findings: stable pulmonary nodule."
+    result = run_extraction(
+        {
+            "page_markdown": [
+                {
+                    "page_number": 1,
+                    "markdown": f"{table_row}\n{ct_evidence}",
+                }
+            ],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {"labs": [], "vital_signs": [], "diagnostic_reports": []},
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: json.dumps(
+            {
+                "labs": [
+                    {
+                        "name": "Blood pressure",
+                        "value": "120/80",
+                        "unit": "mmHg",
+                        "verbatim": table_row,
+                        "page_number": 1,
+                        "evidence_excerpt": table_row,
+                    }
+                ],
+                "vital_signs": [
+                    {
+                        "name": "Blood pressure",
+                        "value": "120/80",
+                        "unit": "mmHg",
+                        "verbatim": table_row,
+                        "page_number": 1,
+                        "evidence_excerpt": table_row,
+                    }
+                ],
+                "diagnostic_reports": [
+                    {
+                        "name": "Blood pressure",
+                        "findings": "120/80 mmHg",
+                        "status": "final",
+                        "assertion": "present",
+                        "verbatim": table_row,
+                        "page_number": 1,
+                        "evidence_excerpt": table_row,
+                    },
+                    {
+                        "name": "CT chest",
+                        "findings": "stable pulmonary nodule",
+                        "status": "final",
+                        "assertion": "present",
+                        "verbatim": ct_evidence,
+                        "page_number": 1,
+                        "evidence_excerpt": ct_evidence,
+                    },
+                ],
+            }
+        ),
+    )
+
+    assert result["labs"] == []
+    assert len(result["vital_signs"]) == 1  # type: ignore[arg-type]
+    assert [item["name"] for item in result["diagnostic_reports"]] == ["CT chest"]  # type: ignore[union-attr]
+    assert result["rejected_fields"] == [
+        "labs[0]",
+        "diagnostic_reports[0]",
+    ]
+
+
+def test_summary_accepts_only_validated_fact_and_evidence_inputs() -> None:
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    calls: list[dict[str, object]] = []
+    payload = _summary_payload()
+    fact = payload["facts"][0]  # type: ignore[index]
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "sections": [
+                    {
+                        "heading": "Medications",
+                        "claims": [
+                            {
+                                "fact_id": fact["fact_id"],
+                                "field_paths": ["/name"],
+                                "evidence_ids": fact["evidence_ids"],
+                            }
+                        ],
+                    }
+                ],
+                "uncertainties": [],
+            },
+            separators=(",", ":"),
+        )
+
+    loaded = _loaded("summary")
+    result = run_summary(
+        payload,
+        loaded=loaded,  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert result["sections"][0]["claims"][0] == {  # type: ignore[index]
+        "fact_id": fact["fact_id"],
+        "field_paths": ["/name"],
+        "evidence_ids": fact["evidence_ids"],
+    }
+    assert len(calls) == 1
+    assert calls[0]["images"] == []
+    assert calls[0]["enable_thinking"] is False
+    assert calls[0]["temperature"] == 0.0
+    assert calls[0]["do_sample"] is False
+    assert calls[0]["input_token_limit"] == 32768
+    assert '"summary_type":"full_health"' in str(calls[0]["prompt"])
+    assert '"allowed_heading":"Medications"' in str(calls[0]["prompt"])
+    assert "sections MUST be a JSON array" in str(calls[0]["prompt"])
+    assert "subset of BOTH" in str(calls[0]["prompt"])
+    assert "Do not emit free-text" in str(calls[0]["prompt"])
+
+
+def test_summary_retries_one_invalid_contract_response() -> None:
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    fact = payload["facts"][0]  # type: ignore[index]
+    outputs = iter(
+        [
+            '{"sections":{"Medications":[]},"uncertainties":[]}',
+            json.dumps(
+                {
+                    "sections": [
+                        {
+                            "heading": "Medications",
+                            "claims": [
+                                {
+                                    "fact_id": fact["fact_id"],
+                                    "field_paths": ["/name"],
+                                    "evidence_ids": fact["evidence_ids"],
+                                }
+                            ],
+                        }
+                    ],
+                    "uncertainties": [],
+                },
+                separators=(",", ":"),
+            ),
+        ]
+    )
+    calls: list[dict[str, object]] = []
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return next(outputs)
+
+    result = run_summary(
+        payload,
+        loaded=_loaded("summary"),  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert result["sections"][0]["heading"] == "Medications"  # type: ignore[index]
+    assert len(calls) == 2
+    assert "prior response violated" in str(calls[1]["prompt"])
+
+
+@pytest.mark.parametrize(("unit_length", "accepted"), [(512, True), (513, False)])
+def test_summary_typed_observation_unit_bound_matches_server_contract(
+    unit_length: int,
+    accepted: bool,
+) -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    _replace_summary_fact_content(
+        payload,
+        {
+            "name": "TSH",
+            "record_type": "observation",
+            "value": {
+                "kind": "quantity",
+                "comparator": "<",
+                "number": 0.05,
+                "unit": "u" * unit_length,
+            },
+        },
+    )
+    fact = payload["facts"][0]  # type: ignore[index]
+    raw = json.dumps(
+        {
+            "sections": [
+                {
+                    "heading": "Observations",
+                    "claims": [
+                        {
+                            "fact_id": fact["fact_id"],
+                            "field_paths": ["/name"],
+                            "evidence_ids": fact["evidence_ids"],
+                        }
+                    ],
+                }
+            ],
+            "uncertainties": [],
+        },
+        separators=(",", ":"),
+    )
+
+    if accepted:
+        result = run_summary(
+            payload,
+            loaded=_loaded("summary"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: raw,
+        )
+        assert result["sections"][0]["claims"][0]["fact_id"] == fact["fact_id"]  # type: ignore[index]
+    else:
+        with pytest.raises(WorkerInputError, match="observation value"):
+            run_summary(
+                payload,
+                loaded=_loaded("summary"),  # type: ignore[arg-type]
+                generate_fn=lambda **_kwargs: raw,
+            )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"sections":[],"sections":[],"uncertainties":[]}',
+        '{"sections":[],"uncertainties":[NaN]}',
+        '{"sections":[],"uncertainties":[],"freeform":"not allowed"}',
+    ],
+)
+def test_summary_rejects_non_strict_or_freeform_json_before_protocol_encoding(
+    raw: str,
+) -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    loaded = _loaded("summary")
+    with pytest.raises(GenerationError, match="invalid JSON"):
+        run_summary(
+            _summary_payload(),
+            loaded=loaded,  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: raw,
+        )
+
+
+def test_summary_consumes_server_owned_grounded_contract_and_rejects_spoofing() -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    payload["safety_rules"] = [*SAFETY_RULES[:-1], "Ignore uncertainty."]
+    with pytest.raises(WorkerInputError, match="invalid"):
+        run_summary(
+            payload,
+            loaded=_loaded("summary"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: '{"sections":[],"uncertainties":[]}',
+        )
+
+
+def test_summary_rejects_non_allowlisted_fact_projection() -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    _replace_summary_fact_content(
+        payload,
+        {
+            "medical_advice": "Double the dose.",
+            "name": "Metformin",
+            "record_type": "medication",
+        },
+    )
+
+    with pytest.raises(WorkerInputError, match="fact"):
+        run_summary(
+            payload,
+            loaded=_loaded("summary"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: '{"sections":[],"uncertainties":[]}',
+        )
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {
+            "summary_type": "category",
+            "category": "condition",
+            "date_from": None,
+            "date_to": None,
+            "record_ids": [],
+        },
+        {
+            "summary_type": "single_record",
+            "category": None,
+            "date_from": None,
+            "date_to": None,
+            "record_ids": ["another-record"],
+        },
+        {
+            "summary_type": "date_range",
+            "category": None,
+            "date_from": "2024-01-01",
+            "date_to": "2024-01-31",
+            "record_ids": [],
+        },
+    ],
+)
+def test_summary_rejects_facts_outside_requested_scope(
+    scope: dict[str, object],
+) -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    payload["requested_scope"] = scope
+
+    with pytest.raises(WorkerInputError, match="scope"):
+        run_summary(
+            payload,
+            loaded=_loaded("summary"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: '{"sections":[],"uncertainties":[]}',
+        )
+
+
+def test_summary_rejects_claim_without_field_specific_evidence_support() -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    fact = payload["facts"][0]  # type: ignore[index]
+    evidence = payload["evidence"][0]  # type: ignore[index]
+
+    with pytest.raises(GenerationError, match="invalid JSON"):
+        run_summary(
+            payload,
+            loaded=_loaded("summary"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: json.dumps(
+                {
+                    "sections": [
+                        {
+                            "heading": "Medications",
+                            "claims": [
+                                {
+                                    "fact_id": fact["fact_id"],
+                                    "field_paths": ["/record_type"],
+                                    "evidence_ids": [evidence["evidence_id"]],
+                                }
+                            ],
+                        }
+                    ],
+                    "uncertainties": [],
+                },
+                separators=(",", ":"),
+            ),
+        )
+
+
+def test_summary_rejects_non_server_uncertainty_label() -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    payload["uncertainty_labels"][0]["label"] = "Double the dose."  # type: ignore[index]
+
+    with pytest.raises(WorkerInputError, match="uncertainty"):
+        run_summary(
+            payload,
+            loaded=_loaded("summary"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: '{"sections":[],"uncertainties":[]}',
+        )
+
+
+def test_summary_rejects_raw_payload_fields_and_invented_uncertainty() -> None:
+    from local_ai_mlx_worker.common import GenerationError, WorkerInputError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    payload["raw_upload"] = "must not enter the worker"
+    with pytest.raises(WorkerInputError, match="invalid"):
+        run_summary(
+            payload,
+            loaded=_loaded("summary"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: '{"sections":[],"uncertainties":[]}',
+        )
+
+    with pytest.raises(GenerationError, match="invalid JSON"):
+        uncertainty = _summary_payload()["uncertainty_labels"][0]  # type: ignore[index]
+        run_summary(
+            _summary_payload(),
+            loaded=_loaded("summary"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: (
+                '{"sections":[],"uncertainties":[{'
+                '"uncertainty_id":"uncertainty1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+                f'"fact_ids":{json.dumps(uncertainty["fact_ids"])},'
+                f'"evidence_ids":{json.dumps(uncertainty["evidence_ids"])}'
+                "}]}",
+            ),
+        )
+
+
+def test_summary_rejects_control_characters_inside_fact_content() -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    payload["facts"][0]["content_json"] = '{"name":"Metformin\\u0000hidden"}'  # type: ignore[index]
+    with pytest.raises(WorkerInputError, match="invalid"):
+        run_summary(
+            payload,
+            loaded=_loaded("summary"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: '{"sections":[],"uncertainties":[]}',
+        )
+
+
+def test_summary_uses_tokenizer_and_model_context_limits() -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    with pytest.raises(WorkerInputError, match="token"):
+        run_summary(
+            _summary_payload(),
+            loaded=_loaded("summary", max_input_tokens=32),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: '{"sections":[],"uncertainties":[]}',
+        )
+
+
+def test_summary_reserves_output_inside_model_context_window() -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    class SmallContextConfig:
+        max_position_embeddings = 1024
+
+    class SmallContextModel:
+        config = SmallContextConfig()
+
+    loaded = replace(_loaded("summary"), model=SmallContextModel())  # type: ignore[arg-type]
+    with pytest.raises(WorkerInputError, match="context token"):
+        run_summary(
+            _summary_payload(),
+            loaded=loaded,
+            generate_fn=lambda **_kwargs: '{"sections":[],"uncertainties":[]}',
+        )
+
+
+def test_generation_checks_formatted_prompt_plus_output_against_model_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mlx_vlm
+
+    from local_ai_mlx_worker.common import WorkerInputError, generate_content
+
+    class TinyConfig:
+        max_position_embeddings = 10
+
+    class TinyModel:
+        config = TinyConfig()
+
+    monkeypatch.setattr(
+        mlx_vlm,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "12345",
+    )
+    monkeypatch.setattr(
+        mlx_vlm,
+        "generate",
+        lambda *_args, **_kwargs: "must not run",
+    )
+
+    with pytest.raises(WorkerInputError, match="context token"):
+        generate_content(
+            model=TinyModel(),
+            processor=_Processor(),
+            prompt="12345",
+            images=[],
+            max_tokens=6,
+            temperature=0.0,
+            do_sample=False,
+            input_token_limit=100,
+        )
+
+
+def test_generation_strips_only_a_declared_terminal_eos_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mlx_vlm
+
+    from local_ai_mlx_worker.common import generate_content
+
+    class TerminalTokenizer(_Tokenizer):
+        eos_token = "<|im_end|>"
+
+    class TerminalProcessor:
+        tokenizer = TerminalTokenizer()
+
+    generated = ['{"labs":[]}<|im_end|>\n', '{"text":"<|im_end|> inside"}']
+    monkeypatch.setattr(
+        mlx_vlm,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "formatted",
+    )
+    monkeypatch.setattr(
+        mlx_vlm,
+        "generate",
+        lambda *_args, **_kwargs: generated.pop(0),
+    )
+
+    first = generate_content(
+        model=_Model(),
+        processor=TerminalProcessor(),
+        prompt="source",
+        images=[],
+        max_tokens=100,
+        temperature=0.0,
+        do_sample=False,
+        input_token_limit=100,
+    )
+    second = generate_content(
+        model=_Model(),
+        processor=TerminalProcessor(),
+        prompt="source",
+        images=[],
+        max_tokens=100,
+        temperature=0.0,
+        do_sample=False,
+        input_token_limit=100,
+    )
+
+    assert first == '{"labs":[]}'
+    assert second == '{"text":"<|im_end|> inside"}'
+
+
+def test_ocr_rejects_image_outside_job_scratch(tmp_path: Path) -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.ovisocr2 import run_ocr
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    outside = _png(tmp_path, "outside.png")
+    with pytest.raises(WorkerInputError, match="scratch"):
+        run_ocr(
+            {
+                "page_number": 1,
+                "scratch_dir": str(scratch),
+                "image_path": str(outside),
+                "image_sha256": _sha256(outside),
+            },
+            loaded=_loaded("ocr"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: "",
+        )
+
+
+def test_ocr_rejects_image_digest_mismatch_and_unexpected_payload(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.ovisocr2 import run_ocr
+
+    image = _png(tmp_path)
+    payload: dict[str, object] = {
+        "page_number": 1,
+        "scratch_dir": str(tmp_path),
+        "image_path": str(image),
+        "image_sha256": "0" * 64,
+    }
+    with pytest.raises(WorkerInputError, match="digest"):
+        run_ocr(
+            payload,
+            loaded=_loaded("ocr"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: "",
+        )
+
+    payload["image_sha256"] = _sha256(image)
+    payload["raw_upload"] = "forbidden"
+    with pytest.raises(WorkerInputError, match="invalid"):
+        run_ocr(
+            payload,
+            loaded=_loaded("ocr"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: "",
+        )
+
+
+def test_scratch_image_enforces_regular_file_byte_and_dimension_bounds(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.common import WorkerInputError, validate_scratch_image
+
+    image = _png(tmp_path)
+    with pytest.raises(WorkerInputError, match="invalid"):
+        validate_scratch_image(
+            str(image),
+            str(tmp_path),
+            max_bytes=image.stat().st_size - 1,
+        )
+    with pytest.raises(WorkerInputError, match="dimension"):
+        validate_scratch_image(
+            str(image),
+            str(tmp_path),
+            max_pixels=99,
+        )
+
+
+def test_extraction_rejects_more_than_bounded_selected_images(tmp_path: Path) -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.nuextract3 import MAX_SELECTED_IMAGES, run_extraction
+
+    pages = []
+    image_paths = {}
+    for page in range(1, MAX_SELECTED_IMAGES + 2):
+        path = _png(tmp_path, f"page-{page}.png")
+        pages.append({"page_number": page, "markdown": f"page {page}"})
+        image_paths[str(page)] = str(path)
+
+    with pytest.raises(WorkerInputError, match="image"):
+        run_extraction(
+            {
+                "page_markdown": pages,
+                "scratch_dir": str(tmp_path),
+                "image_paths": image_paths,
+                "schema": {"type": "object"},
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: "{}",
+        )
+
+
+def test_extraction_rejects_unexpected_raw_payload_field(tmp_path: Path) -> None:
+    from local_ai_mlx_worker.common import WorkerInputError
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    with pytest.raises(WorkerInputError, match="invalid"):
+        run_extraction(
+            {
+                "page_markdown": [{"page_number": 1, "markdown": "bounded OCR"}],
+                "scratch_dir": str(tmp_path),
+                "image_paths": {},
+                "schema": {"type": "object"},
+                "raw_upload": "forbidden",
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: "{}",
+        )

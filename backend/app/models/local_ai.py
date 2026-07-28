@@ -19,6 +19,7 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
     inspect,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, validates
@@ -115,7 +116,9 @@ class LocalAIJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         try:
             return ProcessingMode(value).value
         except (TypeError, ValueError) as exc:
-            raise LocalValidationError("Local AI job processing mode is invalid") from exc
+            raise LocalValidationError(
+                "Local AI job processing mode is invalid"
+            ) from exc
 
     @validates("manifest_snapshot")
     def _validate_manifest_snapshot(self, _key: str, value: Any) -> dict:
@@ -138,7 +141,9 @@ class LocalAIJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         try:
             snapshot, digest = canonicalize_manifest_snapshot(self.manifest_snapshot)
         except LocalValidationError as exc:
-            raise LocalValidationError("Stored local AI job manifest is invalid") from exc
+            raise LocalValidationError(
+                "Stored local AI job manifest is invalid"
+            ) from exc
         if (
             snapshot != self.manifest_snapshot
             or not isinstance(self.manifest_sha256, str)
@@ -169,6 +174,12 @@ class LocalAIJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         ),
         Index("ix_local_ai_jobs_user_status", "user_id", "status"),
         Index("ix_local_ai_jobs_upload_id", "upload_id"),
+        Index(
+            "uq_local_ai_jobs_ingestion_upload",
+            "upload_id",
+            unique=True,
+            postgresql_where=text("kind = 'ingestion' AND upload_id IS NOT NULL"),
+        ),
         Index("ix_local_ai_jobs_summary_prompt_id", "summary_prompt_id"),
     )
 
@@ -284,8 +295,7 @@ def _reject_persisted_evidence_scope_changes(
 ) -> None:
     state = inspect(target)
     if any(
-        state.attrs[field].history.has_changes()
-        for field in _IMMUTABLE_EVIDENCE_FIELDS
+        state.attrs[field].history.has_changes() for field in _IMMUTABLE_EVIDENCE_FIELDS
     ):
         raise LocalValidationError("Extraction evidence scope is immutable")
 

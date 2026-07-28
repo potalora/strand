@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import shlex
 import signal
+import socket
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -11,8 +16,21 @@ import pytest
 from fastapi import FastAPI
 
 from app.services.local_ai.errors import LocalWorkerError, LocalWorkerTimeout
-from app.services.local_ai.model_manager import LocalModelManager
+from app.services.local_ai.model_manager import (
+    LocalModelManager as ProductionLocalModelManager,
+)
 from app.services.local_ai.types import ModelRole
+
+
+class LocalModelManager(ProductionLocalModelManager):
+    """Explicitly unisolated fake-worker manager for unit-level protocol tests."""
+
+    def __init__(self, worker_command, **kwargs) -> None:
+        super().__init__(
+            worker_command,
+            _allow_unisolated_test_worker=True,
+            **kwargs,
+        )
 
 
 @pytest.fixture
@@ -49,6 +67,457 @@ async def test_manager_never_overlaps_role_processes(
     assert manager.metrics.roles_started == [ModelRole.OCR, ModelRole.EXTRACTION]
     assert manager.active_pid is None
     await manager.stop()
+
+
+def test_separate_backend_processes_never_overlap_workers(
+    fake_worker_command: list[str],
+    worker_home: Path,
+    tmp_path: Path,
+) -> None:
+    guard_path = tmp_path / "live-worker.guard"
+    start_path = tmp_path / "start"
+    backend_root = Path(__file__).resolve().parents[1]
+    script = "\n".join(
+        [
+            "import asyncio,json,time",
+            "from pathlib import Path",
+            "from app.services.local_ai.model_manager import LocalModelManager",
+            "from app.services.local_ai.types import ModelRole",
+            f"start_path = Path({str(start_path)!r})",
+            "while not start_path.exists(): time.sleep(0.01)",
+            "async def main():",
+            (
+                "    manager = LocalModelManager("
+                f"{fake_worker_command!r}, worker_home={str(worker_home)!r}, "
+                "_allow_unisolated_test_worker=True)"
+            ),
+            "    await manager.start()",
+            (
+                "    result = await manager.run(ModelRole.OCR, "
+                f"{{'delay_ms': 750, 'concurrency_guard_path': {str(guard_path)!r}}})"
+            ),
+            "    await manager.stop()",
+            "    print(json.dumps(result), flush=True)",
+            "asyncio.run(main())",
+        ]
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=backend_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    start_path.touch()
+    outputs = [process.communicate(timeout=15) for process in processes]
+
+    for process, (stdout, stderr) in zip(processes, outputs, strict=True):
+        assert process.returncode == 0, stderr
+        assert json.loads(stdout)["overlap_detected"] is False
+
+
+def test_worker_keeps_cross_process_lock_after_backend_parent_crash(
+    fake_worker_command: list[str],
+    worker_home: Path,
+) -> None:
+    backend_root = Path(__file__).resolve().parents[1]
+    started_marker = worker_home.parent / "orphan-started"
+    crash_script = "\n".join(
+        [
+            "import asyncio,os",
+            "from pathlib import Path",
+            "from app.services.local_ai.model_manager import LocalModelManager",
+            "from app.services.local_ai.types import ModelRole",
+            f"started_marker = Path({str(started_marker)!r})",
+            "async def main():",
+            (
+                "    manager = LocalModelManager("
+                f"{fake_worker_command!r}, worker_home={str(worker_home)!r}, "
+                "_allow_unisolated_test_worker=True)"
+            ),
+            "    await manager.start()",
+            (
+                "    task = asyncio.create_task(manager.run("
+                "ModelRole.OCR, {'job_id': 'orphaned', 'delay_ms': 2000, "
+                f"'started_marker_path': {str(started_marker)!r}}}))"
+            ),
+            "    await manager.wait_until_running('orphaned')",
+            "    while not started_marker.exists(): await asyncio.sleep(0.01)",
+            "    print(manager.active_pid, flush=True)",
+            "    os._exit(0)",
+            "asyncio.run(main())",
+        ]
+    )
+    crashed_parent = subprocess.Popen(
+        [sys.executable, "-c", crash_script],
+        cwd=backend_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert crashed_parent.stdout is not None
+    worker_pid = int(crashed_parent.stdout.readline().strip())
+    assert crashed_parent.wait(timeout=5) == 0
+
+    follower_script = "\n".join(
+        [
+            "import asyncio,json,time",
+            "from app.services.local_ai.model_manager import LocalModelManager",
+            "from app.services.local_ai.types import ModelRole",
+            "async def main():",
+            (
+                "    manager = LocalModelManager("
+                f"{fake_worker_command!r}, worker_home={str(worker_home)!r}, "
+                "_allow_unisolated_test_worker=True)"
+            ),
+            "    await manager.start()",
+            "    started = time.monotonic()",
+            "    await manager.run(ModelRole.OCR, {})",
+            "    print(json.dumps({'elapsed': time.monotonic() - started}), flush=True)",
+            "    await manager.stop()",
+            "asyncio.run(main())",
+        ]
+    )
+    follower = subprocess.run(
+        [sys.executable, "-c", follower_script],
+        cwd=backend_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert follower.returncode == 0, follower.stderr
+    assert json.loads(follower.stdout)["elapsed"] >= 1.25
+    with pytest.raises(ProcessLookupError):
+        os.kill(worker_pid, 0)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox contract")
+def test_parent_watchdog_releases_sandboxed_lock_after_backend_crash(
+    fake_worker_command: list[str],
+    worker_home: Path,
+) -> None:
+    backend_root = Path(__file__).resolve().parents[1]
+    model_root = worker_home.parent / "models"
+    started_marker = worker_home.parent / "hung-worker-started"
+    configured_command = shlex.join(fake_worker_command)
+    crash_script = "\n".join(
+        [
+            "import asyncio,os",
+            "from pathlib import Path",
+            "from app.config import settings",
+            "from app.services.local_ai.model_manager import LocalModelManager",
+            "from app.services.local_ai.types import ModelRole",
+            f"settings.local_ai_worker_command = {configured_command!r}",
+            f"settings.local_ai_model_dir = {str(model_root)!r}",
+            f"started_marker = Path({str(started_marker)!r})",
+            "async def main():",
+            f"    manager = LocalModelManager(worker_home={str(worker_home)!r})",
+            "    await manager.start()",
+            (
+                "    asyncio.create_task(manager.run("
+                "ModelRole.OCR, {'job_id': 'hung-orphan', 'block': True, "
+                f"'started_marker_path': {str(started_marker)!r}}}))"
+            ),
+            "    await manager.wait_until_running('hung-orphan')",
+            "    while not started_marker.exists(): await asyncio.sleep(0.01)",
+            "    print(manager.active_pid, flush=True)",
+            "    os._exit(0)",
+            "asyncio.run(main())",
+        ]
+    )
+    crashed_parent = subprocess.Popen(
+        [sys.executable, "-c", crash_script],
+        cwd=backend_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert crashed_parent.stdout is not None
+    worker_pid = int(crashed_parent.stdout.readline().strip())
+    assert crashed_parent.wait(timeout=5) == 0
+
+    follower_script = "\n".join(
+        [
+            "import asyncio,json,time",
+            "from app.config import settings",
+            "from app.services.local_ai.model_manager import LocalModelManager",
+            "from app.services.local_ai.types import ModelRole",
+            f"settings.local_ai_worker_command = {configured_command!r}",
+            f"settings.local_ai_model_dir = {str(model_root)!r}",
+            "async def main():",
+            f"    manager = LocalModelManager(worker_home={str(worker_home)!r})",
+            "    await manager.start()",
+            "    started = time.monotonic()",
+            "    await manager.run(ModelRole.OCR, {})",
+            "    print(json.dumps({'elapsed': time.monotonic() - started}), flush=True)",
+            "    await manager.stop()",
+            "asyncio.run(main())",
+        ]
+    )
+    follower = subprocess.run(
+        [sys.executable, "-c", follower_script],
+        cwd=backend_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert follower.returncode == 0, follower.stderr
+    assert json.loads(follower.stdout)["elapsed"] < 3
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(worker_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    with pytest.raises(ProcessLookupError):
+        os.kill(worker_pid, 0)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox contract")
+def test_parent_watchdog_retains_lock_through_failed_cleanup_and_backend_crash(
+    fake_worker_command: list[str],
+    worker_home: Path,
+) -> None:
+    backend_root = Path(__file__).resolve().parents[1]
+    model_root = worker_home.parent / "models"
+    configured_command = shlex.join(fake_worker_command)
+    crash_script = "\n".join(
+        [
+            "import asyncio,json,os,signal,subprocess,time",
+            "from pathlib import Path",
+            "from app.config import settings",
+            "from app.services.local_ai.errors import LocalWorkerError",
+            "from app.services.local_ai.model_manager import LocalModelManager",
+            "from app.services.local_ai.types import ModelRole",
+            f"settings.local_ai_worker_command = {configured_command!r}",
+            f"settings.local_ai_model_dir = {str(model_root)!r}",
+            "async def main():",
+            f"    manager = LocalModelManager(worker_home={str(worker_home)!r})",
+            "    await manager.start()",
+            "    async def fail_after_parent_exit(process):",
+            (
+                "        child_pids = [int(value) for value in "
+                "subprocess.check_output(['pgrep', '-P', str(process.pid)], "
+                "text=True).split()]"
+            ),
+            (
+                "        watchdog_pid = next(pid for pid in child_pids "
+                "if os.getpgid(pid) != process.pid)"
+            ),
+            "        os.kill(watchdog_pid, signal.SIGSTOP)",
+            "        process.kill()",
+            "        await process.wait()",
+            "        manager._test_watchdog_pid = watchdog_pid",
+            "        raise LocalWorkerError('Local worker failed.')",
+            "    manager._terminate_process = fail_after_parent_exit",
+            "    try:",
+            (
+                "        await manager.run("
+                "ModelRole.OCR, {'spawn_descendant': True, "
+                "'descendant_ignores_term': True, 'malformed': True})"
+            ),
+            "    except LocalWorkerError:",
+            "        pass",
+            "    descendant_pid = int((Path(manager._worker_home) / 'descendant.pid').read_text())",
+            (
+                "    print(json.dumps({'pgid': manager.active_pid, "
+                "'descendant_pid': descendant_pid, "
+                "'watchdog_pid': manager._test_watchdog_pid}), flush=True)"
+            ),
+            "    os._exit(0)",
+            "asyncio.run(main())",
+        ]
+    )
+    crashed_parent = subprocess.Popen(
+        [sys.executable, "-c", crash_script],
+        cwd=backend_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    follower: subprocess.CompletedProcess[str] | None = None
+    orphan_pgid: int | None = None
+    try:
+        assert crashed_parent.stdout is not None
+        owner_state = json.loads(crashed_parent.stdout.readline())
+        orphan_pgid = owner_state["pgid"]
+        descendant_pid = owner_state["descendant_pid"]
+        watchdog_pid = owner_state["watchdog_pid"]
+        os.kill(descendant_pid, 0)
+        os.kill(watchdog_pid, 0)
+        assert crashed_parent.wait(timeout=5) == 0
+
+        follower_script = "\n".join(
+            [
+                "import asyncio,json",
+                "from app.config import settings",
+                "from app.services.local_ai.model_manager import LocalModelManager",
+                "from app.services.local_ai.types import ModelRole",
+                f"settings.local_ai_worker_command = {configured_command!r}",
+                f"settings.local_ai_model_dir = {str(model_root)!r}",
+                "async def main():",
+                (
+                    f"    manager = LocalModelManager(worker_home="
+                    f"{str(worker_home.parent / 'follower-home')!r})"
+                ),
+                "    await manager.start()",
+                "    result = await manager.run(ModelRole.OCR, {})",
+                "    print(json.dumps(result), flush=True)",
+                "    await manager.stop()",
+                "asyncio.run(main())",
+            ]
+        )
+        follower_process = subprocess.Popen(
+            [sys.executable, "-c", follower_script],
+            cwd=backend_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.3)
+        assert follower_process.poll() is None
+
+        os.kill(watchdog_pid, signal.SIGCONT)
+        follower_stdout, follower_stderr = follower_process.communicate(timeout=10)
+        follower = subprocess.CompletedProcess(
+            follower_process.args,
+            follower_process.returncode,
+            follower_stdout,
+            follower_stderr,
+        )
+
+        assert follower.returncode == 0, follower.stderr
+        assert json.loads(follower.stdout)["markdown"] == "# Synthetic OCR"
+        with pytest.raises(ProcessLookupError):
+            os.kill(descendant_pid, 0)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(watchdog_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        with pytest.raises(ProcessLookupError):
+            os.kill(watchdog_pid, 0)
+    finally:
+        if orphan_pgid is not None:
+            try:
+                os.killpg(orphan_pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if crashed_parent.poll() is None:
+            crashed_parent.kill()
+            crashed_parent.communicate(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox contract")
+@pytest.mark.asyncio
+async def test_default_manager_os_sandbox_denies_worker_network(
+    fake_worker_command: list[str],
+    worker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(
+        settings,
+        "local_ai_worker_command",
+        shlex.join(fake_worker_command),
+    )
+    monkeypatch.setattr(
+        settings,
+        "local_ai_model_dir",
+        str(worker_home.parent / "models"),
+    )
+    manager = ProductionLocalModelManager(worker_home=worker_home)
+    await manager.start()
+
+    result = await manager.run(ModelRole.OCR, {"probe_network": True})
+
+    assert result["network_denied"] is True
+    assert result["network_errno"] in {1, 13}
+
+    result = await manager.run(ModelRole.OCR, {"inspect_lock_fd": True})
+    assert result["lock_fd_inherited"] is True
+    assert result["lock_identity_matches"] is True
+    assert result["lock_path_exposed"] is False
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as socket_directory:
+        socket_path = str(Path(socket_directory) / "probe.sock")
+        server = socket.socket(socket.AF_UNIX)
+        try:
+            server.bind(socket_path)
+            server.listen(1)
+            result = await manager.run(
+                ModelRole.OCR,
+                {"probe_unix_socket_path": socket_path},
+            )
+        finally:
+            server.close()
+    assert result["network_denied"] is True
+    assert result["network_errno"] in {1, 13}
+    await manager.stop()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox contract")
+@pytest.mark.asyncio
+async def test_explicit_worker_command_does_not_bypass_os_sandbox(
+    fake_worker_command: list[str],
+    worker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(
+        settings,
+        "local_ai_model_dir",
+        str(worker_home.parent / "models"),
+    )
+    manager = ProductionLocalModelManager(
+        fake_worker_command,
+        worker_home=worker_home,
+    )
+    await manager.start()
+
+    result = await manager.run(ModelRole.OCR, {"probe_network": True})
+
+    assert result["network_denied"] is True
+    assert result["network_errno"] in {1, 13}
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_default_manager_fails_closed_without_supported_network_sandbox(
+    fake_worker_command: list[str],
+    worker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings
+    from app.services.local_ai import model_manager
+
+    monkeypatch.setattr(
+        settings,
+        "local_ai_worker_command",
+        shlex.join(fake_worker_command),
+    )
+    monkeypatch.setattr(
+        settings,
+        "local_ai_model_dir",
+        str(worker_home.parent / "models"),
+    )
+    monkeypatch.setattr(model_manager.sys, "platform", "unsupported")
+    manager = ProductionLocalModelManager(worker_home=worker_home)
+
+    with pytest.raises(LocalWorkerError, match="network isolation is unavailable"):
+        await manager.start()
 
 
 @pytest.mark.asyncio
@@ -212,6 +681,38 @@ async def test_duplicate_queued_job_id_is_rejected_without_second_registration(
 
 
 @pytest.mark.asyncio
+async def test_cancel_registered_stops_lock_queued_job_without_reservation(
+    fake_worker_command: list[str],
+    worker_home: Path,
+) -> None:
+    manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
+    await manager.start()
+    active = asyncio.create_task(
+        manager.run(ModelRole.OCR, {"job_id": "registered-active", "block": True})
+    )
+    await manager.wait_until_running("registered-active")
+    queued = asyncio.create_task(
+        manager.run(ModelRole.EXTRACTION, {"job_id": "registered-queued"})
+    )
+    for _ in range(100):
+        if "registered-queued" in manager._jobs:
+            break
+        await asyncio.sleep(0.01)
+
+    assert await manager.cancel_registered("registered-queued") is True
+    with pytest.raises(LocalWorkerError, match="cancelled"):
+        await queued
+    assert await manager.cancel_registered("never-registered") is False
+    assert manager._cancelled_jobs == {}
+
+    await manager.cancel("registered-active")
+    with pytest.raises(LocalWorkerError, match="cancelled"):
+        await active
+    assert manager.metrics.roles_started == [ModelRole.OCR]
+    await manager.stop()
+
+
+@pytest.mark.asyncio
 async def test_task_cancellation_during_spawn_reaps_created_process(
     fake_worker_command: list[str], worker_home: Path
 ) -> None:
@@ -350,6 +851,112 @@ async def test_cleanup_failure_before_group_death_poison_blocks_until_recovery(
     }
     await recovered_manager.stop()
     await other_manager.stop()
+
+
+def test_cleanup_failure_retains_cross_process_lock_until_orphan_group_exits(
+    fake_worker_command: list[str],
+    worker_home: Path,
+) -> None:
+    backend_root = Path(__file__).resolve().parents[1]
+    release_owner = worker_home.parent / "release-owner"
+    owner_script = "\n".join(
+        [
+            "import asyncio,json",
+            "from pathlib import Path",
+            "from app.services.local_ai.errors import LocalWorkerError",
+            "from app.services.local_ai.model_manager import LocalModelManager",
+            "from app.services.local_ai.types import ModelRole",
+            f"release_owner = Path({str(release_owner)!r})",
+            "async def main():",
+            (
+                "    manager = LocalModelManager("
+                f"{fake_worker_command!r}, worker_home={str(worker_home)!r}, "
+                "_allow_unisolated_test_worker=True)"
+            ),
+            "    await manager.start()",
+            "    async def fail_after_parent_exit(process):",
+            "        process.kill()",
+            "        await process.wait()",
+            "        raise LocalWorkerError('Local worker failed.')",
+            "    manager._terminate_process = fail_after_parent_exit",
+            "    try:",
+            (
+                "        await manager.run("
+                "ModelRole.OCR, {'spawn_descendant': True, "
+                "'descendant_ignores_term': True})"
+            ),
+            "    except LocalWorkerError:",
+            "        pass",
+            "    descendant_pid = int((Path(manager._worker_home) / 'descendant.pid').read_text())",
+            (
+                "    print(json.dumps({'pgid': manager.active_pid, "
+                "'descendant_pid': descendant_pid}), flush=True)"
+            ),
+            "    while not release_owner.exists():",
+            "        await asyncio.sleep(0.01)",
+            "asyncio.run(main())",
+        ]
+    )
+    owner = subprocess.Popen(
+        [sys.executable, "-c", owner_script],
+        cwd=backend_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    follower: subprocess.Popen[str] | None = None
+    orphan_pgid: int | None = None
+    try:
+        assert owner.stdout is not None
+        owner_state = json.loads(owner.stdout.readline())
+        orphan_pgid = owner_state["pgid"]
+        os.kill(owner_state["descendant_pid"], 0)
+
+        follower_script = "\n".join(
+            [
+                "import asyncio,json",
+                "from app.services.local_ai.model_manager import LocalModelManager",
+                "from app.services.local_ai.types import ModelRole",
+                "async def main():",
+                (
+                    "    manager = LocalModelManager("
+                    f"{fake_worker_command!r}, worker_home={str(worker_home)!r}, "
+                    "_allow_unisolated_test_worker=True)"
+                ),
+                "    await manager.start()",
+                "    result = await manager.run(ModelRole.OCR, {})",
+                "    print(json.dumps(result), flush=True)",
+                "    await manager.stop()",
+                "asyncio.run(main())",
+            ]
+        )
+        follower = subprocess.Popen(
+            [sys.executable, "-c", follower_script],
+            cwd=backend_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        time.sleep(0.5)
+        assert follower.poll() is None
+
+        os.killpg(orphan_pgid, signal.SIGKILL)
+        follower_stdout, follower_stderr = follower.communicate(timeout=5)
+        assert follower.returncode == 0, follower_stderr
+        assert json.loads(follower_stdout)["markdown"] == "# Synthetic OCR"
+    finally:
+        if orphan_pgid is not None:
+            try:
+                os.killpg(orphan_pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if follower is not None and follower.poll() is None:
+            follower.kill()
+            follower.communicate(timeout=5)
+        release_owner.touch()
+        owner_stdout, owner_stderr = owner.communicate(timeout=5)
+        assert owner.returncode == 0, f"{owner_stdout}\n{owner_stderr}"
 
 
 @pytest.mark.asyncio
@@ -857,16 +1464,23 @@ async def test_enabled_app_lifespan_starts_and_always_stops_manager(
     monkeypatch.setattr(main_module.settings, "local_ai_enabled", True)
     monkeypatch.setattr(main_module.settings, "phi_ner_enabled", False)
     monkeypatch.setattr(main_module.settings, "extraction_engine", "gemini")
-    monkeypatch.setattr(main_module, "local_model_manager", FakeManager(), raising=False)
+    monkeypatch.setattr(
+        main_module, "local_model_manager", FakeManager(), raising=False
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_reconcile_model_pack_operations_on_startup",
+        lambda: events.append("reconcile-pack") or 0,
+    )
     monkeypatch.setattr(main_module, "async_session_factory", FakeSessionContext)
     monkeypatch.setattr(terminology, "schedule_medication_refresh", lambda: None)
     monkeypatch.setattr(auth_service, "purge_expired_revoked_tokens", no_purge)
     monkeypatch.setattr(upload, "start_extraction_worker", lambda: None)
 
     async with main_module.lifespan(FastAPI()):
-        assert events == ["start"]
+        assert events == ["reconcile-pack", "start"]
 
-    assert events == ["start", "stop"]
+    assert events == ["reconcile-pack", "start", "stop"]
 
 
 @pytest.mark.asyncio

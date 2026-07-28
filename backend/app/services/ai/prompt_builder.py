@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 from uuid import UUID
@@ -94,9 +93,7 @@ async def build_prompt(
     # / DOB are stripped (regex patterns alone don't catch free-text names).
     patient = (
         await db.execute(
-            select(Patient).where(
-                Patient.id == patient_id, Patient.user_id == user_id
-            )
+            select(Patient).where(Patient.id == patient_id, Patient.user_id == user_id)
         )
     ).scalar_one_or_none()
     scrubbed_text, deidentification_report = scrub_phi(
@@ -104,7 +101,9 @@ async def build_prompt(
     )
 
     # Build user prompt
-    prompt_instruction = CATEGORY_PROMPTS.get(category or summary_type, CATEGORY_PROMPTS["full"])
+    prompt_instruction = CATEGORY_PROMPTS.get(
+        category or summary_type, CATEGORY_PROMPTS["full"]
+    )
     user_prompt = f"""{prompt_instruction}
 
 The following de-identified health records are provided for summarization:

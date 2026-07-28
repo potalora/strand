@@ -33,6 +33,13 @@ from app.services.ingestion.zip_child_sets import (
     STAGING_EXTRACTION_STATUS,
     ZipChildSet,
 )
+from app.services.local_ai.manifest import canonicalize_manifest_snapshot
+from app.services.local_ai.processing_snapshot import (
+    ProcessingSnapshot,
+    build_ingestion_job,
+    revalidate_strict_snapshot_admission,
+)
+from app.services.local_ai.types import ProcessingMode
 from app.utils.file_utils import (
     EncryptedFileWriter,
     decrypt_file_to,
@@ -122,7 +129,8 @@ def _safe_extract_zip(zf: zipfile.ZipFile, temp_dir: Path) -> None:
             ratio = info.file_size / info.compress_size
             if ratio > _ZIP_MAX_COMPRESSION_RATIO:
                 raise HTTPException(
-                    status_code=413, detail="ZIP compression ratio too high (suspected zip bomb)"
+                    status_code=413,
+                    detail="ZIP compression ratio too high (suspected zip bomb)",
                 )
         declared_total += info.file_size
     if declared_total > _ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES:
@@ -172,7 +180,10 @@ def _find_patient_resource_streaming(file_path: Path) -> dict | None:
                 if not isinstance(entry, dict):
                     continue
                 resource = entry.get("resource")
-                if isinstance(resource, dict) and resource.get("resourceType") == "Patient":
+                if (
+                    isinstance(resource, dict)
+                    and resource.get("resourceType") == "Patient"
+                ):
                     return resource
     except Exception as e:  # noqa: BLE001 - fail-open; never block ingestion
         logger.warning("Streaming Patient lookup failed for %s: %s", file_path, e)
@@ -192,9 +203,12 @@ async def get_or_create_patient(
         # the deterministic PHI scrubber can strip the patient's own name.
         if demo:
             await backfill_patient_demographics(
-                db, patient,
-                name=demo.get("name"), mrn=demo.get("mrn"),
-                dob=demo.get("dob"), gender=demo.get("gender"),
+                db,
+                patient,
+                name=demo.get("name"),
+                mrn=demo.get("mrn"),
+                dob=demo.get("dob"),
+                gender=demo.get("gender"),
             )
         return patient
 
@@ -208,9 +222,12 @@ async def get_or_create_patient(
     await db.refresh(patient)
     if demo:
         await backfill_patient_demographics(
-            db, patient,
-            name=demo.get("name"), mrn=demo.get("mrn"),
-            dob=demo.get("dob"), gender=demo.get("gender"),
+            db,
+            patient,
+            name=demo.get("name"),
+            mrn=demo.get("mrn"),
+            dob=demo.get("dob"),
+            gender=demo.get("gender"),
         )
     return patient
 
@@ -273,6 +290,10 @@ async def ingest_file(
     file_path: Path,
     original_filename: str,
     mime_type: str = "application/octet-stream",
+    *,
+    processing_mode: str = "cloud_assisted",
+    processing_manifest: dict | None = None,
+    processing_schema_version: str | None = None,
 ) -> dict:
     """Main ingestion entry point. Detects file type and routes to appropriate parser."""
     # CRYPTO-02 (issue #54): structured uploads are encrypted at rest in the
@@ -313,6 +334,9 @@ async def ingest_file(
             storage_path=str(file_path),
             ingestion_status="processing",
             processing_started_at=datetime.now(timezone.utc),
+            processing_mode=processing_mode,
+            processing_manifest=copy.deepcopy(processing_manifest),
+            processing_schema_version=processing_schema_version,
         )
         db.add(upload)
         await db.commit()
@@ -322,13 +346,19 @@ async def ingest_file(
 
         try:
             if file_type == "fhir_r4":
-                stats = await _ingest_fhir(db, user_id, patient.id, upload.id, work_path)
+                stats = await _ingest_fhir(
+                    db, user_id, patient.id, upload.id, work_path
+                )
             elif file_type == "epic_ehi":
-                stats = await _ingest_epic_dir(db, user_id, patient.id, upload.id, work_path)
+                stats = await _ingest_epic_dir(
+                    db, user_id, patient.id, upload.id, work_path
+                )
             elif file_type == "zip":
                 stats = await _ingest_zip(db, user_id, patient.id, upload.id, work_path)
             elif file_type == "cda_xml":
-                stats = await _ingest_cda_standalone(db, user_id, patient.id, upload.id, work_path)
+                stats = await _ingest_cda_standalone(
+                    db, user_id, patient.id, upload.id, work_path
+                )
             else:
                 raise ValueError(f"Unsupported file type: {file_type}")
 
@@ -347,9 +377,7 @@ async def ingest_file(
             upload.ingestion_status = "dedup_scanning"
             await db.commit()
 
-            asyncio.create_task(
-                _run_dedup_background(upload.id, patient.id, user_id)
-            )
+            asyncio.create_task(_run_dedup_background(upload.id, patient.id, user_id))
 
             return {
                 "upload_id": str(upload.id),
@@ -389,7 +417,11 @@ async def _run_dedup_background(
                 return
 
             dedup_summary = await run_upload_dedup(
-                upload_id, patient_id, user_id, db
+                upload_id,
+                patient_id,
+                user_id,
+                db,
+                processing_mode=upload.processing_mode,
             )
             upload.dedup_summary = dedup_summary.to_dict()
 
@@ -404,8 +436,10 @@ async def _run_dedup_background(
             await db.commit()
             logger.info(
                 "Background dedup completed for %s: %d candidates, %d auto-merged, %d need review",
-                upload_id, dedup_summary.total_candidates,
-                dedup_summary.auto_merged, dedup_summary.needs_review,
+                upload_id,
+                dedup_summary.total_candidates,
+                dedup_summary.auto_merged,
+                dedup_summary.needs_review,
             )
     except Exception:
         logger.exception("Background dedup failed for %s", upload_id)
@@ -457,9 +491,12 @@ async def _backfill_patient_by_id(
     if patient is None:
         return
     await backfill_patient_demographics(
-        db, patient,
-        name=demo.get("name"), mrn=demo.get("mrn"),
-        dob=demo.get("dob"), gender=demo.get("gender"),
+        db,
+        patient,
+        name=demo.get("name"),
+        mrn=demo.get("mrn"),
+        dob=demo.get("dob"),
+        gender=demo.get("gender"),
     )
 
 
@@ -519,7 +556,9 @@ async def _ingest_cda_standalone(
         result = await idempotent_insert_records(db, batch)
         stats["records_inserted"] += result["inserted"]
         stats["records_updated"] = stats.get("records_updated", 0) + result["updated"]
-        stats["records_unchanged"] = stats.get("records_unchanged", 0) + result["unchanged"]
+        stats["records_unchanged"] = (
+            stats.get("records_unchanged", 0) + result["unchanged"]
+        )
         await db.commit()
 
     logger.info(
@@ -556,9 +595,14 @@ async def _ingest_xdm(
     # Backfill patient identifiers from the XDM manifest (HL7 PID-5/PID-7) so the
     # deterministic PHI scrubber can strip the patient's own name from CDA text.
     await _backfill_patient_by_id(
-        db, patient_id,
-        {"name": manifest.patient_name, "dob": manifest.patient_dob,
-         "mrn": None, "gender": None},
+        db,
+        patient_id,
+        {
+            "name": manifest.patient_name,
+            "dob": manifest.patient_dob,
+            "mrn": None,
+            "gender": None,
+        },
     )
 
     # Filter to XML documents only
@@ -567,11 +611,13 @@ async def _ingest_xdm(
 
     # Log skipped files
     for doc in skipped_docs:
-        stats["errors"].append({
-            "file": doc.uri,
-            "reason": "structured_preferred",
-            "message": "Skipped: CDA XML documents provide higher-fidelity structured data",
-        })
+        stats["errors"].append(
+            {
+                "file": doc.uri,
+                "reason": "structured_preferred",
+                "message": "Skipped: CDA XML documents provide higher-fidelity structured data",
+            }
+        )
 
     if not xml_docs:
         stats["errors"].append({"error": "No CDA XML documents found in manifest"})
@@ -613,7 +659,9 @@ async def _ingest_xdm(
         result = await idempotent_insert_records(db, batch)
         stats["records_inserted"] += result["inserted"]
         stats["records_updated"] = stats.get("records_updated", 0) + result["updated"]
-        stats["records_unchanged"] = stats.get("records_unchanged", 0) + result["unchanged"]
+        stats["records_unchanged"] = (
+            stats.get("records_unchanged", 0) + result["unchanged"]
+        )
         await db.commit()
 
     logger.info(
@@ -647,7 +695,9 @@ async def _ingest_zip(
         if metadata_path:
             logger.info("Detected IHE XDM package: %s", metadata_path)
             xdm_dir = metadata_path.parent
-            return await _ingest_xdm(db, user_id, patient_id, upload_id, xdm_dir, metadata_path)
+            return await _ingest_xdm(
+                db, user_id, patient_id, upload_id, xdm_dir, metadata_path
+            )
 
         # Collect all files, excluding schema dirs and readme
         all_files = list(temp_dir.rglob("*"))
@@ -685,7 +735,9 @@ async def _ingest_zip(
         # Process structured content
         if tsv_files:
             tsv_dir = tsv_files[0].parent
-            epic_stats = await _ingest_epic_dir(db, user_id, patient_id, upload_id, tsv_dir)
+            epic_stats = await _ingest_epic_dir(
+                db, user_id, patient_id, upload_id, tsv_dir
+            )
             stats["total_entries"] += epic_stats.get("total_files", 0)
             stats["records_inserted"] += epic_stats.get("records_inserted", 0)
             stats["records_skipped"] += epic_stats.get("records_skipped", 0)
@@ -719,6 +771,7 @@ async def _ingest_zip(
                 writer_factory=EncryptedFileWriter,
             )
             staged_uploads: list[UploadedFile] = []
+            strict_job_uploads: list[UploadedFile] = []
             staged_results: list[dict[str, str]] = []
             staging_rows_committed = False
             try:
@@ -742,9 +795,7 @@ async def _ingest_zip(
                             id=uuid4(),
                             user_id=user_id,
                             filename=uf.name,
-                            mime_type=mime_map.get(
-                                suffix, "application/octet-stream"
-                            ),
+                            mime_type=mime_map.get(suffix, "application/octet-stream"),
                             file_size_bytes=uf.stat().st_size,
                             file_hash=compute_file_hash(uf),
                             storage_path=str(dest_path),
@@ -754,8 +805,13 @@ async def _ingest_zip(
                             processing_manifest=copy.deepcopy(
                                 parent_upload.processing_manifest
                             ),
+                            processing_schema_version=(
+                                parent_upload.processing_schema_version
+                            ),
                         )
                         db.add(unstr_upload)
+                        if parent_upload.processing_mode == "validated_strict_local":
+                            strict_job_uploads.append(unstr_upload)
                         staged_uploads.append(unstr_upload)
                         staged_results.append(
                             {
@@ -769,6 +825,35 @@ async def _ingest_zip(
                         stats["errors"].append({"file": uf.name, "error": str(e)})
 
                 if staged_uploads:
+                    await db.flush(staged_uploads)
+                    if strict_job_uploads:
+                        manifest_snapshot, manifest_digest = (
+                            canonicalize_manifest_snapshot(
+                                parent_upload.processing_manifest
+                            )
+                        )
+                        strict_snapshot = ProcessingSnapshot(
+                            mode=ProcessingMode.VALIDATED_STRICT_LOCAL,
+                            manifest_snapshot=manifest_snapshot,
+                            manifest_sha256=manifest_digest,
+                            schema_version=parent_upload.processing_schema_version,
+                        )
+                        await revalidate_strict_snapshot_admission(
+                            db,
+                            strict_snapshot,
+                        )
+
+                        for strict_upload in strict_job_uploads:
+                            job = build_ingestion_job(
+                                upload_id=strict_upload.id,
+                                user_id=user_id,
+                                snapshot=strict_snapshot,
+                            )
+                            if job is None:
+                                raise RuntimeError(
+                                    "Strict-local child job could not be created"
+                                )
+                            db.add(job)
                     child_set.seal()
                     try:
                         await db.commit()

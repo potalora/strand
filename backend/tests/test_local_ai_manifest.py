@@ -16,19 +16,48 @@ import httpx
 import pytest
 
 from app.services.local_ai.errors import LocalValidationError
-from app.services.local_ai.manifest import load_manifest
+from app.services.local_ai.manifest import (
+    is_secret_shaped_manifest_text,
+    load_manifest,
+    parse_manifest,
+)
 from app.services.local_ai.types import ModelRole
 
 lock_script = importlib.import_module("scripts.lock_local_ai_manifest")
 
 ROLES = ("ocr", "extraction", "summary")
+LICENSE_SOURCE_CONTENT = b"Apache License\nVersion 2.0, January 2004\n"
+LICENSE_SOURCE_REVISION = "f" * 40
+LICENSE_SOURCE_SHA256 = hashlib.sha256(LICENSE_SOURCE_CONTENT).hexdigest()
+
+
+@pytest.fixture(autouse=True)
+def _stable_validation_disk_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep non-capacity lock tests independent of the host's free disk."""
+
+    usage_type = type(shutil.disk_usage(tmp_path))
+    ample_usage = usage_type(
+        80 * 1024**3,
+        20 * 1024**3,
+        60 * 1024**3,
+    )
+    monkeypatch.setattr(
+        lock_script.shutil,
+        "disk_usage",
+        lambda _: ample_usage,
+    )
 
 
 def _pathological_json_nesting(depth: int = 2_000) -> bytes:
     return b"[" * depth + b"0" + b"]" * depth
 
 
-def _manifest_file(path: str = "model.safetensors", *, size: int = 10) -> dict[str, Any]:
+def _manifest_file(
+    path: str = "model.safetensors", *, size: int = 10
+) -> dict[str, Any]:
     return {"path": path, "sha256": "a" * 64, "size": size}
 
 
@@ -71,6 +100,72 @@ def test_manifest_loads_exactly_one_of_each_role(tmp_path: Path) -> None:
         ModelRole.SUMMARY,
     )
     assert manifest.validation_suite_version == "local-ai-fixtures-v1"
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate", "canary"),
+    [
+        (
+            "pack revision",
+            lambda value, canary: value.update(pack_revision=canary),
+            "sk-proj-pack-manifest-canary",
+        ),
+        (
+            "repository",
+            lambda value, canary: value["artifacts"][0].update(
+                repository=f"owner/{canary}"
+            ),
+            "sk-proj-repository-manifest-canary",
+        ),
+        (
+            "revision",
+            lambda value, canary: value["artifacts"][0].update(revision=canary),
+            "sk-proj-revision-manifest-canary",
+        ),
+        (
+            "quantization",
+            lambda value, canary: value["artifacts"][0].update(quantization=canary),
+            "sk_" + "live_quantization_manifest_canary",
+        ),
+        (
+            "runtime",
+            lambda value, canary: value["runtime"].update(name=canary),
+            "api_key=runtime-manifest-canary",
+        ),
+        (
+            "validation suite",
+            lambda value, canary: value.update(validation_suite_version=canary),
+            "secret-validation-manifest-canary",
+        ),
+        (
+            "attribution",
+            lambda value, canary: value["artifacts"][0].update(
+                attribution=f"authorization=Bearer-{canary}"
+            ),
+            "attribution-manifest-canary",
+        ),
+        (
+            "path",
+            lambda value, canary: value["artifacts"][0]["files"][0].update(
+                path=f"weights/{canary}.safetensors"
+            ),
+            "sk-proj-path-manifest-canary",
+        ),
+    ],
+)
+def test_manifest_rejects_secret_shaped_metadata_without_echo(
+    field: str,
+    mutate: Any,
+    canary: str,
+) -> None:
+    raw = _valid_manifest()
+    mutate(raw, canary)
+
+    with pytest.raises(LocalValidationError) as exc_info:
+        parse_manifest(raw)
+
+    assert field
+    assert canary not in str(exc_info.value)
 
 
 def test_manifest_requires_immutable_revision_and_sha256(tmp_path: Path) -> None:
@@ -129,7 +224,9 @@ def test_manifest_rejects_repository_code_and_pickle(tmp_path: Path) -> None:
             "duplicate",
         ),
         (
-            lambda value: value["artifacts"][0]["files"][0].update(path="../model.json"),
+            lambda value: value["artifacts"][0]["files"][0].update(
+                path="../model.json"
+            ),
             "path",
         ),
         (
@@ -137,7 +234,9 @@ def test_manifest_rejects_repository_code_and_pickle(tmp_path: Path) -> None:
             "path",
         ),
         (
-            lambda value: value["artifacts"][0]["files"][0].update(path="a\\model.json"),
+            lambda value: value["artifacts"][0]["files"][0].update(
+                path="a\\model.json"
+            ),
             "path",
         ),
         (
@@ -149,7 +248,9 @@ def test_manifest_rejects_repository_code_and_pickle(tmp_path: Path) -> None:
             "forbidden",
         ),
         (
-            lambda value: value["artifacts"][0].update(decode_limits={"max_input_tokens": 0}),
+            lambda value: value["artifacts"][0].update(
+                decode_limits={"max_input_tokens": 0}
+            ),
             "decode limits",
         ),
     ],
@@ -245,9 +346,23 @@ def _catalog() -> dict[str, Any]:
             {
                 "role": role,
                 "repository": f"owner/{role}",
+                "revision": str(ROLES.index(role) + 1) * 40,
                 "quantization": "4bit",
                 "license": "apache-2.0",
                 "attribution": f"https://huggingface.co/owner/{role}",
+                **(
+                    {
+                        "license_source": {
+                            "repository": "owner/extraction-base",
+                            "revision": LICENSE_SOURCE_REVISION,
+                            "path": "LICENSE",
+                            "sha256": LICENSE_SOURCE_SHA256,
+                            "size": len(LICENSE_SOURCE_CONTENT),
+                        }
+                    }
+                    if role == "extraction"
+                    else {}
+                ),
                 "decode_limits": {
                     "max_input_tokens": 4096,
                     "max_output_tokens": 1024,
@@ -256,6 +371,122 @@ def _catalog() -> dict[str, Any]:
             for role in ROLES
         ],
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation", "canary"),
+    [
+        (
+            "pack revision",
+            lambda value, canary: value.update(pack_revision=canary),
+            "sk-proj-catalog-canary",
+        ),
+        (
+            "validation suite",
+            lambda value, canary: value.update(validation_suite_version=canary),
+            "secret-validation-catalog-canary",
+        ),
+        (
+            "runtime",
+            lambda value, canary: value["runtime"].update(name=canary),
+            "api_key=runtime-catalog-canary",
+        ),
+        (
+            "repository",
+            lambda value, canary: value["candidates"][0].update(
+                repository=f"owner/{canary}"
+            ),
+            "sk-proj-repository-catalog-canary",
+        ),
+        (
+            "quantization",
+            lambda value, canary: value["candidates"][0].update(quantization=canary),
+            "sk_" + "live_quantization_catalog_canary",
+        ),
+        (
+            "attribution",
+            lambda value, canary: value["candidates"][0].update(
+                attribution=f"authorization=Bearer-{canary}"
+            ),
+            "attribution-catalog-canary",
+        ),
+        (
+            "license source repository",
+            lambda value, canary: value["candidates"][1]["license_source"].update(
+                repository=f"owner/{canary}"
+            ),
+            "sk-proj-license-source-catalog-canary",
+        ),
+        (
+            "standalone token label",
+            lambda value, canary: value.update(pack_revision=canary),
+            "token-mycredential1234",
+        ),
+        (
+            "concatenated password label",
+            lambda value, canary: value.update(validation_suite_version=canary),
+            "passwordhunter2",
+        ),
+        (
+            "concatenated secret label",
+            lambda value, canary: value["runtime"].update(version=canary),
+            "secretcanary123",
+        ),
+        (
+            "repository token label",
+            lambda value, canary: value["candidates"][0].update(
+                repository=f"owner/{canary}"
+            ),
+            "token-mycredential1234",
+        ),
+    ],
+)
+def test_lock_catalog_rejects_secret_shaped_strings_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    mutation: Any,
+    canary: str,
+) -> None:
+    catalog = _catalog()
+    mutation(catalog, canary)
+    network_called = False
+
+    def forbidden_client(*args: Any, **kwargs: Any) -> None:
+        nonlocal network_called
+        network_called = True
+        raise AssertionError("network must not be called")
+
+    monkeypatch.setattr(lock_script.httpx, "Client", forbidden_client)
+
+    with pytest.raises(LocalValidationError) as exc_info:
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", catalog),
+            tmp_path / "candidate.lock.json",
+        )
+
+    assert field
+    assert network_called is False
+    assert canary not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "apple-m4-16gb-v1",
+        "local-ai-fixtures-v1",
+        "mlx-vlm",
+        "0.5.0",
+        "owner/ocr",
+        "sahilchachra/ovisocr2-int4-mlx",
+        "938d8919941c6e7efd3c7150eff7fe9d12afa631",
+        "https://huggingface.co/sahilchachra/ovisocr2-int4-mlx",
+        "https://huggingface.co/numind/NuExtract3-mlx-4bits",
+        "tokenizer_config.json",
+    ],
+)
+def test_manifest_secret_filter_preserves_pinned_public_identity(value: str) -> None:
+    assert is_secret_shaped_manifest_text(value) is False
 
 
 class _HFTransport:
@@ -269,6 +500,10 @@ class _HFTransport:
         uppercase_json_role: str | None = None,
         nested_config_role: str | None = None,
         recursive_config_role: str | None = None,
+        large_tokenizer_role: str | None = None,
+        large_vocab_role: str | None = None,
+        missing_license_role: str | None = None,
+        tampered_license_source: bool = False,
     ) -> None:
         self.requests: list[str] = []
         self.forbidden_role = forbidden_role
@@ -276,7 +511,11 @@ class _HFTransport:
         self.bad_weight_role = bad_weight_role
         self.oversized_json_role = oversized_json_role
         self.uppercase_json_role = uppercase_json_role
+        self.missing_license_role = missing_license_role
+        self.tampered_license_source = tampered_license_source
         self.config_bytes: dict[str, bytes] = {}
+        self.tokenizer_bytes: dict[str, bytes] = {}
+        self.vocab_bytes: dict[str, bytes] = {}
         self.weight_bytes: dict[str, bytes] = {}
         for role in ROLES:
             config = {"architectures": [f"{role.title()}Model"]}
@@ -291,6 +530,17 @@ class _HFTransport:
                 self.config_bytes[role] = _pathological_json_nesting()
             else:
                 self.config_bytes[role] = json.dumps(config).encode()
+            if role == large_tokenizer_role:
+                self.tokenizer_bytes[role] = json.dumps(
+                    {"vocab": list(range(lock_script.MAX_JSON_STRUCTURE_NODES + 1))}
+                ).encode()
+            if role == large_vocab_role:
+                self.vocab_bytes[role] = json.dumps(
+                    {
+                        f"token-{index}": index
+                        for index in range(lock_script.MAX_JSON_STRUCTURE_NODES + 1)
+                    }
+                ).encode()
             self.weight_bytes[role] = f"safe-{role}-weights".encode()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -300,7 +550,9 @@ class _HFTransport:
             role = parts[3]
             config = self.config_bytes[role]
             weights = self.weight_bytes[role]
-            config_path = "config.JSON" if role == self.uppercase_json_role else "config.json"
+            config_path = (
+                "config.JSON" if role == self.uppercase_json_role else "config.json"
+            )
             config_size = (
                 lock_script.MAX_JSON_METADATA_BYTES + 1
                 if role == self.oversized_json_role
@@ -323,6 +575,28 @@ class _HFTransport:
                 },
                 {"rfilename": ".gitattributes", "size": 10, "blobId": "f" * 40},
             ]
+            tokenizer = self.tokenizer_bytes.get(role)
+            if tokenizer is not None:
+                siblings.append(
+                    {
+                        "rfilename": "tokenizer.json",
+                        "size": len(tokenizer),
+                        "blobId": hashlib.sha1(
+                            tokenizer, usedforsecurity=False
+                        ).hexdigest(),
+                    }
+                )
+            vocab = self.vocab_bytes.get(role)
+            if vocab is not None:
+                siblings.append(
+                    {
+                        "rfilename": "vocab.json",
+                        "size": len(vocab),
+                        "blobId": hashlib.sha1(
+                            vocab, usedforsecurity=False
+                        ).hexdigest(),
+                    }
+                )
             if role == self.forbidden_role:
                 siblings.append(
                     {"rfilename": "modeling_custom.py", "size": 20, "blobId": "e" * 40}
@@ -332,16 +606,39 @@ class _HFTransport:
                 json={
                     "id": f"owner/{role}",
                     "sha": str(ROLES.index(role) + 1) * 40,
-                    "cardData": {"license": "apache-2.0"},
+                    "cardData": (
+                        {}
+                        if role == self.missing_license_role
+                        else {"license": "apache-2.0"}
+                    ),
                     "siblings": siblings,
                 },
                 request=request,
             )
+        if (
+            parts[:2] == ["owner", "extraction-base"]
+            and parts[2:4] == ["resolve", LICENSE_SOURCE_REVISION]
+            and parts[4:] == ["LICENSE"]
+        ):
+            content = LICENSE_SOURCE_CONTENT
+            if self.tampered_license_source:
+                content += b"tampered"
+            return httpx.Response(200, content=content, request=request)
         if parts[0] == "owner" and parts[2] == "resolve":
             role = parts[1]
             filename = "/".join(parts[4:])
             if filename == "config.json":
-                return httpx.Response(200, content=self.config_bytes[role], request=request)
+                return httpx.Response(
+                    200, content=self.config_bytes[role], request=request
+                )
+            if filename == "tokenizer.json":
+                return httpx.Response(
+                    200, content=self.tokenizer_bytes[role], request=request
+                )
+            if filename == "vocab.json":
+                return httpx.Response(
+                    200, content=self.vocab_bytes[role], request=request
+                )
             if filename == "model.safetensors":
                 content = self.weight_bytes[role]
                 if role == self.bad_weight_role:
@@ -350,7 +647,9 @@ class _HFTransport:
         return httpx.Response(404, request=request)
 
 
-def _install_mock_client(monkeypatch: pytest.MonkeyPatch, transport: _HFTransport) -> None:
+def _install_mock_client(
+    monkeypatch: pytest.MonkeyPatch, transport: _HFTransport
+) -> None:
     real_client = httpx.Client
 
     def client_factory(*args: Any, **kwargs: Any) -> httpx.Client:
@@ -374,14 +673,130 @@ def test_lock_catalog_resolves_hashes_and_writes_canonical_lock_atomically(
     assert count == 3
     assert output.read_bytes().endswith(b"\n")
     assert output.read_text() == (
-        json.dumps(json.loads(output.read_text()), sort_keys=True, separators=(",", ":"))
+        json.dumps(
+            json.loads(output.read_text()), sort_keys=True, separators=(",", ":")
+        )
         + "\n"
     )
     manifest = load_manifest(output)
     assert {artifact.role for artifact in manifest.artifacts} == set(ModelRole)
     assert all(len(artifact.revision) == 40 for artifact in manifest.artifacts)
-    assert all(len(file.sha256) == 64 for artifact in manifest.artifacts for file in artifact.files)
-    assert not any(".gitattributes" in file.path for artifact in manifest.artifacts for file in artifact.files)
+    assert all(
+        len(file.sha256) == 64
+        for artifact in manifest.artifacts
+        for file in artifact.files
+    )
+    assert not any(
+        ".gitattributes" in file.path
+        for artifact in manifest.artifacts
+        for file in artifact.files
+    )
+    extraction = next(
+        artifact
+        for artifact in manifest.artifacts
+        if artifact.role == ModelRole.EXTRACTION
+    )
+    assert f"license-sha256={LICENSE_SOURCE_SHA256}" in extraction.attribution
+
+
+def test_lock_catalog_accepts_missing_quant_license_only_with_verified_pinned_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _HFTransport(missing_license_role="extraction")
+    _install_mock_client(monkeypatch, transport)
+
+    lock_script.lock_catalog(
+        _write_json(tmp_path / "catalog.json", _catalog()),
+        tmp_path / "candidate.lock.json",
+    )
+
+    license_request = next(
+        index
+        for index, request in enumerate(transport.requests)
+        if "/owner/extraction-base/resolve/" in request
+    )
+    first_model_file_request = next(
+        index
+        for index, request in enumerate(transport.requests)
+        if "/resolve/" in request and "/owner/extraction-base/resolve/" not in request
+    )
+    assert license_request < first_model_file_request
+
+
+def test_lock_catalog_rejects_missing_license_metadata_without_attestation_before_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _catalog()
+    catalog["candidates"][1].pop("license_source")
+    transport = _HFTransport(missing_license_role="extraction")
+    _install_mock_client(monkeypatch, transport)
+
+    with pytest.raises(LocalValidationError, match="license metadata"):
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", catalog),
+            tmp_path / "candidate.lock.json",
+        )
+
+    assert len(transport.requests) == 2
+    assert all("/api/models/" in request for request in transport.requests)
+
+
+def test_lock_catalog_rejects_tampered_license_attestation_before_model_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _HFTransport(
+        missing_license_role="extraction",
+        tampered_license_source=True,
+    )
+    _install_mock_client(monkeypatch, transport)
+
+    with pytest.raises(LocalValidationError, match="[Ll]icense attestation"):
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", _catalog()),
+            tmp_path / "candidate.lock.json",
+        )
+
+    assert not any(
+        "/resolve/" in request and "/owner/extraction-base/resolve/" not in request
+        for request in transport.requests
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda source: source.update(revision="main"),
+        lambda source: source.update(path="../LICENSE"),
+        lambda source: source.update(sha256="A" * 64),
+        lambda source: source.update(size=0),
+    ],
+)
+def test_lock_catalog_rejects_invalid_license_attestation_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: Any,
+) -> None:
+    catalog = _catalog()
+    mutation(catalog["candidates"][1]["license_source"])
+    network_called = False
+
+    def forbidden_client(*args: Any, **kwargs: Any) -> None:
+        nonlocal network_called
+        network_called = True
+        raise AssertionError("network must not be called")
+
+    monkeypatch.setattr(lock_script.httpx, "Client", forbidden_client)
+
+    with pytest.raises(LocalValidationError, match="license source"):
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", catalog),
+            tmp_path / "candidate.lock.json",
+        )
+
+    assert network_called is False
 
 
 def test_lock_catalog_preflights_all_metadata_before_any_file_download(
@@ -393,7 +808,9 @@ def test_lock_catalog_preflights_all_metadata_before_any_file_download(
     output = tmp_path / "candidate.lock.json"
 
     with pytest.raises(LocalValidationError, match="forbidden"):
-        lock_script.lock_catalog(_write_json(tmp_path / "catalog.json", _catalog()), output)
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", _catalog()), output
+        )
 
     assert not output.exists()
     assert len(transport.requests) == 3
@@ -443,14 +860,97 @@ def test_lock_catalog_rejects_remote_code_before_weight_download(
     output = tmp_path / "candidate.lock.json"
 
     with pytest.raises(LocalValidationError, match="remote code"):
-        lock_script.lock_catalog(_write_json(tmp_path / "catalog.json", _catalog()), output)
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", _catalog()), output
+        )
 
     assert not output.exists()
     extraction_requests = [
-        request for request in transport.requests if "/owner/extraction/resolve/" in request
+        request
+        for request in transport.requests
+        if "/owner/extraction/resolve/" in request
     ]
     assert any(request.endswith("/config.json") for request in extraction_requests)
-    assert not any(request.endswith("/model.safetensors") for request in transport.requests)
+    assert not any(
+        request.endswith("/model.safetensors") for request in transport.requests
+    )
+
+
+def test_lock_catalog_accepts_large_static_tokenizer_json_but_still_inspects_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _HFTransport(large_tokenizer_role="ocr")
+    _install_mock_client(monkeypatch, transport)
+    output = tmp_path / "candidate.lock.json"
+
+    lock_script.lock_catalog(
+        _write_json(tmp_path / "catalog.json", _catalog()),
+        output,
+    )
+
+    manifest = load_manifest(output)
+    ocr = next(
+        artifact for artifact in manifest.artifacts if artifact.role is ModelRole.OCR
+    )
+    assert any(file.path == "tokenizer.json" for file in ocr.files)
+    assert any(request.endswith("/config.json") for request in transport.requests)
+
+
+def test_lock_catalog_accepts_large_static_vocab_json_but_still_inspects_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _HFTransport(large_vocab_role="ocr")
+    _install_mock_client(monkeypatch, transport)
+    output = tmp_path / "candidate.lock.json"
+
+    lock_script.lock_catalog(
+        _write_json(tmp_path / "catalog.json", _catalog()),
+        output,
+    )
+
+    manifest = load_manifest(output)
+    ocr = next(
+        artifact for artifact in manifest.artifacts if artifact.role is ModelRole.OCR
+    )
+    assert any(file.path == "vocab.json" for file in ocr.files)
+    assert any(request.endswith("/config.json") for request in transport.requests)
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        (
+            "tokenizer.json",
+            {"auto_map": {"AutoTokenizer": "custom.Tokenizer"}},
+        ),
+        (
+            "vocab.json",
+            {"trust_remote_code": True},
+        ),
+    ],
+)
+def test_static_tokenizer_json_rejects_remote_code_keys(
+    tmp_path: Path,
+    filename: str,
+    payload: dict[str, Any],
+) -> None:
+    path = _write_json(tmp_path / filename, payload)
+
+    with pytest.raises(LocalValidationError, match="remote code"):
+        lock_script._inspect_downloaded_json(path, path.stat().st_size)
+
+
+def test_static_tokenizer_allows_bounded_bpe_merge_containers() -> None:
+    tokenizer = {
+        "model": {
+            "type": "BPE",
+            "merges": [["left", "right"]] * (lock_script.MAX_JSON_STRUCTURE_NODES + 1),
+        }
+    }
+
+    assert lock_script._static_json_contains_remote_code_requirement(tokenizer) is False
 
 
 def test_lock_catalog_refuses_download_when_validation_cache_would_leave_low_disk(
@@ -489,7 +989,9 @@ def test_lock_catalog_rejects_stream_mismatch_without_output_or_temp_bytes(
     output = tmp_path / "candidate.lock.json"
 
     with pytest.raises(LocalValidationError, match="metadata"):
-        lock_script.lock_catalog(_write_json(tmp_path / "catalog.json", _catalog()), output)
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", _catalog()), output
+        )
 
     assert not output.exists()
     assert list(tmp_path.glob(".local-ai-lock-*")) == []
@@ -552,6 +1054,49 @@ def test_lock_catalog_rejects_invalid_pack_revision_before_network(
     assert network_called is False
 
 
+def test_lock_catalog_rejects_mutable_candidate_revision_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog_value = _catalog()
+    catalog_value["candidates"][0]["revision"] = "main"
+    network_called = False
+
+    def forbidden_client(*args: Any, **kwargs: Any) -> None:
+        nonlocal network_called
+        network_called = True
+        raise AssertionError("network must not be called")
+
+    monkeypatch.setattr(lock_script.httpx, "Client", forbidden_client)
+
+    with pytest.raises(LocalValidationError, match="candidate revision"):
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", catalog_value),
+            tmp_path / "candidate.lock.json",
+        )
+
+    assert network_called is False
+
+
+def test_lock_catalog_rejects_repository_revision_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog_value = _catalog()
+    catalog_value["candidates"][0]["revision"] = "9" * 40
+    transport = _HFTransport()
+    _install_mock_client(monkeypatch, transport)
+
+    with pytest.raises(LocalValidationError, match="candidate revision"):
+        lock_script.lock_catalog(
+            _write_json(tmp_path / "catalog.json", catalog_value),
+            tmp_path / "candidate.lock.json",
+        )
+
+    assert len(transport.requests) == 1
+    assert f"/revision/{'9' * 40}" in transport.requests[0]
+
+
 def test_lock_catalog_normalizes_pathological_catalog_nesting_before_network(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -611,8 +1156,13 @@ def test_lock_catalog_normalizes_pathological_downloaded_json_nesting(
             tmp_path / "candidate.lock.json",
         )
 
-    assert len(transport.requests) == 4
-    assert transport.requests[-1].endswith("/config.json")
+    model_file_requests = [
+        request
+        for request in transport.requests
+        if "/resolve/" in request and "/owner/extraction-base/resolve/" not in request
+    ]
+    assert len(model_file_requests) == 1
+    assert model_file_requests[-1].endswith("/config.json")
 
 
 def test_lock_catalog_bounds_downloaded_json_structure_depth(
@@ -628,8 +1178,13 @@ def test_lock_catalog_bounds_downloaded_json_structure_depth(
             tmp_path / "candidate.lock.json",
         )
 
-    assert len(transport.requests) == 4
-    assert transport.requests[-1].endswith("/config.json")
+    model_file_requests = [
+        request
+        for request in transport.requests
+        if "/resolve/" in request and "/owner/extraction-base/resolve/" not in request
+    ]
+    assert len(model_file_requests) == 1
+    assert model_file_requests[-1].endswith("/config.json")
 
 
 def test_lock_catalog_rejects_oversized_declared_metadata_before_json_decode(

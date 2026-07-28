@@ -8,6 +8,7 @@ from app.api import (
     dashboard,
     dedup,
     llm_settings,
+    local_ai,
     observations,
     records,
     summary,
@@ -23,6 +24,7 @@ api_router.include_router(timeline.router)
 api_router.include_router(upload.router)
 api_router.include_router(summary.router)
 api_router.include_router(llm_settings.router)
+api_router.include_router(local_ai.router)
 api_router.include_router(dedup.router)
 api_router.include_router(dashboard.router)
 api_router.include_router(observations.router)

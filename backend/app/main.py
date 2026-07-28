@@ -3,17 +3,21 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.router import api_router
 from app.config import settings
 from app.database import async_session_factory
 from app.middleware.audit import AuditMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.services.local_ai.lifecycle_lock import acquire_local_ai_lifecycle_lock
 from app.services.local_ai.model_manager import local_model_manager
 from app.services.local_ai.scratch import sweep_stale_scratch
 from app.services.ingestion.zip_child_sets import reconcile_zip_child_sets
@@ -47,6 +51,117 @@ _STALE_LOCAL_AI_SCRATCH_SECONDS = 24 * 60 * 60
 logger = logging.getLogger(__name__)
 
 
+def _reconcile_model_pack_operations_on_startup() -> int:
+    """Resolve crash-interrupted model-pack operations before job admission."""
+    model_root = Path(settings.local_ai_model_dir)
+    if not model_root.exists():
+        return 0
+    from app.services.local_ai.artifact_store import ArtifactStore
+    from app.services.local_ai.pack_operations import PackOperationStore
+
+    return PackOperationStore(ArtifactStore(model_root)).reconcile_interrupted()
+
+
+async def _recover_unstructured_jobs_on_startup(db: AsyncSession) -> int:
+    """Pair strict cancellation state, then requeue only uncancelled work."""
+    recovered_at = datetime.now(timezone.utc)
+    await db.execute(
+        text(
+            "UPDATE uploaded_files "
+            "SET ingestion_status = 'cancelled', progress_stage = NULL, "
+            "progress_detail = NULL, processing_completed_at = :now "
+            "WHERE ingestion_status IN ('pending_extraction', 'processing') "
+            "AND file_category = 'unstructured' "
+            "AND cancel_requested = true"
+        ),
+        {"now": recovered_at},
+    )
+    await db.execute(
+        text(
+            "UPDATE local_ai_jobs AS j "
+            "SET cancel_requested = true, status = 'cancelled', "
+            "stage = 'cancelled', progress = '{\"stage\":\"cancelled\"}'::jsonb, "
+            "failure = NULL, completed_at = :now "
+            "FROM uploaded_files AS u "
+            "WHERE j.upload_id = u.id "
+            "AND j.processing_mode = 'validated_strict_local' "
+            "AND j.status IN ('queued', 'processing') "
+            "AND u.ingestion_status = 'cancelled' "
+            "AND u.cancel_requested = true"
+        ),
+        {"now": recovered_at},
+    )
+    result = await db.execute(
+        text(
+            "UPDATE uploaded_files SET ingestion_status = 'pending_extraction', "
+            "processing_started_at = NULL "
+            "WHERE ingestion_status = 'processing' "
+            "AND file_category = 'unstructured' "
+            "AND cancel_requested = false"
+        )
+    )
+    await db.execute(
+        text(
+            "UPDATE local_ai_jobs AS j "
+            "SET status = 'queued', stage = 'recovery', "
+            "failure = NULL, completed_at = NULL "
+            "FROM uploaded_files AS u "
+            "WHERE j.upload_id = u.id "
+            "AND j.processing_mode = 'validated_strict_local' "
+            "AND j.status = 'processing' "
+            "AND u.ingestion_status = 'pending_extraction'"
+        )
+    )
+    return int(result.rowcount or 0)
+
+
+async def _recover_strict_local_summary_jobs_on_startup(
+    db: AsyncSession,
+) -> list[UUID]:
+    """Requeue interrupted strict-local summaries and return resumable job IDs."""
+    from app.models.local_ai import LocalAIJob
+
+    jobs = list(
+        (
+            await db.execute(
+                select(LocalAIJob)
+                .where(
+                    LocalAIJob.kind == "summary",
+                    LocalAIJob.processing_mode == "validated_strict_local",
+                    LocalAIJob.status.in_(("queued", "processing")),
+                )
+                .order_by(LocalAIJob.created_at.asc(), LocalAIJob.id.asc())
+                .limit(1001)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(jobs) > 1000:
+        logger.warning(
+            "Strict-local summary recovery reached its 1000-job safety bound"
+        )
+        jobs = jobs[:1000]
+    recovered_at = datetime.now(timezone.utc)
+    resumable: list[UUID] = []
+    for job in jobs:
+        if job.cancel_requested:
+            job.status = "cancelled"
+            job.stage = "cancelled"
+            job.progress = {"stage": "cancelled"}
+            job.failure = None
+            job.completed_at = recovered_at
+            continue
+        if job.status == "processing":
+            job.status = "queued"
+            job.stage = "recovery"
+            job.progress = {"stage": "recovery"}
+            job.failure = None
+            job.completed_at = None
+        resumable.append(job.id)
+    return resumable
+
+
 def build_cors_config(cors_origins: str) -> tuple[list[str], bool]:
     """Parse ``CORS_ORIGINS`` into a clean origin list + a safe credentials flag.
 
@@ -64,7 +179,10 @@ def build_cors_config(cors_origins: str) -> tuple[list[str], bool]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle handler."""
-    # A1: Recover files stuck in 'processing' from previous crash/restart
+    summary_jobs_to_resume: list[UUID] = []
+    reconciled_operations = 0
+    # Reconcile ZIP child sets independently so one malformed set cannot prevent
+    # the globally locked local-AI recovery pass.
     try:
         async with async_session_factory() as db:
             set_recovery = await reconcile_zip_child_sets(
@@ -84,13 +202,25 @@ async def lifespan(app: FastAPI):
                 )
             if set_recovery is not None and set_recovery.bounded:
                 logger.warning("ZIP child set recovery reached its safety bound")
-            result = await db.execute(text(
-                "UPDATE uploaded_files SET ingestion_status = 'pending_extraction', "
-                "processing_started_at = NULL "
-                "WHERE ingestion_status = 'processing' AND file_category = 'unstructured'"
-            ))
-            if result.rowcount:
-                logger.info("Recovered %d stuck files to pending_extraction on startup", result.rowcount)
+            await db.commit()
+    except Exception:
+        logger.exception("Failed to reconcile ZIP child sets on startup")
+
+    # A1: Recover files stuck in 'processing' from previous crash/restart.
+    try:
+        async with async_session_factory() as db:
+            if settings.local_ai_enabled:
+                await acquire_local_ai_lifecycle_lock(db)
+                reconciled_operations = _reconcile_model_pack_operations_on_startup()
+            recovered = await _recover_unstructured_jobs_on_startup(db)
+            if recovered:
+                logger.info(
+                    "Recovered %d stuck files to pending_extraction on startup",
+                    recovered,
+                )
+            summary_jobs_to_resume = (
+                await _recover_strict_local_summary_jobs_on_startup(db)
+            )
             await db.commit()
     except Exception:
         logger.exception("Failed to recover stuck files on startup")
@@ -103,11 +233,14 @@ async def lifespan(app: FastAPI):
             from app.services.ai.phi_ner import warm_load_ner
 
             if warm_load_ner():
-                logger.info("PHI-NER spaCy model warm-loaded (%s)", settings.phi_ner_spacy_model)
+                logger.info(
+                    "PHI-NER spaCy model warm-loaded (%s)", settings.phi_ner_spacy_model
+                )
             else:
                 logger.warning(
                     "PHI-NER spaCy model %s NOT available at startup; name "
-                    "redaction will retry per-call", settings.phi_ner_spacy_model
+                    "redaction will retry per-call",
+                    settings.phi_ner_spacy_model,
                 )
         except Exception:
             logger.exception("PHI-NER warm-load raised at startup")
@@ -119,14 +252,18 @@ async def lifespan(app: FastAPI):
     # orchestrator falls back / escalates) and never blocks startup.
     if (settings.extraction_engine or "gemini").lower() in ("local", "hybrid"):
         try:
-            from app.services.extraction.clinical_context import warm_load_clinical_context
+            from app.services.extraction.clinical_context import (
+                warm_load_clinical_context,
+            )
             from app.services.extraction.local_ner import warm_load_local_ner
 
             ner_ok = warm_load_local_ner()
             ctx_ok = warm_load_clinical_context()
             logger.info(
                 "WS-A local extraction engine=%s warm-load: scispaCy NER=%s, medspaCy=%s",
-                settings.extraction_engine, ner_ok, ctx_ok,
+                settings.extraction_engine,
+                ner_ok,
+                ctx_ok,
             )
             if not (ner_ok and ctx_ok):
                 logger.warning(
@@ -168,6 +305,11 @@ async def lifespan(app: FastAPI):
     local_ai_started = False
     if settings.local_ai_enabled:
         try:
+            if reconciled_operations:
+                logger.info(
+                    "Reconciled %d interrupted model-pack operations",
+                    reconciled_operations,
+                )
             removed = sweep_stale_scratch(
                 Path(settings.local_ai_scratch_dir),
                 stale_after_seconds=_STALE_LOCAL_AI_SCRATCH_SECONDS,
@@ -177,6 +319,16 @@ async def lifespan(app: FastAPI):
                 logger.info("Removed %d stale strict-local scratch jobs", removed)
             await local_model_manager.start()
             local_ai_started = True
+            if summary_jobs_to_resume:
+                from app.services.ai.summarizer import (
+                    resume_grounded_local_summary_jobs,
+                )
+
+                summary_resume_task = asyncio.create_task(
+                    resume_grounded_local_summary_jobs(summary_jobs_to_resume)
+                )
+                _background_tasks.add(summary_resume_task)
+                summary_resume_task.add_done_callback(_background_tasks.discard)
         except BaseException:
             await local_model_manager.stop()
             raise
@@ -204,7 +356,9 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     if not settings.gemini_api_key:
-        logger.warning("GEMINI_API_KEY is not set — extraction and summarization will fail")
+        logger.warning(
+            "GEMINI_API_KEY is not set — extraction and summarization will fail"
+        )
 
     app = FastAPI(
         title="AI Web Records API",

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
 import inspect
 import os
 import resource
@@ -10,6 +12,7 @@ import shlex
 import shutil
 import signal
 import stat
+import sys
 import time
 import uuid
 from collections import OrderedDict
@@ -41,6 +44,10 @@ _GLOBAL_ROLE_PROCESS_LOOP: asyncio.AbstractEventLoop | None = None
 _GLOBAL_PROCESS_BOUNDARY_POISONED = False
 _PROCESS_SHUTDOWN_SECONDS = 5.0
 _MAX_PENDING_CANCELLATIONS = 1_024
+_INTERPROCESS_LOCK_POLL_SECONDS = 0.05
+_MACOS_SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
+_MACOS_NETWORK_DENY_PROFILE = "(version 1) (allow default) (deny network*)"
+_WORKER_PROCESS_LOCK = "worker-process.lock"
 
 
 @dataclass
@@ -73,6 +80,25 @@ class _RunCancelled(RuntimeError):
     def __init__(self, *, stopped: bool) -> None:
         super().__init__()
         self.stopped = stopped
+
+
+@dataclass
+class _WorkerProcessLease:
+    """Local and cross-process ownership held through worker-group cleanup."""
+
+    local_lock: asyncio.Lock
+    descriptor: int
+
+    def release(self) -> None:
+        try:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(self.descriptor)
+        except OSError:
+            pass
+        self.local_lock.release()
 
 
 def _global_role_process_lock() -> asyncio.Lock:
@@ -108,10 +134,19 @@ class LocalModelManager:
         *,
         worker_home: str | Path | None = None,
         timeout_seconds: float | None = None,
+        _allow_unisolated_test_worker: bool = False,
     ) -> None:
+        if _allow_unisolated_test_worker and worker_command is None:
+            raise ValueError("An unisolated test worker command is required.")
         self._worker_command_spec = worker_command
         self._worker_command: tuple[str, ...] | None = None
-        self._worker_home = Path(worker_home) if worker_home else self._default_worker_home()
+        self._enforce_network_sandbox = not _allow_unisolated_test_worker
+        self._network_sandbox_prefix: tuple[str, ...] = ()
+        self._worker_home = (
+            Path(worker_home) if worker_home else self._default_worker_home()
+        )
+        self._worker_process_lock_path: Path | None = None
+        self._worker_process_lock_fd: int | None = None
         self._timeout_seconds = (
             float(timeout_seconds)
             if timeout_seconds is not None
@@ -130,6 +165,8 @@ class LocalModelManager:
         self._detached_callbacks: set[asyncio.Future[object]] = set()
         self._cleanup_lock = asyncio.Lock()
         self._cleanup_poisoned = False
+        self._retained_worker_process_lease: _WorkerProcessLease | None = None
+        self._cleanup_recovery_task: asyncio.Task[None] | None = None
         self.metrics = LocalModelMetrics()
 
     @staticmethod
@@ -157,6 +194,8 @@ class LocalModelManager:
             return
         self._prepare_worker_home()
         self._worker_command = self._resolve_command()
+        self._prepare_worker_process_lock()
+        self._network_sandbox_prefix = self._resolve_network_sandbox()
         self._started = True
 
     def _resolve_command(self) -> tuple[str, ...]:
@@ -190,6 +229,84 @@ class LocalModelManager:
             raise LocalWorkerError("Local worker is unavailable.")
         return (str(executable), *parts[1:])
 
+    def _resolve_network_sandbox(self) -> tuple[str, ...]:
+        if not self._enforce_network_sandbox:
+            return ()
+        if sys.platform != "darwin":
+            raise LocalWorkerError("Local worker network isolation is unavailable.")
+        try:
+            metadata = _MACOS_SANDBOX_EXEC.stat()
+        except OSError:
+            raise LocalWorkerError(
+                "Local worker network isolation is unavailable."
+            ) from None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & 0o022
+            or not os.access(_MACOS_SANDBOX_EXEC, os.X_OK)
+        ):
+            raise LocalWorkerError("Local worker network isolation is unavailable.")
+        return (
+            str(_MACOS_SANDBOX_EXEC),
+            "-p",
+            _MACOS_NETWORK_DENY_PROFILE,
+        )
+
+    def _process_lock_root(self) -> Path:
+        if not self._enforce_network_sandbox:
+            return self._worker_home.parent / ".local-ai-runtime"
+        from app.config import settings
+
+        return Path(settings.local_ai_model_dir).resolve() / ".runtime"
+
+    def _prepare_worker_process_lock(self) -> None:
+        root = self._process_lock_root()
+        if root.is_symlink():
+            raise LocalWorkerError("Local worker is unavailable.")
+        try:
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if root.is_symlink() or not root.is_dir():
+                raise LocalWorkerError("Local worker is unavailable.")
+            os.chmod(root, 0o700)
+            root_metadata = root.stat()
+        except LocalWorkerError:
+            raise
+        except OSError:
+            raise LocalWorkerError("Local worker is unavailable.") from None
+        if stat.S_IMODE(root_metadata.st_mode) != 0o700 or (
+            hasattr(os, "getuid") and root_metadata.st_uid != os.getuid()
+        ):
+            raise LocalWorkerError("Local worker is unavailable.")
+
+        lock_path = root / _WORKER_PROCESS_LOCK
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                lock_path,
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+            ):
+                raise LocalWorkerError("Local worker is unavailable.")
+            os.fchmod(descriptor, 0o600)
+        except LocalWorkerError:
+            raise
+        except OSError:
+            raise LocalWorkerError("Local worker is unavailable.") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        self._worker_process_lock_path = lock_path
+
     def _prepare_worker_home(self) -> None:
         if self._worker_home.is_symlink():
             raise LocalWorkerError("Local worker is unavailable.")
@@ -220,8 +337,7 @@ class LocalModelManager:
         if active_process is not None:
             await self._terminate_process(active_process)
             if self._cleanup_poisoned:
-                self._clear_active_process_state(active_process)
-                self._clear_process_boundary_poison()
+                await self._finish_cleanup_recovery(active_process)
         if states:
             try:
                 await asyncio.wait_for(
@@ -292,7 +408,7 @@ class LocalModelManager:
         payload: dict[str, Any],
         on_progress: ProgressCallback | None,
     ) -> Any:
-        lock = await self._acquire_role_process_lock(state)
+        lease = await self._acquire_worker_process_lease(state)
         process: asyncio.subprocess.Process | None = None
         result: Any = None
         try:
@@ -326,7 +442,12 @@ class LocalModelManager:
                 raise
             self._raise_if_cancelled(state)
         finally:
-            cleanup_task = asyncio.create_task(self._cleanup_run_process(process))
+            cleanup_process = process
+            if cleanup_process is None and self._cleanup_poisoned:
+                cleanup_process = self._active_process
+            cleanup_task = asyncio.create_task(
+                self._cleanup_run_process(cleanup_process)
+            )
             cleanup_error: LocalWorkerError | None = None
             try:
                 caller_cancelled = await self._wait_for_task_final(cleanup_task)
@@ -340,10 +461,12 @@ class LocalModelManager:
                     cleanup_error = LocalWorkerError("Local worker failed.")
             finally:
                 if cleanup_error is None:
-                    self._clear_active_process_state(process)
+                    self._clear_active_process_state(cleanup_process)
+                    self._clear_process_boundary_poison()
+                    self._worker_process_lock_fd = None
+                    lease.release()
                 else:
-                    self._poison_process_boundary()
-                lock.release()
+                    self._retain_failed_cleanup(cleanup_process, lease)
             if cleanup_error is not None:
                 raise cleanup_error from None
             if caller_cancelled:
@@ -417,6 +540,57 @@ class LocalModelManager:
         self._cleanup_poisoned = False
         _GLOBAL_PROCESS_BOUNDARY_POISONED = False
 
+    def _retain_failed_cleanup(
+        self,
+        process: asyncio.subprocess.Process | None,
+        lease: _WorkerProcessLease,
+    ) -> None:
+        """Keep exclusivity until a failed-cleanup process group is confirmed gone."""
+        if process is None or not self._process_group_exists(process.pid):
+            self._clear_active_process_state(process)
+            self._clear_process_boundary_poison()
+            self._worker_process_lock_fd = None
+            lease.release()
+            return
+        self._poison_process_boundary()
+        self._retained_worker_process_lease = lease
+        recovery_task = asyncio.create_task(
+            self._recover_failed_cleanup(process),
+        )
+        self._cleanup_recovery_task = recovery_task
+
+    async def _recover_failed_cleanup(
+        self,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        """Release retained ownership only after the orphan group exits."""
+        while self._process_group_exists(process.pid):
+            await asyncio.sleep(_INTERPROCESS_LOCK_POLL_SECONDS)
+        await self._finish_cleanup_recovery(process)
+
+    async def _finish_cleanup_recovery(
+        self,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        """Clear a poisoned boundary and release its retained lease once."""
+        recovery_task = self._cleanup_recovery_task
+        if (
+            recovery_task is not None
+            and recovery_task is not asyncio.current_task()
+            and not recovery_task.done()
+        ):
+            recovery_task.cancel()
+            await asyncio.gather(recovery_task, return_exceptions=True)
+        self._cleanup_recovery_task = None
+        lease = self._retained_worker_process_lease
+        if lease is None:
+            return
+        self._retained_worker_process_lease = None
+        self._clear_active_process_state(process)
+        self._clear_process_boundary_poison()
+        self._worker_process_lock_fd = None
+        lease.release()
+
     async def _acquire_role_process_lock(self, state: _RunState) -> asyncio.Lock:
         if _GLOBAL_PROCESS_BOUNDARY_POISONED:
             raise LocalWorkerError("Local worker is unavailable.")
@@ -453,6 +627,74 @@ class LocalModelManager:
             if lock.locked() and acquire_task.done() and not acquire_task.cancelled():
                 lock.release()
             raise
+
+    async def _acquire_worker_process_lease(
+        self,
+        state: _RunState,
+    ) -> _WorkerProcessLease:
+        local_lock = await self._acquire_role_process_lock(state)
+        descriptor = -1
+        try:
+            descriptor = await self._acquire_interprocess_lock(state)
+            self._worker_process_lock_fd = descriptor
+            return _WorkerProcessLease(
+                local_lock=local_lock,
+                descriptor=descriptor,
+            )
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            local_lock.release()
+            raise
+
+    async def _acquire_interprocess_lock(self, state: _RunState) -> int:
+        lock_path = self._worker_process_lock_path
+        if lock_path is None:
+            raise LocalWorkerError("Local worker is unavailable.")
+        descriptor = -1
+        acquired = False
+        try:
+            descriptor = os.open(
+                lock_path,
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+            ):
+                raise LocalWorkerError("Local worker is unavailable.")
+            while True:
+                self._raise_if_cancelled(state)
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    acquired = True
+                    return descriptor
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                        raise LocalWorkerError("Local worker is unavailable.") from None
+                try:
+                    await asyncio.wait_for(
+                        state.cancel_event.wait(),
+                        timeout=_INTERPROCESS_LOCK_POLL_SECONDS,
+                    )
+                except TimeoutError:
+                    continue
+                raise _RunCancelled(stopped=state.stop_requested)
+        except (LocalWorkerError, _RunCancelled):
+            raise
+        except OSError:
+            raise LocalWorkerError("Local worker is unavailable.") from None
+        finally:
+            if descriptor >= 0 and not acquired:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     @staticmethod
     def _raise_if_cancelled(state: _RunState) -> None:
@@ -503,7 +745,7 @@ class LocalModelManager:
             raise LocalWorkerError("Local worker request was rejected.") from None
 
     def _child_environment(self) -> dict[str, str]:
-        return {
+        environment = {
             "PATH": os.defpath,
             "HOME": str(self._worker_home),
             "HF_HUB_OFFLINE": "1",
@@ -511,13 +753,44 @@ class LocalModelManager:
             "HF_HUB_DISABLE_TELEMETRY": "1",
             "PYTHONUNBUFFERED": "1",
         }
+        if self._enforce_network_sandbox:
+            lock_fd = self._worker_process_lock_fd
+            lock_path = self._worker_process_lock_path
+            if lock_fd is None or lock_path is None:
+                raise LocalWorkerError("Local worker is unavailable.")
+            try:
+                descriptor_metadata = os.fstat(lock_fd)
+                path_metadata = os.stat(lock_path, follow_symlinks=False)
+            except OSError:
+                raise LocalWorkerError("Local worker is unavailable.") from None
+            if (
+                not stat.S_ISREG(descriptor_metadata.st_mode)
+                or stat.S_IMODE(descriptor_metadata.st_mode) != 0o600
+                or descriptor_metadata.st_nlink != 1
+                or (hasattr(os, "getuid") and descriptor_metadata.st_uid != os.getuid())
+                or not stat.S_ISREG(path_metadata.st_mode)
+                or descriptor_metadata.st_dev != path_metadata.st_dev
+                or descriptor_metadata.st_ino != path_metadata.st_ino
+            ):
+                raise LocalWorkerError("Local worker is unavailable.")
+            environment["LOCAL_AI_PARENT_PID"] = str(os.getpid())
+            environment["LOCAL_AI_PROCESS_LOCK_FD"] = str(lock_fd)
+            environment["LOCAL_AI_PROCESS_LOCK_DEVICE"] = str(
+                descriptor_metadata.st_dev
+            )
+            environment["LOCAL_AI_PROCESS_LOCK_INODE"] = str(descriptor_metadata.st_ino)
+        return environment
 
     async def _spawn_worker(self) -> asyncio.subprocess.Process:
         if self._worker_command is None:
             raise LocalWorkerError("Local worker is unavailable.")
+        lock_fd = self._worker_process_lock_fd
+        if lock_fd is None:
+            raise LocalWorkerError("Local worker is unavailable.")
+        command = (*self._network_sandbox_prefix, *self._worker_command)
         try:
             return await asyncio.create_subprocess_exec(
-                *self._worker_command,
+                *command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -525,6 +798,7 @@ class LocalModelManager:
                 cwd=self._worker_home,
                 start_new_session=True,
                 preexec_fn=_disable_core_dumps,
+                pass_fds=(lock_fd,),
                 limit=MAX_MESSAGE_BYTES + 1,
             )
         except (OSError, ValueError):
@@ -586,7 +860,10 @@ class LocalModelManager:
                 raise ProtocolViolation("Worker responded before readiness.")
             if response.kind == "progress":
                 progress = response.payload
-                if not isinstance(progress, ProgressPayload) or progress.role is not role:
+                if (
+                    not isinstance(progress, ProgressPayload)
+                    or progress.role is not role
+                ):
                     raise ProtocolViolation("Worker progress response is invalid.")
                 await self._forward_progress(progress, on_progress, state)
                 continue
@@ -615,7 +892,7 @@ class LocalModelManager:
         self._prune_detached_callbacks()
         if self._detached_callbacks:
             return
-        safe_progress = progress.model_dump(mode="json")
+        safe_progress = progress.model_dump(mode="json", exclude_none=True)
         try:
             callback_result = on_progress(safe_progress)
         except Exception:
@@ -724,7 +1001,9 @@ class LocalModelManager:
                     break
                 response = parse_response_line(line)
                 if response.request_id != request_id:
-                    raise ProtocolViolation("Worker response request ID does not match.")
+                    raise ProtocolViolation(
+                        "Worker response request ID does not match."
+                    )
                 raise ProtocolViolation("Worker responded after a terminal response.")
             return_code = await process.wait()
             if return_code != 0:
@@ -741,10 +1020,22 @@ class LocalModelManager:
             job_id = validate_identifier(job_id)
         except ProtocolViolation:
             raise LocalWorkerError("Local worker request was rejected.") from None
+        if await self._cancel_registered(job_id):
+            return
+        self._reserve_cancellation(job_id)
+
+    async def cancel_registered(self, job_id: str) -> bool:
+        """Cancel only an existing registration, never reserving an unknown ID."""
+        try:
+            job_id = validate_identifier(job_id)
+        except ProtocolViolation:
+            raise LocalWorkerError("Local worker request was rejected.") from None
+        return await self._cancel_registered(job_id)
+
+    async def _cancel_registered(self, job_id: str) -> bool:
         state = self._jobs.get(job_id)
         if state is None:
-            self._reserve_cancellation(job_id)
-            return
+            return False
         state.cancel_event.set()
         process = self._active_process if self._active_job_id == job_id else None
         if process is not None:
@@ -757,6 +1048,7 @@ class LocalModelManager:
                 )
             except TimeoutError:
                 pass
+        return True
 
     def _reserve_cancellation(self, job_id: str) -> None:
         if job_id in self._cancelled_jobs:
@@ -825,20 +1117,20 @@ class LocalModelManager:
     @staticmethod
     async def _wait_for_group_exit(pgid: int, deadline: float) -> bool:
         while time.monotonic() < deadline:
-            try:
-                os.killpg(pgid, 0)
-            except ProcessLookupError:
+            if not LocalModelManager._process_group_exists(pgid):
                 return True
-            except PermissionError:
-                pass
             await asyncio.sleep(0.01)
+        return not LocalModelManager._process_group_exists(pgid)
+
+    @staticmethod
+    def _process_group_exists(pgid: int) -> bool:
         try:
             os.killpg(pgid, 0)
         except ProcessLookupError:
-            return True
+            return False
         except PermissionError:
             pass
-        return False
+        return True
 
 
 def create_local_model_manager() -> LocalModelManager:

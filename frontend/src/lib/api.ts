@@ -1,9 +1,25 @@
 import { useAuthStore } from "@/stores/useAuthStore";
 import type { ExtractionProgressResponse } from "@/types/api";
 import type {
+  GenerateSummaryApiResponse,
+  GenerateSummaryRequest,
+} from "@/types/api";
+import type {
   CancelExtractionResponse,
   ExtractionFileStatus,
 } from "@/types/upload";
+import type {
+  LocalModelRole,
+  LocalPackOperation,
+  LocalPackOperationCreated,
+  LocalPackStatus,
+  ProcessingMode,
+  RecordExtractionProvenance,
+} from "@/types/local-ai";
+import {
+  parseLocalRunInfo,
+  parseRecordExtractionProvenance,
+} from "@/types/local-ai";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
 
@@ -253,9 +269,22 @@ class ApiClient {
     const qs = statuses.length
       ? `?statuses=${encodeURIComponent(statuses.join(","))}`
       : "";
-    return this.get<{ files: ExtractionFileStatus[]; total: number }>(
+    const payload = await this.get<{
+      files: ExtractionFileStatus[];
+      total: number;
+    }>(
       `/upload/pending-extraction${qs}`
     );
+    return {
+      ...payload,
+      files: payload.files.map((file) => ({
+        ...file,
+        local_run:
+          file.local_run == null
+            ? file.local_run
+            : parseLocalRunInfo(file.local_run),
+      })),
+    };
   }
 
   /** Cancel in-flight extractions; the worker stops and marks them `cancelled`. */
@@ -265,6 +294,71 @@ class ApiClient {
     return this.post<CancelExtractionResponse>("/upload/cancel", {
       upload_ids: uploadIds,
     });
+  }
+
+  // --- Validated local model pack / evidence ----------------------------
+
+  async getLocalPackStatus(): Promise<LocalPackStatus> {
+    return this.get<LocalPackStatus>("/local-ai/status");
+  }
+
+  async installLocalPack(): Promise<LocalPackOperationCreated> {
+    return this.post<LocalPackOperationCreated>("/local-ai/install");
+  }
+
+  async getLocalPackOperation(id: string): Promise<LocalPackOperation> {
+    return this.get<LocalPackOperation>(
+      `/local-ai/operations/${encodeURIComponent(id)}`
+    );
+  }
+
+  async resumeLocalPackOperation(id: string): Promise<LocalPackOperation> {
+    return this.post<LocalPackOperation>(
+      `/local-ai/operations/${encodeURIComponent(id)}/resume`
+    );
+  }
+
+  async retryLocalPackOperation(id: string): Promise<LocalPackOperation> {
+    return this.post<LocalPackOperation>(
+      `/local-ai/operations/${encodeURIComponent(id)}/retry`
+    );
+  }
+
+  async verifyLocalPack(): Promise<LocalPackOperationCreated> {
+    return this.post<LocalPackOperationCreated>("/local-ai/verify");
+  }
+
+  async updateLocalPack(): Promise<LocalPackOperationCreated> {
+    return this.post<LocalPackOperationCreated>("/local-ai/update");
+  }
+
+  async rollbackLocalPack(): Promise<LocalPackOperationCreated> {
+    return this.post<LocalPackOperationCreated>("/local-ai/rollback");
+  }
+
+  async removeLocalModel(role: LocalModelRole): Promise<void> {
+    return this.delete<void>(
+      `/local-ai/models/${encodeURIComponent(role)}`
+    );
+  }
+
+  async removeLocalPack(): Promise<void> {
+    return this.delete<void>("/local-ai");
+  }
+
+  async getRecordEvidence(
+    recordId: string
+  ): Promise<RecordExtractionProvenance> {
+    const payload = await this.get<unknown>(
+      `/records/${encodeURIComponent(recordId)}/evidence`
+    );
+    return parseRecordExtractionProvenance(payload);
+  }
+
+  async generateSummary(
+    body: GenerateSummaryRequest
+  ): Promise<GenerateSummaryApiResponse> {
+    return this.post<GenerateSummaryApiResponse>("/summary/generate", body);
   }
 }
 
@@ -322,6 +416,7 @@ export interface LlmRouting {
   extraction: string;
   vision: string;
   extraction_engine: string;
+  processing_mode: ProcessingMode;
 }
 
 export interface LlmSettings {
@@ -344,6 +439,7 @@ export interface RoutingUpdate {
   extraction?: string;
   vision?: string;
   extraction_engine?: string;
+  processing_mode?: ProcessingMode;
 }
 
 export interface ProviderTestResult {

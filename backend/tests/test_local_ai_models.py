@@ -119,7 +119,9 @@ def _record_for(
     )
 
 
-async def test_local_job_locks_mode_and_manifest_when_preferences_change(db_session) -> None:
+async def test_local_job_locks_mode_and_manifest_when_preferences_change(
+    db_session,
+) -> None:
     user = User(email="local-job-models@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
@@ -176,7 +178,9 @@ def test_local_job_requires_kind_matched_target() -> None:
         "cross_user_summary",
     ),
 )
-async def test_local_job_rejects_kind_and_owner_mismatches(db_session, case: str) -> None:
+async def test_local_job_rejects_kind_and_owner_mismatches(
+    db_session, case: str
+) -> None:
     user_a = User(email=f"{case}-a@example.com", password_hash="x")
     user_b = User(email=f"{case}-b@example.com", password_hash="x")
     db_session.add_all([user_a, user_b])
@@ -724,6 +728,42 @@ async def test_database_rejects_invalid_raw_local_job_insert(
         await db_session.rollback()
 
 
+async def test_database_rejects_second_raw_ingestion_job_for_one_upload(
+    db_session,
+) -> None:
+    """A raw SQL insert cannot create a competing strict-local ingestion job."""
+    user = User(email="duplicate-raw-local-job@example.com", password_hash="x")
+    db_session.add(user)
+    await db_session.flush()
+    upload = _upload_for(user)
+    db_session.add(upload)
+    await db_session.flush()
+    manifest = _valid_manifest()
+    digest = _manifest_digest(manifest)
+    await _raw_insert_local_job(
+        db_session,
+        user_id=user.id,
+        upload_id=upload.id,
+        processing_mode="validated_strict_local",
+        manifest=manifest,
+        digest=digest,
+    )
+    await db_session.commit()
+
+    try:
+        with pytest.raises(IntegrityError):
+            await _raw_insert_local_job(
+                db_session,
+                user_id=user.id,
+                upload_id=upload.id,
+                processing_mode="validated_strict_local",
+                manifest=manifest,
+                digest=digest,
+            )
+    finally:
+        await db_session.rollback()
+
+
 @pytest.mark.parametrize(
     ("field", "numeric_value"),
     (
@@ -861,7 +901,9 @@ def test_page_evidence_and_typed_summary_payload_columns_use_encrypted_types() -
     assert isinstance(LocalAIPage.__table__.c.ocr_result.type, EncryptedJSON)
     assert isinstance(ExtractionEvidence.__table__.c.excerpt.type, EncryptedText)
     assert isinstance(ExtractionEvidence.__table__.c.field_paths.type, EncryptedJSON)
-    assert isinstance(ExtractionEvidence.__table__.c.source_metadata.type, EncryptedJSON)
+    assert isinstance(
+        ExtractionEvidence.__table__.c.source_metadata.type, EncryptedJSON
+    )
     assert isinstance(AISummaryPrompt.__table__.c.typed_response.type, EncryptedJSON)
 
 
@@ -870,6 +912,7 @@ def test_local_ai_indexes_match_checkpoint_and_lookup_paths() -> None:
         "ix_local_ai_jobs_user_status",
         "ix_local_ai_jobs_upload_id",
         "ix_local_ai_jobs_summary_prompt_id",
+        "uq_local_ai_jobs_ingestion_upload",
     }
     assert {index.name for index in LocalAIPage.__table__.indexes} == {
         "ix_local_ai_pages_job_page"

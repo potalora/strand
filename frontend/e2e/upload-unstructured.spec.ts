@@ -127,6 +127,7 @@ test.describe("Unstructured Upload", () => {
     const recentUploads = (history.items || history).filter(
       (item: { filename?: string; created_at?: string }) =>
         item.filename?.toLowerCase().endsWith(".rtf") &&
+        item.created_at !== undefined &&
         new Date(item.created_at).getTime() > Date.now() - 120_000
     );
     expect(recentUploads.length).toBeGreaterThanOrEqual(rtfFiles.length);

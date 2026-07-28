@@ -22,6 +22,9 @@ from app.services.local_ai.manifest import (
     ManifestFile,
 )
 from app.services.local_ai.types import ModelRole
+from app.services.local_ai.validation_receipt import (
+    _issue_runtime_validation_receipt,
+)
 
 
 def _manifest(
@@ -85,7 +88,11 @@ def _install(
     manifest, contents = _manifest(revision)
     stage = store.stage(revision)
     _write_manifest_files(stage, manifest, contents)
-    store.activate(stage, manifest)
+    store.activate_validated(
+        stage,
+        manifest,
+        _issue_runtime_validation_receipt(manifest),
+    )
     return manifest, contents
 
 
@@ -99,10 +106,34 @@ def test_activation_is_atomic_and_preserves_previous_pack(tmp_path: Path) -> Non
     target.write_bytes(b"x" * len(contents[ModelRole.OCR]))
 
     with pytest.raises(LocalValidationError, match="SHA-256"):
-        store.activate(stage, manifest)
+        store.activate_validated(
+            stage,
+            manifest,
+            _issue_runtime_validation_receipt(manifest),
+        )
 
     assert store.active_revision() == "first"
     assert not (tmp_path / "packs" / "second").exists()
+
+
+def test_active_manifest_returns_only_the_fully_verified_active_pack(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    manifest, _contents = _install(store, "first")
+
+    assert store.active_manifest() == manifest
+
+
+def test_active_manifest_returns_none_without_an_active_pack(tmp_path: Path) -> None:
+    assert ArtifactStore(tmp_path).active_manifest() is None
+
+
+def test_store_has_no_public_hash_only_activation_method(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+
+    assert not hasattr(store, "activate")
+    assert hasattr(store, "activate_validated")
 
 
 def test_activation_uses_one_authoritative_atomic_state_file(tmp_path: Path) -> None:
@@ -118,7 +149,7 @@ def test_activation_uses_one_authoritative_atomic_state_file(tmp_path: Path) -> 
     assert not (tmp_path / "previous.json").exists()
 
 
-def test_state_failure_before_replace_leaves_verified_pack_as_inactive_orphan(
+def test_state_failure_restores_prior_pointer_and_removes_inactive_orphan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -134,14 +165,49 @@ def test_state_failure_before_replace_leaves_verified_pack_as_inactive_orphan(
     monkeypatch.setattr(store, "_write_state", fail_state)
 
     with pytest.raises(LocalValidationError, match="injected"):
-        store.activate(stage, manifest)
+        store.activate_validated(
+            stage,
+            manifest,
+            _issue_runtime_validation_receipt(manifest),
+        )
 
     assert store.active_revision() == "first"
     assert (tmp_path / "packs" / "first").is_dir()
-    assert (tmp_path / "packs" / "second").is_dir()
+    assert not (tmp_path / "packs" / "second").exists()
+    assert len(list(store.validations_dir.glob("*.json"))) == 1
 
 
-def test_state_fsync_failure_after_replace_keeps_new_active_pack_present(
+def test_receipt_write_failure_preserves_prior_active_pack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    _install(store, "first")
+    manifest, contents = _manifest("second")
+    stage = store.stage("second")
+    _write_manifest_files(stage, manifest, contents)
+    original_write = store._write_json_atomic
+
+    def fail_receipt_write(path: Path, payload: dict[str, object]) -> None:
+        if path.parent == store.validations_dir:
+            raise LocalValidationError("injected receipt write failure")
+        original_write(path, payload)
+
+    monkeypatch.setattr(store, "_write_json_atomic", fail_receipt_write)
+
+    with pytest.raises(LocalValidationError, match="receipt write"):
+        store.activate_validated(
+            stage,
+            manifest,
+            _issue_runtime_validation_receipt(manifest),
+        )
+
+    assert store.active_revision() == "first"
+    assert store.active_manifest() is not None
+    assert not (store.packs_dir / "second").exists()
+
+
+def test_state_fsync_failure_restores_prior_validated_active_pack(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -151,9 +217,12 @@ def test_state_fsync_failure_after_replace_keeps_new_active_pack_present(
     stage = store.stage("second")
     _write_manifest_files(stage, manifest, contents)
     original_fsync = artifact_store_module._fsync_directory
+    failed_once = False
 
     def fail_after_state_replace(path: Path) -> None:
-        if path == tmp_path:
+        nonlocal failed_once
+        if path == tmp_path and not failed_once:
+            failed_once = True
             raise LocalValidationError("injected state fsync failure")
         original_fsync(path)
 
@@ -164,11 +233,15 @@ def test_state_fsync_failure_after_replace_keeps_new_active_pack_present(
     )
 
     with pytest.raises(LocalValidationError, match="injected"):
-        store.activate(stage, manifest)
+        store.activate_validated(
+            stage,
+            manifest,
+            _issue_runtime_validation_receipt(manifest),
+        )
 
-    assert store.active_revision() == "second"
+    assert store.active_revision() == "first"
     assert (tmp_path / "packs" / "first").is_dir()
-    assert (tmp_path / "packs" / "second").is_dir()
+    assert not (tmp_path / "packs" / "second").exists()
 
 
 def test_post_rename_verification_failure_does_not_update_activation_state(
@@ -202,12 +275,31 @@ def test_post_rename_verification_failure_does_not_update_activation_state(
     monkeypatch.setattr(os, "replace", replace_then_mutate)
 
     with pytest.raises(LocalValidationError):
-        store.activate(stage, manifest)
+        store.activate_validated(
+            stage,
+            manifest,
+            _issue_runtime_validation_receipt(manifest),
+        )
 
     assert replaced
     assert store.active_revision() == "first"
     assert (tmp_path / "activation-state.json").read_bytes() == original_state
-    assert destination.is_dir()
+    assert not destination.exists()
+
+
+def test_stage_removes_unreferenced_orphan_destination_for_honest_retry(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    orphan = store.packs_dir / "retry-revision"
+    orphan.mkdir()
+    (orphan / "partial.bin").write_bytes(b"partial")
+
+    staging = store.stage("retry-revision")
+
+    assert not orphan.exists()
+    assert staging.parent == store.staging_dir
+    assert staging.is_dir()
 
 
 def test_mutations_are_serialized_within_the_process(
@@ -243,11 +335,17 @@ def test_mutations_are_serialized_within_the_process(
     monkeypatch.setattr(second_store, "_write_json_atomic", observed_write)
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
-            executor.submit(store.activate, first_stage, first_manifest),
             executor.submit(
-                second_store.activate,
+                store.activate_validated,
+                first_stage,
+                first_manifest,
+                _issue_runtime_validation_receipt(first_manifest),
+            ),
+            executor.submit(
+                second_store.activate_validated,
                 second_stage,
                 second_manifest,
+                _issue_runtime_validation_receipt(second_manifest),
             ),
         ]
         for future in futures:
@@ -289,7 +387,11 @@ def test_activation_rejects_a_stale_active_pointer_without_replacing_it(
     tmp_path: Path,
 ) -> None:
     store = ArtifactStore(tmp_path)
-    stale = {"pack_revision": "missing", "manifest_sha256": "a" * 64}
+    stale = {
+        "pack_revision": "missing",
+        "manifest_sha256": "a" * 64,
+        "validation_receipt_sha256": "b" * 64,
+    }
     stale_state = {"active": stale, "previous": None}
     state_path = tmp_path / "activation-state.json"
     state_path.write_text(json.dumps(stale_state), encoding="utf-8")
@@ -298,7 +400,11 @@ def test_activation_rejects_a_stale_active_pointer_without_replacing_it(
     _write_manifest_files(stage, manifest, contents)
 
     with pytest.raises(LocalValidationError, match="verified"):
-        store.activate(stage, manifest)
+        store.activate_validated(
+            stage,
+            manifest,
+            _issue_runtime_validation_receipt(manifest),
+        )
 
     assert json.loads(state_path.read_text()) == stale_state
 
@@ -399,7 +505,11 @@ def test_verification_rejects_file_replaced_with_symlink_during_open(
     monkeypatch.setattr(os, "open", racing_os_open)
 
     with pytest.raises(LocalValidationError):
-        store.activate(stage, manifest)
+        store.activate_validated(
+            stage,
+            manifest,
+            _issue_runtime_validation_receipt(manifest),
+        )
 
     assert replaced
     assert store.active_revision() is None
@@ -433,7 +543,11 @@ def test_verification_rejects_entry_replaced_while_descriptor_is_hashed(
     monkeypatch.setattr(os, "read", read_then_replace)
 
     with pytest.raises(LocalValidationError):
-        store.activate(stage, manifest)
+        store.activate_validated(
+            stage,
+            manifest,
+            _issue_runtime_validation_receipt(manifest),
+        )
 
     assert replaced
     assert store.active_revision() is None

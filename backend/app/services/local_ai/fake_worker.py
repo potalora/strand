@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import select
+import socket
+import stat
 import subprocess
 import sys
 import time
@@ -50,6 +53,42 @@ def _role_for(request: WorkerRequest) -> ModelRole:
 
 
 def _fixed_result(role: ModelRole, payload: dict[str, object]) -> dict[str, object]:
+    if payload.get("inspect_lock_fd") is True:
+        raw_descriptor = os.environ.get("LOCAL_AI_PROCESS_LOCK_FD", "")
+        try:
+            metadata = os.fstat(int(raw_descriptor))
+            expected_device = int(os.environ.get("LOCAL_AI_PROCESS_LOCK_DEVICE", ""))
+            expected_inode = int(os.environ.get("LOCAL_AI_PROCESS_LOCK_INODE", ""))
+        except (OSError, ValueError):
+            return {
+                "lock_fd_inherited": False,
+                "lock_identity_matches": False,
+                "lock_path_exposed": "LOCAL_AI_PROCESS_LOCK_PATH" in os.environ,
+            }
+        return {
+            "lock_fd_inherited": stat.S_ISREG(metadata.st_mode),
+            "lock_identity_matches": (
+                metadata.st_dev == expected_device and metadata.st_ino == expected_inode
+            ),
+            "lock_path_exposed": "LOCAL_AI_PROCESS_LOCK_PATH" in os.environ,
+        }
+    unix_socket_path = payload.get("probe_unix_socket_path")
+    if payload.get("probe_network") is True or isinstance(unix_socket_path, str):
+        if isinstance(unix_socket_path, str):
+            probe = socket.socket(socket.AF_UNIX)
+            address: tuple[str, int] | str = unix_socket_path
+        else:
+            probe = socket.socket()
+            address = ("127.0.0.1", 9)
+        probe.settimeout(0.2)
+        try:
+            error_number = probe.connect_ex(address)
+        finally:
+            probe.close()
+        return {
+            "network_denied": error_number in {1, 13},
+            "network_errno": error_number,
+        }
     if payload.get("inspect_env") is True:
         forbidden_names = {
             "ANTHROPIC_API_KEY",
@@ -118,7 +157,85 @@ def _spawn_descendant(ignore_term: bool) -> int:
     return child.pid
 
 
+def _start_parent_watchdog() -> None:
+    parent_value = os.environ.get("LOCAL_AI_PARENT_PID")
+    lock_value = os.environ.get("LOCAL_AI_PROCESS_LOCK_FD")
+    device_value = os.environ.get("LOCAL_AI_PROCESS_LOCK_DEVICE")
+    inode_value = os.environ.get("LOCAL_AI_PROCESS_LOCK_INODE")
+    if all(
+        value is None for value in (parent_value, lock_value, device_value, inode_value)
+    ):
+        return
+    try:
+        parent_pid = int(parent_value)
+        lock_descriptor = int(lock_value)
+        expected_device = int(device_value)
+        expected_inode = int(inode_value)
+        lock_metadata = os.fstat(lock_descriptor)
+    except (OSError, TypeError, ValueError):
+        os._exit(126)
+    worker_pid = os.getpid()
+    if (
+        parent_pid != os.getppid()
+        or parent_pid <= 1
+        or lock_descriptor < 3
+        or not stat.S_ISREG(lock_metadata.st_mode)
+        or stat.S_IMODE(lock_metadata.st_mode) != 0o600
+        or lock_metadata.st_nlink != 1
+        or (hasattr(os, "getuid") and lock_metadata.st_uid != os.getuid())
+        or expected_device < 0
+        or expected_inode <= 0
+        or lock_metadata.st_dev != expected_device
+        or lock_metadata.st_ino != expected_inode
+    ):
+        os._exit(126)
+    backend_root = Path(__file__).resolve().parents[3]
+    bootstrap = (
+        "import sys;"
+        f"sys.path.insert(0,{str(backend_root)!r});"
+        "from app.services.local_ai.parent_watchdog import main;"
+        "raise SystemExit(main())"
+    )
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        watchdog = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                bootstrap,
+                str(parent_pid),
+                str(worker_pid),
+                str(os.getpgrp()),
+                str(write_descriptor),
+                str(lock_descriptor),
+                str(expected_device),
+                str(expected_inode),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(write_descriptor, lock_descriptor),
+            start_new_session=True,
+        )
+    except OSError:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
+        os._exit(126)
+    os.close(write_descriptor)
+    try:
+        readable, _, _ = select.select([read_descriptor], [], [], 5)
+        ready = os.read(read_descriptor, 1) if readable else b""
+    finally:
+        os.close(read_descriptor)
+    if ready != b"1":
+        watchdog.kill()
+        watchdog.wait()
+        os._exit(126)
+
+
 def _main() -> int:
+    _start_parent_watchdog()
     line = sys.stdin.buffer.readline(MAX_MESSAGE_BYTES + 2)
     try:
         request = parse_request_line(line)
@@ -152,7 +269,11 @@ def _main() -> int:
         return 0
 
     role = _role_for(request)
-    response_id = "mismatched-request" if payload.get("mismatched_id") is True else request.request_id
+    response_id = (
+        "mismatched-request"
+        if payload.get("mismatched_id") is True
+        else request.request_id
+    )
 
     _write(_response(response_id, "ready", ReadyPayload(role=role)))
 
@@ -183,6 +304,28 @@ def _main() -> int:
             ProgressPayload(role=role, stage="processing", current=0, total=1),
         )
     )
+    guard_path_value = payload.get("concurrency_guard_path")
+    guard_path = (
+        Path(guard_path_value)
+        if isinstance(guard_path_value, str) and guard_path_value
+        else None
+    )
+    guard_fd: int | None = None
+    if guard_path is not None:
+        try:
+            guard_fd = os.open(
+                guard_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            payload["_overlap_detected"] = False
+        except FileExistsError:
+            payload["_overlap_detected"] = True
+    started_marker_value = payload.get("started_marker_path")
+    if isinstance(started_marker_value, str) and started_marker_value:
+        started_marker = Path(started_marker_value)
+        started_marker.write_text("started")
+        os.chmod(started_marker, 0o600)
     delay_ms = payload.get("delay_ms", 0)
     if isinstance(delay_ms, int) and not isinstance(delay_ms, bool) and delay_ms > 0:
         time.sleep(min(delay_ms, 60_000) / 1000)
@@ -197,12 +340,25 @@ def _main() -> int:
             ErrorPayload(code="worker_failed", message="Local worker failed."),
         )
     else:
+        if "_overlap_detected" in payload:
+            terminal_data: dict[str, object] = {
+                "overlap_detected": payload["_overlap_detected"],
+            }
+        else:
+            terminal_data = _fixed_result(role, payload)
         terminal = _response(
             response_id,
             "result",
-            ResultPayload(data=_fixed_result(role, payload)),
+            ResultPayload(data=terminal_data),
         )
     _write(terminal)
+
+    if guard_fd is not None:
+        os.close(guard_fd)
+        try:
+            guard_path.unlink()
+        except FileNotFoundError:
+            pass
 
     if payload.get("duplicate_terminal") is True:
         _write(terminal)

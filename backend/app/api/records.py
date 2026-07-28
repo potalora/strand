@@ -11,8 +11,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.dependencies import get_authenticated_user_id
 from app.middleware.audit import log_audit_event
+from app.models.local_ai import ExtractionEvidence
 from app.models.record import HealthRecord
+from app.models.uploaded_file import UploadedFile
+from app.schemas.local_ai import (
+    ExtractionEvidenceResponse,
+    ExtractionModelIdentityResponse,
+    RecordExtractionEvidenceResponse,
+)
 from app.schemas.records import HealthRecordResponse, RecordListResponse
+from app.services.local_ai.errors import LocalAIError
+from app.services.local_ai.manifest import parse_manifest
+from app.services.local_ai.types import ModelRole, ProcessingMode
 from app.schemas.timeline import TimelineEvent
 from app.services.timeline_preview import build_timeline_preview
 from app.services.timeline_service import extract_provider_display
@@ -208,7 +218,9 @@ async def record_series(
         items.append(
             {
                 "id": str(r.id),
-                "effective_date": r.effective_date.isoformat() if r.effective_date else None,
+                "effective_date": r.effective_date.isoformat()
+                if r.effective_date
+                else None,
                 "value": value,
                 "unit": value_qty.get("unit", ""),
             }
@@ -238,7 +250,9 @@ async def export_records(
     Declared before /{record_id} so the literal path isn't captured as a UUID.
     """
     if format != "fhir-bundle":
-        raise HTTPException(status_code=400, detail=f"Unsupported export format: {format}")
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported export format: {format}"
+        )
 
     result = await db.execute(
         select(HealthRecord)
@@ -269,7 +283,9 @@ async def export_records(
 
     return JSONResponse(
         content=bundle,
-        headers={"Content-Disposition": 'attachment; filename="medtimeline-fhir-bundle.json"'},
+        headers={
+            "Content-Disposition": 'attachment; filename="medtimeline-fhir-bundle.json"'
+        },
     )
 
 
@@ -306,7 +322,9 @@ async def recent_records(
                 "id": str(r.id),
                 "record_type": r.record_type,
                 "display_text": r.display_text,
-                "effective_date": r.effective_date.isoformat() if r.effective_date else None,
+                "effective_date": r.effective_date.isoformat()
+                if r.effective_date
+                else None,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
                 "source": source_label(r.source_format, r.source_system),
                 "value": raw_value if is_num else None,
@@ -367,6 +385,150 @@ async def record_stats(
         "last_date": last_date.isoformat() if last_date else None,
         "source_count": source_count or 0,
     }
+
+
+@router.get(
+    "/{record_id}/evidence",
+    response_model=RecordExtractionEvidenceResponse,
+)
+async def get_record_evidence(
+    record_id: UUID,
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> RecordExtractionEvidenceResponse:
+    """Return bounded extraction evidence for one user-owned health record."""
+
+    record = (
+        await db.execute(
+            select(HealthRecord).where(
+                HealthRecord.id == record_id,
+                HealthRecord.user_id == user_id,
+                HealthRecord.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if record is None or record.source_file_id is None:
+        raise HTTPException(status_code=404, detail="Record evidence not found")
+
+    upload = (
+        await db.execute(
+            select(UploadedFile).where(
+                UploadedFile.id == record.source_file_id,
+                UploadedFile.user_id == user_id,
+                UploadedFile.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if (
+        upload is None
+        or upload.processing_mode != ProcessingMode.VALIDATED_STRICT_LOCAL.value
+        or not isinstance(upload.processing_manifest, dict)
+    ):
+        raise HTTPException(status_code=404, detail="Record evidence not found")
+
+    evidence_rows = (
+        (
+            await db.execute(
+                select(ExtractionEvidence)
+                .where(
+                    ExtractionEvidence.health_record_id == record_id,
+                    ExtractionEvidence.user_id == user_id,
+                    ExtractionEvidence.upload_id == upload.id,
+                )
+                .order_by(
+                    ExtractionEvidence.page_number.asc().nullslast(),
+                    ExtractionEvidence.start_offset.asc().nullslast(),
+                    ExtractionEvidence.id.asc(),
+                )
+                .limit(256)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not evidence_rows:
+        raise HTTPException(status_code=404, detail="Record evidence not found")
+
+    try:
+        manifest = parse_manifest(upload.processing_manifest)
+    except LocalAIError:
+        raise HTTPException(
+            status_code=409,
+            detail="Record extraction provenance is invalid",
+        ) from None
+    metadata = (
+        upload.document_metadata if isinstance(upload.document_metadata, dict) else {}
+    )
+    unresolved = metadata.get("unresolved_fields", [])
+    rejected = metadata.get("rejected_fields", [])
+    if (
+        not isinstance(unresolved, list)
+        or not isinstance(rejected, list)
+        or len(unresolved) > 128
+        or len(rejected) > 128
+        or any(not isinstance(item, str) for item in (*unresolved, *rejected))
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Record extraction provenance is invalid",
+        )
+
+    evidence: list[ExtractionEvidenceResponse] = []
+    for row in evidence_rows:
+        source_metadata = (
+            row.source_metadata if isinstance(row.source_metadata, dict) else {}
+        )
+        evidence_id = source_metadata.get("evidence_id")
+        if not isinstance(evidence_id, str):
+            raise HTTPException(
+                status_code=409,
+                detail="Record extraction provenance is invalid",
+            )
+        evidence.append(
+            ExtractionEvidenceResponse(
+                id=evidence_id,
+                page_number=row.page_number,
+                section=row.section,
+                excerpt=row.excerpt,
+                start_offset=row.start_offset,
+                end_offset=row.end_offset,
+                field_paths=row.field_paths,
+            )
+        )
+
+    models = [
+        ExtractionModelIdentityResponse(
+            role=artifact.role,
+            repository=artifact.repository,
+            revision=artifact.revision,
+            quantization=artifact.quantization,
+            runtime=f"{manifest.runtime['name']} {manifest.runtime['version']}",
+        )
+        for artifact in manifest.artifacts
+        if artifact.role in {ModelRole.OCR, ModelRole.EXTRACTION}
+    ]
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="records.evidence",
+        resource_type="health_record",
+        resource_id=record_id,
+        ip_address=request.client.host if request.client else None,
+        details={
+            "evidence_count": len(evidence),
+            "processing_mode": upload.processing_mode,
+        },
+    )
+    return RecordExtractionEvidenceResponse(
+        record_id=record_id,
+        processing_mode=ProcessingMode.VALIDATED_STRICT_LOCAL,
+        schema_version=upload.processing_schema_version,
+        evidence=evidence,
+        unresolved_fields=unresolved,
+        rejected_fields=rejected,
+        models=models,
+    )
 
 
 @router.get("/{record_id}", response_model=HealthRecordResponse)

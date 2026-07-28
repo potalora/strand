@@ -31,7 +31,9 @@ test.describe("Overview (home) with seeded data", () => {
     await expect(page.getByText("Personal Health Record")).toBeVisible({
       timeout: 15_000,
     });
-    await expect(page.getByText("End-to-end encrypted")).toBeVisible();
+    await expect(
+      page.getByText("Application-layer encrypted at rest")
+    ).toBeVisible();
   });
 
   test("most recent results section renders", async ({ page }) => {

@@ -31,6 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from unittest.mock import AsyncMock, patch
 
+from app.models.local_ai import LocalAIJob
 from app.models.record import HealthRecord
 from app.models.uploaded_file import UploadedFile
 from app.utils.file_utils import (
@@ -48,6 +49,40 @@ PLAINTEXT_MARKER = b"SECRET_PHI_MARKER_Jane_Q_Public_MRN_0001234567"
 # (the real DB, not the test session). Patch it so the full ingest_file path
 # stays self-contained and deterministic in tests.
 PATCH_DEDUP_BG = "app.services.ingestion.coordinator._run_dedup_background"
+
+
+def _strict_local_manifest() -> dict:
+    artifacts = []
+    for index, role in enumerate(("ocr", "extraction", "summary"), start=1):
+        artifacts.append(
+            {
+                "role": role,
+                "repository": f"owner/{role}",
+                "revision": str(index) * 40,
+                "quantization": "4bit",
+                "license": "apache-2.0",
+                "attribution": f"https://huggingface.co/owner/{role}",
+                "decode_limits": {
+                    "max_input_tokens": 4096,
+                    "max_output_tokens": 1024,
+                },
+                "files": [
+                    {
+                        "path": f"{role}/model.safetensors",
+                        "sha256": str(index) * 64,
+                        "size": 10,
+                    }
+                ],
+            }
+        )
+    return {
+        "schema_version": 1,
+        "pack_revision": "apple-m4-16gb-v1",
+        "platform": "apple_silicon",
+        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "validation_suite_version": "fixtures-v1",
+        "artifacts": artifacts,
+    }
 
 
 def _encrypt_bytes_to(path: Path, data: bytes, chunk: int = 1024 * 1024) -> None:
@@ -247,12 +282,16 @@ async def test_encrypted_fhir_bundle_ingests_equal_to_plaintext(
 
     with patch(PATCH_DEDUP_BG, new_callable=AsyncMock):
         plain_result = await ingest_file(
-            db=db_session, user_id=UUID(uid_plain),
-            file_path=plain_path, original_filename="bundle.json",
+            db=db_session,
+            user_id=UUID(uid_plain),
+            file_path=plain_path,
+            original_filename="bundle.json",
         )
         enc_result = await ingest_file(
-            db=db_session, user_id=UUID(uid_enc),
-            file_path=enc_path, original_filename="bundle.json",
+            db=db_session,
+            user_id=UUID(uid_enc),
+            file_path=enc_path,
+            original_filename="bundle.json",
         )
 
     assert plain_result["records_inserted"] > 0
@@ -270,10 +309,14 @@ async def test_encrypted_fhir_bundle_ingests_equal_to_plaintext(
 
     # Records actually landed for the encrypted user.
     enc_records = (
-        await db_session.execute(
-            select(HealthRecord).where(HealthRecord.user_id == UUID(uid_enc))
+        (
+            await db_session.execute(
+                select(HealthRecord).where(HealthRecord.user_id == UUID(uid_enc))
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(enc_records) == enc_result["records_inserted"]
 
 
@@ -286,7 +329,9 @@ async def test_encrypted_zip_bomb_still_rejected_by_w9_caps(
     from app.services.ingestion.coordinator import ingest_file
 
     # Tighten the uncompressed budget so the bomb trips it deterministically.
-    monkeypatch.setattr(coord, "_ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES", 1024 * 1024, raising=False)
+    monkeypatch.setattr(
+        coord, "_ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES", 1024 * 1024, raising=False
+    )
 
     _, uid = await auth_headers(client, "zipbomb@example.com")
 
@@ -300,8 +345,10 @@ async def test_encrypted_zip_bomb_still_rejected_by_w9_caps(
     # decrypted content.
     with pytest.raises(HTTPException) as exc:
         await ingest_file(
-            db=db_session, user_id=UUID(uid),
-            file_path=enc_zip, original_filename="bomb.zip",
+            db=db_session,
+            user_id=UUID(uid),
+            file_path=enc_zip,
+            original_filename="bomb.zip",
         )
     assert exc.value.status_code in (400, 413)
 
@@ -321,8 +368,10 @@ async def test_legacy_plaintext_fhir_still_ingests(
 
     with patch(PATCH_DEDUP_BG, new_callable=AsyncMock):
         result = await ingest_file(
-            db=db_session, user_id=UUID(uid),
-            file_path=plain_path, original_filename="legacy.json",
+            db=db_session,
+            user_id=UUID(uid),
+            file_path=plain_path,
+            original_filename="legacy.json",
         )
 
     assert result["records_inserted"] > 0
@@ -357,12 +406,16 @@ async def test_reupload_dedup_hash_matches_for_encrypted_copies(
 
     with patch(PATCH_DEDUP_BG, new_callable=AsyncMock):
         await ingest_file(
-            db=db_session, user_id=UUID(uid_a),
-            file_path=enc_a, original_filename="bundle.json",
+            db=db_session,
+            user_id=UUID(uid_a),
+            file_path=enc_a,
+            original_filename="bundle.json",
         )
         await ingest_file(
-            db=db_session, user_id=UUID(uid_b),
-            file_path=enc_b, original_filename="bundle.json",
+            db=db_session,
+            user_id=UUID(uid_b),
+            file_path=enc_b,
+            original_filename="bundle.json",
         )
 
     row_a = (
@@ -397,41 +450,18 @@ async def test_encrypted_mixed_zip_child_is_ciphertext_and_inherits_parent_polic
     upload_dir = tmp_path / "uploads"
     monkeypatch.setattr(coord.settings, "upload_dir", str(upload_dir))
     monkeypatch.setattr(coord.settings, "temp_extract_dir", str(tmp_path / "extract"))
+    admission = AsyncMock()
+    monkeypatch.setattr(
+        coord,
+        "revalidate_strict_snapshot_admission",
+        admission,
+    )
 
     pdf = b"%PDF-1.7\n" + PLAINTEXT_MARKER + b"\n%%EOF"
     encrypted_zip = tmp_path / "mixed.zip"
     _encrypt_bytes_to(encrypted_zip, _make_zip({"clinical-note.pdf": pdf}))
 
-    original_ingest_zip = coord._ingest_zip
-    manifest = {"manifest_digest": "d" * 64, "pack_revision": "test-pack"}
-
-    async def stamp_parent_then_ingest(
-        db: AsyncSession,
-        scoped_user_id: UUID,
-        patient_id: UUID,
-        upload_id: UUID,
-        zip_path: Path,
-    ) -> dict:
-        parent = (
-            await db.execute(
-                select(UploadedFile).where(
-                    UploadedFile.id == upload_id,
-                    UploadedFile.user_id == scoped_user_id,
-                )
-            )
-        ).scalar_one()
-        parent.processing_mode = "validated_strict_local"
-        parent.processing_manifest = manifest
-        await db.commit()
-        return await original_ingest_zip(
-            db,
-            scoped_user_id,
-            patient_id,
-            upload_id,
-            zip_path,
-        )
-
-    monkeypatch.setattr(coord, "_ingest_zip", stamp_parent_then_ingest)
+    manifest = _strict_local_manifest()
 
     with patch(PATCH_DEDUP_BG, new_callable=AsyncMock):
         result = await ingest_file(
@@ -439,14 +469,21 @@ async def test_encrypted_mixed_zip_child_is_ciphertext_and_inherits_parent_polic
             user_id=user_id,
             file_path=encrypted_zip,
             original_filename="mixed.zip",
+            processing_mode="validated_strict_local",
+            processing_manifest=manifest,
+            processing_schema_version="clinical-document-extraction.v1",
         )
 
     assert len(result["unstructured_uploads"]) == 1
     rows = (
-        await db_session.execute(
-            select(UploadedFile).where(UploadedFile.user_id == user_id)
+        (
+            await db_session.execute(
+                select(UploadedFile).where(UploadedFile.user_id == user_id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     child = next(row for row in rows if row.file_category == "unstructured")
     durable_bytes = Path(child.storage_path).read_bytes()
     assert durable_bytes.startswith(ENC_MAGIC)
@@ -456,6 +493,18 @@ async def test_encrypted_mixed_zip_child_is_ciphertext_and_inherits_parent_polic
     assert child.file_hash == hashlib.sha256(pdf).hexdigest()
     assert child.processing_mode == "validated_strict_local"
     assert child.processing_manifest == manifest
+    assert child.processing_schema_version == "clinical-document-extraction.v1"
+    job = (
+        await db_session.execute(
+            select(LocalAIJob).where(LocalAIJob.upload_id == child.id)
+        )
+    ).scalar_one()
+    assert job.user_id == user_id
+    assert job.processing_mode == "validated_strict_local"
+    assert job.manifest_snapshot == manifest
+    assert job.status == "queued"
+    assert job.stage == "queued"
+    admission.assert_awaited_once()
 
 
 @pytest.mark.asyncio

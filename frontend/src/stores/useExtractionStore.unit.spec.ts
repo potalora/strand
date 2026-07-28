@@ -13,6 +13,8 @@ function f(over: Partial<TrackedFile>): TrackedFile {
     status: over.status ?? "pending_extraction",
     progress_stage: null,
     progress_detail: null,
+    local_run: null,
+    local_failure: null,
     needsTrigger: over.needsTrigger ?? false,
     triggered: over.triggered ?? false,
   };
@@ -95,5 +97,67 @@ test.describe("startBatch merge-or-replace", () => {
     s.startBatch([{ upload_id: "A", filename: "a.pdf", status: "processing" }]);
     s.startBatch([{ upload_id: "A", filename: "a.pdf", status: "processing" }]);
     expect(useExtractionStore.getState().batchIds).toEqual(["A"]);
+  });
+});
+
+test.describe("mergeFileStatuses local provenance", () => {
+  test.beforeEach(() => useExtractionStore.getState().reset());
+
+  test("merges local run data without replacing other tracked files", () => {
+    useExtractionStore.getState().startBatch([
+      { upload_id: "A", filename: "a.pdf", status: "processing" },
+      { upload_id: "B", filename: "b.pdf", status: "pending_extraction" },
+    ]);
+
+    useExtractionStore.getState().mergeFileStatuses([
+      {
+        id: "A",
+        ingestion_status: "processing",
+        local_run: {
+          privacy_mode: "validated_strict_local",
+          models: [
+            {
+              role: "ocr",
+              repository: "sahilchachra/ovisocr2-int4-mlx",
+              revision: "0123456789abcdef0123456789abcdef01234567",
+            },
+          ],
+        },
+      },
+    ]);
+
+    const state = useExtractionStore.getState();
+    expect(state.files.A.local_run?.models[0]?.role).toBe("ocr");
+    expect(state.files.B.filename).toBe("b.pdf");
+    expect(state.batchIds).toEqual(["A", "B"]);
+  });
+
+  test("merges a fail-closed local failure into the tracked file", () => {
+    useExtractionStore.getState().startBatch([
+      { upload_id: "A", filename: "a.pdf", status: "processing" },
+    ]);
+
+    useExtractionStore.getState().mergeFileStatuses([
+      {
+        id: "A",
+        ingestion_status: "failed",
+        local_failure: {
+          stage: "ocr",
+          code: "worker_failed",
+          message: "Local OCR did not complete.",
+          model_role: "ocr",
+          repository: "sahilchachra/ovisocr2-int4-mlx",
+          revision: "0123456789abcdef0123456789abcdef01234567",
+          retryable: true,
+          checkpoint_preserved: true,
+          cloud_fallback_attempted: false,
+        },
+      },
+    ]);
+
+    const tracked = useExtractionStore.getState().files.A;
+    expect(tracked.status).toBe("failed");
+    expect(tracked.local_failure?.code).toBe("worker_failed");
+    expect(tracked.local_failure?.cloud_fallback_attempted).toBe(false);
   });
 });

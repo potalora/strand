@@ -15,6 +15,7 @@ from app.models.record import HealthRecord
 from app.services.ai.llm import LLMConfig, load_llm_config
 from app.services.dedup.detector import detect_upload_duplicates
 from app.services.dedup.llm_judge import judge_candidates_batch, JudgmentResult
+from app.services.local_ai.types import ProcessingMode
 
 logger = logging.getLogger(__name__)
 
@@ -44,20 +45,20 @@ async def run_upload_dedup(
     patient_id: UUID,
     user_id: UUID,
     db: AsyncSession,
+    *,
+    processing_mode: ProcessingMode | str = ProcessingMode.CLOUD_ASSISTED,
 ) -> DedupSummary:
     """Run the full dedup pipeline for a single upload.
 
     1. Heuristic filter: scoped comparison (new records vs existing)
     2. Auto-merge exact matches (score >= 0.95)
-    3. LLM judge on fuzzy matches (score 0.6–0.95)
+    3. Persist fuzzy non-cloud matches for manual review, or use the configured
+       LLM judge only for cloud-assisted uploads (score 0.6–0.95)
     4. Auto-resolve based on LLM output
     5. Return summary
     """
     summary = DedupSummary()
-
-    # Resolve the per-user LLM config once for this upload's dedup run (falls back
-    # to .env when the user has no saved rows). Threaded into the LLM judge.
-    config = await load_llm_config(db, user_id)
+    llm_enabled = processing_mode == ProcessingMode.CLOUD_ASSISTED
 
     # Step 1: Heuristic filter
     auto_merged_candidates, needs_llm_candidates = await detect_upload_duplicates(
@@ -81,45 +82,61 @@ async def run_upload_dedup(
 
     # Step 3: LLM judge on fuzzy matches
     if needs_llm_candidates:
-        judgments = await _run_llm_judge(db, needs_llm_candidates, config)
-
-        llm_auto_merge = []
-        llm_dismissed = []
-        llm_needs_review = []
-
-        for candidate, judgment in zip(needs_llm_candidates, judgments):
-            candidate["llm_classification"] = judgment.classification
-            candidate["llm_confidence"] = judgment.confidence
-            candidate["llm_explanation"] = judgment.explanation
-            candidate["field_diff"] = judgment.field_diff
-
-            # Auto-resolution rules
-            if judgment.classification == "duplicate" and judgment.confidence >= 0.8:
-                candidate["auto_resolved"] = True
-                candidate["status"] = "merged"
-                llm_auto_merge.append(candidate)
-            elif judgment.classification == "distinct" and judgment.confidence >= 0.8:
-                candidate["auto_resolved"] = True
-                candidate["status"] = "dismissed"
-                llm_dismissed.append(candidate)
-            else:
+        if not llm_enabled:
+            for candidate in needs_llm_candidates:
                 candidate["auto_resolved"] = False
                 candidate["status"] = "pending"
-                llm_needs_review.append(candidate)
+            await _save_candidates(db, needs_llm_candidates)
+            summary.needs_review = len(needs_llm_candidates)
+        else:
+            # Resolve routing only when an LLM judgment will actually run.
+            config = await load_llm_config(db, user_id)
+            judgments = await _run_llm_judge(db, needs_llm_candidates, config)
 
-        # Save all LLM-judged candidates
-        all_llm = llm_auto_merge + llm_dismissed + llm_needs_review
-        await _save_candidates(db, all_llm)
+            llm_auto_merge = []
+            llm_dismissed = []
+            llm_needs_review = []
 
-        # Apply auto-merges from LLM duplicates
-        if llm_auto_merge:
-            await _apply_auto_merges(db, llm_auto_merge, upload_id, user_id)
-            summary.auto_merged += len(llm_auto_merge)
+            for candidate, judgment in zip(needs_llm_candidates, judgments):
+                candidate["llm_classification"] = judgment.classification
+                candidate["llm_confidence"] = judgment.confidence
+                candidate["llm_explanation"] = judgment.explanation
+                candidate["field_diff"] = judgment.field_diff
 
-        summary.dismissed = len(llm_dismissed)
-        summary.needs_review = len(llm_needs_review)
+                # Auto-resolution rules
+                if (
+                    judgment.classification == "duplicate"
+                    and judgment.confidence >= 0.8
+                ):
+                    candidate["auto_resolved"] = True
+                    candidate["status"] = "merged"
+                    llm_auto_merge.append(candidate)
+                elif (
+                    judgment.classification == "distinct" and judgment.confidence >= 0.8
+                ):
+                    candidate["auto_resolved"] = True
+                    candidate["status"] = "dismissed"
+                    llm_dismissed.append(candidate)
+                else:
+                    candidate["auto_resolved"] = False
+                    candidate["status"] = "pending"
+                    llm_needs_review.append(candidate)
 
-    summary.total_candidates = summary.auto_merged + summary.needs_review + summary.dismissed
+            # Save all LLM-judged candidates
+            all_llm = llm_auto_merge + llm_dismissed + llm_needs_review
+            await _save_candidates(db, all_llm)
+
+            # Apply auto-merges from LLM duplicates
+            if llm_auto_merge:
+                await _apply_auto_merges(db, llm_auto_merge, upload_id, user_id)
+                summary.auto_merged += len(llm_auto_merge)
+
+            summary.dismissed = len(llm_dismissed)
+            summary.needs_review = len(llm_needs_review)
+
+    summary.total_candidates = (
+        summary.auto_merged + summary.needs_review + summary.dismissed
+    )
 
     # Build by_type counts from all candidates
     all_candidates = auto_merged_candidates + needs_llm_candidates
@@ -169,17 +186,19 @@ async def _apply_auto_merges(
             )
         )
         # Create provenance
-        db.add(Provenance(
-            record_id=c["record_a_id"],
-            action="merge",
-            agent="system/auto-merge",
-            source_file_id=upload_id,
-            details={
-                "merged_record_id": str(c["record_b_id"]),
-                "similarity_score": c["similarity_score"],
-                "classification": c.get("llm_classification", "duplicate"),
-            },
-        ))
+        db.add(
+            Provenance(
+                record_id=c["record_a_id"],
+                action="merge",
+                agent="system/auto-merge",
+                source_file_id=upload_id,
+                details={
+                    "merged_record_id": str(c["record_b_id"]),
+                    "similarity_score": c["similarity_score"],
+                    "classification": c.get("llm_classification", "duplicate"),
+                },
+            )
+        )
     await db.flush()
 
 
@@ -198,11 +217,13 @@ async def _run_llm_judge(
         rec_a = await db.get(HealthRecord, c["record_a_id"])
         rec_b = await db.get(HealthRecord, c["record_b_id"])
         if rec_a and rec_b:
-            pairs.append((
-                rec_a.fhir_resource or {},
-                rec_b.fhir_resource or {},
-                rec_a.record_type,
-            ))
+            pairs.append(
+                (
+                    rec_a.fhir_resource or {},
+                    rec_b.fhir_resource or {},
+                    rec_a.record_type,
+                )
+            )
         else:
             pairs.append(({}, {}, "unknown"))
 

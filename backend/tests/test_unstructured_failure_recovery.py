@@ -5,9 +5,11 @@ as a generic TimeoutError).
 
 Gemini is fully mocked, so this is a fast test (no GEMINI_API_KEY needed).
 """
+
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -18,9 +20,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.models.uploaded_file import UploadedFile
+from app.models.local_ai import LocalAIJob, LocalAIPage
+from app.services.local_ai.manifest import canonicalize_manifest_snapshot
 from app.services.extraction.entity_extractor import ExtractedEntity, ExtractionResult
 from app.services.extraction.text_extractor import FileType
 from tests.conftest import TEST_DB_URL, auth_headers
+from tests.test_strict_local_pipeline import _manifest_payload
 
 
 @pytest_asyncio.fixture
@@ -129,7 +134,9 @@ async def test_insert_failure_marks_failed_with_real_error_not_timeout(
 
     async with test_session_factory() as check:
         row = (
-            await check.execute(select(UploadedFile).where(UploadedFile.id == upload_id))
+            await check.execute(
+                select(UploadedFile).where(UploadedFile.id == upload_id)
+            )
         ).scalar_one()
         status = row.ingestion_status
         completed_at = row.processing_completed_at
@@ -145,6 +152,237 @@ async def test_insert_failure_marks_failed_with_real_error_not_timeout(
     assert "TimeoutError" not in error_types, (
         f"failure was mislabeled as a timeout: {errors}"
     )
-    assert any(
-        et and ("Error" in et or "Exception" in et) for et in error_types
-    ), f"expected a real DB error type, got {error_types}"
+    assert any(et and ("Error" in et or "Exception" in et) for et in error_types), (
+        f"expected a real DB error type, got {error_types}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stuck_strict_job_requeues_without_losing_page_checkpoints(
+    db_session: AsyncSession,
+    client: AsyncClient,
+    test_session_factory: async_sessionmaker,  # type: ignore[type-arg]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.upload import _recover_stuck_files
+
+    _headers, uid_str = await auth_headers(client)
+    user_id = uuid.UUID(uid_str)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = UploadedFile(
+        user_id=user_id,
+        filename="recover.pdf",
+        mime_type="application/pdf",
+        file_hash="d" * 64,
+        storage_path="/private/recover.pdf",
+        ingestion_status="processing",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+        processing_started_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        retry_count=0,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user_id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="extraction",
+    )
+    db_session.add(job)
+    await db_session.flush()
+    page = LocalAIPage(
+        job_id=job.id,
+        page_number=1,
+        checkpoint_key="1" * 64,
+        image_sha256="2" * 64,
+        ocr_result={"markdown": "Private checkpoint", "width": 10, "height": 10},
+        warnings=[],
+    )
+    db_session.add(page)
+    await db_session.commit()
+
+    monkeypatch.setattr("app.api.upload.async_session_factory", test_session_factory)
+    monkeypatch.setattr("app.api.upload.settings.extraction_timeout_minutes", 1)
+    monkeypatch.setattr("app.api.upload.settings.extraction_max_retries", 3)
+
+    await _recover_stuck_files()
+
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert upload.ingestion_status == "pending_extraction"
+    assert job.status == "queued"
+    assert job.stage == "recovery"
+    assert await db_session.get(LocalAIPage, page.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_stuck_strict_upload_at_max_retries_fails_queued_job_too(
+    db_session: AsyncSession,
+    client: AsyncClient,
+    test_session_factory: async_sessionmaker,  # type: ignore[type-arg]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.upload import _recover_stuck_files
+
+    _headers, uid_str = await auth_headers(
+        client,
+        email="queued-strict-timeout@example.com",
+    )
+    user_id = uuid.UUID(uid_str)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = UploadedFile(
+        user_id=user_id,
+        filename="queued-timeout.pdf",
+        mime_type="application/pdf",
+        file_hash="e" * 64,
+        storage_path="/private/queued-timeout.pdf",
+        ingestion_status="processing",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+        processing_started_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        retry_count=3,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user_id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="queued",
+        stage="queued",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    monkeypatch.setattr("app.api.upload.async_session_factory", test_session_factory)
+    monkeypatch.setattr("app.api.upload.settings.extraction_timeout_minutes", 1)
+    monkeypatch.setattr("app.api.upload.settings.extraction_max_retries", 3)
+
+    await _recover_stuck_files()
+
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert upload.ingestion_status == "failed"
+    assert upload.processing_completed_at is not None
+    assert job.status == "failed"
+    assert job.stage == "failed"
+    assert job.completed_at == upload.processing_completed_at
+    assert job.failure["code"] == "local_worker_timeout"
+
+
+@pytest.mark.asyncio
+async def test_stuck_cancelled_strict_job_terminalizes_both_rows(
+    db_session: AsyncSession,
+    client: AsyncClient,
+    test_session_factory: async_sessionmaker,  # type: ignore[type-arg]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.upload import _recover_stuck_files
+
+    _headers, uid_str = await auth_headers(client)
+    user_id = uuid.UUID(uid_str)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = UploadedFile(
+        user_id=user_id,
+        filename="recover-cancelled.pdf",
+        mime_type="application/pdf",
+        file_hash="d" * 64,
+        storage_path="/private/recover-cancelled.pdf",
+        ingestion_status="processing",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+        processing_started_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        cancel_requested=True,
+        retry_count=0,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user_id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="ocr",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    monkeypatch.setattr("app.api.upload.async_session_factory", test_session_factory)
+    monkeypatch.setattr("app.api.upload.settings.extraction_timeout_minutes", 1)
+    monkeypatch.setattr("app.api.upload.settings.extraction_max_retries", 3)
+
+    await _recover_stuck_files()
+
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert upload.ingestion_status == "cancelled"
+    assert upload.processing_completed_at is not None
+    assert job.status == "cancelled"
+    assert job.stage == "cancelled"
+    assert job.cancel_requested is True
+    assert job.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_terminalizes_cancelled_strict_pair(
+    db_session: AsyncSession,
+    client: AsyncClient,
+) -> None:
+    from app.main import _recover_unstructured_jobs_on_startup
+
+    _headers, uid_str = await auth_headers(client)
+    user_id = uuid.UUID(uid_str)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = UploadedFile(
+        user_id=user_id,
+        filename="startup-cancelled.pdf",
+        mime_type="application/pdf",
+        file_hash="d" * 64,
+        storage_path="/private/startup-cancelled.pdf",
+        ingestion_status="processing",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+        processing_started_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        cancel_requested=True,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user_id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="queued",
+        stage="recovery",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    await _recover_unstructured_jobs_on_startup(db_session)
+    await db_session.commit()
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+
+    assert upload.ingestion_status == "cancelled"
+    assert upload.processing_completed_at is not None
+    assert job.status == "cancelled"
+    assert job.stage == "cancelled"
+    assert job.cancel_requested is True
+    assert job.completed_at is not None

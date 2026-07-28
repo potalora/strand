@@ -1,0 +1,103 @@
+name: Backend tests
+
+on:
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: medtimeline_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d medtimeline_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/medtimeline_test
+      REDIS_URL: redis://127.0.0.1:6379/0
+      JWT_SECRET_KEY: ci-only-jwt-secret-with-more-than-thirty-two-characters
+      DATABASE_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      PHI_NER_ENABLED: "false"
+      LOCAL_AI_ENABLED: "false"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.6.6"
+          python-version: "3.11.8"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install locked backend dependencies
+        working-directory: backend
+        run: uv sync --frozen
+
+      - name: Check backend lint and strict-local formatting
+        working-directory: backend
+        run: |
+          uv run ruff check app scripts tests
+          uv run ruff format --check \
+            app/api/local_ai.py \
+            app/api/summary.py \
+            app/api/upload.py \
+            app/models/local_ai.py \
+            app/models/uploaded_file.py \
+            app/schemas/local_ai.py \
+            app/schemas/summary.py \
+            app/schemas/upload.py \
+            app/services/ai/grounded_routing.py \
+            app/services/ai/prompt_grounding.py \
+            app/services/ai/summarizer.py \
+            app/services/local_ai \
+            scripts/benchmark_local_ai.py \
+            scripts/local_ai_pack.py \
+            scripts/lock_local_ai_manifest.py \
+            scripts/promote_local_ai_release.py \
+            scripts/run_local_ai_fidelity.py \
+            tests/test_grounded_*.py \
+            tests/test_local_ai_*.py \
+            tests/test_processing_mode_snapshot.py \
+            tests/test_prompt_only_grounded_summary.py \
+            tests/test_record_evidence_api.py \
+            tests/test_strict_local_*.py \
+            tests/test_summary_projection.py \
+            tests/test_summary_schema_contract.py
+
+      - name: Run ordinary backend tests
+        working-directory: backend
+        run: >-
+          uv run pytest
+          -m "not slow and not fidelity and not local_model and not hardware"
+          -q

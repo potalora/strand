@@ -120,6 +120,36 @@ def test_progress_response_accepts_only_non_content_fields() -> None:
         )
 
 
+def test_progress_response_allows_bounded_non_content_memory_metrics() -> None:
+    response = WorkerResponse.model_validate(
+        _response(
+            "progress",
+            {
+                "role": "summary",
+                "stage": "finalizing",
+                "current": 1,
+                "total": 1,
+                "active_memory_bytes": 512 * 1024**2,
+                "peak_memory_bytes": 6 * 1024**3,
+            },
+        )
+    )
+
+    assert response.payload.active_memory_bytes == 512 * 1024**2
+    assert response.payload.peak_memory_bytes == 6 * 1024**3
+    for invalid in (-1, True, 1.5, "1024"):
+        payload = {
+            "role": "summary",
+            "stage": "finalizing",
+            "current": 1,
+            "total": 1,
+            "active_memory_bytes": invalid,
+            "peak_memory_bytes": 1024,
+        }
+        with pytest.raises(ValidationError):
+            WorkerResponse.model_validate(_response("progress", payload))
+
+
 def test_health_ready_response_needs_no_model_role() -> None:
     response = WorkerResponse.model_validate(_response("ready", {}))
 
@@ -151,7 +181,9 @@ def test_error_response_cannot_contain_raw_detail_or_arbitrary_message() -> None
 def test_response_kind_must_match_its_bounded_payload_schema() -> None:
     with pytest.raises(ValidationError):
         WorkerResponse.model_validate(
-            _response("result", {"code": "worker_failed", "message": "Local worker failed."})
+            _response(
+                "result", {"code": "worker_failed", "message": "Local worker failed."}
+            )
         )
     with pytest.raises(ValidationError):
         WorkerResponse.model_validate(_response("unknown", {"role": "ocr"}))

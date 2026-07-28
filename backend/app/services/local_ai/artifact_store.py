@@ -33,12 +33,21 @@ from app.services.local_ai.manifest import (
     LocalAIManifest,
     ManifestArtifact,
     ManifestFile,
+    is_secret_shaped_manifest_text,
     manifest_path_suffix,
     safe_relative_manifest_path,
 )
 from app.services.local_ai.types import ModelRole
+from app.services.local_ai.validation_receipt import (
+    RuntimeValidationReceipt,
+    validate_persisted_receipt,
+    validated_receipt_payload,
+    validation_receipt_sha256,
+)
 
-_POINTER_KEYS = frozenset({"pack_revision", "manifest_sha256"})
+_POINTER_KEYS = frozenset(
+    {"pack_revision", "manifest_sha256", "validation_receipt_sha256"}
+)
 _STATE_KEYS = frozenset({"active", "previous"})
 _ACTIVATION_STATE = "activation-state.json"
 _ACTIVATION_LOCK = ".activation.lock"
@@ -126,6 +135,7 @@ def _validate_manifest(manifest: LocalAIManifest) -> None:
         if (
             not isinstance(manifest.pack_revision, str)
             or PACK_REVISION_RE.fullmatch(manifest.pack_revision) is None
+            or is_secret_shaped_manifest_text(manifest.pack_revision)
         ):
             raise LocalValidationError("Model pack revision is invalid")
         if not isinstance(manifest.runtime, dict) or set(manifest.runtime) != {
@@ -138,6 +148,7 @@ def _validate_manifest(manifest: LocalAIManifest) -> None:
             and value
             and len(value) <= 2048
             and not any(ord(character) < 32 for character in value)
+            and not is_secret_shaped_manifest_text(value)
             for value in manifest.runtime.values()
         ):
             raise LocalValidationError("Model manifest is invalid")
@@ -148,6 +159,7 @@ def _validate_manifest(manifest: LocalAIManifest) -> None:
             or any(
                 ord(character) < 32 for character in manifest.validation_suite_version
             )
+            or is_secret_shaped_manifest_text(manifest.validation_suite_version)
         ):
             raise LocalValidationError("Model manifest is invalid")
 
@@ -167,6 +179,7 @@ def _validate_manifest(manifest: LocalAIManifest) -> None:
             if (
                 not isinstance(artifact.repository, str)
                 or REPOSITORY_RE.fullmatch(artifact.repository) is None
+                or is_secret_shaped_manifest_text(artifact.repository)
                 or not isinstance(artifact.revision, str)
                 or COMMIT_RE.fullmatch(artifact.revision) is None
             ):
@@ -181,6 +194,7 @@ def _validate_manifest(manifest: LocalAIManifest) -> None:
                 and value
                 and len(value) <= 2048
                 and not any(ord(character) < 32 for character in value)
+                and not is_secret_shaped_manifest_text(value)
                 for value in text_metadata
             ):
                 raise LocalValidationError("Model manifest metadata is invalid")
@@ -315,6 +329,7 @@ class ArtifactStore:
         self.staging_dir = self.root / ".staging"
         self.packs_dir = self.root / "packs"
         self.operations_dir = self.root / "operations"
+        self.validations_dir = self.root / "validations"
         self.activation_lock_path = self.root / _ACTIVATION_LOCK
         self._mutation_lock = _mutation_lock_for(self.root)
         self._initialize()
@@ -325,7 +340,12 @@ class ArtifactStore:
                 _assert_real_directory(self.root)
             else:
                 self.root.mkdir(parents=True, mode=0o700)
-            for path in (self.staging_dir, self.packs_dir, self.operations_dir):
+            for path in (
+                self.staging_dir,
+                self.packs_dir,
+                self.operations_dir,
+                self.validations_dir,
+            ):
                 if path.exists() or path.is_symlink():
                     _assert_real_directory(path)
                 else:
@@ -407,20 +427,36 @@ class ArtifactStore:
             or PACK_REVISION_RE.fullmatch(pack_revision) is None
         ):
             raise LocalValidationError("Model pack revision is invalid")
-        destination = self.packs_dir / pack_revision
-        if destination.exists() or destination.is_symlink():
-            raise LocalValidationError("Model pack revision already exists")
+        with self._mutation_guard():
+            destination = self.packs_dir / pack_revision
+            if destination.exists() or destination.is_symlink():
+                state = self._read_state()
+                referenced = {
+                    pointer["pack_revision"]
+                    for pointer in (state["active"], state["previous"])
+                    if pointer is not None
+                }
+                if pack_revision in referenced:
+                    raise LocalValidationError("Model pack revision already exists")
+                _assert_real_directory(destination)
+                try:
+                    shutil.rmtree(destination)
+                    _fsync_directory(self.packs_dir)
+                except OSError as exc:
+                    raise LocalValidationError(
+                        "Orphan model pack could not be removed"
+                    ) from exc
 
-        operation_id = f"{pack_revision}-{uuid.uuid4().hex}"
-        path = self.staging_dir / operation_id
-        try:
-            path.mkdir(mode=0o700)
-            path.chmod(0o700)
-        except OSError as exc:
-            raise LocalValidationError(
-                "Model staging operation could not be created"
-            ) from exc
-        return path
+            operation_id = f"{pack_revision}-{uuid.uuid4().hex}"
+            path = self.staging_dir / operation_id
+            try:
+                path.mkdir(mode=0o700)
+                path.chmod(0o700)
+            except OSError as exc:
+                raise LocalValidationError(
+                    "Model staging operation could not be created"
+                ) from exc
+            return path
 
     def _assert_staging_path(self, path: Path) -> None:
         if path.parent != self.staging_dir or not _OPERATION_RE.fullmatch(path.name):
@@ -764,14 +800,21 @@ class ArtifactStore:
             raise LocalValidationError("Model activation pointer is invalid")
         revision = value.get("pack_revision")
         digest = value.get("manifest_sha256")
+        receipt_digest = value.get("validation_receipt_sha256")
         if (
             not isinstance(revision, str)
             or PACK_REVISION_RE.fullmatch(revision) is None
             or not isinstance(digest, str)
             or SHA256_RE.fullmatch(digest) is None
+            or not isinstance(receipt_digest, str)
+            or SHA256_RE.fullmatch(receipt_digest) is None
         ):
             raise LocalValidationError("Model activation pointer is invalid")
-        return {"pack_revision": revision, "manifest_sha256": digest}
+        return {
+            "pack_revision": revision,
+            "manifest_sha256": digest,
+            "validation_receipt_sha256": receipt_digest,
+        }
 
     def _validate_state(self, value: Any) -> dict[str, dict[str, str] | None]:
         if not isinstance(value, dict) or set(value) != _STATE_KEYS:
@@ -814,60 +857,135 @@ class ArtifactStore:
         state = self._validate_state({"active": active, "previous": previous})
         self._write_json_atomic(self.root / _ACTIVATION_STATE, state)
 
-    def activate(self, staging_path: Path, manifest: LocalAIManifest) -> None:
-        """Verify and atomically activate a new immutable model pack."""
-
-        with self._mutation_guard():
-            self._activate_locked(staging_path, manifest)
-
-    def _activate_locked(
+    def activate_validated(
         self,
         staging_path: Path,
         manifest: LocalAIManifest,
+        receipt: RuntimeValidationReceipt,
     ) -> None:
-        self.verify(staging_path, manifest)
-        destination = self.packs_dir / manifest.pack_revision
-        if destination.exists() or destination.is_symlink():
-            raise LocalValidationError("Model pack revision already exists")
+        """Atomically activate only a candidate carrying a runtime receipt."""
 
-        digest = manifest_sha256(manifest)
-        state = self._read_state()
-        current = state["active"]
-        if current is not None:
-            self._load_installed_manifest(
-                self.packs_dir / current["pack_revision"],
-                current,
+        receipt_payload = validated_receipt_payload(receipt, manifest)
+        with self._mutation_guard():
+            self.verify(staging_path, manifest)
+            destination = self.packs_dir / manifest.pack_revision
+            if destination.exists() or destination.is_symlink():
+                raise LocalValidationError("Model pack revision already exists")
+
+            digest = manifest_sha256(manifest)
+            state = self._read_state()
+            current = state["active"]
+            if current is not None:
+                self._load_validated_installed_manifest(
+                    self.packs_dir / current["pack_revision"],
+                    current,
+                )
+            receipt_digest = validation_receipt_sha256(receipt_payload)
+            new_pointer = {
+                "pack_revision": manifest.pack_revision,
+                "manifest_sha256": digest,
+                "validation_receipt_sha256": receipt_digest,
+            }
+            metadata_payload = _manifest_payload(manifest)
+            metadata = _canonical_json(metadata_payload)
+            self._write_json_atomic(
+                Path(staging_path) / _MANIFEST_METADATA,
+                metadata_payload,
             )
-        new_pointer = {
-            "pack_revision": manifest.pack_revision,
-            "manifest_sha256": digest,
-        }
-        metadata_payload = _manifest_payload(manifest)
-        metadata = _canonical_json(metadata_payload)
-        self._write_json_atomic(
-            Path(staging_path) / _MANIFEST_METADATA,
-            metadata_payload,
-        )
-        try:
-            os.replace(staging_path, destination)
-            _fsync_directory(self.packs_dir)
-            self._verify_tree(
-                destination,
-                manifest,
-                allow_manifest_metadata=True,
-                expected_metadata=metadata,
-            )
-            self._write_state(active=new_pointer, previous=current)
-        except (OSError, LocalValidationError) as exc:
-            if isinstance(exc, LocalValidationError):
-                raise
-            raise LocalValidationError("Model pack activation failed") from exc
+            moved = False
+            receipt_path = self._validation_path(digest)
+            try:
+                os.replace(staging_path, destination)
+                moved = True
+                _fsync_directory(self.packs_dir)
+                self._verify_tree(
+                    destination,
+                    manifest,
+                    allow_manifest_metadata=True,
+                    expected_metadata=metadata,
+                )
+                self._write_json_atomic(receipt_path, receipt_payload)
+                self._write_state(active=new_pointer, previous=current)
+                self._load_validated_installed_manifest(destination, new_pointer)
+            except (OSError, LocalValidationError) as exc:
+                cleanup_errors: list[OSError | LocalValidationError] = []
+                try:
+                    observed = self._read_state()
+                    if observed["active"] == new_pointer:
+                        self._write_state(
+                            active=state["active"],
+                            previous=state["previous"],
+                        )
+                except (OSError, LocalValidationError) as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+                try:
+                    receipt_path.unlink(missing_ok=True)
+                    _fsync_directory(self.validations_dir)
+                except (OSError, LocalValidationError) as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+                try:
+                    if moved and destination.exists():
+                        _assert_real_directory(destination)
+                        shutil.rmtree(destination)
+                        _fsync_directory(self.packs_dir)
+                except (OSError, LocalValidationError) as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+                if cleanup_errors:
+                    raise LocalValidationError(
+                        "Model pack activation recovery failed"
+                    ) from cleanup_errors[0]
+                if isinstance(exc, LocalValidationError):
+                    raise
+                raise LocalValidationError("Model pack activation failed") from exc
 
     def active_revision(self) -> str | None:
         """Return the active pack revision, if one is selected."""
 
         pointer = self._read_state()["active"]
         return pointer["pack_revision"] if pointer is not None else None
+
+    def active_manifest(self) -> LocalAIManifest | None:
+        """Return the fully verified active manifest, or ``None`` when unset."""
+
+        state = self._read_state()
+        pointer = state["active"]
+        if pointer is None:
+            return None
+        return self._load_validated_installed_manifest(
+            self.packs_dir / pointer["pack_revision"],
+            pointer,
+        )
+
+    def active_candidate_manifest_for_validation(self) -> LocalAIManifest | None:
+        """Return the hash-verified active candidate before refreshing fixtures."""
+
+        pointer = self._read_state()["active"]
+        if pointer is None:
+            return None
+        return self._load_installed_manifest(
+            self.packs_dir / pointer["pack_revision"],
+            pointer,
+        )
+
+    def previous_manifest(self) -> LocalAIManifest | None:
+        """Return the hash-verified rollback candidate without selecting it."""
+
+        pointer = self._read_state()["previous"]
+        if pointer is None:
+            return None
+        return self._load_validated_installed_manifest(
+            self.packs_dir / pointer["pack_revision"],
+            pointer,
+        )
+
+    def _load_validated_installed_manifest(
+        self,
+        pack: Path,
+        pointer: dict[str, str],
+    ) -> LocalAIManifest:
+        manifest = self._load_installed_manifest(pack, pointer)
+        self._read_validation_receipt(manifest, pointer)
+        return manifest
 
     def _load_installed_manifest(
         self,
@@ -906,6 +1024,114 @@ class ArtifactStore:
                 os.close(root_fd)
         return manifest
 
+    def _validation_path(self, manifest_digest: str) -> Path:
+        if SHA256_RE.fullmatch(manifest_digest) is None:
+            raise LocalValidationError("Model runtime validation receipt is invalid")
+        return self.validations_dir / f"{manifest_digest}.json"
+
+    def _read_validation_receipt(
+        self,
+        manifest: LocalAIManifest,
+        pointer: dict[str, str],
+    ) -> dict[str, str]:
+        path = self._validation_path(manifest_sha256(manifest))
+        try:
+            status = path.lstat()
+        except (FileNotFoundError, OSError) as exc:
+            raise LocalValidationError(
+                "Previously installed model pack is not runtime validated"
+            ) from exc
+        if (
+            stat.S_ISLNK(status.st_mode)
+            or not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+            or status.st_size > 16 * 1024
+        ):
+            raise LocalValidationError(
+                "Previously installed model pack is not runtime validated"
+            )
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            payload = validate_persisted_receipt(raw, manifest)
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            LocalValidationError,
+        ) as exc:
+            raise LocalValidationError(
+                "Previously installed model pack is not runtime validated"
+            ) from exc
+        if validation_receipt_sha256(payload) != pointer["validation_receipt_sha256"]:
+            raise LocalValidationError(
+                "Previously installed model pack is not runtime validated"
+            )
+        return payload
+
+    def has_validation_receipt(self, manifest: LocalAIManifest) -> bool:
+        """Return whether the active/previous pointer carries the exact receipt."""
+
+        digest = manifest_sha256(manifest)
+        state = self._read_state()
+        for pointer in (state["active"], state["previous"]):
+            if (
+                pointer is not None
+                and pointer["manifest_sha256"] == digest
+                and pointer["pack_revision"] == manifest.pack_revision
+            ):
+                try:
+                    self._read_validation_receipt(manifest, pointer)
+                except LocalValidationError:
+                    return False
+                return True
+        return False
+
+    def refresh_validation_receipt(
+        self,
+        manifest: LocalAIManifest,
+        receipt: RuntimeValidationReceipt,
+    ) -> None:
+        """Durably refresh the exact receipt for the selected active pack."""
+
+        payload = validated_receipt_payload(receipt, manifest)
+        with self._mutation_guard():
+            state = self._read_state()
+            active = state["active"]
+            if (
+                active is None
+                or active["pack_revision"] != manifest.pack_revision
+                or active["manifest_sha256"] != manifest_sha256(manifest)
+            ):
+                raise LocalValidationError("The local model pack is unavailable.")
+            self._load_installed_manifest(
+                self.packs_dir / manifest.pack_revision,
+                active,
+            )
+            receipt_digest = validation_receipt_sha256(payload)
+            self._write_json_atomic(
+                self._validation_path(active["manifest_sha256"]),
+                payload,
+            )
+            refreshed = {**active, "validation_receipt_sha256": receipt_digest}
+            try:
+                self._write_state(active=refreshed, previous=state["previous"])
+            except LocalValidationError:
+                # The prior pointer remains authoritative. Its old exact receipt
+                # payload is byte-identical for the same immutable manifest.
+                raise
+
+    def remove_validation_receipt(self, manifest: LocalAIManifest) -> None:
+        """Remove one exact receipt without touching clinical data."""
+
+        try:
+            self._validation_path(manifest_sha256(manifest)).unlink(missing_ok=True)
+            _fsync_directory(self.validations_dir)
+        except (OSError, LocalValidationError) as exc:
+            raise LocalValidationError(
+                "Model pack validation state could not be removed"
+            ) from exc
+
     def rollback(self) -> None:
         """Atomically reactivate the prior pack after verifying it in place."""
 
@@ -918,7 +1144,7 @@ class ArtifactStore:
         if previous is None:
             raise LocalValidationError("No verified previous model pack is available")
         pack = self.packs_dir / previous["pack_revision"]
-        self._load_installed_manifest(pack, previous)
+        self._load_validated_installed_manifest(pack, previous)
         self._write_state(active=previous, previous=state["active"])
 
     def operation_id(self, staging_path: Path) -> str:
@@ -975,6 +1201,31 @@ class ArtifactStore:
                 "Failed model staging operation could not be removed"
             ) from exc
 
+    def sweep_orphan_staging(self) -> int:
+        """Remove only validated staging directories while lifecycle is idle."""
+
+        removed = 0
+        with self._mutation_guard():
+            try:
+                _assert_real_directory(self.staging_dir)
+                for child in list(self.staging_dir.iterdir()):
+                    if _OPERATION_RE.fullmatch(child.name) is None:
+                        raise LocalValidationError("Model staging path is invalid")
+                    status = child.lstat()
+                    if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+                        raise LocalValidationError("Model staging path is invalid")
+                    shutil.rmtree(child)
+                    removed += 1
+                if removed:
+                    _fsync_directory(self.staging_dir)
+            except LocalValidationError:
+                raise
+            except OSError as exc:
+                raise LocalValidationError(
+                    "Failed model staging operation could not be removed"
+                ) from exc
+        return removed
+
     def remove(self, role: ModelRole | str | None = None) -> None:
         """Remove model packs, or one role from the currently active pack."""
 
@@ -985,7 +1236,11 @@ class ArtifactStore:
         if role is None:
             self._write_state(active=None, previous=None)
             try:
-                for directory in (self.packs_dir, self.staging_dir):
+                for directory in (
+                    self.packs_dir,
+                    self.staging_dir,
+                    self.validations_dir,
+                ):
                     _assert_real_directory(directory)
                     for child in list(directory.iterdir()):
                         status = child.lstat()
@@ -1026,6 +1281,8 @@ class ArtifactStore:
             else previous
         )
         self._write_state(active=None, previous=new_previous)
+        self._validation_path(active["manifest_sha256"]).unlink(missing_ok=True)
+        _fsync_directory(self.validations_dir)
         if role_path.exists():
             try:
                 shutil.rmtree(role_path)

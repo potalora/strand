@@ -105,6 +105,20 @@ async function mockBackend(page: Page): Promise<void> {
         access_token: "fresh.access.token",
         refresh_token: "fresh.refresh.token",
       });
+    if (url.includes("/settings/llm"))
+      return json({
+        providers: [],
+        routing: {
+          default: "gemini",
+          summary: "gemini",
+          section: "gemini",
+          dedup: "gemini",
+          extraction: "gemini",
+          vision: "gemini",
+          extraction_engine: "hybrid",
+          processing_mode: "cloud_assisted",
+        },
+      });
     if (url.includes("/upload/history")) return json(HISTORY);
     // The upload page's batch progress bar is inert (no active batch) but be safe.
     if (url.includes("/upload/extraction-progress"))
