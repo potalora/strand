@@ -91,11 +91,11 @@ async def test_strict_local_failure_never_logs_or_persists_exception_phi(
     assert upload.ingestion_errors == [
         {
             "error": "Processing failed. Please retry or contact support.",
-            "error_type": "RuntimeError",
+            "error_type": "local_ai_error",
         }
     ]
     assert str(upload.id) in captured_logs
-    assert "RuntimeError" in captured_logs
+    assert "local_ai_error" in captured_logs
 
 
 @pytest.mark.asyncio

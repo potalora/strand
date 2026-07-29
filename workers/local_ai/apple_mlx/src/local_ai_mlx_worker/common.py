@@ -16,6 +16,7 @@ from typing import Literal
 Role = Literal["ocr", "extraction", "summary"]
 Loader = Callable[..., tuple[object, object]]
 Generate = Callable[..., str]
+ActivityCallback = Callable[[], None]
 
 EXPECTED_ROLES = frozenset({"ocr", "extraction", "summary"})
 OFFLINE_ENVIRONMENT = {
@@ -45,6 +46,7 @@ MAX_MANIFEST_PACK_BYTES = 20 * 1024 * 1024 * 1024
 MAX_DECODE_TOKENS = 1_000_000
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
+STREAM_ACTIVITY_INTERVAL = 32
 
 _TOP_LEVEL_KEYS = frozenset(
     {
@@ -96,6 +98,10 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 class WorkerInputError(ValueError):
     """A request is malformed without exposing its content."""
+
+
+class WorkerInputLimitError(WorkerInputError):
+    """A valid request cannot fit the locked model/runtime limits."""
 
 
 class ArtifactUnavailableError(ValueError):
@@ -732,16 +738,20 @@ def validate_token_budget(
     text_parts: Sequence[str],
     *,
     max_output_tokens: int,
+    max_input_tokens: int | None = None,
 ) -> None:
     """Enforce manifest input tokens and the tokenizer/model context window."""
 
     text = "\n".join(text_parts)
     count = _token_count(loaded.processor, text)
-    if count > loaded.decode_limits["max_input_tokens"]:
-        raise WorkerInputError("Local worker input exceeds its token limit.")
+    input_limit = loaded.decode_limits["max_input_tokens"]
+    if max_input_tokens is not None:
+        input_limit = min(input_limit, max_input_tokens)
+    if count > input_limit:
+        raise WorkerInputLimitError("Local worker input exceeds its token limit.")
     runtime_limit = _runtime_context_limit(loaded)
     if runtime_limit is not None and count + max_output_tokens > runtime_limit:
-        raise WorkerInputError("Local worker input exceeds its model context token limit.")
+        raise WorkerInputLimitError("Local worker input exceeds its model context token limit.")
 
 
 def validate_scratch_image(
@@ -844,12 +854,13 @@ def generate_content(
     template: str | None = None,
     mode: str | None = None,
     instructions: str | None = None,
+    activity_fn: ActivityCallback | None = None,
 ) -> str:
     """Apply the local chat template and run quiet, bounded MLX generation."""
 
     if temperature != 0.0 or do_sample:
         raise WorkerInputError("Local worker sampling configuration is forbidden.")
-    from mlx_vlm import apply_chat_template, generate
+    from mlx_vlm import apply_chat_template, stream_generate
 
     config = getattr(model, "config", None)
     if config is None:
@@ -874,11 +885,11 @@ def generate_content(
         raise GenerationError("Local generation failed.")
     count = _token_count(processor, formatted)
     if count > input_token_limit:
-        raise WorkerInputError("Local worker input exceeds its token limit.")
+        raise WorkerInputLimitError("Local worker input exceeds its token limit.")
     runtime_limit = _runtime_context_limit_for(model, processor)
     if runtime_limit is not None and count + max_tokens > runtime_limit:
-        raise WorkerInputError("Local worker input exceeds its model context token limit.")
-    result = generate(
+        raise WorkerInputLimitError("Local worker input exceeds its model context token limit.")
+    stream = stream_generate(
         model,
         processor,
         formatted,
@@ -887,7 +898,22 @@ def generate_content(
         temperature=0.0,
         verbose=False,
     )
-    text = getattr(result, "text", result)
-    if not isinstance(text, str):
-        raise GenerationError("Local generation failed.")
-    return _strip_terminal_eos_suffix(text, processor)
+    if isinstance(stream, str):
+        return _strip_terminal_eos_suffix(stream, processor)
+
+    fragments: list[str] = []
+    last_activity_fragment = 0
+    for fragment_number, result in enumerate(stream, start=1):
+        text = getattr(result, "text", result)
+        if not isinstance(text, str):
+            raise GenerationError("Local generation failed.")
+        fragments.append(text)
+        if activity_fn is not None and (
+            fragment_number == 1
+            or fragment_number - last_activity_fragment >= STREAM_ACTIVITY_INTERVAL
+        ):
+            activity_fn()
+            last_activity_fragment = fragment_number
+    if activity_fn is not None and fragments and last_activity_fragment != len(fragments):
+        activity_fn()
+    return _strip_terminal_eos_suffix("".join(fragments), processor)

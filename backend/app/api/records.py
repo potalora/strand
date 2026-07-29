@@ -11,9 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.dependencies import get_authenticated_user_id
 from app.middleware.audit import log_audit_event
-from app.models.local_ai import ExtractionEvidence
 from app.models.record import HealthRecord
-from app.models.uploaded_file import UploadedFile
 from app.schemas.local_ai import (
     ExtractionEvidenceResponse,
     ExtractionModelIdentityResponse,
@@ -21,6 +19,7 @@ from app.schemas.local_ai import (
 )
 from app.schemas.records import HealthRecordResponse, RecordListResponse
 from app.services.local_ai.errors import LocalAIError
+from app.services.local_ai.evidence_lineage import load_strict_local_evidence_lineage
 from app.services.local_ai.manifest import parse_manifest
 from app.services.local_ai.types import ModelRole, ProcessingMode
 from app.schemas.timeline import TimelineEvent
@@ -408,74 +407,100 @@ async def get_record_evidence(
             )
         )
     ).scalar_one_or_none()
-    if record is None or record.source_file_id is None:
+    if record is None:
         raise HTTPException(status_code=404, detail="Record evidence not found")
 
-    upload = (
-        await db.execute(
-            select(UploadedFile).where(
-                UploadedFile.id == record.source_file_id,
-                UploadedFile.user_id == user_id,
-                UploadedFile.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one_or_none()
-    if (
-        upload is None
-        or upload.processing_mode != ProcessingMode.VALIDATED_STRICT_LOCAL.value
-        or not isinstance(upload.processing_manifest, dict)
-    ):
-        raise HTTPException(status_code=404, detail="Record evidence not found")
-
-    evidence_rows = (
-        (
-            await db.execute(
-                select(ExtractionEvidence)
-                .where(
-                    ExtractionEvidence.health_record_id == record_id,
-                    ExtractionEvidence.user_id == user_id,
-                    ExtractionEvidence.upload_id == upload.id,
-                )
-                .order_by(
-                    ExtractionEvidence.page_number.asc().nullslast(),
-                    ExtractionEvidence.start_offset.asc().nullslast(),
-                    ExtractionEvidence.id.asc(),
-                )
-                .limit(256)
-            )
-        )
-        .scalars()
-        .all()
+    lineage_result = await load_strict_local_evidence_lineage(
+        db,
+        user_id=user_id,
+        survivor_ids=[record_id],
+        limit=256,
     )
-    if not evidence_rows:
+    if lineage_result.overflowed:
+        raise HTTPException(
+            status_code=409,
+            detail="Record extraction evidence exceeds the supported limit",
+        )
+    evidence_pairs = [
+        (lineage.evidence, lineage.upload) for lineage in lineage_result.rows
+    ]
+    if not evidence_pairs:
         raise HTTPException(status_code=404, detail="Record evidence not found")
 
+    uploads_by_id = {upload.id: upload for _, upload in evidence_pairs}
+    unresolved: list[str] = []
+    rejected: list[str] = []
+    schema_versions: set[str] = set()
+    model_identities: dict[
+        tuple[str, str, str, str, str],
+        ExtractionModelIdentityResponse,
+    ] = {}
     try:
-        manifest = parse_manifest(upload.processing_manifest)
+        for upload in sorted(uploads_by_id.values(), key=lambda item: str(item.id)):
+            if (
+                not isinstance(upload.processing_manifest, dict)
+                or not isinstance(upload.processing_schema_version, str)
+                or not upload.processing_schema_version
+            ):
+                raise LocalAIError("Stored strict-local provenance is invalid.")
+            manifest = parse_manifest(upload.processing_manifest)
+            schema_versions.add(upload.processing_schema_version)
+            metadata = (
+                upload.document_metadata
+                if isinstance(upload.document_metadata, dict)
+                else {}
+            )
+            upload_unresolved = metadata.get("unresolved_fields", [])
+            upload_rejected = metadata.get("rejected_fields", [])
+            if (
+                not isinstance(upload_unresolved, list)
+                or not isinstance(upload_rejected, list)
+                or any(
+                    not isinstance(item, str)
+                    for item in (*upload_unresolved, *upload_rejected)
+                )
+            ):
+                raise LocalAIError("Stored strict-local provenance is invalid.")
+            for target, values in (
+                (unresolved, upload_unresolved),
+                (rejected, upload_rejected),
+            ):
+                for value in values:
+                    if value not in target:
+                        target.append(value)
+                    if len(target) > 128:
+                        raise LocalAIError("Stored strict-local provenance is invalid.")
+            runtime = f"{manifest.runtime['name']} {manifest.runtime['version']}"
+            for artifact in manifest.artifacts:
+                if artifact.role not in {ModelRole.OCR, ModelRole.EXTRACTION}:
+                    continue
+                identity = ExtractionModelIdentityResponse(
+                    role=artifact.role,
+                    repository=artifact.repository,
+                    revision=artifact.revision,
+                    quantization=artifact.quantization,
+                    runtime=runtime,
+                )
+                key = (
+                    identity.role,
+                    identity.repository,
+                    identity.revision,
+                    identity.quantization,
+                    identity.runtime,
+                )
+                model_identities.setdefault(key, identity)
+        if len(schema_versions) != 1:
+            raise LocalAIError("Stored strict-local provenance is invalid.")
+        unresolved.sort()
+        rejected.sort()
     except LocalAIError:
         raise HTTPException(
             status_code=409,
             detail="Record extraction provenance is invalid",
         ) from None
-    metadata = (
-        upload.document_metadata if isinstance(upload.document_metadata, dict) else {}
-    )
-    unresolved = metadata.get("unresolved_fields", [])
-    rejected = metadata.get("rejected_fields", [])
-    if (
-        not isinstance(unresolved, list)
-        or not isinstance(rejected, list)
-        or len(unresolved) > 128
-        or len(rejected) > 128
-        or any(not isinstance(item, str) for item in (*unresolved, *rejected))
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Record extraction provenance is invalid",
-        )
 
     evidence: list[ExtractionEvidenceResponse] = []
-    for row in evidence_rows:
+    for row, _upload in evidence_pairs:
         source_metadata = (
             row.source_metadata if isinstance(row.source_metadata, dict) else {}
         )
@@ -497,17 +522,7 @@ async def get_record_evidence(
             )
         )
 
-    models = [
-        ExtractionModelIdentityResponse(
-            role=artifact.role,
-            repository=artifact.repository,
-            revision=artifact.revision,
-            quantization=artifact.quantization,
-            runtime=f"{manifest.runtime['name']} {manifest.runtime['version']}",
-        )
-        for artifact in manifest.artifacts
-        if artifact.role in {ModelRole.OCR, ModelRole.EXTRACTION}
-    ]
+    models = [model_identities[key] for key in sorted(model_identities)]
     await log_audit_event(
         db,
         user_id=user_id,
@@ -517,13 +532,13 @@ async def get_record_evidence(
         ip_address=request.client.host if request.client else None,
         details={
             "evidence_count": len(evidence),
-            "processing_mode": upload.processing_mode,
+            "processing_mode": ProcessingMode.VALIDATED_STRICT_LOCAL.value,
         },
     )
     return RecordExtractionEvidenceResponse(
         record_id=record_id,
         processing_mode=ProcessingMode.VALIDATED_STRICT_LOCAL,
-        schema_version=upload.processing_schema_version,
+        schema_version=next(iter(schema_versions)),
         evidence=evidence,
         unresolved_fields=unresolved,
         rejected_fields=rejected,

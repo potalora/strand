@@ -1858,7 +1858,7 @@ def test_unit_cannot_truncate_a_per_denominator() -> None:
         _validate(raw, page=text)
 
 
-def test_duplicate_clinical_facts_are_rejected_before_evidence_assignment() -> None:
+def test_corroborating_clinical_facts_on_different_pages_keep_both_evidence() -> None:
     first = _medication(
         fact_id="med-1",
         verbatim="Metformin active",
@@ -1877,13 +1877,36 @@ def test_duplicate_clinical_facts_are_rejected_before_evidence_assignment() -> N
         "evidence_excerpt": "Current medication: Metformin",
     }
 
+    result = validate_clinical_extraction(
+        {"medications": [first, second]},
+        pages={
+            1: "Metformin active",
+            2: "Current medication: Metformin",
+        },
+        upload_id="upload-1",
+    )
+
+    assert [fact.page_number for fact in result.medications] == [1, 2]
+    assert [evidence.page_number for evidence in result.evidence] == [1, 2]
+
+
+def test_duplicate_clinical_facts_on_the_same_evidence_span_are_rejected() -> None:
+    first = _medication(
+        fact_id="med-1",
+        verbatim="Metformin active",
+        evidence_excerpt="Metformin active",
+        dose_value=None,
+        dose_unit=None,
+        route=None,
+        frequency=None,
+        status="active",
+    )
+    second = {**first, "fact_id": "med-2"}
+
     with pytest.raises(LocalValidationError, match=r"medications\[1\].*duplicate"):
         validate_clinical_extraction(
             {"medications": [first, second]},
-            pages={
-                1: "Metformin active",
-                2: "Current medication: Metformin",
-            },
+            pages={1: "Metformin active"},
             upload_id="upload-1",
         )
 
@@ -2701,7 +2724,9 @@ def test_html_table_entities_are_decoded_only_for_semantic_grounding() -> None:
     assert result.evidence[0].start_offset == 0
 
 
-def test_duplicate_fact_comparison_is_case_insensitive_across_pages() -> None:
+def test_duplicate_fact_comparison_preserves_case_varied_corroboration_across_pages() -> (
+    None
+):
     first = _medication(
         fact_id="med-upper",
         name="METFORMIN",
@@ -2722,12 +2747,14 @@ def test_duplicate_fact_comparison_is_case_insensitive_across_pages() -> None:
         "evidence_excerpt": "metformin active",
     }
 
-    with pytest.raises(LocalValidationError, match=r"medications\[1\].*duplicate"):
-        validate_clinical_extraction(
-            {"medications": [first, second]},
-            pages={1: "METFORMIN ACTIVE", 2: "metformin active"},
-            upload_id="upload-1",
-        )
+    result = validate_clinical_extraction(
+        {"medications": [first, second]},
+        pages={1: "METFORMIN ACTIVE", 2: "metformin active"},
+        upload_id="upload-1",
+    )
+
+    assert len(result.medications) == 2
+    assert len(result.evidence) == 2
 
 
 def test_model_authored_normalization_metadata_is_rejected() -> None:

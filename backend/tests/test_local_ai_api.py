@@ -112,6 +112,77 @@ def _install_pack(
 
 
 @pytest.mark.asyncio
+async def test_retrying_failed_strict_upload_requeues_its_existing_job(
+    client,
+    db_session,
+) -> None:
+    headers, user_id = await auth_headers(
+        client,
+        email="strict-retry@example.com",
+    )
+    manifest, _contents = _manifest()
+    upload = UploadedFile(
+        id=uuid4(),
+        user_id=UUID(user_id),
+        filename="fixture-001.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=100,
+        file_hash="a" * 64,
+        storage_path="/tmp/fixture-001.pdf",
+        ingestion_status="failed",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=_manifest_dict(manifest),
+        processing_schema_version="clinical-document-extraction.v1",
+        processing_started_at=datetime.now(timezone.utc),
+        processing_completed_at=datetime.now(timezone.utc),
+        retry_count=3,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=_manifest_dict(manifest),
+        status="failed",
+        stage="failed",
+        progress={"stage": "extraction"},
+        failure={"code": "local_worker_error"},
+        started_at=datetime.now(timezone.utc),
+        completed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch(
+        "app.api.upload.start_extraction_worker",
+        new_callable=AsyncMock,
+    ):
+        response = await client.post(
+            "/api/v1/upload/trigger-extraction",
+            json={"upload_ids": [str(upload.id)]},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["triggered"] == 1
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert upload.ingestion_status == "pending_extraction"
+    assert upload.processing_started_at is None
+    assert upload.processing_completed_at is None
+    assert upload.retry_count == 0
+    assert job.status == "queued"
+    assert job.stage == "queued"
+    assert job.progress == {}
+    assert job.failure is None
+    assert job.started_at is None
+    assert job.completed_at is None
+
+
+@pytest.mark.asyncio
 async def test_summary_job_status_and_cancel_are_owner_scoped_and_content_free(
     client,
     db_session,

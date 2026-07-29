@@ -224,7 +224,8 @@ class Settings(BaseSettings):
     local_ai_max_files: int = 64
     local_ai_max_file_bytes: int = 8 * 1024 * 1024 * 1024
     local_ai_max_pack_bytes: int = 20 * 1024 * 1024 * 1024
-    local_ai_worker_timeout_seconds: int = 900
+    local_ai_worker_timeout_seconds: int = 1800
+    local_ai_worker_hard_timeout_seconds: int = 7200
     local_ai_max_page_pixels: int = 40_000_000
 
     # Redis

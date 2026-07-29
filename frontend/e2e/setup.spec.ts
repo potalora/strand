@@ -1,8 +1,14 @@
 import { test, expect } from "@playwright/test";
 import { ApiClient } from "./helpers/api-client";
-import { testEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";
+import { uniqueEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";
 
-const email = testEmail("setup");
+const email = uniqueEmail("setup");
+const SUCCESSFUL_UPLOAD_STATUSES = [
+  "awaiting_confirmation",
+  "completed",
+  "completed_with_merges",
+  "awaiting_review",
+];
 
 test.describe("E2E Setup", () => {
   const api = new ApiClient();
@@ -17,11 +23,19 @@ test.describe("E2E Setup", () => {
     expect(me.email).toBeTruthy();
   });
 
+  test("local-only profile persists validated strict-local routing", async () => {
+    test.skip(process.env.E2E_LOCAL_ONLY !== "1", "Local-only profile is not active");
+    const settings = await api.getLlmSettings();
+    expect(settings.routing.processing_mode).toBe("validated_strict_local");
+  });
+
   test("fixture data can be uploaded and ingested", async () => {
     const result = await api.uploadStructured(PATHS.fhirBundle, "sample_fhir_bundle.json");
     expect(result.upload_id).toBeTruthy();
     const status = await api.pollUploadStatus(result.upload_id, 60_000);
-    expect(status).toBeTruthy();
+    expect(SUCCESSFUL_UPLOAD_STATUSES).toContain(
+      status.ingestion_status ?? status.status
+    );
   });
 
   test("multiple record types were created", async () => {

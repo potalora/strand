@@ -150,6 +150,33 @@ def test_progress_response_allows_bounded_non_content_memory_metrics() -> None:
             WorkerResponse.model_validate(_response("progress", payload))
 
 
+def test_progress_activity_is_bounded_integer_only() -> None:
+    response = WorkerResponse.model_validate(
+        _response(
+            "progress",
+            {
+                "role": "extraction",
+                "stage": "processing",
+                "current": 0,
+                "total": 3,
+                "activity": 2,
+            },
+        )
+    )
+
+    assert response.payload.activity == 2
+    for invalid in (-1, True, 1.5, "2", 2**63):
+        payload = {
+            "role": "extraction",
+            "stage": "processing",
+            "current": 0,
+            "total": 3,
+            "activity": invalid,
+        }
+        with pytest.raises(ValidationError):
+            WorkerResponse.model_validate(_response("progress", payload))
+
+
 def test_health_ready_response_needs_no_model_role() -> None:
     response = WorkerResponse.model_validate(_response("ready", {}))
 
@@ -174,6 +201,59 @@ def test_error_response_cannot_contain_raw_detail_or_arbitrary_message() -> None
             _response(
                 "error",
                 {"code": "worker_failed", "message": "Traceback: patient content"},
+            )
+        )
+
+
+def test_input_limit_error_uses_only_its_fixed_non_content_message() -> None:
+    response = WorkerResponse.model_validate(
+        _response(
+            "error",
+            {
+                "code": "input_limit_exceeded",
+                "message": ("Local worker input exceeds supported limits."),
+            },
+        )
+    )
+
+    assert response.payload.code == "input_limit_exceeded"
+    with pytest.raises(ValidationError):
+        WorkerResponse.model_validate(
+            _response(
+                "error",
+                {
+                    "code": "input_limit_exceeded",
+                    "message": "53676 patient tokens exceeded 32768",
+                },
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("generation_failed", "Local worker generation failed."),
+        ("runtime_failed", "Local worker runtime failed."),
+        ("resource_exhausted", "Local worker resources were exhausted."),
+    ],
+)
+def test_runtime_error_codes_use_only_fixed_non_content_messages(
+    code: str,
+    message: str,
+) -> None:
+    response = WorkerResponse.model_validate(
+        _response("error", {"code": code, "message": message})
+    )
+
+    assert response.payload.code == code
+    with pytest.raises(ValidationError):
+        WorkerResponse.model_validate(
+            _response(
+                "error",
+                {
+                    "code": code,
+                    "message": "private runtime detail",
+                },
             )
         )
 

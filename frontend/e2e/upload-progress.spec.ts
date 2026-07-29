@@ -4,9 +4,16 @@ import {
   PATHS,
   hasTestData,
   getRtfFiles,
-  testEmail,
+  uniqueEmail,
   TEST_PASSWORD,
 } from "./helpers/test-data";
+
+const SUCCESSFUL_UPLOAD_STATUSES = [
+  "awaiting_confirmation",
+  "completed",
+  "completed_with_merges",
+  "awaiting_review",
+];
 
 test.describe("Extraction progress tracking", () => {
   test.setTimeout(180_000);
@@ -18,7 +25,7 @@ test.describe("Extraction progress tracking", () => {
     );
 
     const api = new ApiClient();
-    const email = testEmail("progress");
+    const email = uniqueEmail("progress");
     await api.register(email, TEST_PASSWORD);
     await api.login(email, TEST_PASSWORD);
 
@@ -31,25 +38,19 @@ test.describe("Extraction progress tracking", () => {
 
     const batch = await api.uploadUnstructuredBatch(files);
     expect(batch.uploads.length).toBeGreaterThanOrEqual(3);
+    const uploadIds = batch.uploads.map((upload) => upload.upload_id);
 
     // Poll extraction progress until all complete or timeout
     const start = Date.now();
     let lastProgress: Awaited<ReturnType<typeof api.getExtractionProgress>> | null = null;
-    let completedIncreased = false;
-    let initialCompleted = 0;
 
     while (Date.now() - start < 120_000) {
-      const progress = await api.getExtractionProgress();
+      const progress = await api.getExtractionProgress(uploadIds);
       lastProgress = progress;
-
-      if (!completedIncreased && progress.completed > initialCompleted) {
-        completedIncreased = true;
-        initialCompleted = progress.completed;
-      }
 
       // All done when nothing is pending or processing
       if (
-        progress.total >= 3 &&
+        progress.total === uploadIds.length &&
         progress.pending === 0 &&
         progress.processing === 0
       ) {
@@ -60,11 +61,22 @@ test.describe("Extraction progress tracking", () => {
     }
 
     expect(lastProgress).toBeTruthy();
-    expect(lastProgress!.total).toBeGreaterThanOrEqual(3);
-    // All should have completed or failed (no stuck files)
-    // processing may be > 0 if other tests' files are still being extracted
-    expect(lastProgress!.completed + lastProgress!.failed).toBeGreaterThanOrEqual(3);
+    expect(lastProgress!.total).toBe(uploadIds.length);
+    expect(lastProgress!.completed).toBe(uploadIds.length);
+    expect(lastProgress!.failed).toBe(0);
+    expect(lastProgress!.processing).toBe(0);
     expect(lastProgress!.pending).toBe(0);
+
+    for (const upload of batch.uploads) {
+      const status = await api.pollUploadStatus(upload.upload_id, 30_000);
+      expect(SUCCESSFUL_UPLOAD_STATUSES).toContain(
+        status.ingestion_status ?? status.status
+      );
+      if (process.env.E2E_LOCAL_ONLY === "1") {
+        expect(status.local_run?.privacy_mode).toBe("validated_strict_local");
+        expect(status.local_failure?.cloud_fallback_attempted ?? false).toBe(false);
+      }
+    }
   });
 });
 
@@ -73,7 +85,7 @@ test.describe("Mixed content upload classification", () => {
 
   test("structured upload inserts records", async () => {
     const api = new ApiClient();
-    const email = testEmail("progress-mixed");
+    const email = uniqueEmail("progress-mixed");
     await api.register(email, TEST_PASSWORD);
     await api.login(email, TEST_PASSWORD);
 
@@ -83,7 +95,10 @@ test.describe("Mixed content upload classification", () => {
     );
     expect(result.upload_id).toBeTruthy();
 
-    await api.pollUploadStatus(result.upload_id, 60_000);
+    const status = await api.pollUploadStatus(result.upload_id, 60_000);
+    expect(SUCCESSFUL_UPLOAD_STATUSES).toContain(
+      status.ingestion_status ?? status.status
+    );
     // Structured upload should insert records directly
     const records = await api.getRecords();
     expect(records.items.length).toBeGreaterThan(0);
@@ -96,7 +111,7 @@ test.describe("Mixed content upload classification", () => {
     );
 
     const api = new ApiClient();
-    const email = testEmail("progress-unstruct");
+    const email = uniqueEmail("progress-unstruct");
     await api.register(email, TEST_PASSWORD);
     await api.login(email, TEST_PASSWORD);
 
@@ -107,12 +122,26 @@ test.describe("Mixed content upload classification", () => {
       mime: "application/rtf",
     }));
 
-    await api.uploadUnstructuredBatch(files);
+    const batch = await api.uploadUnstructuredBatch(files);
+    const uploadIds = batch.uploads.map((upload) => upload.upload_id);
+    expect(uploadIds).toHaveLength(files.length);
 
-    // Check that extraction progress shows the file
-    // Give it a moment to register
-    await new Promise((r) => setTimeout(r, 2000));
-    const progress = await api.getExtractionProgress();
-    expect(progress.total).toBeGreaterThanOrEqual(1);
+    const status = await api.pollUploadStatus(uploadIds[0], 90_000);
+    expect(SUCCESSFUL_UPLOAD_STATUSES).toContain(
+      status.ingestion_status ?? status.status
+    );
+    if (process.env.E2E_LOCAL_ONLY === "1") {
+      expect(status.local_run?.privacy_mode).toBe("validated_strict_local");
+      expect(status.local_failure?.cloud_fallback_attempted ?? false).toBe(false);
+    }
+
+    const progress = await api.getExtractionProgress(uploadIds);
+    expect(progress).toMatchObject({
+      total: uploadIds.length,
+      completed: uploadIds.length,
+      processing: 0,
+      failed: 0,
+      pending: 0,
+    });
   });
 });

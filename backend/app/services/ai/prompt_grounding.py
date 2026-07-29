@@ -14,7 +14,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.ai_summary import AISummaryPrompt
-from app.models.local_ai import ExtractionEvidence
 from app.models.patient import Patient
 from app.models.record import HealthRecord
 from app.services.ai.grounded_routing import (
@@ -26,6 +25,7 @@ from app.services.ai.grounded_routing import (
 )
 from app.services.ai.patient_phi import patient_scrub_args
 from app.services.local_ai.errors import LocalValidationError
+from app.services.local_ai.evidence_lineage import load_strict_local_evidence_lineage
 from app.services.local_ai.grounded_summary import (
     MAX_EVIDENCE,
     MAX_FACTS,
@@ -212,29 +212,15 @@ async def _build_grounding_registry(
     records: Sequence[HealthRecord],
     scope: Mapping[str, object],
 ) -> GroundedSummaryInput:
-    evidence_rows = list(
-        (
-            await db.execute(
-                select(ExtractionEvidence)
-                .where(
-                    ExtractionEvidence.user_id == user_id,
-                    ExtractionEvidence.health_record_id.in_(
-                        [record.id for record in records]
-                    ),
-                )
-                .order_by(ExtractionEvidence.id.asc())
-                .limit(MAX_EVIDENCE + 1)
-            )
-        )
-        .scalars()
-        .all()
+    lineage = await load_strict_local_evidence_lineage(
+        db,
+        user_id=user_id,
+        survivor_ids=[record.id for record in records],
+        limit=MAX_EVIDENCE,
     )
-    if len(evidence_rows) > MAX_EVIDENCE:
+    if lineage.overflowed:
         raise ValueError("Too much evidence for a grounded prompt")
-    evidence_by_record: dict[UUID, list[ExtractionEvidence]] = {}
-    for item in evidence_rows:
-        if item.health_record_id is not None:
-            evidence_by_record.setdefault(item.health_record_id, []).append(item)
+    evidence_by_record = lineage.by_survivor()
     projection = project_summary_records(records, evidence_by_record)
     return build_grounded_summary_input(
         facts=projection.facts,

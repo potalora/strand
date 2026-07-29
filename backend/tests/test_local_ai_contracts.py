@@ -122,7 +122,7 @@ def test_upload_provenance_rejects_summary_models_and_more_than_two_models() -> 
         )
 
 
-def test_record_evidence_rejects_summary_models_and_more_than_two_models() -> None:
+def test_record_evidence_rejects_summary_models_and_bounds_lineage_models() -> None:
     model = {
         "repository": "owner/model",
         "revision": "0" * 40,
@@ -140,6 +140,17 @@ def test_record_evidence_rejects_summary_models_and_more_than_two_models() -> No
         )
 
     valid_model = ExtractionModelIdentityResponse(role="ocr", **model)
+    response = RecordExtractionEvidenceResponse(
+        record_id=uuid4(),
+        processing_mode="validated_strict_local",
+        schema_version="clinical-document-extraction.v1",
+        evidence=[],
+        unresolved_fields=[],
+        rejected_fields=[],
+        models=[valid_model, valid_model, valid_model],
+    )
+    assert len(response.models) == 3
+
     with pytest.raises(ValidationError):
         RecordExtractionEvidenceResponse(
             record_id=uuid4(),
@@ -148,5 +159,5 @@ def test_record_evidence_rejects_summary_models_and_more_than_two_models() -> No
             evidence=[],
             unresolved_fields=[],
             rejected_fields=[],
-            models=[valid_model, valid_model, valid_model],
+            models=[valid_model] * 513,
         )

@@ -344,6 +344,16 @@ def test_invalid_role_payload_maps_to_fixed_non_content_error(
     assert sentinel not in worker_process.stderr.read()
 
 
+def test_runtime_failures_map_to_fixed_non_content_codes() -> None:
+    from local_ai_mlx_worker import __main__ as worker_main
+    from local_ai_mlx_worker.common import GenerationError
+
+    assert worker_main._safe_runtime_error_code(GenerationError("private")) == ("generation_failed")
+    assert worker_main._safe_runtime_error_code(MemoryError("private")) == ("resource_exhausted")
+    assert worker_main._safe_runtime_error_code(RuntimeError("private")) == ("runtime_failed")
+    assert worker_main._safe_runtime_error_code(Exception("private")) == ("worker_failed")
+
+
 def test_role_runtime_output_is_suppressed_from_protocol_and_logs(
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
@@ -371,6 +381,93 @@ def test_role_runtime_output_is_suppressed_from_protocol_and_logs(
     captured = capfd.readouterr()
     assert sentinel not in captured.out
     assert sentinel not in captured.err
+
+
+def test_quiet_extraction_dispatch_preserves_page_counters_and_activity_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Progress frames distinguish completed pages from content-free activity."""
+
+    from local_ai_mlx_worker import __main__ as worker_main
+
+    emitted: list[dict[str, object]] = []
+    sentinel = "clinical-content-must-not-enter-progress"
+
+    def extraction_dispatch(
+        _request: object,
+        *,
+        extraction_progress: object = None,
+        extraction_heartbeat: object = None,
+        extraction_lifecycle: object = None,
+    ) -> dict[str, object]:
+        assert callable(extraction_lifecycle)
+        assert callable(extraction_progress)
+        assert callable(extraction_heartbeat)
+        extraction_lifecycle()
+        extraction_progress(0, 3)
+        extraction_heartbeat()
+        extraction_progress(1, 3)
+        return {"ok": True, "private": sentinel}
+
+    monkeypatch.setattr(worker_main, "_dispatch", extraction_dispatch)
+    monkeypatch.setattr(
+        worker_main,
+        "_write_to_descriptor",
+        lambda _descriptor, _request_id, kind, payload: emitted.append(
+            {"kind": kind, "payload": payload}
+        ),
+    )
+    request = worker_main.Request(
+        request_id="request-1",
+        job_id="job-1",
+        command="extract",
+        payload={},
+    )
+
+    assert worker_main._quiet_dispatch(request) == {"ok": True, "private": sentinel}
+    assert emitted == [
+        {
+            "kind": "progress",
+            "payload": {
+                "role": "extraction",
+                "stage": "loading",
+                "current": 0,
+                "total": 0,
+                "activity": 1,
+            },
+        },
+        {
+            "kind": "progress",
+            "payload": {
+                "role": "extraction",
+                "stage": "processing",
+                "current": 0,
+                "total": 3,
+                "activity": 2,
+            },
+        },
+        {
+            "kind": "progress",
+            "payload": {
+                "role": "extraction",
+                "stage": "processing",
+                "current": 0,
+                "total": 3,
+                "activity": 3,
+            },
+        },
+        {
+            "kind": "progress",
+            "payload": {
+                "role": "extraction",
+                "stage": "processing",
+                "current": 1,
+                "total": 3,
+                "activity": 4,
+            },
+        },
+    ]
+    assert sentinel not in json.dumps(emitted)
 
 
 def test_memory_progress_payload_contains_only_bounded_counters(
@@ -447,6 +544,8 @@ def test_extraction_retries_duplicate_json_keys_once_with_non_thinking_template(
         ]
     )
     calls: list[dict[str, object]] = []
+    attempt_progress: list[int] = []
+    lifecycle_progress: list[int] = []
 
     def generate(**kwargs: object) -> str:
         calls.append(kwargs)
@@ -466,12 +565,17 @@ def test_extraction_retries_duplicate_json_keys_once_with_non_thinking_template(
         },
         loaded=loaded,  # type: ignore[arg-type]
         generate_fn=generate,
+        attempt_progress_fn=lambda: attempt_progress.append(1),
+        lifecycle_progress_fn=lambda: lifecycle_progress.append(1),
     )
 
     assert result == {"schema_version": "clinical-document-extraction.v1"}
     assert len(calls) == 2
+    assert attempt_progress == [1, 1]
+    assert lifecycle_progress == [1] * 4
     assert all(call["temperature"] == 0.0 for call in calls)
     assert all(call["do_sample"] is False for call in calls)
+    assert all(call["max_tokens"] == 4096 for call in calls)
     assert all(call["enable_thinking"] is False for call in calls)
     assert all(call["mode"] == "structured" for call in calls)
     assert all(
@@ -483,7 +587,7 @@ def test_extraction_retries_duplicate_json_keys_once_with_non_thinking_template(
         for call in calls
     )
     assert all(call["images"] == [str(image)] for call in calls)
-    assert all(call["input_token_limit"] == 32768 for call in calls)
+    assert all(call["input_token_limit"] == 4_096 for call in calls)
     assert all(
         "Never use JSON null for enum-valued fields." in str(call["instructions"]) for call in calls
     )
@@ -498,6 +602,506 @@ def test_extraction_retries_duplicate_json_keys_once_with_non_thinking_template(
         in str(call["instructions"])
         for call in calls
     )
+
+
+def test_extraction_converts_schema_leaf_constraints_to_native_nuextract_template(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    calls: list[dict[str, object]] = []
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "medications": [],
+            }
+        )
+
+    run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": "bounded OCR"}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "medications": [
+                    {
+                        "name": {"type": "verbatim-string"},
+                        "page_number": {"type": "integer", "minimum": 1},
+                        "status": {
+                            "type": "string",
+                            "enum": ["active", "stopped", "unknown"],
+                        },
+                    }
+                ],
+            },
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert len(calls) == 1
+    assert json.loads(str(calls[0]["template"])) == {
+        "schema_version": "clinical-document-extraction.v1",
+        "medications": [
+            {
+                "name": "verbatim-string",
+                "page_number": "integer",
+                "status": ["active", "stopped", "unknown"],
+            }
+        ],
+    }
+
+
+def test_extraction_batches_long_documents_without_reloading_the_model(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    calls: list[dict[str, object]] = []
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [
+                    f"page-{item['page_number']}" for item in source["source_pages"]
+                ],
+            }
+        )
+
+    loaded = _loaded("extraction", max_input_tokens=2_000)
+    first_image = _png(tmp_path, "page-1.png")
+    last_image = _png(tmp_path, "page-6.png")
+    result = run_extraction(
+        {
+            "page_markdown": [
+                {
+                    "page_number": page_number,
+                    "markdown": "bounded local OCR " * 30,
+                }
+                for page_number in range(1, 7)
+            ],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {
+                "1": str(first_image),
+                "6": str(last_image),
+            },
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            },
+        },
+        loaded=loaded,  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert len(calls) > 1
+    assert all(call["model"] is loaded.model for call in calls)
+    for call in calls:
+        source = json.loads(str(call["prompt"]).split("INPUT_JSON=", 1)[1])
+        page_numbers = {item["page_number"] for item in source["source_pages"]}
+        assert call["images"] == [
+            path
+            for page_number, path in (
+                (1, str(first_image)),
+                (6, str(last_image)),
+            )
+            if page_number in page_numbers
+        ]
+    assert result["result_type"] == "chunked_clinical_extraction.v1"
+    assert [page_number for chunk in result["chunks"] for page_number in chunk["page_numbers"]] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    ]
+    assert [
+        value for chunk in result["chunks"] for value in chunk["extraction"]["unresolved_fields"]
+    ] == [
+        "page-1",
+        "page-2",
+        "page-3",
+        "page-4",
+        "page-5",
+        "page-6",
+    ]
+
+
+def test_extraction_soft_caps_batch_input_for_the_16gb_profile(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    calls: list[list[int]] = []
+
+    def generate(**kwargs: object) -> str:
+        source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
+        page_numbers = [int(item["page_number"]) for item in source["source_pages"]]
+        calls.append(page_numbers)
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            }
+        )
+
+    result = run_extraction(
+        {
+            "page_markdown": [
+                {
+                    "page_number": page_number,
+                    "markdown": "x" * 1_000,
+                }
+                for page_number in range(1, 5)
+            ],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            },
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert len(calls) > 1
+    assert [page for batch in calls for page in batch] == [1, 2, 3, 4]
+    assert result["result_type"] == "chunked_clinical_extraction.v1"
+
+
+def test_extraction_recursively_splits_a_formatted_batch_over_the_runtime_limit(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.common import WorkerInputLimitError
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    calls: list[list[int]] = []
+
+    def generate(**kwargs: object) -> str:
+        source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
+        page_numbers = [int(item["page_number"]) for item in source["source_pages"]]
+        calls.append(page_numbers)
+        if len(page_numbers) > 2:
+            raise WorkerInputLimitError("Formatted multimodal request exceeds the runtime limit.")
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [f"page-{page_number}" for page_number in page_numbers],
+            }
+        )
+
+    loaded = _loaded("extraction")
+    progress: list[tuple[int, int]] = []
+    result = run_extraction(
+        {
+            "page_markdown": [
+                {
+                    "page_number": page_number,
+                    "markdown": "bounded local OCR",
+                }
+                for page_number in range(1, 7)
+            ],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            },
+        },
+        loaded=loaded,  # type: ignore[arg-type]
+        generate_fn=generate,
+        progress_fn=lambda current, total: progress.append((current, total)),
+    )
+
+    assert calls == [
+        [1, 2, 3, 4, 5, 6],
+        [1, 2, 3],
+        [1],
+        [2, 3],
+        [4, 5, 6],
+        [4],
+        [5, 6],
+    ]
+    assert result["result_type"] == "chunked_clinical_extraction.v1"
+    assert [page_number for chunk in result["chunks"] for page_number in chunk["page_numbers"]] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    ]
+    assert all(
+        chunk["extraction"]["schema_version"] == "clinical-document-extraction.v1"
+        for chunk in result["chunks"]
+    )
+    assert progress == [(0, 6), (1, 6), (3, 6), (4, 6), (6, 6)]
+
+
+def test_extraction_recursively_splits_a_batch_that_cannot_finish_valid_json(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    calls: list[list[int]] = []
+
+    def generate(**kwargs: object) -> str:
+        source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
+        page_numbers = [int(item["page_number"]) for item in source["source_pages"]]
+        calls.append(page_numbers)
+        if len(page_numbers) > 1:
+            return "{"
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            }
+        )
+
+    result = run_extraction(
+        {
+            "page_markdown": [
+                {
+                    "page_number": page_number,
+                    "markdown": "bounded local OCR",
+                }
+                for page_number in range(1, 5)
+            ],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            },
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert calls[:2] == [[1, 2, 3, 4], [1, 2, 3, 4]]
+    assert result["result_type"] == "chunked_clinical_extraction.v1"
+    assert [page_number for chunk in result["chunks"] for page_number in chunk["page_numbers"]] == [
+        1,
+        2,
+        3,
+        4,
+    ]
+    assert all(len(chunk["page_numbers"]) == 1 for chunk in result["chunks"])
+
+
+def test_split_markdown_overlaps_a_fact_crossing_the_old_midpoint() -> None:
+    from local_ai_mlx_worker.nuextract3 import _split_markdown
+
+    fact = "Metformin 500 mg twice daily."
+    prefix = "ordinary history " * 18
+    suffix = " continued detail" * 18
+    markdown = f"{prefix}{fact}{suffix}"
+    midpoint = len(markdown) // 2
+    assert markdown[:midpoint].find(fact) < 0
+    assert markdown[midpoint:].find(fact) < 0
+
+    left, right = _split_markdown(markdown)
+
+    assert fact in left or fact in right
+    assert len(left) < len(markdown)
+    assert len(right) < len(markdown)
+
+
+def test_extraction_splits_one_long_page_and_merges_page_grounded_facts(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    first = "MedicationAlpha is active.\n" + ("first section detail " * 20)
+    second = "MedicationBeta is active.\n" + ("second section detail " * 20)
+    markdown = f"{first}\n\n{second}"
+    calls: list[dict[str, object]] = []
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
+        assert len(source["source_pages"]) == 1
+        page = source["source_pages"][0]
+        facts = []
+        for name in ("MedicationAlpha", "MedicationBeta"):
+            if name in page["markdown"]:
+                facts.append(
+                    {
+                        "name": name,
+                        "status": "active",
+                        "verbatim": f"{name} is active.",
+                        "page_number": 1,
+                        "evidence_excerpt": f"{name} is active.",
+                    }
+                )
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "medications": facts,
+            },
+        )
+
+    image = _png(tmp_path, "long-page.png")
+    result = run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": markdown}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {"1": str(image)},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "medications": [
+                    {
+                        "name": {"type": "verbatim-string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["active", "stopped", "historical", "unknown"],
+                        },
+                        "verbatim": {"type": "verbatim-string"},
+                        "page_number": {"type": "integer", "minimum": 1},
+                        "evidence_excerpt": {"type": "verbatim-string"},
+                    }
+                ],
+            },
+        },
+        loaded=_loaded(  # type: ignore[arg-type]
+            "extraction",
+            max_input_tokens=2_000,
+        ),
+        generate_fn=generate,
+    )
+
+    fragments = [
+        json.loads(str(call["prompt"]).split("INPUT_JSON=", 1)[1])["source_pages"][0]
+        for call in calls
+    ]
+    assert len(fragments) >= 2
+    assert all(call["images"] == [] for call in calls)
+    assert all(str(fragment["markdown"]) in markdown for fragment in fragments)
+    assert all(
+        any(name in str(fragment["markdown"]) for fragment in fragments)
+        for name in ("MedicationAlpha", "MedicationBeta")
+    )
+    assert {fragment["page_number"] for fragment in fragments} == {1}
+    assert result["schema_version"] == "clinical-document-extraction.v1"
+    assert [fact["name"] for fact in result["medications"]] == [
+        "MedicationAlpha",
+        "MedicationBeta",
+    ]
+    assert {fact["page_number"] for fact in result["medications"]} == {1}
+
+
+def test_fragment_filter_rejects_full_page_image_fact_outside_supplied_fragment(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    first = "MedicationAlpha is active.\n" + ("first section detail " * 20)
+    second = "MedicationBeta is active.\n" + ("second section detail " * 20)
+    markdown = f"{first}\n\n{second}"
+    calls: list[dict[str, object]] = []
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "medications": [
+                    {
+                        "name": "MedicationBeta",
+                        "status": "active",
+                        "verbatim": "MedicationBeta is active.",
+                        "page_number": 1,
+                        "evidence_excerpt": "MedicationBeta is active.",
+                    }
+                ],
+            }
+        )
+
+    image = _png(tmp_path, "fragment-source.png")
+    result = run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": markdown}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {"1": str(image)},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "medications": [
+                    {
+                        "name": {"type": "verbatim-string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["active", "stopped", "historical", "unknown"],
+                        },
+                        "verbatim": {"type": "verbatim-string"},
+                        "page_number": {"type": "integer", "minimum": 1},
+                        "evidence_excerpt": {"type": "verbatim-string"},
+                    }
+                ],
+            },
+        },
+        loaded=_loaded(  # type: ignore[arg-type]
+            "extraction",
+            max_input_tokens=2_000,
+        ),
+        generate_fn=generate,
+    )
+
+    assert len(calls) >= 2
+    assert all(call["images"] == [] for call in calls)
+    assert [fact["name"] for fact in result["medications"]] == ["MedicationBeta"]
+
+
+def test_extraction_splits_immediately_after_cap_length_invalid_output(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    markdown = ("first bounded section " * 20) + "\n\n" + ("second bounded section " * 20)
+    calls: list[str] = []
+
+    def generate(**kwargs: object) -> str:
+        source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
+        source_markdown = str(source["source_pages"][0]["markdown"])
+        calls.append(source_markdown)
+        if source_markdown == markdown:
+            return "{" + ("x" * 4_095)
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            }
+        )
+
+    result = run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": markdown}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            },
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert calls.count(markdown) == 1
+    assert all(call in markdown for call in calls[1:])
+    assert sum(len(call) for call in calls[1:]) >= len(markdown)
+    assert result == {
+        "schema_version": "clinical-document-extraction.v1",
+        "unresolved_fields": [],
+    }
 
 
 def test_extraction_deterministically_grounds_explicit_assertion_phrases(
@@ -1232,8 +1836,8 @@ def test_generation_strips_only_a_declared_terminal_eos_suffix(
     )
     monkeypatch.setattr(
         mlx_vlm,
-        "generate",
-        lambda *_args, **_kwargs: generated.pop(0),
+        "stream_generate",
+        lambda *_args, **_kwargs: iter([generated.pop(0)]),
     )
 
     first = generate_content(
@@ -1259,6 +1863,89 @@ def test_generation_strips_only_a_declared_terminal_eos_suffix(
 
     assert first == '{"labs":[]}'
     assert second == '{"text":"<|im_end|> inside"}'
+
+
+def test_generation_streams_identical_text_and_emits_content_free_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The heartbeat is driven by stream events, never generated text."""
+
+    import mlx_vlm
+
+    from local_ai_mlx_worker.common import generate_content
+
+    class StreamItem:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    monkeypatch.setattr(
+        mlx_vlm,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "formatted",
+    )
+    monkeypatch.setattr(
+        mlx_vlm,
+        "generate",
+        lambda *_args, **_kwargs: "must-not-use-non-streaming-generation",
+    )
+    monkeypatch.setattr(
+        mlx_vlm,
+        "stream_generate",
+        lambda *_args, **_kwargs: iter([StreamItem("{"), StreamItem("}")]),
+    )
+    activity: list[int] = []
+
+    result = generate_content(
+        model=_Model(),
+        processor=_Processor(),
+        prompt="source",
+        images=[],
+        max_tokens=100,
+        temperature=0.0,
+        do_sample=False,
+        input_token_limit=100,
+        activity_fn=lambda: activity.append(1),
+    )
+
+    assert result == "{}"
+    assert activity == [1, 1]
+
+
+def test_generation_throttles_stream_activity_without_changing_generated_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Activity is bounded even when MLX yields many text fragments."""
+
+    import mlx_vlm
+
+    from local_ai_mlx_worker.common import generate_content
+
+    monkeypatch.setattr(
+        mlx_vlm,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "formatted",
+    )
+    monkeypatch.setattr(
+        mlx_vlm,
+        "stream_generate",
+        lambda *_args, **_kwargs: iter(["x"] * 65),
+    )
+    activity: list[int] = []
+
+    result = generate_content(
+        model=_Model(),
+        processor=_Processor(),
+        prompt="source",
+        images=[],
+        max_tokens=100,
+        temperature=0.0,
+        do_sample=False,
+        input_token_limit=100,
+        activity_fn=lambda: activity.append(1),
+    )
+
+    assert result == "x" * 65
+    assert activity == [1, 1, 1]
 
 
 def test_ocr_rejects_image_outside_job_scratch(tmp_path: Path) -> None:
@@ -1348,6 +2035,64 @@ def test_extraction_rejects_more_than_bounded_selected_images(tmp_path: Path) ->
                 "page_markdown": pages,
                 "scratch_dir": str(tmp_path),
                 "image_paths": image_paths,
+                "schema": {"type": "object"},
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: "{}",
+        )
+
+
+def test_extraction_rejects_selected_images_over_aggregate_byte_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_mlx_worker import nuextract3
+    from local_ai_mlx_worker.common import WorkerInputError
+
+    first = _png(tmp_path, "aggregate-bytes-1.png")
+    second = _png(tmp_path, "aggregate-bytes-2.png")
+    monkeypatch.setattr(
+        nuextract3,
+        "MAX_SELECTED_IMAGE_BYTES",
+        first.stat().st_size + second.stat().st_size - 1,
+    )
+
+    with pytest.raises(WorkerInputError, match="aggregate byte"):
+        nuextract3.run_extraction(
+            {
+                "page_markdown": [
+                    {"page_number": 1, "markdown": "page one"},
+                    {"page_number": 2, "markdown": "page two"},
+                ],
+                "scratch_dir": str(tmp_path),
+                "image_paths": {"1": str(first), "2": str(second)},
+                "schema": {"type": "object"},
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: "{}",
+        )
+
+
+def test_extraction_rejects_selected_images_over_aggregate_pixel_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_mlx_worker import nuextract3
+    from local_ai_mlx_worker.common import WorkerInputError
+
+    first = _png(tmp_path, "aggregate-pixels-1.png")
+    second = _png(tmp_path, "aggregate-pixels-2.png")
+    monkeypatch.setattr(nuextract3, "MAX_SELECTED_IMAGE_PIXELS", 199)
+
+    with pytest.raises(WorkerInputError, match="aggregate pixel"):
+        nuextract3.run_extraction(
+            {
+                "page_markdown": [
+                    {"page_number": 1, "markdown": "page one"},
+                    {"page_number": 2, "markdown": "page two"},
+                ],
+                "scratch_dir": str(tmp_path),
+                "image_paths": {"1": str(first), "2": str(second)},
                 "schema": {"type": "object"},
             },
             loaded=_loaded("extraction"),  # type: ignore[arg-type]

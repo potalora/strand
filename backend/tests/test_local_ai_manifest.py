@@ -1259,7 +1259,8 @@ def test_local_ai_env_is_documented_only_in_canonical_example() -> None:
         "LOCAL_AI_MAX_FILES=64",
         "LOCAL_AI_MAX_FILE_BYTES=8589934592",
         "LOCAL_AI_MAX_PACK_BYTES=21474836480",
-        "LOCAL_AI_WORKER_TIMEOUT_SECONDS=900",
+        "LOCAL_AI_WORKER_TIMEOUT_SECONDS=1800",
+        "LOCAL_AI_WORKER_HARD_TIMEOUT_SECONDS=7200",
         "LOCAL_AI_MAX_PAGE_PIXELS=40000000",
     }
     assert expected_lines <= set(canonical_example.splitlines())

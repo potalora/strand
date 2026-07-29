@@ -58,6 +58,12 @@
 
 :root {
   --radius: 1.15rem;
+  --font-display: "Source Serif 4", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
+    serif;
+  --font-body: "Source Sans 3", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+    sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas,
+    monospace;
 
   /* ---- core design tokens (light) ---- */
   --bg: #f1f0e8;

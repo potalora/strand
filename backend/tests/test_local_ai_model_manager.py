@@ -15,7 +15,11 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 
-from app.services.local_ai.errors import LocalWorkerError, LocalWorkerTimeout
+from app.services.local_ai.errors import (
+    LocalInputLimitError,
+    LocalWorkerError,
+    LocalWorkerTimeout,
+)
 from app.services.local_ai.model_manager import (
     LocalModelManager as ProductionLocalModelManager,
 )
@@ -1090,12 +1094,12 @@ async def test_cancel_or_stop_interrupts_callback_that_suppresses_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_detached_callbacks_are_bounded_and_do_not_block_queue_or_stop(
+async def test_detached_callback_is_isolated_from_later_jobs_and_stop(
     fake_worker_command: list[str], worker_home: Path
 ) -> None:
     callback_started = asyncio.Event()
     release_callback = asyncio.Event()
-    skipped_callback_calls = 0
+    later_callback_calls = 0
 
     async def uncooperative_callback(_progress: dict[str, object]) -> None:
         callback_started.set()
@@ -1104,9 +1108,9 @@ async def test_detached_callbacks_are_bounded_and_do_not_block_queue_or_stop(
         except asyncio.CancelledError:
             await release_callback.wait()
 
-    def skipped_callback(_progress: dict[str, object]) -> None:
-        nonlocal skipped_callback_calls
-        skipped_callback_calls += 1
+    def later_callback(_progress: dict[str, object]) -> None:
+        nonlocal later_callback_calls
+        later_callback_calls += 1
 
     manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
     await manager.start()
@@ -1128,14 +1132,14 @@ async def test_detached_callbacks_are_bounded_and_do_not_block_queue_or_stop(
             manager.run(
                 ModelRole.OCR,
                 {"job_id": f"detached-repeat-{index}"},
-                skipped_callback,
+                later_callback,
             ),
             1,
         )
         assert result["markdown"] == "# Synthetic OCR"
         assert len(manager._detached_callbacks) == 1
         assert manager.metrics.live_processes == 0
-    assert skipped_callback_calls == 0
+    assert later_callback_calls == 5
 
     assert await manager.run(ModelRole.OCR, {}) == {
         "markdown": "# Synthetic OCR",
@@ -1149,6 +1153,31 @@ async def test_detached_callbacks_are_bounded_and_do_not_block_queue_or_stop(
             break
         await asyncio.sleep(0.01)
     assert manager._detached_callbacks == set()
+
+
+@pytest.mark.asyncio
+async def test_detached_callback_retention_is_bounded_before_spawning_more_workers(
+    fake_worker_command: list[str],
+    worker_home: Path,
+) -> None:
+    from app.services.local_ai.model_manager import _MAX_DETACHED_CALLBACKS
+
+    manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
+    await manager.start()
+    retained = {
+        asyncio.get_running_loop().create_future()
+        for _ in range(_MAX_DETACHED_CALLBACKS)
+    }
+    manager._detached_callbacks.update(retained)
+
+    with pytest.raises(LocalWorkerError, match="unavailable"):
+        await manager.run(ModelRole.OCR, {"job_id": "retention-limit"})
+
+    assert manager.metrics.pids_started == []
+    for callback in retained:
+        callback.cancel()
+    manager._prune_detached_callbacks()
+    await manager.stop()
 
 
 @pytest.mark.asyncio
@@ -1263,6 +1292,30 @@ async def test_failures_are_safe_and_always_reap_the_worker(
 
 
 @pytest.mark.asyncio
+async def test_input_limit_error_preserves_safe_non_retryable_taxonomy(
+    fake_worker_command: list[str],
+    worker_home: Path,
+) -> None:
+    manager = LocalModelManager(
+        fake_worker_command,
+        worker_home=worker_home,
+    )
+    await manager.start()
+
+    with pytest.raises(LocalInputLimitError) as exc_info:
+        await manager.run(
+            ModelRole.EXTRACTION,
+            {"input_limit_error": True},
+        )
+
+    assert exc_info.value.code == "local_input_limit_exceeded"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.__cause__ is None
+    assert manager.active_pid is None
+    await manager.stop()
+
+
+@pytest.mark.asyncio
 async def test_timeout_reaps_worker_and_returns_safe_taxonomy(
     fake_worker_command: list[str], worker_home: Path
 ) -> None:
@@ -1276,6 +1329,367 @@ async def test_timeout_reaps_worker_and_returns_safe_taxonomy(
     with pytest.raises(LocalWorkerTimeout, match="timed out"):
         await manager.run(ModelRole.OCR, {"block": True})
 
+    assert manager.active_pid is None
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_forward_progress_extends_idle_timeout_but_not_hard_deadline(
+    fake_worker_command: list[str], worker_home: Path
+) -> None:
+    manager = LocalModelManager(
+        fake_worker_command,
+        worker_home=worker_home,
+        timeout_seconds=0.25,
+        hard_timeout_seconds=1.0,
+    )
+    await manager.start()
+
+    result = await manager.run(
+        ModelRole.EXTRACTION,
+        {
+            "progress_steps": 3,
+            "progress_delay_ms": 150,
+        },
+    )
+
+    assert result["entities"] == []
+    assert manager.active_pid is None
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_repeated_progress_does_not_extend_idle_timeout(
+    fake_worker_command: list[str], worker_home: Path
+) -> None:
+    manager = LocalModelManager(
+        fake_worker_command,
+        worker_home=worker_home,
+        timeout_seconds=0.08,
+        hard_timeout_seconds=0.5,
+    )
+    await manager.start()
+
+    with pytest.raises(LocalWorkerTimeout, match="timed out"):
+        await manager.run(
+            ModelRole.EXTRACTION,
+            {
+                "repeat_progress": True,
+                "progress_delay_ms": 25,
+            },
+        )
+
+    assert manager.active_pid is None
+    await manager.stop()
+
+
+def test_activity_counter_extends_idle_without_changing_page_completion() -> None:
+    from app.services.local_ai.protocol import ProgressPayload, ProtocolViolation
+
+    first = ProgressPayload(
+        role=ModelRole.EXTRACTION,
+        stage="processing",
+        current=0,
+        total=3,
+        activity=1,
+    )
+    heartbeat = first.model_copy(update={"activity": 2})
+
+    assert ProductionLocalModelManager._validate_progress_sequence(None, first) is True
+    assert (
+        ProductionLocalModelManager._validate_progress_sequence(first, heartbeat)
+        is True
+    )
+    assert (
+        ProductionLocalModelManager._validate_progress_sequence(heartbeat, heartbeat)
+        is False
+    )
+    with pytest.raises(ProtocolViolation, match="progress"):
+        ProductionLocalModelManager._validate_progress_sequence(
+            heartbeat,
+            heartbeat.model_copy(update={"activity": 1}),
+        )
+
+
+@pytest.mark.asyncio
+async def test_activity_only_progress_extends_liveness_without_public_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Only a real stage or page advance reaches the public progress callback."""
+
+    from app.services.local_ai.model_manager import _RunState
+    from app.services.local_ai.protocol import (
+        ProgressPayload,
+        ReadyPayload,
+        ResultPayload,
+        WorkerResponse,
+        encode_message,
+    )
+
+    class Input:
+        def write(self, _value: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+    class Process:
+        stdin = Input()
+        stdout = object()
+
+    manager = LocalModelManager([], worker_home=tmp_path / "worker-home")
+    request = manager._build_request(ModelRole.EXTRACTION, {}, "job-1")
+    first = ProgressPayload(
+        role=ModelRole.EXTRACTION,
+        stage="processing",
+        current=0,
+        total=3,
+        activity=1,
+    )
+    heartbeat = first.model_copy(update={"activity": 2})
+    frames = iter(
+        [
+            encode_message(
+                WorkerResponse(
+                    version=1,
+                    request_id=request.request_id,
+                    kind="ready",
+                    payload=ReadyPayload(role=ModelRole.EXTRACTION),
+                )
+            ),
+            encode_message(
+                WorkerResponse(
+                    version=1,
+                    request_id=request.request_id,
+                    kind="progress",
+                    payload=first,
+                )
+            ),
+            encode_message(
+                WorkerResponse(
+                    version=1,
+                    request_id=request.request_id,
+                    kind="progress",
+                    payload=heartbeat,
+                )
+            ),
+            encode_message(
+                WorkerResponse(
+                    version=1,
+                    request_id=request.request_id,
+                    kind="result",
+                    payload=ResultPayload(data={"entities": []}),
+                )
+            ),
+        ]
+    )
+
+    async def readline(_process: object) -> bytes:
+        return next(frames)
+
+    async def noop(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_readline", readline)
+    monkeypatch.setattr(manager, "_request_shutdown", noop)
+    monkeypatch.setattr(manager, "_drain_and_reap_after_terminal", noop)
+    observed: list[dict[str, object]] = []
+    durable_heartbeats: list[int] = []
+
+    result = await manager._exchange(
+        Process(),  # type: ignore[arg-type]
+        request,
+        ModelRole.EXTRACTION,
+        observed.append,
+        lambda: durable_heartbeats.append(1),
+        _RunState(job_id="job-1"),
+    )
+
+    assert result == {"entities": []}
+    assert observed == [first.model_dump(mode="json", exclude_none=True)]
+    assert durable_heartbeats == [1]
+
+
+@pytest.mark.asyncio
+async def test_progress_renews_idle_deadline_before_awaiting_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A timely worker frame gives its callback a fresh idle-time allowance."""
+
+    from app.services.local_ai.model_manager import _RunState
+    from app.services.local_ai.protocol import (
+        ProgressPayload,
+        ReadyPayload,
+        ResultPayload,
+        WorkerResponse,
+        encode_message,
+    )
+
+    class Input:
+        def write(self, _value: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+    class Process:
+        stdin = Input()
+        stdout = object()
+
+    manager = LocalModelManager(
+        [],
+        worker_home=tmp_path / "worker-home",
+        timeout_seconds=0.06,
+        hard_timeout_seconds=0.5,
+    )
+    request = manager._build_request(ModelRole.EXTRACTION, {}, "job-renew")
+    frames = iter(
+        [
+            encode_message(
+                WorkerResponse(
+                    version=1,
+                    request_id=request.request_id,
+                    kind="ready",
+                    payload=ReadyPayload(role=ModelRole.EXTRACTION),
+                )
+            ),
+            encode_message(
+                WorkerResponse(
+                    version=1,
+                    request_id=request.request_id,
+                    kind="progress",
+                    payload=ProgressPayload(
+                        role=ModelRole.EXTRACTION,
+                        stage="processing",
+                        current=1,
+                        total=1,
+                    ),
+                )
+            ),
+            encode_message(
+                WorkerResponse(
+                    version=1,
+                    request_id=request.request_id,
+                    kind="result",
+                    payload=ResultPayload(data={"entities": []}),
+                )
+            ),
+        ]
+    )
+    reads = 0
+
+    async def readline(_process: object) -> bytes:
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            await asyncio.sleep(0.04)
+        return next(frames)
+
+    async def callback(_progress: dict[str, object]) -> None:
+        await asyncio.sleep(0.04)
+
+    async def noop(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_readline", readline)
+    monkeypatch.setattr(manager, "_request_shutdown", noop)
+    monkeypatch.setattr(manager, "_drain_and_reap_after_terminal", noop)
+
+    result = await manager._exchange(
+        Process(),  # type: ignore[arg-type]
+        request,
+        ModelRole.EXTRACTION,
+        callback,
+        None,
+        _RunState(job_id="job-renew"),
+    )
+
+    assert result == {"entities": []}
+
+
+@pytest.mark.asyncio
+async def test_forward_progress_cannot_extend_hard_timeout(
+    fake_worker_command: list[str], worker_home: Path
+) -> None:
+    manager = LocalModelManager(
+        fake_worker_command,
+        worker_home=worker_home,
+        timeout_seconds=0.25,
+        hard_timeout_seconds=0.5,
+    )
+    await manager.start()
+
+    with pytest.raises(LocalWorkerTimeout, match="timed out"):
+        await manager.run(
+            ModelRole.EXTRACTION,
+            {
+                "progress_steps": 20,
+                "progress_delay_ms": 50,
+            },
+        )
+
+    assert manager.active_pid is None
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_hard_timeout_includes_blocked_request_drain(worker_home: Path) -> None:
+    manager = LocalModelManager(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        worker_home=worker_home,
+        timeout_seconds=0.05,
+        hard_timeout_seconds=0.08,
+    )
+    await manager.start()
+
+    with pytest.raises(LocalWorkerTimeout, match="timed out"):
+        await asyncio.wait_for(
+            manager.run(
+                ModelRole.EXTRACTION,
+                {"content": "x" * (2 * 1024 * 1024)},
+            ),
+            timeout=1,
+        )
+
+    assert manager.active_pid is None
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_hard_timeout_includes_async_progress_callback(
+    fake_worker_command: list[str],
+    worker_home: Path,
+) -> None:
+    callback_started = asyncio.Event()
+
+    async def blocked_callback(_progress: dict[str, object]) -> None:
+        callback_started.set()
+        await asyncio.Event().wait()
+
+    manager = LocalModelManager(
+        fake_worker_command,
+        worker_home=worker_home,
+        timeout_seconds=0.3,
+        hard_timeout_seconds=0.5,
+    )
+    await manager.start()
+
+    with pytest.raises(LocalWorkerTimeout, match="timed out"):
+        await asyncio.wait_for(
+            manager.run(
+                ModelRole.EXTRACTION,
+                {
+                    "progress_steps": 2,
+                    "progress_delay_ms": 20,
+                },
+                blocked_callback,
+            ),
+            timeout=1,
+        )
+
+    assert callback_started.is_set()
     assert manager.active_pid is None
     await manager.stop()
 

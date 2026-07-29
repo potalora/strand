@@ -137,4 +137,4 @@ class RecordExtractionEvidenceResponse(_StrictResponse):
     evidence: list[ExtractionEvidenceResponse] = Field(max_length=256)
     unresolved_fields: list[StrictStr] = Field(max_length=128)
     rejected_fields: list[StrictStr] = Field(max_length=128)
-    models: list[ExtractionModelIdentityResponse] = Field(max_length=2)
+    models: list[ExtractionModelIdentityResponse] = Field(max_length=512)

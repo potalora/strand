@@ -79,7 +79,10 @@ export function ExtractionEvidencePanel({
         <>
           <div className="flex flex-wrap gap-2">
             {provenance.models.map((model) => (
-              <span className="tag" key={`${model.role}-${model.revision}`}>
+              <span
+                className="tag"
+                key={`${model.role}-${model.repository}-${model.revision}-${model.quantization}-${model.runtime}`}
+              >
                 {modelName(model.repository)} · {shortRevision(model.revision)}
               </span>
             ))}

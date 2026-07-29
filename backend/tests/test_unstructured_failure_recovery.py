@@ -193,6 +193,7 @@ async def test_stuck_strict_job_requeues_without_losing_page_checkpoints(
         manifest_snapshot=snapshot,
         status="processing",
         stage="extraction",
+        updated_at=datetime.now(timezone.utc) - timedelta(hours=2),
     )
     db_session.add(job)
     await db_session.flush()
@@ -219,6 +220,142 @@ async def test_stuck_strict_job_requeues_without_losing_page_checkpoints(
     assert job.status == "queued"
     assert job.stage == "recovery"
     assert await db_session.get(LocalAIPage, page.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_live_strict_job_uses_fresh_job_heartbeat_not_generic_upload_age(
+    db_session: AsyncSession,
+    client: AsyncClient,
+    test_session_factory: async_sessionmaker,  # type: ignore[type-arg]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.upload import (
+        _recover_stuck_files,
+        _refresh_strict_local_job_lease,
+    )
+
+    _headers, uid_str = await auth_headers(
+        client,
+        email="live-strict-heartbeat@example.com",
+    )
+    user_id = uuid.UUID(uid_str)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = UploadedFile(
+        user_id=user_id,
+        filename="live.pdf",
+        mime_type="application/pdf",
+        file_hash="c" * 64,
+        storage_path="/private/live.pdf",
+        ingestion_status="processing",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+        processing_started_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        retry_count=0,
+        progress_stage="local_extraction",
+        progress_detail={
+            "stage": "extraction",
+            "model_role": "extraction",
+            "worker_current": 0,
+            "worker_total": 4,
+        },
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user_id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="extraction",
+        progress={
+            "stage": "extraction",
+            "model_role": "extraction",
+            "worker_current": 0,
+            "worker_total": 4,
+        },
+        updated_at=datetime.now(timezone.utc) - timedelta(hours=2),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    public_job_progress = dict(job.progress)
+    public_upload_progress = dict(upload.progress_detail)
+    await _refresh_strict_local_job_lease(
+        db_session,
+        upload_id=upload.id,
+        job_id=job.id,
+        user_id=user_id,
+    )
+    await db_session.refresh(job)
+    assert job.updated_at > datetime.now(timezone.utc) - timedelta(minutes=1)
+    assert job.progress == public_job_progress
+    assert upload.progress_detail == public_upload_progress
+
+    monkeypatch.setattr("app.api.upload.async_session_factory", test_session_factory)
+    monkeypatch.setattr("app.api.upload.settings.extraction_timeout_minutes", 1)
+    monkeypatch.setattr("app.api.upload.settings.local_ai_worker_timeout_seconds", 5)
+
+    await _recover_stuck_files()
+
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert upload.ingestion_status == "processing"
+    assert upload.retry_count == 0
+    assert job.status == "processing"
+    assert job.stage == "extraction"
+
+
+@pytest.mark.asyncio
+async def test_claim_pending_files_can_exclude_strict_jobs_waiting_for_model_slot(
+    db_session: AsyncSession,
+    client: AsyncClient,
+    test_session_factory: async_sessionmaker,  # type: ignore[type-arg]
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.upload import _claim_pending_files
+
+    _headers, uid_str = await auth_headers(client)
+    user_id = uuid.UUID(uid_str)
+    strict_upload = UploadedFile(
+        user_id=user_id,
+        filename="queued-strict.pdf",
+        mime_type="application/pdf",
+        file_hash="8" * 64,
+        storage_path="/private/queued-strict.pdf",
+        ingestion_status="pending_extraction",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+    )
+    non_strict_upload = UploadedFile(
+        user_id=user_id,
+        filename="queued-custom.rtf",
+        mime_type="application/rtf",
+        file_hash="9" * 64,
+        storage_path="/private/queued-custom.rtf",
+        ingestion_status="pending_extraction",
+        file_category="unstructured",
+        processing_mode="cloud_assisted",
+    )
+    db_session.add_all([strict_upload, non_strict_upload])
+    await db_session.commit()
+
+    monkeypatch.setattr("app.api.upload.async_session_factory", test_session_factory)
+    claimed = await _claim_pending_files(1, allow_strict=False)
+
+    assert claimed == [
+        (
+            str(non_strict_upload.id),
+            non_strict_upload.storage_path,
+            str(user_id),
+            "cloud_assisted",
+        )
+    ]
+    await db_session.refresh(strict_upload)
+    assert strict_upload.ingestion_status == "pending_extraction"
 
 
 @pytest.mark.asyncio

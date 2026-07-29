@@ -32,6 +32,10 @@ test.describe("Duplicate file upload (idempotency)", () => {
     expect(
       ["awaiting_confirmation", "completed", "completed_with_merges", "awaiting_review"]
     ).toContain(firstSt);
+    if (process.env.E2E_LOCAL_ONLY === "1") {
+      expect(firstStatus.local_run?.privacy_mode).toBe("validated_strict_local");
+      expect(firstStatus.local_failure?.cloud_fallback_attempted ?? false).toBe(false);
+    }
 
     // Second upload of the SAME file X by the same user — backend idempotency
     // should short-circuit re-ingestion and mark it as a duplicate.
@@ -45,5 +49,10 @@ test.describe("Duplicate file upload (idempotency)", () => {
     const secondStatus = await api.pollUploadStatus(secondId, 270_000);
     const secondSt = secondStatus.ingestion_status ?? secondStatus.status;
     expect(secondSt).toBe("duplicate_file");
+    if (process.env.E2E_LOCAL_ONLY === "1") {
+      const settings = await api.getLlmSettings();
+      expect(settings.routing.processing_mode).toBe("validated_strict_local");
+      expect(secondStatus.local_failure?.cloud_fallback_attempted ?? false).toBe(false);
+    }
   });
 });

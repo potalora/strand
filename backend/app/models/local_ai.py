@@ -216,6 +216,46 @@ class LocalAIPage(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
 
 
+class LocalAIExtractionCheckpoint(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    """Encrypted, resumable clinical extraction for one immutable local job."""
+
+    __tablename__ = "local_ai_extraction_checkpoints"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("local_ai_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    checkpoint_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    ocr_text_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    page_bindings_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_result_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    raw_extraction_result: Mapped[Any | None] = mapped_column(
+        EncryptedJSON,
+        nullable=True,
+    )
+    extraction_result: Mapped[dict | None] = mapped_column(
+        EncryptedJSON,
+        nullable=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            name="uq_local_ai_extraction_checkpoints_job",
+        ),
+        Index(
+            "ix_local_ai_extraction_checkpoints_job",
+            "job_id",
+        ),
+    )
+
+
 class ExtractionEvidence(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     """Encrypted source evidence that grounds an extracted health record."""
 

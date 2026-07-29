@@ -47,6 +47,7 @@ async def run_upload_dedup(
     db: AsyncSession,
     *,
     processing_mode: ProcessingMode | str = ProcessingMode.CLOUD_ASSISTED,
+    commit: bool = True,
 ) -> DedupSummary:
     """Run the full dedup pipeline for a single upload.
 
@@ -147,7 +148,10 @@ async def run_upload_dedup(
             rtype = rec.record_type
             summary.by_type[rtype] = summary.by_type.get(rtype, 0) + 1
 
-    await db.commit()
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
     return summary
 
 

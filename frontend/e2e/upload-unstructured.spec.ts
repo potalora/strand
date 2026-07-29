@@ -57,6 +57,14 @@ function mimeForExt(filePath: string): string {
   }
 }
 
+function expectLocalOnlyStatus(
+  status: Awaited<ReturnType<ApiClient["pollUploadStatus"]>>
+): void {
+  if (process.env.E2E_LOCAL_ONLY !== "1") return;
+  expect(status.local_run?.privacy_mode).toBe("validated_strict_local");
+  expect(status.local_failure?.cloud_fallback_attempted ?? false).toBe(false);
+}
+
 test.describe("Unstructured Upload", () => {
   let api: ApiClient;
   let email: string;
@@ -88,10 +96,11 @@ test.describe("Unstructured Upload", () => {
     const uploadId = result.uploads[0].upload_id;
     expect(uploadId).toBeTruthy();
 
-    // Poll until extraction completes (RTF text is local, but entity extraction uses Gemini)
+    // Poll until extraction completes.
     const status = await api.pollUploadStatus(uploadId, 270_000);
     const st = status.ingestion_status ?? status.status;
     expect(["awaiting_confirmation", "completed", "completed_with_merges", "awaiting_review"]).toContain(st);
+    expectLocalOnlyStatus(status);
 
     // Verify entities were extracted
     const progress = await api.getExtractionProgress();
@@ -116,38 +125,40 @@ test.describe("Unstructured Upload", () => {
 
     // Wait for file list to appear, then click Upload All
     await page.waitForSelector("text=Upload All", { timeout: 10_000 });
-    await page.click("text=Upload All");
-
-    // Wait for upload to complete — poll via API for reliability
-    // Give the upload a moment to register
-    await page.waitForTimeout(2000);
-
-    // Check upload history for the batch results
-    const history = await api.getUploadHistory();
-    const recentUploads = (history.items || history).filter(
-      (item: { filename?: string; created_at?: string }) =>
-        item.filename?.toLowerCase().endsWith(".rtf") &&
-        item.created_at !== undefined &&
-        new Date(item.created_at).getTime() > Date.now() - 120_000
+    const batchResponsePromise = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname.endsWith(
+          "/api/v1/upload/unstructured-batch"
+        )
     );
-    expect(recentUploads.length).toBeGreaterThanOrEqual(rtfFiles.length);
+    await page.getByRole("button", { name: "Upload all" }).click();
+    const batchResponse = await batchResponsePromise;
+    expect(batchResponse.ok()).toBeTruthy();
+    const batchResult = (await batchResponse.json()) as {
+      uploads: { upload_id: string }[];
+    };
+    expect(batchResult.uploads).toHaveLength(rtfFiles.length);
+    const uploadIds = batchResult.uploads.map((upload) => upload.upload_id);
 
-    // Poll all uploads concurrently (entity extraction uses Gemini, may be slow under load)
+    // The response is returned only after every batch row is committed. Verify
+    // those exact IDs rather than racing a wall-clock history window.
+    const history = await api.getUploadHistory();
+    const historyIds = new Set(history.items.map((upload) => upload.id));
+    expect(uploadIds.every((uploadId) => historyIds.has(uploadId))).toBe(true);
+
+    // Poll all uploads concurrently.
     const statuses = await Promise.all(
-      recentUploads.slice(0, rtfFiles.length).map((upload) =>
-        api.pollUploadStatus(upload.id, 240_000)
-      )
+      uploadIds.map((uploadId) => api.pollUploadStatus(uploadId, 240_000))
     );
     for (const status of statuses) {
       const st = status.ingestion_status ?? status.status;
       expect(["awaiting_confirmation", "completed", "completed_with_merges", "awaiting_review"]).toContain(st);
+      expectLocalOnlyStatus(status);
     }
   });
 
-  test("upload PDF via API (requires Gemini)", async () => {
-    const geminiKey = process.env.GEMINI_API_KEY;
-    test.skip(!geminiKey, "GEMINI_API_KEY not set — PDF extraction requires Gemini");
-
+  test("upload PDF via API", async () => {
     const pdfPath = findPdf();
     test.skip(!pdfPath, "No PDF test data found");
     test.setTimeout(300_000);
@@ -159,10 +170,11 @@ test.describe("Unstructured Upload", () => {
     expect(result.uploads).toHaveLength(1);
     const uploadId = result.uploads[0].upload_id;
 
-    // PDF extraction takes longer due to Gemini vision API
+    // PDF extraction includes local rasterization and one sandboxed OCR job per page.
     const status = await api.pollUploadStatus(uploadId, 270_000);
     const st = status.ingestion_status ?? status.status;
     expect(["awaiting_confirmation", "completed", "completed_with_merges", "awaiting_review"]).toContain(st);
+    expectLocalOnlyStatus(status);
   });
 
   test("extraction progress tracking via API", async () => {
@@ -191,6 +203,7 @@ test.describe("Unstructured Upload", () => {
     for (const status of statuses) {
       const st = status.ingestion_status ?? status.status;
       expect(["awaiting_confirmation", "completed", "completed_with_merges", "awaiting_review"]).toContain(st);
+      expectLocalOnlyStatus(status);
     }
 
     // Verify extraction progress reflects the completed files

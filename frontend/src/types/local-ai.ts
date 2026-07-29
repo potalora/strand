@@ -130,7 +130,7 @@ export interface RecordExtractionProvenance {
   evidence: EvidenceReference[];
   unresolved_fields: string[];
   rejected_fields: string[];
-  models: BoundedIngestionModels<ExtractionModelIdentity>;
+  models: ExtractionModelIdentity[];
 }
 
 type UnknownObject = Record<string, unknown>;
@@ -158,6 +158,27 @@ function parseIngestionModels<T extends LocalRunModel>(
   return value as BoundedIngestionModels<T>;
 }
 
+function parseExtractionModelHistory(
+  value: unknown
+): ExtractionModelIdentity[] {
+  if (
+    !Array.isArray(value) ||
+    value.length > 512 ||
+    value.some(
+      (model) =>
+        !isObject(model) ||
+        (model.role !== "ocr" && model.role !== "extraction") ||
+        typeof model.repository !== "string" ||
+        typeof model.revision !== "string" ||
+        typeof model.quantization !== "string" ||
+        typeof model.runtime !== "string"
+    )
+  ) {
+    throw new TypeError("Invalid ingestion model provenance");
+  }
+  return value as ExtractionModelIdentity[];
+}
+
 /** Validate the bounded, summary-free ingestion provenance on upload payloads. */
 export function parseLocalRunInfo(value: unknown): LocalRunInfo {
   if (
@@ -182,7 +203,7 @@ export function parseRecordExtractionProvenance(
   ) {
     throw new TypeError("Invalid ingestion model provenance");
   }
-  parseIngestionModels<ExtractionModelIdentity>(value.models);
+  parseExtractionModelHistory(value.models);
   return value as unknown as RecordExtractionProvenance;
 }
 

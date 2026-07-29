@@ -22,6 +22,12 @@ class LocalWorkerError(LocalAIError):
     code = "local_worker_error"
 
 
+class LocalInputLimitError(LocalWorkerError):
+    """Raised when valid local input cannot fit the locked model limits."""
+
+    code = "local_input_limit_exceeded"
+
+
 class LocalWorkerTimeout(LocalWorkerError):
     """Raised when a local worker exceeds its execution deadline."""
 

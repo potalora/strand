@@ -9,6 +9,7 @@ import inspect
 import os
 import socket
 import stat
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -27,6 +28,8 @@ from app.services.local_ai.manifest import (
 
 _DOWNLOAD_ORIGIN = "https://huggingface.co"
 _STREAM_CHUNK_BYTES = 1024 * 1024
+_PROGRESS_PERSIST_BYTES = 8 * 1024 * 1024
+_PROGRESS_PERSIST_SECONDS = 1.0
 _MAX_REDIRECTS = 5
 _MAX_STREAM_RESUME_RETRIES = 2
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -143,6 +146,52 @@ async def _publish_progress(
             await result
     except Exception as exc:
         raise LocalAIError("Model download progress callback failed") from exc
+
+
+@dataclass
+class _ProgressPublisher:
+    """Bound durable progress writes while preserving role boundaries."""
+
+    store: ArtifactStore
+    operation_id: str
+    callback: ProgressCallback | None
+    last_role: str | None = None
+    last_bytes_done: int = 0
+    last_published_at: float = 0.0
+
+    async def publish(
+        self,
+        progress: DownloadProgress,
+        *,
+        force: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        role_changed = progress.role != self.last_role
+        byte_delta = (
+            progress.bytes_done
+            if role_changed
+            else progress.bytes_done - self.last_bytes_done
+        )
+        elapsed = now - self.last_published_at
+        terminal = progress.bytes_done == progress.bytes_total
+        if not force and (
+            terminal
+            or (
+                not role_changed
+                and byte_delta < _PROGRESS_PERSIST_BYTES
+                and elapsed < _PROGRESS_PERSIST_SECONDS
+            )
+        ):
+            return
+        await _publish_progress(
+            store=self.store,
+            operation_id=self.operation_id,
+            progress=progress,
+            callback=self.callback,
+        )
+        self.last_role = progress.role
+        self.last_bytes_done = progress.bytes_done
+        self.last_published_at = time.monotonic()
 
 
 def _declared_content_length(response: httpx.Response) -> int | None:
@@ -272,6 +321,11 @@ async def download_manifest_to_stage(
 
         staging = store.stage(manifest.pack_revision)
         operation_id = store.operation_id(staging)
+        publisher = _ProgressPublisher(
+            store=store,
+            operation_id=operation_id,
+            callback=progress_callback,
+        )
         observed_total = 0
 
         async with httpx.AsyncClient(
@@ -281,6 +335,14 @@ async def download_manifest_to_stage(
             for artifact in manifest.artifacts:
                 role_total = sum(file.size for file in artifact.files)
                 role_done = 0
+                await publisher.publish(
+                    DownloadProgress(
+                        role=artifact.role.value,
+                        bytes_done=0,
+                        bytes_total=role_total,
+                    ),
+                    force=True,
+                )
                 for file in artifact.files:
                     if file.size > MAX_MANIFEST_FILE_BYTES:
                         raise LocalValidationError(
@@ -347,15 +409,12 @@ async def download_manifest_to_stage(
                                                 )
                                             stream.write(chunk)
                                             digest.update(chunk)
-                                            await _publish_progress(
-                                                store=store,
-                                                operation_id=operation_id,
-                                                progress=DownloadProgress(
+                                            await publisher.publish(
+                                                DownloadProgress(
                                                     role=artifact.role.value,
                                                     bytes_done=role_done + file_done,
                                                     bytes_total=role_total,
                                                 ),
-                                                callback=progress_callback,
                                             )
                                         stream.flush()
                                         os.fsync(stream.fileno())
@@ -383,6 +442,14 @@ async def download_manifest_to_stage(
                         except OSError:
                             pass
                         raise
+                await publisher.publish(
+                    DownloadProgress(
+                        role=artifact.role.value,
+                        bytes_done=role_done,
+                        bytes_total=role_total,
+                    ),
+                    force=True,
+                )
 
         if observed_total != declared_total:
             raise LocalValidationError(

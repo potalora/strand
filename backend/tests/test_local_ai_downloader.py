@@ -182,6 +182,67 @@ async def test_downloader_is_manifest_only_and_progress_has_exact_keys(
 
 
 @pytest.mark.asyncio
+async def test_downloader_throttles_durable_progress_and_forces_role_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Many transport chunks must not cause two atomic fsyncs per chunk."""
+
+    one_mib = 1024 * 1024
+    payloads = {
+        ModelRole.OCR: b"x" * (20 * one_mib),
+        ModelRole.EXTRACTION: b"extract",
+        ModelRole.SUMMARY: b"summary",
+    }
+    manifest, responses = _manifest(payloads=payloads)
+    first_url = next(iter(responses))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        content = responses[str(request.url)]
+        if str(request.url) == first_url:
+            return httpx.Response(
+                200,
+                headers={"content-length": str(len(content))},
+                stream=_ChunksThenError(
+                    [
+                        content[offset : offset + one_mib]
+                        for offset in range(0, len(content), one_mib)
+                    ]
+                ),
+                request=request,
+            )
+        return httpx.Response(200, content=content, request=request)
+
+    _install_handler(monkeypatch, handler)
+    store = ArtifactStore(tmp_path)
+    writes: list[dict[str, int | str]] = []
+    original_write_progress = store.write_progress
+
+    def observe_write(
+        operation_id: str,
+        payload: dict[str, int | str],
+    ) -> None:
+        writes.append(dict(payload))
+        original_write_progress(operation_id, payload)
+
+    monkeypatch.setattr(store, "write_progress", observe_write)
+    callbacks: list[dict[str, int | str]] = []
+
+    await download_manifest_to_stage(manifest, store, callbacks.append)
+
+    assert writes == callbacks
+    assert len(callbacks) <= 8
+    for artifact in manifest.artifacts:
+        role_progress = [
+            item for item in callbacks if item["role"] == artifact.role.value
+        ]
+        role_total = sum(file.size for file in artifact.files)
+        assert role_progress[0]["bytes_done"] == 0
+        assert role_progress[-1]["bytes_done"] == role_total
+        assert role_progress[-1]["bytes_total"] == role_total
+
+
+@pytest.mark.asyncio
 async def test_staged_downloader_verifies_without_activating_before_runtime_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -509,16 +570,20 @@ async def test_partial_and_operation_files_are_owner_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import app.services.local_ai.downloader as downloader_module
+
     manifest, responses = _manifest()
     observed_modes: list[int] = []
+    original_open_partial = downloader_module._open_partial
 
-    async def callback(_: dict[str, int | str]) -> None:
-        partials = list(tmp_path.rglob("*.partial"))
-        if partials:
-            observed_modes.append(partials[0].stat().st_mode & 0o777)
+    def observed_open_partial(path: Path):
+        stream = original_open_partial(path)
+        observed_modes.append(path.stat().st_mode & 0o777)
+        return stream
 
     _install_transport(monkeypatch, responses)
-    await download_manifest_to_stage(manifest, ArtifactStore(tmp_path), callback)
+    monkeypatch.setattr(downloader_module, "_open_partial", observed_open_partial)
+    await download_manifest_to_stage(manifest, ArtifactStore(tmp_path), None)
 
     assert observed_modes and set(observed_modes) == {0o600}
     operation_files = list((tmp_path / "operations").glob("*.json"))

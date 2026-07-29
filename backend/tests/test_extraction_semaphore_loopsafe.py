@@ -15,7 +15,11 @@ import asyncio
 import pytest
 
 from app.api import upload as upload_mod
-from app.api.upload import _get_extraction_semaphore, _get_gemini_semaphore
+from app.api.upload import (
+    _get_extraction_semaphore,
+    _get_gemini_semaphore,
+    _get_strict_extraction_semaphore,
+)
 
 
 async def _coro_get_gemini_sem() -> asyncio.Semaphore:
@@ -46,7 +50,14 @@ def _acquire_under_contention(get_sem, n_tasks: int, hold: float) -> tuple[int, 
     return asyncio.run(run_all())
 
 
-@pytest.mark.parametrize("get_sem", [_get_gemini_semaphore, _get_extraction_semaphore])
+@pytest.mark.parametrize(
+    "get_sem",
+    [
+        _get_gemini_semaphore,
+        _get_extraction_semaphore,
+        _get_strict_extraction_semaphore,
+    ],
+)
 def test_semaphore_survives_separate_loops_under_contention(get_sem) -> None:
     """Each fresh event loop gets a semaphore bound to it — no RuntimeError.
 

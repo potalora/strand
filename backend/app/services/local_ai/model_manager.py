@@ -6,6 +6,7 @@ import asyncio
 import errno
 import fcntl
 import inspect
+import logging
 import os
 import resource
 import shlex
@@ -23,7 +24,11 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from app.services.local_ai.errors import LocalWorkerError, LocalWorkerTimeout
+from app.services.local_ai.errors import (
+    LocalInputLimitError,
+    LocalWorkerError,
+    LocalWorkerTimeout,
+)
 from app.services.local_ai.protocol import (
     MAX_MESSAGE_BYTES,
     ErrorPayload,
@@ -38,16 +43,28 @@ from app.services.local_ai.protocol import (
 from app.services.local_ai.types import ModelRole
 
 ProgressCallback = Callable[[dict[str, object]], object | Awaitable[object]]
+LivenessCallback = Callable[[], object | Awaitable[object]]
 
 _GLOBAL_ROLE_PROCESS_LOCK: asyncio.Lock | None = None
 _GLOBAL_ROLE_PROCESS_LOOP: asyncio.AbstractEventLoop | None = None
 _GLOBAL_PROCESS_BOUNDARY_POISONED = False
 _PROCESS_SHUTDOWN_SECONDS = 5.0
 _MAX_PENDING_CANCELLATIONS = 1_024
+# One cancellation-resistant callback never blocks a later job. A sustained
+# application callback failure is capped and then fails fast before spawning.
+_MAX_DETACHED_CALLBACKS = 32
 _INTERPROCESS_LOCK_POLL_SECONDS = 0.05
 _MACOS_SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 _MACOS_NETWORK_DENY_PROFILE = "(version 1) (allow default) (deny network*)"
 _WORKER_PROCESS_LOCK = "worker-process.lock"
+_PROGRESS_STAGE_ORDER = {
+    "starting": 0,
+    "loading": 1,
+    "processing": 2,
+    "finalizing": 3,
+    "cancelling": 4,
+}
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -134,6 +151,7 @@ class LocalModelManager:
         *,
         worker_home: str | Path | None = None,
         timeout_seconds: float | None = None,
+        hard_timeout_seconds: float | None = None,
         _allow_unisolated_test_worker: bool = False,
     ) -> None:
         if _allow_unisolated_test_worker and worker_command is None:
@@ -152,6 +170,16 @@ class LocalModelManager:
             if timeout_seconds is not None
             else self._default_timeout_seconds()
         )
+        self._hard_timeout_seconds = (
+            float(hard_timeout_seconds)
+            if hard_timeout_seconds is not None
+            else self._default_hard_timeout_seconds()
+        )
+        if (
+            self._timeout_seconds <= 0
+            or self._hard_timeout_seconds < self._timeout_seconds
+        ):
+            raise ValueError("Local worker timeout configuration is invalid.")
         self._started = False
         self._stopping = False
         self._stopped = False
@@ -180,6 +208,12 @@ class LocalModelManager:
         from app.config import settings
 
         return float(settings.local_ai_worker_timeout_seconds)
+
+    @staticmethod
+    def _default_hard_timeout_seconds() -> float:
+        from app.config import settings
+
+        return float(settings.local_ai_worker_hard_timeout_seconds)
 
     @property
     def active_pid(self) -> int | None:
@@ -354,6 +388,8 @@ class LocalModelManager:
         role: ModelRole,
         payload: dict[str, Any],
         on_progress: ProgressCallback | None = None,
+        *,
+        on_liveness: LivenessCallback | None = None,
     ) -> Any:
         """Run one role in a fresh process and return only after group cleanup."""
         role = ModelRole(role)
@@ -367,7 +403,13 @@ class LocalModelManager:
             if job_id in self._cancelled_jobs:
                 self._cancelled_jobs.pop(job_id)
                 raise _RunCancelled(stopped=False)
-            return await self._run_registered(state, role, payload, on_progress)
+            return await self._run_registered(
+                state,
+                role,
+                payload,
+                on_progress,
+                on_liveness,
+            )
         except _RunCancelled as exc:
             self.metrics.cancelled_runs += 1
             message = (
@@ -407,11 +449,15 @@ class LocalModelManager:
         role: ModelRole,
         payload: dict[str, Any],
         on_progress: ProgressCallback | None,
+        on_liveness: LivenessCallback | None,
     ) -> Any:
         lease = await self._acquire_worker_process_lease(state)
         process: asyncio.subprocess.Process | None = None
         result: Any = None
         try:
+            self._prune_detached_callbacks()
+            if len(self._detached_callbacks) >= _MAX_DETACHED_CALLBACKS:
+                raise LocalWorkerError("Local worker is unavailable.")
             self._raise_if_cancelled(state)
             request = self._build_request(role, payload, state.job_id)
             self._active_job_id = state.job_id
@@ -422,12 +468,14 @@ class LocalModelManager:
             self._raise_if_cancelled(state)
 
             try:
-                result = await asyncio.wait_for(
-                    self._exchange(process, request, role, on_progress, state),
-                    timeout=self._timeout_seconds,
+                result = await self._exchange(
+                    process,
+                    request,
+                    role,
+                    on_progress,
+                    on_liveness,
+                    state,
                 )
-            except TimeoutError:
-                raise LocalWorkerTimeout("Local worker timed out.") from None
             except _ProgressCallbackFailure:
                 raise LocalWorkerError(
                     "Local worker progress callback failed."
@@ -833,18 +881,42 @@ class LocalModelManager:
         request: WorkerRequest,
         role: ModelRole,
         on_progress: ProgressCallback | None,
+        on_liveness: LivenessCallback | None,
         state: _RunState,
     ) -> Any:
         if process.stdin is None or process.stdout is None:
             raise LocalWorkerError("Local worker failed.")
+        started_at = time.monotonic()
+        idle_deadline = started_at + self._timeout_seconds
+        hard_deadline = started_at + self._hard_timeout_seconds
         process.stdin.write(encode_message(request))
-        await process.stdin.drain()
+        remaining = min(
+            idle_deadline - time.monotonic(),
+            hard_deadline - time.monotonic(),
+        )
+        if remaining <= 0:
+            raise LocalWorkerTimeout("Local worker timed out.")
+        try:
+            await asyncio.wait_for(process.stdin.drain(), timeout=remaining)
+        except TimeoutError:
+            raise LocalWorkerTimeout("Local worker timed out.") from None
 
         ready_seen = False
         terminal: ResultPayload | ErrorPayload | None = None
+        last_progress: ProgressPayload | None = None
         while terminal is None:
             self._raise_if_cancelled(state)
-            line = await self._readline(process)
+            now = time.monotonic()
+            remaining = min(idle_deadline - now, hard_deadline - now)
+            if remaining <= 0:
+                raise LocalWorkerTimeout("Local worker timed out.")
+            try:
+                line = await asyncio.wait_for(
+                    self._readline(process),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                raise LocalWorkerTimeout("Local worker timed out.") from None
             if not line:
                 self._raise_if_cancelled(state)
                 raise LocalWorkerError("Local worker failed.")
@@ -855,6 +927,7 @@ class LocalModelManager:
                 if ready_seen or response.payload.role is not role:
                     raise ProtocolViolation("Worker readiness response is invalid.")
                 ready_seen = True
+                idle_deadline = time.monotonic() + self._timeout_seconds
                 continue
             if not ready_seen:
                 raise ProtocolViolation("Worker responded before readiness.")
@@ -865,7 +938,34 @@ class LocalModelManager:
                     or progress.role is not role
                 ):
                     raise ProtocolViolation("Worker progress response is invalid.")
-                await self._forward_progress(progress, on_progress, state)
+                liveness_advanced = self._validate_progress_sequence(
+                    last_progress,
+                    progress,
+                )
+                visible_advance = self._progress_is_visible_advance(
+                    last_progress,
+                    progress,
+                )
+                if liveness_advanced:
+                    # The worker has already proved it is live. Give any
+                    # persistence callback a fresh idle window while the hard
+                    # deadline remains absolute.
+                    idle_deadline = time.monotonic() + self._timeout_seconds
+                callback_deadline = min(idle_deadline, hard_deadline)
+                if liveness_advanced and not visible_advance:
+                    await self._forward_liveness(
+                        on_liveness,
+                        state,
+                        deadline=callback_deadline,
+                    )
+                if visible_advance:
+                    await self._forward_progress(
+                        progress,
+                        on_progress,
+                        state,
+                        deadline=callback_deadline,
+                    )
+                last_progress = progress
                 continue
             if response.kind in {"result", "error"}:
                 if not isinstance(response.payload, (ResultPayload, ErrorPayload)):
@@ -878,35 +978,126 @@ class LocalModelManager:
         await self._drain_and_reap_after_terminal(process, request.request_id)
         self._raise_if_cancelled(state)
         if isinstance(terminal, ErrorPayload):
+            logger.warning(
+                "Local worker returned safe error code %s for role %s",
+                terminal.code,
+                role.value,
+            )
+            if terminal.code == "input_limit_exceeded":
+                raise LocalInputLimitError(terminal.message)
             raise LocalWorkerError(terminal.message)
         return terminal.data
+
+    @staticmethod
+    def _validate_progress_sequence(
+        previous: ProgressPayload | None,
+        current: ProgressPayload,
+    ) -> bool:
+        """Reject regressing counters and identify deadline-extending progress."""
+
+        if previous is None:
+            return True
+        previous_activity = previous.activity or 0
+        current_activity = current.activity or 0
+        if current_activity < previous_activity:
+            raise ProtocolViolation("Worker progress response is invalid.")
+        activity_advanced = current_activity > previous_activity
+        previous_order = _PROGRESS_STAGE_ORDER[previous.stage]
+        current_order = _PROGRESS_STAGE_ORDER[current.stage]
+        if current_order < previous_order:
+            raise ProtocolViolation("Worker progress response is invalid.")
+        if current.stage != previous.stage:
+            return True
+        if current.total != previous.total or current.current < previous.current:
+            raise ProtocolViolation("Worker progress response is invalid.")
+        return current.current > previous.current or activity_advanced
+
+    @staticmethod
+    def _progress_is_visible_advance(
+        previous: ProgressPayload | None,
+        current: ProgressPayload,
+    ) -> bool:
+        """Return whether a stage or completed-page change should reach callers."""
+
+        return (
+            previous is None
+            or current.stage != previous.stage
+            or current.current > previous.current
+        )
 
     async def _forward_progress(
         self,
         progress: ProgressPayload,
         on_progress: ProgressCallback | None,
         state: _RunState,
+        *,
+        deadline: float,
     ) -> None:
         if on_progress is None:
             return
         self._prune_detached_callbacks()
-        if self._detached_callbacks:
-            return
         safe_progress = progress.model_dump(mode="json", exclude_none=True)
         try:
             callback_result = on_progress(safe_progress)
         except Exception:
             raise _ProgressCallbackFailure from None
+        await self._await_callback(
+            callback_result,
+            state,
+            deadline=deadline,
+        )
+
+    async def _forward_liveness(
+        self,
+        on_liveness: LivenessCallback | None,
+        state: _RunState,
+        *,
+        deadline: float,
+    ) -> None:
+        """Persist an activity-only lease without manufacturing UI progress."""
+
+        if on_liveness is None:
+            return
+        self._prune_detached_callbacks()
+        try:
+            callback_result = on_liveness()
+        except Exception:
+            raise _ProgressCallbackFailure from None
+        await self._await_callback(
+            callback_result,
+            state,
+            deadline=deadline,
+        )
+
+    async def _await_callback(
+        self,
+        callback_result: object | Awaitable[object],
+        state: _RunState,
+        *,
+        deadline: float,
+    ) -> None:
+        """Await one callback without coupling it to any later job."""
+
         if not inspect.isawaitable(callback_result):
             return
 
         callback_task = asyncio.ensure_future(callback_result)
         cancel_task = asyncio.create_task(state.cancel_event.wait())
         try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._detach_callback(callback_task)
+                raise LocalWorkerTimeout("Local worker timed out.")
             done, _pending = await asyncio.wait(
                 {callback_task, cancel_task},
+                timeout=remaining,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if not done or time.monotonic() >= deadline:
+                self._detach_callback(callback_task)
+                cancel_task.cancel()
+                await asyncio.gather(cancel_task, return_exceptions=True)
+                raise LocalWorkerTimeout("Local worker timed out.")
             if cancel_task in done:
                 self._detach_callback(callback_task)
                 raise _RunCancelled(stopped=state.stop_requested)
@@ -921,6 +1112,10 @@ class LocalModelManager:
             await asyncio.gather(cancel_task, return_exceptions=True)
             raise
         except _RunCancelled:
+            cancel_task.cancel()
+            await asyncio.gather(cancel_task, return_exceptions=True)
+            raise
+        except LocalWorkerTimeout:
             cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)
             raise

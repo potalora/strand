@@ -35,7 +35,9 @@ def _build(entities, document_date=None):
 
 
 def _records_of_type(built, record_type):
-    return [rec for _, rec in built if rec is not None and rec["record_type"] == record_type]
+    return [
+        rec for _, rec in built if rec is not None and rec["record_type"] == record_type
+    ]
 
 
 # --- ENCOUNTERS ---------------------------------------------------------------
@@ -46,7 +48,11 @@ def test_encounter_fragments_collapse_to_one():
     real = ExtractedEntity(
         "encounter",
         "Office Visit",
-        {"date": "2024-09-24", "provider": "Dr. Jane Smith", "reason": "abdominal pain"},
+        {
+            "date": "2024-09-24",
+            "provider": "Dr. Jane Smith",
+            "reason": "abdominal pain",
+        },
     )
     mychart = ExtractedEntity("encounter", "UCSF MyChart", {})
     avs = ExtractedEntity("encounter", "After Visit Summary", {})
@@ -98,7 +104,9 @@ def test_encounters_on_different_dates_are_kept():
 
 def test_all_dateless_encounters_collapse_to_one():
     """Multiple dateless encounters in one doc are the same (missing-date) visit."""
-    a = ExtractedEntity("encounter", "Office Visit", {"provider": "Dr. C", "reason": "cough"})
+    a = ExtractedEntity(
+        "encounter", "Office Visit", {"provider": "Dr. C", "reason": "cough"}
+    )
     b = ExtractedEntity("encounter", "UCSF MyChart", {})
 
     built = _build([a, b], document_date=None)
@@ -116,6 +124,12 @@ def _force_code(rec, code, system=RXNORM):
     return rec
 
 
+def _set_evidence_ids(rec, evidence_ids):
+    metadata = rec["fhir_resource"].setdefault("_extraction_metadata", {})
+    metadata["_evidence_ids"] = evidence_ids
+    return rec
+
+
 def test_brand_and_generic_same_rxnorm_collapse():
     """Lexapro + escitalopram resolving to the SAME RxNorm code → 1 medication."""
     lexapro = ExtractedEntity("medication", "Lexapro", {})
@@ -130,6 +144,43 @@ def test_brand_and_generic_same_rxnorm_collapse():
     meds = _records_of_type(out, "medication")
     assert len(meds) == 1
     assert meds[0]["code_value"] == "321988"
+
+
+def test_medication_collapse_unions_unique_evidence_ids_in_stable_order():
+    """The clinical winner retains every source fact's evidence for linking."""
+    first = ExtractedEntity("medication", "Lexapro", {})
+    winner = ExtractedEntity(
+        "medication",
+        "escitalopram",
+        {"dose": "10 mg daily"},
+    )
+    third = ExtractedEntity("medication", "Escitalopram", {})
+
+    built = _build([first, winner, third])
+    for _, rec in built:
+        _force_code(rec, "321988")
+    _set_evidence_ids(built[0][1], ["ev-first", "ev-shared"])
+    _set_evidence_ids(built[1][1], ["ev-winner", "ev-shared"])
+    _set_evidence_ids(built[2][1], ["ev-third", "ev-first"])
+    original_winner_metadata = dict(
+        built[1][1]["fhir_resource"]["_extraction_metadata"]
+    )
+    original_winner_hash = built[1][1]["content_hash"]
+
+    out = dedup_within_document(built)
+
+    medications = _records_of_type(out, "medication")
+    assert len(medications) == 1
+    assert medications[0]["fhir_resource"]["_extraction_metadata"]["_evidence_ids"] == [
+        "ev-winner",
+        "ev-shared",
+        "ev-first",
+        "ev-third",
+    ]
+    assert medications[0]["content_hash"] == original_winner_hash
+    assert (
+        built[1][1]["fhir_resource"]["_extraction_metadata"] == original_winner_metadata
+    )
 
 
 def test_different_rxnorm_meds_are_kept():
@@ -173,11 +224,113 @@ def test_uncoded_different_drugs_are_kept():
     assert len(_records_of_type(out, "medication")) == 2
 
 
+def test_encounter_collapse_unions_evidence_ids_for_downstream_linking():
+    """Every same-visit fact can resolve to the surviving HealthRecord."""
+    real = ExtractedEntity(
+        "encounter",
+        "Office Visit",
+        {"date": "2024-09-24", "provider": "Dr. Jane Smith"},
+    )
+    chrome = ExtractedEntity("encounter", "After Visit Summary", {})
+    built = _build([real, chrome], document_date=None)
+    _set_evidence_ids(built[0][1], ["ev-visit"])
+    _set_evidence_ids(built[1][1], ["ev-chrome"])
+
+    out = dedup_within_document(built)
+
+    encounter = _records_of_type(out, "encounter")[0]
+    evidence_ids = encounter["fhir_resource"]["_extraction_metadata"]["_evidence_ids"]
+    record_by_evidence_id = {evidence_id: encounter for evidence_id in evidence_ids}
+    assert set(record_by_evidence_id) == {"ev-visit", "ev-chrome"}
+    assert record_by_evidence_id["ev-visit"] is encounter
+    assert record_by_evidence_id["ev-chrome"] is encounter
+
+
+def test_collapse_creates_missing_survivor_metadata_from_loser_evidence():
+    """Missing extraction metadata does not prevent lineage preservation."""
+    winner = ExtractedEntity(
+        "medication",
+        "Metformin",
+        {"dose": "500 mg twice daily"},
+    )
+    duplicate = ExtractedEntity("medication", "metformin", {})
+    built = _build([winner, duplicate])
+    for _, rec in built:
+        _force_code(rec, "6809")
+    built[0][1]["fhir_resource"].pop("_extraction_metadata", None)
+    _set_evidence_ids(built[1][1], ["ev-duplicate"])
+
+    out = dedup_within_document(built)
+
+    medication = _records_of_type(out, "medication")[0]
+    assert medication["fhir_resource"]["_extraction_metadata"]["_evidence_ids"] == [
+        "ev-duplicate"
+    ]
+    assert "_extraction_metadata" not in built[0][1]["fhir_resource"]
+
+
+def test_collapse_ignores_malformed_evidence_metadata_without_crashing():
+    """Malformed IDs are ignored while valid IDs on either record survive."""
+    winner = ExtractedEntity(
+        "medication",
+        "Metformin",
+        {"dose": "500 mg twice daily"},
+    )
+    duplicate = ExtractedEntity("medication", "metformin", {})
+    built = _build([winner, duplicate])
+    for _, rec in built:
+        _force_code(rec, "6809")
+    built[0][1]["fhir_resource"]["_extraction_metadata"] = {
+        "_evidence_ids": "not-a-list",
+        "other": "preserved",
+    }
+    _set_evidence_ids(built[1][1], [None, "ev-valid", 7, "ev-valid"])
+
+    out = dedup_within_document(built)
+
+    metadata = _records_of_type(out, "medication")[0]["fhir_resource"][
+        "_extraction_metadata"
+    ]
+    assert metadata == {
+        "_evidence_ids": ["ev-valid"],
+        "other": "preserved",
+    }
+
+
 # --- CROSS-TYPE SAFETY --------------------------------------------------------
 
 
-def test_non_encounter_non_medication_records_untouched():
-    """Conditions/labs pass through unchanged; dedup only touches enc + meds."""
+def test_exact_duplicate_labs_collapse_and_union_corroborating_evidence():
+    """The mapped clinical fact stays singular while every source span remains linked."""
+    first = ExtractedEntity("lab_result", "Glucose", {"value": "95", "unit": "mg/dL"})
+    second = ExtractedEntity("lab_result", "Glucose", {"value": "95", "unit": "mg/dL"})
+
+    built = _build([first, second])
+    _set_evidence_ids(built[0][1], ["ev-page-1"])
+    _set_evidence_ids(built[1][1], ["ev-page-2"])
+
+    out = dedup_within_document(built)
+
+    labs = _records_of_type(out, "observation")
+    assert len(labs) == 1
+    assert labs[0]["fhir_resource"]["_extraction_metadata"]["_evidence_ids"] == [
+        "ev-page-1",
+        "ev-page-2",
+    ]
+
+
+def test_exact_duplicate_labs_without_validated_evidence_are_kept():
+    """Generic extraction does not gain a broader lab-collapse heuristic."""
+    first = ExtractedEntity("lab_result", "Glucose", {"value": "95", "unit": "mg/dL"})
+    second = ExtractedEntity("lab_result", "Glucose", {"value": "95", "unit": "mg/dL"})
+
+    out = dedup_within_document(_build([first, second]))
+
+    assert len(_records_of_type(out, "observation")) == 2
+
+
+def test_distinct_non_encounter_non_medication_records_untouched():
+    """Clinically distinct conditions/labs pass through unchanged."""
     cond = ExtractedEntity("condition", "Hypertension", {"status": "active"})
     lab = ExtractedEntity("lab_result", "Glucose 95 mg/dL", {})
     other_lab = ExtractedEntity("lab_result", "Sodium 140 mmol/L", {})

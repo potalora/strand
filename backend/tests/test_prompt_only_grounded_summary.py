@@ -10,6 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.middleware.encryption import encrypt_field
 from app.models.ai_summary import AISummaryPrompt
+from app.models.local_ai import ExtractionEvidence
+from app.models.record import HealthRecord
+from app.models.uploaded_file import UploadedFile
 from app.services.local_ai.grounded_summary import SERVER_MEDICAL_DISCLAIMER
 from tests.conftest import auth_headers, create_test_patient, seed_test_records
 
@@ -53,6 +56,129 @@ def _first_selection(prompt: dict[str, object]) -> dict[str, object]:
             }
         ],
         "uncertainties": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_prompt_survivor_inherits_owner_scoped_archived_strict_evidence_until_undo(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    headers, user_id = await auth_headers(
+        client,
+        email="prompt-grounding-merged-evidence@example.com",
+    )
+    patient = await create_test_patient(db_session, user_id)
+    survivor = HealthRecord(
+        user_id=UUID(user_id),
+        patient_id=patient.id,
+        record_type="medication",
+        fhir_resource_type="MedicationRequest",
+        fhir_resource={
+            "resourceType": "MedicationRequest",
+            "status": "active",
+            "medicationCodeableConcept": {"text": "Metformin"},
+            "dosageInstruction": [
+                {
+                    "doseAndRate": [
+                        {"doseQuantity": {"value": 500, "unit": "mg"}},
+                    ],
+                    "route": {"text": "oral"},
+                    "timing": {"code": {"text": "twice daily"}},
+                }
+            ],
+        },
+        source_format="fhir",
+        source_file_id=None,
+        display_text="Metformin",
+        status="active",
+        ai_extracted=False,
+    )
+    db_session.add(survivor)
+    await db_session.flush()
+    upload = UploadedFile(
+        user_id=UUID(user_id),
+        filename="archived-note.pdf",
+        mime_type="application/pdf",
+        file_hash="a" * 64,
+        storage_path="/private/archived-note.pdf",
+        processing_mode="validated_strict_local",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    archived = HealthRecord(
+        user_id=UUID(user_id),
+        patient_id=patient.id,
+        record_type="medication",
+        fhir_resource_type="MedicationRequest",
+        fhir_resource={"resourceType": "MedicationRequest"},
+        source_format="local_ai",
+        source_file_id=upload.id,
+        display_text="Metformin",
+        status="active",
+        ai_extracted=True,
+        is_duplicate=True,
+        merged_into_id=survivor.id,
+    )
+    db_session.add(archived)
+    await db_session.flush()
+    marker = "Metformin evidence from archived strict child."
+    db_session.add(
+        ExtractionEvidence(
+            user_id=UUID(user_id),
+            upload_id=upload.id,
+            health_record_id=archived.id,
+            page_number=1,
+            section="Medications",
+            excerpt=marker,
+            start_offset=0,
+            end_offset=len(marker),
+            field_paths=["medications[0].name", "medications[0].dose"],
+            source_metadata={"evidence_id": "archived-evidence"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.post(
+        "/api/v1/summary/build-prompt",
+        headers=headers,
+        json={
+            "patient_id": str(patient.id),
+            "summary_type": "single_record",
+            "record_ids": [str(survivor.id)],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    transport = _transport(response.json())
+    assert len(transport["facts"]) == 1
+    assert [item["excerpt"] for item in transport["evidence"]] == [marker]
+    prompt = (
+        await db_session.execute(
+            select(AISummaryPrompt).where(
+                AISummaryPrompt.id == UUID(response.json()["id"]),
+                AISummaryPrompt.user_id == UUID(user_id),
+            )
+        )
+    ).scalar_one()
+    assert prompt.scope_filter["selected_record_ids"] == [str(survivor.id)]
+    assert str(archived.id) not in prompt.scope_filter["selected_record_ids"]
+
+    archived.is_duplicate = False
+    archived.merged_into_id = None
+    await db_session.commit()
+    after_undo = await client.post(
+        "/api/v1/summary/build-prompt",
+        headers=headers,
+        json={
+            "patient_id": str(patient.id),
+            "summary_type": "single_record",
+            "record_ids": [str(survivor.id)],
+        },
+    )
+    assert after_undo.status_code == 200
+    assert marker not in {
+        item["excerpt"] for item in _transport(after_undo.json())["evidence"]
     }
 
 

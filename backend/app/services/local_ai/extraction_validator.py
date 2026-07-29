@@ -227,9 +227,6 @@ _LIFECYCLE_BLOCKERS = {
 }
 _DUPLICATE_SIGNATURE_EXCLUDES = {
     "fact_id",
-    "verbatim",
-    "page_number",
-    "evidence_excerpt",
     "confidence",
     "normalized_value",
     "normalization_method",
@@ -1243,19 +1240,30 @@ def _validate_duplicate_facts(extraction: ClinicalDocumentExtraction) -> None:
     for category in FACT_CATEGORY_NAMES:
         seen: set[str] = set()
         for index, fact in enumerate(getattr(extraction, category)):
-            signature = json.dumps(
-                _canonical_duplicate_value(
-                    fact.model_dump(
-                        mode="json",
-                        exclude=_DUPLICATE_SIGNATURE_EXCLUDES,
-                    )
-                ),
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+            signature = clinical_fact_duplicate_signature(fact)
             if signature in seen:
                 _fail(f"{category}[{index}]", "duplicate clinical fact")
             seen.add(signature)
+
+
+def clinical_fact_duplicate_signature(fact: EvidenceFact) -> str:
+    """Return a clinical-and-locator signature for one source-grounded fact.
+
+    Identical model repeats bound to the same source span collapse, while the
+    same clinical fact on another page remains available as corroborating
+    evidence for the one mapped record.
+    """
+
+    return json.dumps(
+        _canonical_duplicate_value(
+            fact.model_dump(
+                mode="json",
+                exclude=_DUPLICATE_SIGNATURE_EXCLUDES,
+            )
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _canonical_duplicate_value(value: Any) -> Any:

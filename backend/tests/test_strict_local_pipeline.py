@@ -5,7 +5,7 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,7 +18,11 @@ from app.models.local_ai import LocalAIJob, LocalAIPage
 from app.models.record import HealthRecord
 from app.models.uploaded_file import UploadedFile
 from app.models.user import User
-from app.services.local_ai.adapters import to_extracted_entities
+from app.services.extraction.intra_doc_dedup import dedup_within_document
+from app.services.local_ai.adapters import (
+    to_extracted_entities,
+    validated_extraction_to_health_record_dicts,
+)
 from app.services.local_ai.checkpoint_store import CheckpointStore, OCRCheckpoint
 from app.services.local_ai.errors import (
     LocalPolicyError,
@@ -179,6 +183,36 @@ def _rasterizer(page_count: int):
 
 
 @pytest.mark.asyncio
+async def test_pipeline_canonicalizes_relative_local_roots_before_worker_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    job, upload = _job_and_upload()
+    manager = _Manager()
+    pipeline = StrictLocalPipeline(
+        manager=manager,
+        checkpoints=MemoryCheckpointStore(),
+        manifest=parse_manifest(job.manifest_snapshot),
+        scratch_root=Path("scratch"),
+        model_dir=Path("pack"),
+        rasterize=_rasterizer(1),
+        source_digest=_trusted_source_digest,
+    )
+
+    await pipeline.run_ingestion(
+        job=job,
+        upload=upload,
+        encrypted_path=Path("encrypted.pdf"),
+    )
+
+    for _role, payload in manager.calls:
+        assert Path(payload["scratch_dir"]).is_absolute()
+        assert Path(payload["manifest_path"]).is_absolute()
+        assert Path(payload["model_dir"]).is_absolute()
+
+
+@pytest.mark.asyncio
 async def test_pipeline_runs_ocr_then_extraction_and_returns_validated_entities(
     tmp_path: Path,
 ) -> None:
@@ -222,6 +256,680 @@ async def test_pipeline_runs_ocr_then_extraction_and_returns_validated_entities(
 
 
 @pytest.mark.asyncio
+async def test_pipeline_forwards_content_free_extraction_chunk_progress(
+    tmp_path: Path,
+) -> None:
+    job, upload = _job_and_upload()
+    observed: list[dict[str, object]] = []
+
+    class ProgressManager(_Manager):
+        async def run(self, role, payload, on_progress=None):
+            if role is ModelRole.EXTRACTION and on_progress is not None:
+                await on_progress(
+                    {
+                        "role": "extraction",
+                        "stage": "processing",
+                        "current": 1,
+                        "total": 2,
+                    }
+                )
+            return await super().run(role, payload, on_progress)
+
+    pipeline = StrictLocalPipeline(
+        manager=ProgressManager(),
+        checkpoints=MemoryCheckpointStore(),
+        manifest=parse_manifest(job.manifest_snapshot),
+        scratch_root=tmp_path / "scratch",
+        model_dir=tmp_path / "pack",
+        rasterize=_rasterizer(2),
+        source_digest=_trusted_source_digest,
+        on_progress=observed.append,
+    )
+
+    await pipeline.run_ingestion(
+        job=job,
+        upload=upload,
+        encrypted_path=tmp_path / "encrypted.pdf",
+    )
+
+    assert {
+        "stage": "extraction",
+        "model_role": "extraction",
+        "worker_current": 1,
+        "worker_total": 2,
+    } in observed
+
+
+@pytest.mark.asyncio
+async def test_pipeline_wires_internal_worker_liveness_without_public_progress(
+    tmp_path: Path,
+) -> None:
+    """Worker activity can renew a durable lease without inventing UI progress."""
+
+    job, upload = _job_and_upload()
+    public_progress: list[dict[str, object]] = []
+    durable_heartbeats: list[int] = []
+
+    class LivenessManager(_Manager):
+        async def run(
+            self,
+            role,
+            payload,
+            on_progress=None,
+            on_liveness=None,
+        ):
+            if on_liveness is not None:
+                value = on_liveness()
+                if hasattr(value, "__await__"):
+                    await value
+            return await super().run(role, payload, on_progress)
+
+    pipeline = StrictLocalPipeline(
+        manager=LivenessManager(),
+        checkpoints=MemoryCheckpointStore(),
+        manifest=parse_manifest(job.manifest_snapshot),
+        scratch_root=tmp_path / "scratch",
+        model_dir=tmp_path / "pack",
+        rasterize=_rasterizer(1),
+        source_digest=_trusted_source_digest,
+        on_progress=public_progress.append,
+        on_liveness=lambda: durable_heartbeats.append(1),
+    )
+
+    await pipeline.run_ingestion(
+        job=job,
+        upload=upload,
+        encrypted_path=tmp_path / "encrypted.pdf",
+    )
+
+    assert durable_heartbeats == [1, 1]
+    assert all("activity" not in item for item in public_progress)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_merges_chunked_extraction_from_one_worker_run(
+    tmp_path: Path,
+) -> None:
+    job, upload = _job_and_upload()
+
+    class LargeDocumentManager(_Manager):
+        async def run(self, role, payload, on_progress=None):
+            del on_progress
+            self.calls.append((role, deepcopy(payload)))
+            if role is ModelRole.OCR:
+                page_number = payload["page_number"]
+                evidence = f"BatchLab{page_number} {page_number}.0 mg"
+                return {
+                    "markdown": f"{'ordinary text ' * 700}\n{evidence}",
+                    "page_number": page_number,
+                }
+            if role is ModelRole.EXTRACTION:
+                return {
+                    "result_type": "chunked_clinical_extraction.v1",
+                    "chunks": [
+                        {
+                            "page_numbers": [item["page_number"]],
+                            "extraction": {
+                                **_empty_extraction(),
+                                "labs": [
+                                    {
+                                        "name": (f"BatchLab{item['page_number']}"),
+                                        "value": (f"{item['page_number']}.0"),
+                                        "unit": "mg",
+                                        "verbatim": (
+                                            f"BatchLab{item['page_number']} "
+                                            f"{item['page_number']}.0 mg"
+                                        ),
+                                        "page_number": item["page_number"],
+                                        "evidence_excerpt": (
+                                            f"BatchLab{item['page_number']} "
+                                            f"{item['page_number']}.0 mg"
+                                        ),
+                                    }
+                                ],
+                            },
+                        }
+                        for item in payload["page_markdown"]
+                    ],
+                }
+            raise AssertionError("summary is not part of ingestion")
+
+    manager = LargeDocumentManager()
+    pipeline = StrictLocalPipeline(
+        manager=manager,
+        checkpoints=MemoryCheckpointStore(),
+        manifest=parse_manifest(job.manifest_snapshot),
+        scratch_root=tmp_path / "scratch",
+        model_dir=tmp_path / "pack",
+        rasterize=_rasterizer(5),
+        source_digest=_trusted_source_digest,
+    )
+
+    result = await pipeline.run_ingestion(
+        job,
+        upload,
+        tmp_path / "encrypted.pdf",
+    )
+
+    extraction_payloads = [
+        payload for role, payload in manager.calls if role is ModelRole.EXTRACTION
+    ]
+    assert len(extraction_payloads) == 1
+    assert len(result.validated_extraction.labs) == 5
+    assert len(result.evidence) == 5
+
+
+@pytest.mark.parametrize(
+    "page_numbers",
+    ([2, 1], [1, 1], [1], [1, 3]),
+)
+def test_chunked_extraction_rejects_non_partitioned_pages(
+    page_numbers: list[int],
+) -> None:
+    with pytest.raises(LocalValidationError, match="chunk"):
+        StrictLocalPipeline._validate_extraction_result(
+            {
+                "result_type": "chunked_clinical_extraction.v1",
+                "chunks": [
+                    {
+                        "page_numbers": page_numbers,
+                        "extraction": _empty_extraction(),
+                    }
+                ],
+            },
+            {1: "Page one.", 2: "Page two."},
+            upload_id="chunk-partition",
+        )
+
+
+def test_chunked_extraction_quarantines_fact_referencing_another_chunk() -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "HbA1c",
+            "value": "6.1",
+            "unit": "%",
+            "verbatim": "HbA1c 6.1 %",
+            "page_number": 2,
+            "evidence_excerpt": "HbA1c 6.1 %",
+        }
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        {
+            "result_type": "chunked_clinical_extraction.v1",
+            "chunks": [
+                {
+                    "page_numbers": [1],
+                    "extraction": extraction,
+                },
+                {
+                    "page_numbers": [2],
+                    "extraction": _empty_extraction(),
+                },
+            ],
+        },
+        {1: "HbA1c 6.1 %", 2: "HbA1c 6.1 %"},
+        upload_id="chunk-cross-reference",
+    )
+
+    assert result.labs == []
+    assert result.evidence == ()
+    assert result.rejected_fields == ["chunks[0].labs[0]:fact_validation_failed"]
+
+
+def test_chunked_extraction_quarantines_only_invalid_fact_in_chunk() -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "Glucose 95 mg/dL",
+            "page_number": 1,
+            "evidence_excerpt": "Glucose 95 mg/dL",
+        },
+        {
+            "name": "Invented result",
+            "value": "999",
+            "unit": "mg/dL",
+            "verbatim": "Invented result 999 mg/dL",
+            "page_number": 1,
+            "evidence_excerpt": "Invented result 999 mg/dL",
+        },
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        {
+            "result_type": "chunked_clinical_extraction.v1",
+            "chunks": [
+                {
+                    "page_numbers": [1],
+                    "extraction": extraction,
+                }
+            ],
+        },
+        {1: "Glucose 95 mg/dL"},
+        upload_id="chunk-invalid-fact",
+    )
+
+    assert [fact.name for fact in result.labs] == ["Glucose"]
+    assert len(result.evidence) == 1
+    assert result.rejected_fields == ["chunks[0].labs[1]:fact_validation_failed"]
+
+
+def test_chunked_extraction_quarantines_adapter_rejected_fact() -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "Glucose 95 mg/dL",
+            "page_number": 1,
+            "evidence_excerpt": "Glucose 95 mg/dL",
+        },
+        {
+            "name": "Business analyst",
+            "verbatim": "Business analyst",
+            "page_number": 1,
+            "evidence_excerpt": "Business analyst",
+        },
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        {
+            "result_type": "chunked_clinical_extraction.v1",
+            "chunks": [
+                {
+                    "page_numbers": [1],
+                    "extraction": extraction,
+                }
+            ],
+        },
+        {1: "Glucose 95 mg/dL. Business analyst."},
+        upload_id="chunk-adapter-rejection",
+    )
+
+    assert [fact.name for fact in result.labs] == ["Glucose"]
+    assert result.rejected_fields == ["chunks[0].labs[1]:adapter_rejected"]
+
+
+def test_chunked_extraction_preserves_semantic_duplicate_evidence_from_every_page() -> (
+    None
+):
+    chunks = []
+    for page_number in (1, 2):
+        extraction = _empty_extraction()
+        extraction["labs"] = [
+            {
+                "name": "HbA1c",
+                "value": "6.1",
+                "unit": "%",
+                "verbatim": "HbA1c 6.1 %",
+                "page_number": page_number,
+                "evidence_excerpt": "HbA1c 6.1 %",
+            }
+        ]
+        chunks.append(
+            {
+                "page_numbers": [page_number],
+                "extraction": extraction,
+            }
+        )
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        {
+            "result_type": "chunked_clinical_extraction.v1",
+            "chunks": chunks,
+        },
+        {1: "HbA1c 6.1 %", 2: "HbA1c 6.1 %"},
+        upload_id="chunk-dedup",
+    )
+
+    assert [fact.page_number for fact in result.labs] == [1, 2]
+    assert [evidence.page_number for evidence in result.evidence] == [1, 2]
+
+
+def test_corroborating_chunk_facts_map_to_one_record_with_all_evidence() -> None:
+    chunks = []
+    for page_number in (1, 2):
+        extraction = _empty_extraction()
+        extraction["labs"] = [
+            {
+                "name": "HbA1c",
+                "value": "6.1",
+                "unit": "%",
+                "verbatim": "HbA1c 6.1 %",
+                "page_number": page_number,
+                "evidence_excerpt": "HbA1c 6.1 %",
+            }
+        ]
+        chunks.append(
+            {
+                "page_numbers": [page_number],
+                "extraction": extraction,
+            }
+        )
+    validated = StrictLocalPipeline._validate_extraction_result(
+        {
+            "result_type": "chunked_clinical_extraction.v1",
+            "chunks": chunks,
+        },
+        {1: "HbA1c 6.1 %", 2: "HbA1c 6.1 %"},
+        upload_id="chunk-record-dedup",
+    )
+    identifiers = [uuid.uuid4() for _ in range(3)]
+    entities = to_extracted_entities(validated)
+    records = validated_extraction_to_health_record_dicts(
+        validated,
+        *identifiers,
+    )
+
+    deduplicated = dedup_within_document(list(zip(entities, records, strict=True)))
+
+    assert len(deduplicated) == 1
+    resource = deduplicated[0][1]["fhir_resource"]
+    assert resource["_extraction_metadata"]["_evidence_ids"] == [
+        evidence.id for evidence in validated.evidence
+    ]
+
+
+def test_chunked_extraction_omits_conflicting_patient_field_and_keeps_facts() -> None:
+    first = _empty_extraction()
+    first["patient"] = {
+        "name": "Alice Example",
+        "date_of_birth": "1970-01-02",
+    }
+    first["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "Glucose 95 mg/dL",
+            "page_number": 1,
+            "evidence_excerpt": "Glucose 95 mg/dL",
+        }
+    ]
+    second = _empty_extraction()
+    second["patient"] = {
+        "name": "Bob Example",
+        "date_of_birth": "1970-01-02",
+    }
+    second["labs"] = [
+        {
+            "name": "Creatinine",
+            "value": "1.0",
+            "unit": "mg/dL",
+            "verbatim": "Creatinine 1.0 mg/dL",
+            "page_number": 2,
+            "evidence_excerpt": "Creatinine 1.0 mg/dL",
+        }
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        {
+            "result_type": "chunked_clinical_extraction.v1",
+            "chunks": [
+                {
+                    "page_numbers": [1],
+                    "extraction": first,
+                },
+                {
+                    "page_numbers": [2],
+                    "extraction": second,
+                },
+            ],
+        },
+        {
+            1: "Patient Alice Example DOB 1970-01-02. Glucose 95 mg/dL",
+            2: "Patient Bob Example DOB 1970-01-02. Creatinine 1.0 mg/dL",
+        },
+        upload_id="chunk-patient-conflict",
+    )
+
+    assert result.patient is not None
+    assert result.patient.name is None
+    assert result.patient.date_of_birth == "1970-01-02"
+    assert [fact.name for fact in result.labs] == ["Glucose", "Creatinine"]
+    assert result.rejected_fields == ["patient.name:conflict"]
+
+
+def test_chunked_extraction_clears_duplicate_model_fact_ids() -> None:
+    chunks = []
+    pages = {}
+    for page_number, name in ((1, "Glucose"), (2, "Creatinine")):
+        evidence = f"{name} {page_number}.0 mg/dL"
+        pages[page_number] = evidence
+        extraction = _empty_extraction()
+        extraction["labs"] = [
+            {
+                "fact_id": "lab-1",
+                "name": name,
+                "value": f"{page_number}.0",
+                "unit": "mg/dL",
+                "verbatim": evidence,
+                "page_number": page_number,
+                "evidence_excerpt": evidence,
+            }
+        ]
+        chunks.append(
+            {
+                "page_numbers": [page_number],
+                "extraction": extraction,
+            }
+        )
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        {
+            "result_type": "chunked_clinical_extraction.v1",
+            "chunks": chunks,
+        },
+        pages,
+        upload_id="chunk-duplicate-fact-id",
+    )
+
+    assert [fact.name for fact in result.labs] == ["Glucose", "Creatinine"]
+    assert [fact.fact_id for fact in result.labs] == [None, None]
+
+
+def test_chunked_extraction_caps_accepted_facts_and_quarantines_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.services.local_ai.pipeline.MAX_FACTS_PER_CATEGORY",
+        2,
+    )
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": name,
+            "verbatim": name,
+            "page_number": 1,
+            "evidence_excerpt": name,
+        }
+        for name in ("LabOne", "LabTwo", "LabThree")
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        {
+            "result_type": "chunked_clinical_extraction.v1",
+            "chunks": [
+                {
+                    "page_numbers": [1],
+                    "extraction": extraction,
+                }
+            ],
+        },
+        {1: "LabOne. LabTwo. LabThree."},
+        upload_id="chunk-fact-cap",
+    )
+
+    assert [fact.name for fact in result.labs] == ["LabOne", "LabTwo"]
+    assert result.rejected_fields == ["chunks[0].labs[2]:fact_limit_exceeded"]
+
+
+def test_quarantine_metadata_never_contains_invalid_clinical_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    canary = "private invalid clinical canary"
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": canary,
+            "verbatim": canary,
+            "page_number": 1,
+            "evidence_excerpt": canary,
+        }
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        {
+            "result_type": "chunked_clinical_extraction.v1",
+            "chunks": [
+                {
+                    "page_numbers": [1],
+                    "extraction": extraction,
+                }
+            ],
+        },
+        {1: "No matching grounded value appears."},
+        upload_id="chunk-private-rejection",
+    )
+
+    assert result.labs == []
+    assert canary not in repr(result.rejected_fields)
+    assert canary not in caplog.text
+
+
+def test_quarantine_discards_model_diagnostics_and_reserved_sentinel() -> None:
+    canary = "private model-authored clinical canary"
+    first = _empty_extraction()
+    first["unresolved_fields"] = [canary]
+    first["rejected_fields"] = [
+        canary,
+        "chunks[1].labs[0]:fact_validation_failed",
+        "extraction.rejections:limit_exceeded",
+    ]
+    second = _empty_extraction()
+    second["labs"] = [
+        {
+            "name": "Invented result",
+            "verbatim": "Invented result",
+            "page_number": 2,
+            "evidence_excerpt": "Invented result",
+        }
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        {
+            "result_type": "chunked_clinical_extraction.v1",
+            "chunks": [
+                {"page_numbers": [1], "extraction": first},
+                {"page_numbers": [2], "extraction": second},
+            ],
+        },
+        {1: "Page one.", 2: "No grounded clinical result."},
+        upload_id="chunk-model-diagnostics",
+    )
+
+    assert result.unresolved_fields == []
+    assert result.rejected_fields == ["chunks[1].labs[0]:fact_validation_failed"]
+    assert canary not in repr(result)
+
+
+def test_quarantine_bounds_raw_item_validation_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.services.local_ai.pipeline._MAX_RAW_ITEMS_PER_DOCUMENT",
+        2,
+    )
+    calls = 0
+
+    def counted_validate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return validate_clinical_extraction(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "app.services.local_ai.pipeline.validate_clinical_extraction",
+        counted_validate,
+    )
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": f"Invented result {index}",
+            "verbatim": f"Invented result {index}",
+            "page_number": 1,
+            "evidence_excerpt": f"Invented result {index}",
+        }
+        for index in range(4)
+    ]
+    extraction["unresolved_fields"] = ["private unresolved value"]
+    extraction["rejected_fields"] = ["private rejected value"]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {1: "No grounded clinical results."},
+        upload_id="chunk-work-budget",
+    )
+
+    assert calls == 3  # two raw-item validations plus the final invariant pass
+    assert result.rejected_fields == [
+        "extraction.validation_work:limit_exceeded",
+        "chunks[0].labs[0]:fact_validation_failed",
+        "chunks[0].labs[1]:fact_validation_failed",
+    ]
+    assert result.unresolved_fields == []
+
+
+def test_quarantine_deduplicates_before_classifying_fact_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.services.local_ai.pipeline.MAX_FACTS_PER_CATEGORY",
+        1,
+    )
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "Glucose 95 mg/dL",
+            "page_number": 1,
+            "evidence_excerpt": "Glucose 95 mg/dL",
+        },
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "Glucose 95 mg/dL",
+            "page_number": 1,
+            "evidence_excerpt": "Glucose 95 mg/dL",
+        },
+        {
+            "name": "Creatinine",
+            "value": "1.0",
+            "unit": "mg/dL",
+            "verbatim": "Creatinine 1.0 mg/dL",
+            "page_number": 1,
+            "evidence_excerpt": "Creatinine 1.0 mg/dL",
+        },
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {1: "Glucose 95 mg/dL. Creatinine 1.0 mg/dL."},
+        upload_id="chunk-dedup-before-cap",
+    )
+
+    assert [fact.name for fact in result.labs] == ["Glucose"]
+    assert result.rejected_fields == ["chunks[0].labs[2]:fact_limit_exceeded"]
+
+
+@pytest.mark.asyncio
 async def test_pipeline_reuses_only_exact_ocr_checkpoint(tmp_path: Path) -> None:
     job, upload = _job_and_upload()
     checkpoints = MemoryCheckpointStore()
@@ -237,11 +945,92 @@ async def test_pipeline_reuses_only_exact_ocr_checkpoint(tmp_path: Path) -> None
     )
 
     first = await pipeline.run_ingestion(job, upload, tmp_path / "encrypted.pdf")
+    stored = checkpoints._extractions[(str(job.id), str(upload.id))]
+    assert stored.prompt_version == "nuextract3-clinical.v3"
     manager.calls.clear()
     second = await pipeline.run_ingestion(job, upload, tmp_path / "encrypted.pdf")
 
     assert first.page_markdown == second.page_markdown
+    assert [role for role, _payload in manager.calls] == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_ignores_mismatched_extraction_checkpoint(
+    tmp_path: Path,
+) -> None:
+    job, upload = _job_and_upload()
+    checkpoints = MemoryCheckpointStore()
+    manager = _Manager()
+    pipeline = StrictLocalPipeline(
+        manager=manager,
+        checkpoints=checkpoints,
+        manifest=parse_manifest(job.manifest_snapshot),
+        scratch_root=tmp_path / "scratch",
+        model_dir=tmp_path / "pack",
+        rasterize=_rasterizer(1),
+        source_digest=_trusted_source_digest,
+    )
+
+    await pipeline.run_ingestion(job, upload, tmp_path / "encrypted.pdf")
+    cache_key = (str(job.id), str(upload.id))
+    stored = checkpoints._extractions[cache_key]
+    checkpoints._extractions[cache_key] = replace(
+        stored,
+        page_bindings_sha256="e" * 64,
+    )
+    raw_stored = checkpoints._raw_extractions[cache_key]
+    checkpoints._raw_extractions[cache_key] = replace(
+        raw_stored,
+        page_bindings_sha256="e" * 64,
+    )
+    manager.calls.clear()
+
+    await pipeline.run_ingestion(job, upload, tmp_path / "encrypted.pdf")
+
     assert [role for role, _payload in manager.calls] == [ModelRole.EXTRACTION]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_quarantines_invalid_fact_from_exact_extraction_checkpoint(
+    tmp_path: Path,
+) -> None:
+    job, upload = _job_and_upload()
+    checkpoints = MemoryCheckpointStore()
+    manager = _Manager()
+    pipeline = StrictLocalPipeline(
+        manager=manager,
+        checkpoints=checkpoints,
+        manifest=parse_manifest(job.manifest_snapshot),
+        scratch_root=tmp_path / "scratch",
+        model_dir=tmp_path / "pack",
+        rasterize=_rasterizer(1),
+        source_digest=_trusted_source_digest,
+    )
+
+    await pipeline.run_ingestion(job, upload, tmp_path / "encrypted.pdf")
+    cache_key = (str(job.id), str(upload.id))
+    stored = checkpoints._extractions[cache_key]
+    invalid = _empty_extraction()
+    invalid["conditions"] = [
+        {
+            "name": "Ungrounded condition",
+            "assertion": "present",
+            "verbatim": "Ungrounded condition",
+            "page_number": 1,
+            "evidence_excerpt": "Ungrounded condition",
+        }
+    ]
+    checkpoints._extractions[cache_key] = replace(
+        stored,
+        extraction_result=invalid,
+    )
+    manager.calls.clear()
+
+    result = await pipeline.run_ingestion(job, upload, tmp_path / "encrypted.pdf")
+
+    assert result.validated_extraction.conditions == []
+    assert result.rejected_fields == ["chunks[0].conditions[0]:fact_validation_failed"]
+    assert manager.calls == []
 
 
 @pytest.mark.asyncio
@@ -271,7 +1060,7 @@ async def test_rtf_bypasses_ocr_and_reuses_text_checkpoint(tmp_path: Path) -> No
 
     assert first.page_markdown == second.page_markdown
     assert "Follow-up note: no clinical facts." in first.page_markdown[1]
-    assert [role for role, _payload in manager.calls] == [ModelRole.EXTRACTION]
+    assert [role for role, _payload in manager.calls] == []
     assert await checkpoints.count_pages(str(job.id)) == 1
     assert not (tmp_path / "scratch" / str(job.id)).exists()
 
@@ -384,6 +1173,49 @@ async def test_pipeline_passes_only_bounded_selected_page_images_to_extraction(
     assert manager.selected_images is not None
     assert sorted(manager.selected_images) == [str(index) for index in range(1, 9)]
     assert not (tmp_path / "scratch" / str(job.id)).exists()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_constrains_selected_images_to_aggregate_pixel_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.local_ai.pipeline as pipeline_module
+
+    job, upload = _job_and_upload()
+    monkeypatch.setattr(pipeline_module, "_MAX_SELECTED_IMAGE_PIXELS", 250)
+
+    class TableManager(_Manager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.selected_images: dict[str, str] | None = None
+
+        async def run(self, role, payload, on_progress=None):
+            if role is ModelRole.OCR:
+                return {
+                    "markdown": "| Test | Value |\n| --- | --- |\n| HbA1c | 6.1% |",
+                    "page_number": payload["page_number"],
+                }
+            if role is ModelRole.EXTRACTION:
+                self.selected_images = dict(payload["image_paths"])
+                return _empty_extraction()
+            return await super().run(role, payload, on_progress)
+
+    manager = TableManager()
+    pipeline = StrictLocalPipeline(
+        manager=manager,
+        checkpoints=MemoryCheckpointStore(),
+        manifest=parse_manifest(job.manifest_snapshot),
+        scratch_root=tmp_path / "scratch",
+        model_dir=tmp_path / "pack",
+        rasterize=_rasterizer(5),
+        source_digest=_trusted_source_digest,
+    )
+
+    await pipeline.run_ingestion(job, upload, tmp_path / "encrypted.pdf")
+
+    assert manager.selected_images is not None
+    assert sorted(manager.selected_images) == ["1", "2"]
 
 
 def test_extraction_payload_rejects_canonical_source_over_worker_limit(
@@ -979,7 +1811,7 @@ async def test_strict_failure_terminalizes_upload_and_job_together(
     assert upload.ingestion_errors == [
         {
             "error": "Processing failed. Please retry or contact support.",
-            "error_type": "LocalPolicyError",
+            "error_type": "local_policy_error",
         }
     ]
     assert job.status == "failed"

@@ -9,8 +9,13 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
+from app.services.local_ai.extraction_schema import (
+    CLINICAL_EXTRACTION_SCHEMA_VERSION,
+    FACT_CATEGORY_NAMES,
+)
 from app.services.local_ai.protocol import (
     MAX_MESSAGE_BYTES,
     ErrorPayload,
@@ -24,6 +29,10 @@ from app.services.local_ai.protocol import (
     parse_request_line,
 )
 from app.services.local_ai.types import ModelRole
+
+_PIPELINE_VALID_FLAG = "--pipeline-valid"
+_PIPELINE_VALID_EVIDENCE = "Fixturemed 10 mg daily is active."
+_PIPELINE_VALID_OCR_MARKDOWN = f"# Synthetic OCR\n\n{_PIPELINE_VALID_EVIDENCE}"
 
 
 def _write(response: WorkerResponse) -> None:
@@ -52,7 +61,125 @@ def _role_for(request: WorkerRequest) -> ModelRole:
     return ModelRole.SUMMARY
 
 
-def _fixed_result(role: ModelRole, payload: dict[str, object]) -> dict[str, object]:
+def _pipeline_valid_summary(payload: dict[str, object]) -> dict[str, object]:
+    """Select only supplied fact/evidence references for E2E pipeline tests."""
+
+    raw_facts = payload.get("facts")
+    raw_evidence = payload.get("evidence")
+    if not isinstance(raw_facts, list) or not isinstance(raw_evidence, list):
+        return {"sections": [], "uncertainties": []}
+
+    evidence_by_id = {
+        evidence["evidence_id"]: evidence
+        for evidence in raw_evidence
+        if isinstance(evidence, dict) and isinstance(evidence.get("evidence_id"), str)
+    }
+    claims: list[dict[str, object]] = []
+    for fact in raw_facts:
+        if not isinstance(fact, dict) or not isinstance(fact.get("fact_id"), str):
+            continue
+        fields = fact.get("fields")
+        linked_evidence = fact.get("evidence_ids")
+        if not isinstance(fields, list) or not isinstance(linked_evidence, list):
+            continue
+        fact_paths = [
+            field["path"]
+            for field in fields
+            if isinstance(field, dict) and isinstance(field.get("path"), str)
+        ]
+        for evidence_id in linked_evidence:
+            if not isinstance(evidence_id, str):
+                continue
+            evidence = evidence_by_id.get(evidence_id)
+            if evidence is None:
+                continue
+            evidence_paths = evidence.get("field_paths")
+            if not isinstance(evidence_paths, list):
+                continue
+            supported_paths = [
+                path
+                for path in fact_paths
+                if path in evidence_paths and isinstance(path, str)
+            ]
+            if not supported_paths:
+                continue
+            claims.append(
+                {
+                    "fact_id": fact["fact_id"],
+                    "field_paths": supported_paths,
+                    "evidence_ids": [evidence_id],
+                }
+            )
+            break
+
+    sections = [{"heading": "Overview", "claims": claims}] if claims else []
+    return {"sections": sections, "uncertainties": []}
+
+
+def _pipeline_valid_extraction(payload: dict[str, object]) -> dict[str, object]:
+    """Return one grounded fictional fact only for synthetic OCR pages."""
+
+    result: dict[str, object] = {
+        "schema_version": CLINICAL_EXTRACTION_SCHEMA_VERSION,
+        "patient": None,
+        **{category: [] for category in FACT_CATEGORY_NAMES},
+        "unresolved_fields": [],
+        "rejected_fields": [],
+    }
+    raw_pages = payload.get("page_markdown")
+    if not isinstance(raw_pages, list):
+        return result
+    for raw_page in raw_pages:
+        if not isinstance(raw_page, dict):
+            continue
+        page_number = raw_page.get("page_number")
+        markdown = raw_page.get("markdown")
+        if (
+            type(page_number) is not int
+            or page_number < 1
+            or not isinstance(markdown, str)
+            or _PIPELINE_VALID_EVIDENCE not in markdown
+        ):
+            continue
+        result["medications"] = [
+            {
+                "fact_id": "synthetic-medication-1",
+                "name": "Fixturemed",
+                "dose_value": "10",
+                "dose_unit": "mg",
+                "frequency": "daily",
+                "status": "active",
+                "verbatim": _PIPELINE_VALID_EVIDENCE,
+                "page_number": page_number,
+                "evidence_excerpt": _PIPELINE_VALID_EVIDENCE,
+            }
+        ]
+        break
+    return result
+
+
+def _pipeline_valid_result(
+    role: ModelRole,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Return validator-compatible deterministic pipeline output."""
+
+    if role is ModelRole.OCR:
+        return {
+            "markdown": _PIPELINE_VALID_OCR_MARKDOWN,
+            "page_number": payload.get("page_number"),
+        }
+    if role is ModelRole.EXTRACTION:
+        return _pipeline_valid_extraction(payload)
+    return _pipeline_valid_summary(payload)
+
+
+def _fixed_result(
+    role: ModelRole,
+    payload: dict[str, object],
+    *,
+    pipeline_valid: bool = False,
+) -> dict[str, object]:
     if payload.get("inspect_lock_fd") is True:
         raw_descriptor = os.environ.get("LOCAL_AI_PROCESS_LOCK_FD", "")
         try:
@@ -111,6 +238,8 @@ def _fixed_result(role: ModelRole, payload: dict[str, object]) -> dict[str, obje
             "path_is_fixed": os.environ.get("PATH") == os.defpath,
             "secret_names_present": sorted(forbidden_names.intersection(os.environ)),
         }
+    if pipeline_valid:
+        return _pipeline_valid_result(role, payload)
     if role is ModelRole.OCR:
         result: dict[str, object] = {
             "markdown": "# Synthetic OCR",
@@ -234,7 +363,7 @@ def _start_parent_watchdog() -> None:
         os._exit(126)
 
 
-def _main() -> int:
+def _main(*, pipeline_valid: bool = False) -> int:
     _start_parent_watchdog()
     line = sys.stdin.buffer.readline(MAX_MESSAGE_BYTES + 2)
     try:
@@ -297,13 +426,63 @@ def _main() -> int:
         _wait_for_shutdown()
         return 0
 
-    _write(
-        _response(
+    progress_steps = payload.get("progress_steps")
+    progress_delay_ms = payload.get("progress_delay_ms", 0)
+    if (
+        not isinstance(progress_delay_ms, int)
+        or isinstance(progress_delay_ms, bool)
+        or progress_delay_ms < 0
+    ):
+        progress_delay_ms = 0
+    if (
+        isinstance(progress_steps, int)
+        and not isinstance(progress_steps, bool)
+        and 0 < progress_steps <= 1_000
+    ):
+        _write(
+            _response(
+                response_id,
+                "progress",
+                ProgressPayload(
+                    role=role,
+                    stage="processing",
+                    current=0,
+                    total=progress_steps,
+                ),
+            )
+        )
+        for current in range(1, progress_steps + 1):
+            time.sleep(min(progress_delay_ms, 60_000) / 1000)
+            _write(
+                _response(
+                    response_id,
+                    "progress",
+                    ProgressPayload(
+                        role=role,
+                        stage="processing",
+                        current=current,
+                        total=progress_steps,
+                    ),
+                )
+            )
+    elif payload.get("repeat_progress") is True:
+        repeated = _response(
             response_id,
             "progress",
             ProgressPayload(role=role, stage="processing", current=0, total=1),
         )
-    )
+        _write(repeated)
+        while True:
+            time.sleep(min(progress_delay_ms, 60_000) / 1000)
+            _write(repeated)
+    else:
+        _write(
+            _response(
+                response_id,
+                "progress",
+                ProgressPayload(role=role, stage="processing", current=0, total=1),
+            )
+        )
     guard_path_value = payload.get("concurrency_guard_path")
     guard_path = (
         Path(guard_path_value)
@@ -333,7 +512,16 @@ def _main() -> int:
         _wait_for_shutdown()
         return 0
 
-    if payload.get("safe_error") is True:
+    if payload.get("input_limit_error") is True:
+        terminal = _response(
+            response_id,
+            "error",
+            ErrorPayload(
+                code="input_limit_exceeded",
+                message="Local worker input exceeds supported limits.",
+            ),
+        )
+    elif payload.get("safe_error") is True:
         terminal = _response(
             response_id,
             "error",
@@ -345,7 +533,11 @@ def _main() -> int:
                 "overlap_detected": payload["_overlap_detected"],
             }
         else:
-            terminal_data = _fixed_result(role, payload)
+            terminal_data = _fixed_result(
+                role,
+                payload,
+                pipeline_valid=pipeline_valid,
+            )
         terminal = _response(
             response_id,
             "result",
@@ -375,5 +567,16 @@ def _main() -> int:
     return 0
 
 
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the fake worker, optionally emitting pipeline-validator-compatible output."""
+
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        return _main()
+    if arguments == [_PIPELINE_VALID_FLAG]:
+        return _main(pipeline_valid=True)
+    return 2
+
+
 if __name__ == "__main__":
-    raise SystemExit(_main())
+    raise SystemExit(main())

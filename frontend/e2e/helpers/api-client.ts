@@ -14,6 +14,12 @@ type ApiRecord = {
 type UploadStatus = {
   ingestion_status?: string;
   status?: string;
+  local_run?: {
+    privacy_mode?: string;
+  } | null;
+  local_failure?: {
+    cloud_fallback_attempted?: boolean;
+  } | null;
 };
 
 type UploadHistoryItem = {
@@ -57,6 +63,12 @@ type TimelineResponse = {
 
 type EmptyApiResponse = Record<string, unknown>;
 
+type SummaryPrompt = {
+  id: string;
+};
+
+const LOCAL_ONLY = process.env.E2E_LOCAL_ONLY === "1";
+
 export class ApiClient {
   private token: string = "";
 
@@ -91,6 +103,9 @@ export class ApiClient {
     }
     const data = await res.json();
     this.token = data.access_token;
+    if (LOCAL_ONLY) {
+      await this.setProcessingMode("validated_strict_local");
+    }
   }
 
   private async _withRateLimitRetry(
@@ -114,6 +129,33 @@ export class ApiClient {
     };
   }
 
+  async setProcessingMode(mode: "validated_strict_local"): Promise<void> {
+    const res = await fetch(`${API_BASE}/settings/llm/routing`, {
+      method: "PUT",
+      headers: this.headers(),
+      body: JSON.stringify({ processing_mode: mode }),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `Set processing mode failed: ${res.status} ${await res.text()}`
+      );
+    }
+  }
+
+  async getLlmSettings(): Promise<{
+    routing: { processing_mode?: string };
+  }> {
+    const res = await fetch(`${API_BASE}/settings/llm`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `Get LLM settings failed: ${res.status} ${await res.text()}`
+      );
+    }
+    return res.json();
+  }
+
   async uploadStructured(
     filePath: string,
     filename: string
@@ -125,6 +167,9 @@ export class ApiClient {
       new Blob([fileContent], { type: "application/json" }),
       filename
     );
+    if (LOCAL_ONLY) {
+      formData.append("processing_mode", "validated_strict_local");
+    }
 
     const res = await fetch(`${API_BASE}/upload`, {
       method: "POST",
@@ -144,6 +189,9 @@ export class ApiClient {
     for (const file of files) {
       const content = fs.readFileSync(file.path);
       formData.append("files", new Blob([content], { type: file.mime }), file.name);
+    }
+    if (LOCAL_ONLY) {
+      formData.append("processing_mode", "validated_strict_local");
     }
 
     const res = await fetch(`${API_BASE}/upload/unstructured-batch`, {
@@ -191,19 +239,35 @@ export class ApiClient {
     );
   }
 
-  async getExtractionProgress(): Promise<{
+  async getExtractionProgress(uploadIds: string[] = []): Promise<{
     total: number;
     completed: number;
     processing: number;
     failed: number;
     pending: number;
   }> {
-    const res = await fetch(`${API_BASE}/upload/extraction-progress`, {
+    const query =
+      uploadIds.length > 0
+        ? `?ids=${encodeURIComponent(uploadIds.join(","))}`
+        : "";
+    const res = await fetch(`${API_BASE}/upload/extraction-progress${query}`, {
       headers: this.headers(),
     });
     if (!res.ok) {
       throw new Error(
         `Extraction progress failed: ${res.status} ${await res.text()}`
+      );
+    }
+    return res.json();
+  }
+
+  async getSummaryPrompts(): Promise<{ items: SummaryPrompt[] }> {
+    const res = await fetch(`${API_BASE}/summary/prompts`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `Summary prompts failed: ${res.status} ${await res.text()}`
       );
     }
     return res.json();

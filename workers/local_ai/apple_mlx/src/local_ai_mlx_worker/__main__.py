@@ -9,11 +9,17 @@ import select
 import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from typing import Literal
 
-from .common import ArtifactUnavailableError, WorkerInputError
+from .common import (
+    ArtifactUnavailableError,
+    GenerationError,
+    WorkerInputError,
+    WorkerInputLimitError,
+)
 from .nuextract3 import run_extraction
 from .ovisocr2 import run_ocr
 from .qwen_summary import run_summary
@@ -21,12 +27,17 @@ from .qwen_summary import run_summary
 PROTOCOL_VERSION = 1
 RUNTIME = "mlx-vlm-0.5.0"
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_EXTRACTION_ACTIVITY = 2**63 - 1
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 COMMANDS = frozenset({"health", "ocr", "extract", "summarize", "cancel", "shutdown"})
 SAFE_MESSAGES = {
     "cancelled": "Local worker cancelled.",
+    "generation_failed": "Local worker generation failed.",
+    "input_limit_exceeded": "Local worker input exceeds supported limits.",
     "invalid_request": "Local worker request was rejected.",
     "protocol_error": "Local worker protocol failed.",
+    "resource_exhausted": "Local worker resources were exhausted.",
+    "runtime_failed": "Local worker runtime failed.",
     "unavailable": "Local worker is unavailable.",
     "worker_failed": "Local worker failed.",
 }
@@ -133,6 +144,36 @@ def _progress(request_id: str, payload: dict[str, object]) -> None:
     _write(request_id, "progress", payload)
 
 
+def _write_to_descriptor(
+    descriptor: int,
+    request_id: str,
+    kind: str,
+    payload: dict[str, object],
+) -> None:
+    """Write one bounded protocol frame through a preserved protocol descriptor."""
+
+    response = {
+        "version": PROTOCOL_VERSION,
+        "request_id": request_id,
+        "kind": kind,
+        "payload": payload,
+    }
+    encoded = json.dumps(
+        response,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode()
+    if len(encoded) > MAX_MESSAGE_BYTES:
+        raise ProtocolError
+    remaining = memoryview(encoded + b"\n")
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise ProtocolError
+        remaining = remaining[written:]
+
+
 def _error(request_id: str, code: str) -> None:
     _write(request_id, "error", {"code": code, "message": SAFE_MESSAGES[code]})
     sys.stderr.write(f"local_ai_worker event=terminal_error code={code}\n")
@@ -147,11 +188,34 @@ def _role(command: str) -> Role:
     return "summary"
 
 
-def _dispatch(request: Request) -> object:
+def _safe_runtime_error_code(exc: Exception) -> str:
+    """Reduce runtime failures to a fixed code without retaining exception text."""
+
+    if isinstance(exc, GenerationError):
+        return "generation_failed"
+    if isinstance(exc, MemoryError):
+        return "resource_exhausted"
+    if isinstance(exc, RuntimeError):
+        return "runtime_failed"
+    return "worker_failed"
+
+
+def _dispatch(
+    request: Request,
+    *,
+    extraction_progress: Callable[[int, int], None] | None = None,
+    extraction_heartbeat: Callable[[], None] | None = None,
+    extraction_lifecycle: Callable[[], None] | None = None,
+) -> object:
     if request.command == "ocr":
         return run_ocr(request.payload)
     if request.command == "extract":
-        return run_extraction(request.payload)
+        return run_extraction(
+            request.payload,
+            progress_fn=extraction_progress,
+            attempt_progress_fn=extraction_heartbeat,
+            lifecycle_progress_fn=extraction_lifecycle,
+        )
     if request.command == "summarize":
         return run_summary(request.payload)
     raise WorkerInputError("Local worker command is invalid.")
@@ -165,6 +229,62 @@ def _quiet_dispatch(request: Request) -> object:
     stdout_copy = os.dup(1)
     stderr_copy = os.dup(2)
     try:
+        activity = 0
+        page_current = 0
+        page_total = 0
+        processing_started = False
+
+        def publish_extraction_progress(stage: str, current: int, total: int) -> None:
+            nonlocal activity
+            if (
+                type(current) is not int
+                or type(total) is not int
+                or current < 0
+                or total < current
+                or total > MAX_EXTRACTION_ACTIVITY
+                or activity >= MAX_EXTRACTION_ACTIVITY
+            ):
+                raise WorkerInputError("Local worker progress is invalid.")
+            activity += 1
+            _write_to_descriptor(
+                stdout_copy,
+                request.request_id,
+                "progress",
+                {
+                    "role": "extraction",
+                    "stage": stage,
+                    "current": current,
+                    "total": total,
+                    "activity": activity,
+                },
+            )
+
+        def publish_page_progress(current: int, total: int) -> None:
+            nonlocal page_current, page_total, processing_started
+            if (
+                type(current) is not int
+                or type(total) is not int
+                or current < page_current
+                or total < current
+                or (processing_started and total != page_total)
+            ):
+                raise WorkerInputError("Local worker progress is invalid.")
+            page_current = current
+            page_total = total
+            processing_started = True
+            publish_extraction_progress("processing", page_current, page_total)
+
+        def publish_activity() -> None:
+            stage = "processing" if processing_started else "loading"
+            publish_extraction_progress(stage, page_current, page_total)
+
+        dispatch_options: dict[str, object] = {}
+        if request.command == "extract":
+            dispatch_options = {
+                "extraction_progress": publish_page_progress,
+                "extraction_heartbeat": publish_activity,
+                "extraction_lifecycle": publish_activity,
+            }
         with (
             open(os.devnull, "w", encoding="utf-8") as sink,
             redirect_stdout(sink),
@@ -172,7 +292,7 @@ def _quiet_dispatch(request: Request) -> object:
         ):
             os.dup2(sink.fileno(), 1)
             os.dup2(sink.fileno(), 2)
-            return _dispatch(request)
+            return _dispatch(request, **dispatch_options)
     finally:
         os.dup2(stdout_copy, 1)
         os.dup2(stderr_copy, 2)
@@ -331,12 +451,14 @@ def main() -> int:
     try:
         _reset_mlx_peak_memory()
         data = _quiet_dispatch(request)
+    except WorkerInputLimitError:
+        _error(request.request_id, "input_limit_exceeded")
     except WorkerInputError:
         _error(request.request_id, "invalid_request")
     except ArtifactUnavailableError:
         _error(request.request_id, "unavailable")
-    except Exception:
-        _error(request.request_id, "worker_failed")
+    except Exception as exc:
+        _error(request.request_id, _safe_runtime_error_code(exc))
     else:
         try:
             memory_progress = _memory_progress_payload(role)

@@ -708,7 +708,10 @@ strict-local provenance. Cross-user and missing lookups both return `404`.
 
 The response includes the captured processing mode, extraction schema version,
 OCR/extraction model identities, evidence spans, and unresolved or rejected
-field names. Summary-model provenance is not mixed into ingestion evidence.
+field names. A survivor can list more than one identity per role when it
+inherits evidence from archived strict-local uploads processed by an older
+model pack. The list is bounded by the evidence-source limit. Summary-model
+provenance is not mixed into ingestion evidence.
 
 See [Strict-local AI operations](operations-strict-local-ai.md) for the
 download/processing network boundary and shipped release evidence.

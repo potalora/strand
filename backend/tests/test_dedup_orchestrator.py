@@ -325,6 +325,98 @@ class TestRunUploadDedup:
         assert summary.dismissed == 0
 
     @pytest.mark.asyncio
+    async def test_strict_repeated_upload_exact_merge_can_share_final_transaction(
+        self,
+        db_session,
+    ) -> None:
+        """The second strict upload is exactly merged without any LLM or early commit."""
+        from app.models.patient import Patient
+        from app.models.record import HealthRecord
+        from app.models.uploaded_file import UploadedFile
+        from app.models.user import User
+
+        user = User(email="strict-repeat-dedup@example.com", password_hash="x")
+        db_session.add(user)
+        await db_session.flush()
+        patient = Patient(user_id=user.id)
+        db_session.add(patient)
+        await db_session.flush()
+        first_upload = UploadedFile(
+            user_id=user.id,
+            filename="first.rtf",
+            mime_type="application/rtf",
+            file_hash="1" * 64,
+            storage_path="/private/first.rtf",
+            processing_mode="validated_strict_local",
+        )
+        second_upload = UploadedFile(
+            user_id=user.id,
+            filename="second.rtf",
+            mime_type="application/rtf",
+            file_hash="2" * 64,
+            storage_path="/private/second.rtf",
+            processing_mode="validated_strict_local",
+        )
+        db_session.add_all([first_upload, second_upload])
+        await db_session.flush()
+        effective_date = datetime(2026, 7, 28, tzinfo=timezone.utc)
+        first_record = HealthRecord(
+            patient_id=patient.id,
+            user_id=user.id,
+            record_type="condition",
+            fhir_resource_type="Condition",
+            fhir_resource={"resourceType": "Condition"},
+            source_format="ai_extracted",
+            source_file_id=first_upload.id,
+            effective_date=effective_date,
+            status="active",
+            code_value="38341003",
+            display_text="Hypertension",
+        )
+        second_record = HealthRecord(
+            patient_id=patient.id,
+            user_id=user.id,
+            record_type="condition",
+            fhir_resource_type="Condition",
+            fhir_resource={"resourceType": "Condition"},
+            source_format="ai_extracted",
+            source_file_id=second_upload.id,
+            effective_date=effective_date,
+            status="active",
+            code_value="38341003",
+            display_text="Hypertension",
+        )
+        db_session.add_all([first_record, second_record])
+        await db_session.flush()
+
+        with (
+            patch(
+                "app.services.dedup.orchestrator.load_llm_config",
+                new_callable=AsyncMock,
+            ) as mock_load_config,
+            patch(
+                "app.services.dedup.orchestrator._run_llm_judge",
+                new_callable=AsyncMock,
+            ) as mock_judge,
+        ):
+            summary = await run_upload_dedup(
+                second_upload.id,
+                patient.id,
+                user.id,
+                db_session,
+                processing_mode="validated_strict_local",
+                commit=False,
+            )
+
+        mock_load_config.assert_not_awaited()
+        mock_judge.assert_not_awaited()
+        assert summary.auto_merged == 1
+        assert second_record.is_duplicate is True
+        assert second_record.merged_into_id == first_record.id
+        await db_session.rollback()
+        assert await db_session.get(HealthRecord, second_record.id) is None
+
+    @pytest.mark.asyncio
     async def test_background_dedup_forwards_persisted_processing_mode(self):
         """A restarted background pass uses the upload's immutable mode."""
         from app.services.ingestion import coordinator

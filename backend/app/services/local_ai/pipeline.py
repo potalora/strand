@@ -17,17 +17,35 @@ from typing import Any, Protocol
 
 from striprtf.striprtf import rtf_to_text
 
-from app.services.local_ai.adapters import to_extracted_entities
-from app.services.local_ai.checkpoint_store import OCRCheckpoint
-from app.services.local_ai.checkpoints import ocr_checkpoint_key
+from app.services.local_ai.adapters import (
+    to_extracted_entities,
+    validated_extraction_to_health_record_dicts,
+)
+from app.services.local_ai.checkpoint_store import (
+    ExtractionCheckpoint,
+    OCRCheckpoint,
+    RawExtractionCheckpoint,
+    extraction_checkpoint_identity,
+    raw_extraction_result_sha256,
+)
+from app.services.local_ai.checkpoints import (
+    extraction_checkpoint_key,
+    ocr_checkpoint_key,
+)
 from app.services.local_ai.errors import LocalPolicyError, LocalValidationError
 from app.services.local_ai.extraction_schema import (
     CLINICAL_EXTRACTION_SCHEMA_VERSION,
     FACT_CATEGORY_NAMES,
+    MAX_FACTS_PER_CATEGORY,
+    MAX_FIELD_LIST_ITEMS,
     NUEXTRACT_TEMPLATE_V1,
     ClinicalDocumentExtraction,
 )
-from app.services.local_ai.extraction_validator import validate_clinical_extraction
+from app.services.local_ai.extraction_validator import (
+    MAX_EXTRACTION_JSON_BYTES,
+    clinical_fact_duplicate_signature,
+    validate_clinical_extraction,
+)
 from app.services.local_ai.manifest import (
     LocalAIManifest,
     ManifestArtifact,
@@ -39,6 +57,7 @@ from app.services.local_ai.types import ModelRole, ProcessingMode
 
 _RASTER_VERSION = "pdfium-pillow-2x.v1"
 _RTF_TEXT_VERSION = "striprtf-text.v1"
+_EXTRACTION_PROMPT_VERSION = "nuextract3-clinical.v3"
 _MAX_PAGES = 500
 _MAX_OCR_MARKDOWN_BYTES = 4 * 1024 * 1024
 _MAX_DOCUMENT_MARKDOWN_BYTES = 16 * 1024 * 1024
@@ -46,6 +65,24 @@ _MAX_RTF_SOURCE_BYTES = 16 * 1024 * 1024
 _MAX_EXTRACTION_SOURCE_BYTES = 4 * 1024 * 1024
 _MAX_SELECTED_IMAGES = 8
 _MAX_SELECTED_IMAGE_BYTES = 64 * 1024 * 1024
+_MAX_SELECTED_IMAGE_PIXELS = 40_000_000
+_CHUNKED_EXTRACTION_RESULT_TYPE = "chunked_clinical_extraction.v1"
+_MAX_EXTRACTION_CHUNKS = 500
+_EXTRACTION_RESULT_KEYS = frozenset(
+    {
+        "schema_version",
+        "patient",
+        *FACT_CATEGORY_NAMES,
+        "unresolved_fields",
+        "rejected_fields",
+    }
+)
+_REJECTION_OVERFLOW_PATH = "extraction.rejections:limit_exceeded"
+_VALIDATION_WORK_OVERFLOW_PATH = "extraction.validation_work:limit_exceeded"
+_MAX_RAW_ITEMS_PER_DOCUMENT = len(FACT_CATEGORY_NAMES) * MAX_FACTS_PER_CATEGORY + (
+    2 * MAX_FIELD_LIST_ITEMS
+)
+_FHIR_VALIDATION_UUID = uuid.UUID(int=0)
 _TABLE_SEPARATOR_RE = re.compile(r"(?m)^\s*\|?(?:\s*:?-{3,}:?\s*\|){2,}\s*$")
 _IMAGE_ESCALATION_MARKERS = (
     "[illegible]",
@@ -64,10 +101,12 @@ class WorkerManager(Protocol):
         role: ModelRole,
         payload: dict[str, Any],
         on_progress: Callable[[dict[str, object]], object] | None = None,
+        *,
+        on_liveness: Callable[[], object] | None = None,
     ) -> Any: ...
 
 
-class OCRCheckpointStore(Protocol):
+class LocalAICheckpointStore(Protocol):
     """Persistence boundary needed by the pipeline."""
 
     async def get_ocr_page(
@@ -83,6 +122,44 @@ class OCRCheckpointStore(Protocol):
         job_id: str | uuid.UUID,
         checkpoint: OCRCheckpoint,
     ) -> OCRCheckpoint: ...
+
+    async def get_extraction(
+        self,
+        job_id: str | uuid.UUID,
+        upload_id: str | uuid.UUID,
+        expected: ExtractionCheckpoint,
+    ) -> ExtractionCheckpoint | None: ...
+
+    async def put_extraction(
+        self,
+        job_id: str | uuid.UUID,
+        checkpoint: ExtractionCheckpoint,
+    ) -> ExtractionCheckpoint: ...
+
+    async def get_raw_extraction(
+        self,
+        job_id: str | uuid.UUID,
+        upload_id: str | uuid.UUID,
+        expected: RawExtractionCheckpoint,
+    ) -> RawExtractionCheckpoint | None: ...
+
+    async def put_raw_extraction(
+        self,
+        job_id: str | uuid.UUID,
+        checkpoint: RawExtractionCheckpoint,
+    ) -> RawExtractionCheckpoint: ...
+
+
+@dataclass
+class _ValidationWorkBudget:
+    """Document-global bound for validation of model-authored clinical items."""
+
+    remaining: int
+
+    def claim(self, requested: int) -> int:
+        allowed = min(max(self.remaining, 0), max(requested, 0))
+        self.remaining -= allowed
+        return allowed
 
 
 class StrictLocalJob(Protocol):
@@ -138,6 +215,8 @@ class MemoryCheckpointStore:
 
     def __init__(self) -> None:
         self._pages: dict[tuple[str, int], OCRCheckpoint] = {}
+        self._extractions: dict[tuple[str, str], ExtractionCheckpoint] = {}
+        self._raw_extractions: dict[tuple[str, str], RawExtractionCheckpoint] = {}
 
     async def get_ocr_page(
         self,
@@ -167,9 +246,64 @@ class MemoryCheckpointStore:
     async def count_pages(self, job_id: str | uuid.UUID) -> int:
         return sum(key[0] == str(job_id) for key in self._pages)
 
+    async def get_extraction(
+        self,
+        job_id: str | uuid.UUID,
+        upload_id: str | uuid.UUID,
+        expected: ExtractionCheckpoint,
+    ) -> ExtractionCheckpoint | None:
+        value = self._extractions.get((str(job_id), str(upload_id)))
+        if value is None or extraction_checkpoint_identity(
+            value
+        ) != extraction_checkpoint_identity(expected):
+            return None
+        return deepcopy(value)
+
+    async def put_extraction(
+        self,
+        job_id: str | uuid.UUID,
+        checkpoint: ExtractionCheckpoint,
+    ) -> ExtractionCheckpoint:
+        detached = deepcopy(checkpoint)
+        self._extractions[(str(job_id), checkpoint.upload_id)] = detached
+        return deepcopy(detached)
+
+    async def get_raw_extraction(
+        self,
+        job_id: str | uuid.UUID,
+        upload_id: str | uuid.UUID,
+        expected: RawExtractionCheckpoint,
+    ) -> RawExtractionCheckpoint | None:
+        value = self._raw_extractions.get((str(job_id), str(upload_id)))
+        if value is None or extraction_checkpoint_identity(
+            value
+        ) != extraction_checkpoint_identity(expected):
+            return None
+        if not hmac.compare_digest(
+            value.raw_result_sha256,
+            raw_extraction_result_sha256(value.raw_extraction_result),
+        ):
+            raise LocalValidationError("Raw extraction checkpoint result is invalid.")
+        return deepcopy(value)
+
+    async def put_raw_extraction(
+        self,
+        job_id: str | uuid.UUID,
+        checkpoint: RawExtractionCheckpoint,
+    ) -> RawExtractionCheckpoint:
+        if not hmac.compare_digest(
+            checkpoint.raw_result_sha256,
+            raw_extraction_result_sha256(checkpoint.raw_extraction_result),
+        ):
+            raise LocalValidationError("Raw extraction checkpoint result is invalid.")
+        detached = deepcopy(checkpoint)
+        self._raw_extractions[(str(job_id), checkpoint.upload_id)] = detached
+        return deepcopy(detached)
+
 
 Rasterizer = Callable[..., Iterator[RasterizedPage]]
 ProgressCallback = Callable[[dict[str, object]], object]
+LivenessCallback = Callable[[], object]
 SourceDigest = Callable[[Path, ScratchJob], str]
 
 
@@ -194,7 +328,7 @@ class StrictLocalPipeline:
         self,
         *,
         manager: WorkerManager,
-        checkpoints: OCRCheckpointStore,
+        checkpoints: LocalAICheckpointStore,
         manifest: LocalAIManifest,
         scratch_root: Path,
         model_dir: Path,
@@ -202,16 +336,18 @@ class StrictLocalPipeline:
         source_digest: SourceDigest = _plaintext_source_digest,
         max_page_pixels: int = 40_000_000,
         on_progress: ProgressCallback | None = None,
+        on_liveness: LivenessCallback | None = None,
     ) -> None:
         self.manager = manager
         self.checkpoints = checkpoints
         self.manifest = manifest
-        self.scratch_root = Path(scratch_root)
-        self.model_dir = Path(model_dir)
+        self.scratch_root = Path(scratch_root).resolve()
+        self.model_dir = Path(model_dir).resolve()
         self.rasterize = rasterize
         self.source_digest = source_digest
         self.max_page_pixels = max_page_pixels
         self.on_progress = on_progress
+        self.on_liveness = on_liveness
         manifest_payload = json.loads(
             json.dumps(asdict(manifest), ensure_ascii=True, allow_nan=False)
         )
@@ -230,7 +366,10 @@ class StrictLocalPipeline:
         self._preflight(job, upload)
         job_id = str(job.id)
         pages: dict[int, str] = {}
+        page_checkpoints: dict[int, OCRCheckpoint] = {}
         selected_images: dict[int, Path] = {}
+        selected_image_bytes = 0
+        selected_image_pixels = 0
         total_markdown_bytes = 0
         with ScratchJob(self.scratch_root, job_id) as scratch:
             source_digest = await asyncio.to_thread(
@@ -261,6 +400,7 @@ class StrictLocalPipeline:
                 )
                 total_markdown_bytes += len(checkpoint.markdown.encode("utf-8"))
                 pages[checkpoint.page_number] = checkpoint.markdown
+                page_checkpoints[checkpoint.page_number] = checkpoint
             else:
                 for page in self.rasterize(
                     encrypted_path,
@@ -284,38 +424,147 @@ class StrictLocalPipeline:
                             "Local OCR returned a duplicate page."
                         )
                     pages[checkpoint.page_number] = checkpoint.markdown
-                    if len(
-                        selected_images
-                    ) < _MAX_SELECTED_IMAGES and self._needs_image_escalation(
-                        checkpoint.markdown
+                    page_checkpoints[checkpoint.page_number] = checkpoint
+                    candidate_bytes = page.path.stat().st_size
+                    candidate_pixels = page.width * page.height
+                    if (
+                        len(selected_images) < _MAX_SELECTED_IMAGES
+                        and selected_image_bytes + candidate_bytes
+                        <= _MAX_SELECTED_IMAGE_BYTES
+                        and selected_image_pixels + candidate_pixels
+                        <= _MAX_SELECTED_IMAGE_PIXELS
+                        and self._needs_image_escalation(checkpoint.markdown)
                     ):
                         selected_images[checkpoint.page_number] = (
                             self._retain_selected_image(page, scratch)
                         )
+                        selected_image_bytes += candidate_bytes
+                        selected_image_pixels += candidate_pixels
             if not pages:
                 raise LocalValidationError("Local OCR returned no pages.")
-            await self._progress(
-                None,
-                ModelRole.EXTRACTION,
-                page_total=len(pages),
+            expected_extraction = self._extraction_checkpoint(
+                upload,
+                pages,
+                page_checkpoints,
             )
-            raw_extraction = await self.manager.run(
-                ModelRole.EXTRACTION,
-                self._extraction_payload(
-                    job_id,
+            cached_extraction = await self.checkpoints.get_extraction(
+                job.id,
+                upload.id,
+                expected_extraction,
+            )
+            if cached_extraction is not None:
+                await self._extraction_stage_progress("validating_extraction")
+                validated = self._validate_extraction_result(
+                    cached_extraction.extraction_result,
                     pages,
-                    selected_images,
-                    locked_manifest_path,
-                ),
-            )
+                    upload_id=str(upload.id),
+                )
+            else:
+                expected_raw = RawExtractionCheckpoint(
+                    upload_id=expected_extraction.upload_id,
+                    checkpoint_key=expected_extraction.checkpoint_key,
+                    source_sha256=expected_extraction.source_sha256,
+                    ocr_text_sha256=expected_extraction.ocr_text_sha256,
+                    page_bindings_sha256=expected_extraction.page_bindings_sha256,
+                    manifest_sha256=expected_extraction.manifest_sha256,
+                    schema_version=expected_extraction.schema_version,
+                    prompt_version=expected_extraction.prompt_version,
+                    page_count=expected_extraction.page_count,
+                    raw_result_sha256="",
+                    raw_extraction_result=None,
+                )
+                cached_raw = await self.checkpoints.get_raw_extraction(
+                    job.id,
+                    upload.id,
+                    expected_raw,
+                )
+                if cached_raw is not None:
+                    raw_extraction = cached_raw.raw_extraction_result
+                else:
+                    await self._progress(
+                        None,
+                        ModelRole.EXTRACTION,
+                        page_total=len(pages),
+                    )
 
-        validated = validate_clinical_extraction(
-            raw_extraction,
-            pages,
-            upload_id=str(upload.id),
-            strict_local=True,
-        )
-        entities = to_extracted_entities(validated)
+                    async def extraction_progress(
+                        value: dict[str, object],
+                    ) -> None:
+                        current = value.get("current")
+                        total = value.get("total")
+                        if (
+                            isinstance(current, int)
+                            and not isinstance(current, bool)
+                            and isinstance(total, int)
+                            and not isinstance(total, bool)
+                        ):
+                            if self.on_progress is None:
+                                return
+                            progress_value = self.on_progress(
+                                {
+                                    "stage": ModelRole.EXTRACTION.value,
+                                    "model_role": ModelRole.EXTRACTION.value,
+                                    "worker_current": current,
+                                    "worker_total": total,
+                                }
+                            )
+                            if inspect.isawaitable(progress_value):
+                                await progress_value
+
+                    extraction_payload = self._extraction_payload(
+                        job_id,
+                        pages,
+                        selected_images,
+                        locked_manifest_path,
+                    )
+                    if self.on_liveness is None:
+                        raw_extraction = await self.manager.run(
+                            ModelRole.EXTRACTION,
+                            extraction_payload,
+                            on_progress=extraction_progress,
+                        )
+                    else:
+                        raw_extraction = await self.manager.run(
+                            ModelRole.EXTRACTION,
+                            extraction_payload,
+                            on_progress=extraction_progress,
+                            on_liveness=self.on_liveness,
+                        )
+                    raw_checkpoint = RawExtractionCheckpoint(
+                        **{
+                            **asdict(expected_raw),
+                            "raw_result_sha256": raw_extraction_result_sha256(
+                                raw_extraction
+                            ),
+                            "raw_extraction_result": raw_extraction,
+                        }
+                    )
+                    await self._extraction_stage_progress("persisting_raw_extraction")
+                    await self.checkpoints.put_raw_extraction(
+                        job.id,
+                        raw_checkpoint,
+                    )
+                await self._extraction_stage_progress("validating_extraction")
+                validated = self._validate_extraction_result(
+                    raw_extraction,
+                    pages,
+                    upload_id=str(upload.id),
+                )
+                checkpoint = ExtractionCheckpoint(
+                    **{
+                        **asdict(expected_extraction),
+                        "extraction_result": validated.model_dump(mode="json"),
+                    }
+                )
+                await self._persisting_extraction_checkpoint_progress()
+                await self.checkpoints.put_extraction(job.id, checkpoint)
+
+        try:
+            entities = to_extracted_entities(validated)
+        except LocalValidationError:
+            raise
+        except Exception:
+            raise LocalValidationError("Local extraction adapter is invalid.") from None
         evidence = self._persistable_evidence(validated)
         return StrictLocalIngestionResult(
             page_markdown=pages,
@@ -328,28 +577,35 @@ class StrictLocalPipeline:
 
     @staticmethod
     def _persistable_evidence(validated: Any) -> list[PersistableEvidence]:
-        facts = [
-            fact
-            for category in FACT_CATEGORY_NAMES
-            for fact in getattr(validated, category)
-        ]
-        if len(facts) != len(validated.evidence):
-            raise LocalValidationError("Local extraction evidence is incomplete.")
-        output: list[PersistableEvidence] = []
-        for fact, evidence in zip(facts, validated.evidence, strict=True):
-            output.append(
-                PersistableEvidence(
-                    id=evidence.id,
-                    page_number=evidence.page_number,
-                    excerpt=fact.evidence_excerpt,
-                    start_offset=evidence.start_offset,
-                    end_offset=evidence.end_offset,
-                    field_paths=tuple(evidence.field_paths),
-                    excerpt_sha256=evidence.excerpt_sha256,
-                    offset_representation=evidence.offset_representation,
+        try:
+            facts = [
+                fact
+                for category in FACT_CATEGORY_NAMES
+                for fact in getattr(validated, category)
+            ]
+            if len(facts) != len(validated.evidence):
+                raise LocalValidationError("Local extraction evidence is incomplete.")
+            output: list[PersistableEvidence] = []
+            for fact, evidence in zip(facts, validated.evidence, strict=True):
+                output.append(
+                    PersistableEvidence(
+                        id=evidence.id,
+                        page_number=evidence.page_number,
+                        excerpt=fact.evidence_excerpt,
+                        start_offset=evidence.start_offset,
+                        end_offset=evidence.end_offset,
+                        field_paths=tuple(evidence.field_paths),
+                        excerpt_sha256=evidence.excerpt_sha256,
+                        offset_representation=evidence.offset_representation,
+                    )
                 )
-            )
-        return output
+            return output
+        except LocalValidationError:
+            raise
+        except Exception:
+            raise LocalValidationError(
+                "Local extraction evidence is invalid."
+            ) from None
 
     def _preflight(self, job: StrictLocalJob, upload: StrictLocalUpload) -> None:
         try:
@@ -403,10 +659,15 @@ class StrictLocalPipeline:
         )
         if cached is not None:
             return cached
-        raw_result = await self.manager.run(
-            ModelRole.OCR,
-            self._ocr_payload(job_id, page, locked_manifest_path),
-        )
+        payload = self._ocr_payload(job_id, page, locked_manifest_path)
+        if self.on_liveness is None:
+            raw_result = await self.manager.run(ModelRole.OCR, payload)
+        else:
+            raw_result = await self.manager.run(
+                ModelRole.OCR,
+                payload,
+                on_liveness=self.on_liveness,
+            )
         checkpoint = self._parse_ocr_result(raw_result, page, key)
         stored = await self.checkpoints.put_ocr_page(job_id, checkpoint)
         return stored
@@ -480,6 +741,53 @@ class StrictLocalPipeline:
             "max_output_tokens": artifact.decode_limits["max_output_tokens"],
         }
 
+    def _extraction_checkpoint(
+        self,
+        upload: StrictLocalUpload,
+        pages: Mapping[int, str],
+        page_checkpoints: Mapping[int, OCRCheckpoint],
+    ) -> ExtractionCheckpoint:
+        if set(pages) != set(page_checkpoints):
+            raise LocalValidationError("Local OCR checkpoint set is incomplete.")
+        page_bindings = [
+            {
+                "page_number": page_number,
+                "checkpoint_key": checkpoint.checkpoint_key,
+                "image_sha256": checkpoint.image_sha256,
+                "markdown_sha256": hashlib.sha256(
+                    pages[page_number].encode("utf-8")
+                ).hexdigest(),
+            }
+            for page_number, checkpoint in sorted(page_checkpoints.items())
+        ]
+        page_bindings_sha256 = hashlib.sha256(
+            json.dumps(
+                page_bindings,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        ocr_text_sha256 = combined_markdown_hash(pages)
+        return ExtractionCheckpoint(
+            upload_id=str(upload.id),
+            checkpoint_key=extraction_checkpoint_key(
+                ocr_text_sha256,
+                CLINICAL_EXTRACTION_SCHEMA_VERSION,
+                _EXTRACTION_PROMPT_VERSION,
+                self._manifest_digest,
+            ),
+            source_sha256=upload.file_hash,
+            ocr_text_sha256=ocr_text_sha256,
+            page_bindings_sha256=page_bindings_sha256,
+            manifest_sha256=self._manifest_digest,
+            schema_version=CLINICAL_EXTRACTION_SCHEMA_VERSION,
+            prompt_version=_EXTRACTION_PROMPT_VERSION,
+            page_count=len(pages),
+            extraction_result={},
+        )
+
     def _extraction_payload(
         self,
         job_id: str,
@@ -522,6 +830,467 @@ class StrictLocalPipeline:
             "schema": deepcopy(NUEXTRACT_TEMPLATE_V1),
             "max_output_tokens": artifact.decode_limits["max_output_tokens"],
         }
+
+    @classmethod
+    def _validate_extraction_result(
+        cls,
+        raw: object,
+        pages: Mapping[int, str],
+        *,
+        upload_id: str,
+    ) -> ClinicalDocumentExtraction:
+        work_budget = _ValidationWorkBudget(_MAX_RAW_ITEMS_PER_DOCUMENT)
+        if not (
+            isinstance(raw, dict)
+            and raw.get("result_type") == _CHUNKED_EXTRACTION_RESULT_TYPE
+        ):
+            return cls._validate_chunk_facts(
+                raw,
+                pages,
+                upload_id=upload_id,
+                chunk_index=0,
+                work_budget=work_budget,
+            )
+        if set(raw) != {"result_type", "chunks"}:
+            raise LocalValidationError("Local extraction chunk envelope is invalid.")
+        raw_chunks = raw.get("chunks")
+        if (
+            not isinstance(raw_chunks, list)
+            or not raw_chunks
+            or len(raw_chunks) > _MAX_EXTRACTION_CHUNKS
+        ):
+            raise LocalValidationError("Local extraction chunk envelope is invalid.")
+
+        expected_pages = sorted(pages)
+        observed_pages: list[int] = []
+        validated_chunks: list[ClinicalDocumentExtraction] = []
+        for raw_chunk in raw_chunks:
+            if not isinstance(raw_chunk, dict) or set(raw_chunk) != {
+                "page_numbers",
+                "extraction",
+            }:
+                raise LocalValidationError("Local extraction chunk is invalid.")
+            page_numbers = raw_chunk.get("page_numbers")
+            if (
+                not isinstance(page_numbers, list)
+                or not page_numbers
+                or any(
+                    isinstance(page_number, bool)
+                    or not isinstance(page_number, int)
+                    or page_number <= 0
+                    for page_number in page_numbers
+                )
+                or page_numbers != sorted(set(page_numbers))
+            ):
+                raise LocalValidationError("Local extraction chunk pages are invalid.")
+            start = len(observed_pages)
+            end = start + len(page_numbers)
+            if page_numbers != expected_pages[start:end]:
+                raise LocalValidationError(
+                    "Local extraction chunks do not match the document."
+                )
+            observed_pages.extend(page_numbers)
+            chunk_pages = {
+                page_number: pages[page_number] for page_number in page_numbers
+            }
+            validated_chunks.append(
+                cls._validate_chunk_facts(
+                    raw_chunk.get("extraction"),
+                    chunk_pages,
+                    upload_id=upload_id,
+                    chunk_index=len(validated_chunks),
+                    work_budget=work_budget,
+                )
+            )
+
+        if observed_pages != expected_pages:
+            raise LocalValidationError(
+                "Local extraction chunks do not cover the document."
+            )
+        if len(validated_chunks) == 1:
+            return validated_chunks[0]
+        try:
+            merged = cls._merge_extraction_chunks(validated_chunks)
+        except LocalValidationError:
+            raise
+        except Exception:
+            raise LocalValidationError("Local extraction merge is invalid.") from None
+        return cls._validate_final_extraction(
+            merged,
+            pages,
+            upload_id=upload_id,
+        )
+
+    @classmethod
+    def _validate_chunk_facts(
+        cls,
+        raw: object,
+        pages: Mapping[int, str],
+        *,
+        upload_id: str,
+        chunk_index: int,
+        work_budget: _ValidationWorkBudget,
+    ) -> ClinicalDocumentExtraction:
+        """Keep independently valid facts while quarantining model-local failures."""
+        if not isinstance(raw, dict):
+            raise LocalValidationError("Local extraction chunk is invalid.")
+        try:
+            encoded = json.dumps(
+                raw,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            raise LocalValidationError("Local extraction chunk is invalid.") from None
+        if len(encoded) > MAX_EXTRACTION_JSON_BYTES:
+            raise LocalValidationError("Local extraction chunk exceeds the size limit.")
+        if set(raw) - _EXTRACTION_RESULT_KEYS:
+            raise LocalValidationError("Local extraction chunk is invalid.")
+        if (
+            raw.get("schema_version", CLINICAL_EXTRACTION_SCHEMA_VERSION)
+            != CLINICAL_EXTRACTION_SCHEMA_VERSION
+        ):
+            raise LocalValidationError("Local extraction schema is invalid.")
+
+        accepted: dict[str, object] = {
+            "schema_version": CLINICAL_EXTRACTION_SCHEMA_VERSION,
+            "patient": None,
+            **{category: [] for category in FACT_CATEGORY_NAMES},
+            "unresolved_fields": [],
+            "rejected_fields": [],
+        }
+        server_rejections: list[str] = []
+        seen_facts: dict[str, set[str]] = {
+            category: set() for category in FACT_CATEGORY_NAMES
+        }
+        raw_patient = raw.get("patient")
+        if raw_patient is not None:
+            patient: dict[str, str | None] = {}
+            if not isinstance(raw_patient, dict):
+                cls._append_rejection(
+                    server_rejections,
+                    f"chunks[{chunk_index}].patient:fact_validation_failed",
+                )
+            else:
+                if set(raw_patient) - {"name", "date_of_birth"}:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"chunks[{chunk_index}].patient:fact_validation_failed",
+                    )
+                for field_name in ("name", "date_of_birth"):
+                    value = raw_patient.get(field_name)
+                    if value is None:
+                        continue
+                    if work_budget.claim(1) == 0:
+                        cls._append_rejection(
+                            server_rejections,
+                            _VALIDATION_WORK_OVERFLOW_PATH,
+                        )
+                        continue
+                    try:
+                        validated_patient = validate_clinical_extraction(
+                            {
+                                "schema_version": CLINICAL_EXTRACTION_SCHEMA_VERSION,
+                                "patient": {field_name: value},
+                            },
+                            pages,
+                            upload_id=upload_id,
+                            strict_local=True,
+                        )
+                    except LocalValidationError:
+                        cls._append_rejection(
+                            server_rejections,
+                            (
+                                f"chunks[{chunk_index}].patient.{field_name}"
+                                ":fact_validation_failed"
+                            ),
+                        )
+                        continue
+                    except Exception:
+                        cls._append_rejection(
+                            server_rejections,
+                            (
+                                f"chunks[{chunk_index}].patient.{field_name}"
+                                ":fact_validation_failed"
+                            ),
+                        )
+                        continue
+                    if validated_patient.patient is not None:
+                        patient[field_name] = getattr(
+                            validated_patient.patient,
+                            field_name,
+                        )
+            if patient:
+                accepted["patient"] = patient
+
+        for category in FACT_CATEGORY_NAMES:
+            raw_facts = raw.get(category, [])
+            if not isinstance(raw_facts, list):
+                cls._append_rejection(
+                    server_rejections,
+                    f"chunks[{chunk_index}].{category}:fact_validation_failed",
+                )
+                continue
+            target = accepted[category]
+            if not isinstance(target, list):
+                raise LocalValidationError("Local extraction merge is invalid.")
+            facts_to_validate = work_budget.claim(len(raw_facts))
+            if facts_to_validate < len(raw_facts):
+                cls._append_rejection(
+                    server_rejections,
+                    _VALIDATION_WORK_OVERFLOW_PATH,
+                )
+            for fact_index in range(facts_to_validate):
+                raw_fact = raw_facts[fact_index]
+                path = f"chunks[{chunk_index}].{category}[{fact_index}]"
+                try:
+                    candidate = validate_clinical_extraction(
+                        {
+                            "schema_version": CLINICAL_EXTRACTION_SCHEMA_VERSION,
+                            category: [raw_fact],
+                        },
+                        pages,
+                        upload_id=upload_id,
+                        strict_local=True,
+                    )
+                except LocalValidationError:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"{path}:fact_validation_failed",
+                    )
+                    continue
+                except Exception:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"{path}:fact_validation_failed",
+                    )
+                    continue
+                try:
+                    adapted_entities = to_extracted_entities(candidate)
+                except LocalValidationError:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"{path}:adapter_rejected",
+                    )
+                    continue
+                except Exception:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"{path}:adapter_rejected",
+                    )
+                    continue
+                if len(adapted_entities) != 1:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"{path}:adapter_rejected",
+                    )
+                    continue
+                try:
+                    mapped_records = validated_extraction_to_health_record_dicts(
+                        candidate,
+                        _FHIR_VALIDATION_UUID,
+                        _FHIR_VALIDATION_UUID,
+                        _FHIR_VALIDATION_UUID,
+                    )
+                except LocalValidationError:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"{path}:fhir_mapping_rejected",
+                    )
+                    continue
+                except Exception:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"{path}:fhir_mapping_rejected",
+                    )
+                    continue
+                if len(mapped_records) != 1:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"{path}:fhir_mapping_rejected",
+                    )
+                    continue
+                try:
+                    fact = getattr(candidate, category)[0]
+                    signature = clinical_fact_duplicate_signature(fact)
+                    fact_payload = fact.model_dump(mode="json")
+                except Exception:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"{path}:fact_validation_failed",
+                    )
+                    continue
+                if signature in seen_facts[category]:
+                    continue
+                if len(target) >= MAX_FACTS_PER_CATEGORY:
+                    cls._append_rejection(
+                        server_rejections,
+                        f"{path}:fact_limit_exceeded",
+                    )
+                    continue
+                seen_facts[category].add(signature)
+                fact_payload["fact_id"] = None
+                target.append(fact_payload)
+
+        for field_name in ("unresolved_fields", "rejected_fields"):
+            values = raw.get(field_name, [])
+            if not isinstance(values, list):
+                cls._append_rejection(
+                    server_rejections,
+                    f"chunks[{chunk_index}].{field_name}:fact_validation_failed",
+                )
+
+        # These lists are model-authored metadata, not grounded facts. Strict-local
+        # quarantine never carries their contents into server-owned diagnostics.
+        accepted["unresolved_fields"] = []
+        accepted["rejected_fields"] = server_rejections
+
+        # This final pass is deliberately outside the quarantine catches. If a
+        # server-owned merge invariant fails, the strict-local job remains fatal.
+        return cls._validate_final_extraction(
+            accepted,
+            pages,
+            upload_id=upload_id,
+        )
+
+    @staticmethod
+    def _validate_final_extraction(
+        raw: dict[str, object],
+        pages: Mapping[int, str],
+        *,
+        upload_id: str,
+    ) -> ClinicalDocumentExtraction:
+        try:
+            return validate_clinical_extraction(
+                raw,
+                pages,
+                upload_id=upload_id,
+                strict_local=True,
+            )
+        except LocalValidationError:
+            raise
+        except Exception:
+            raise LocalValidationError(
+                "Local extraction invariant is invalid."
+            ) from None
+
+    @staticmethod
+    def _append_rejection(values: list[str], path: str) -> None:
+        """Append one server-owned path while preserving the schema's hard cap."""
+        if path in values or _REJECTION_OVERFLOW_PATH in values:
+            return
+        if len(values) < MAX_FIELD_LIST_ITEMS - 1:
+            values.append(path)
+            return
+        values.append(_REJECTION_OVERFLOW_PATH)
+
+    @staticmethod
+    def _merge_extraction_chunks(
+        chunks: list[ClinicalDocumentExtraction],
+    ) -> dict[str, object]:
+        if not chunks:
+            raise LocalValidationError("Local extraction returned no validated chunks.")
+        merged: dict[str, object] = {
+            "schema_version": CLINICAL_EXTRACTION_SCHEMA_VERSION,
+            "patient": None,
+            **{category: [] for category in FACT_CATEGORY_NAMES},
+            "unresolved_fields": [],
+            "rejected_fields": [],
+        }
+        patient_fields: dict[str, tuple[str, str]] = {}
+        seen_facts: dict[str, set[str]] = {
+            category: set() for category in FACT_CATEGORY_NAMES
+        }
+        seen_fields = {
+            "unresolved_fields": set(),
+            "rejected_fields": set(),
+        }
+        conflicted_patient_fields: set[str] = set()
+
+        for chunk in chunks:
+            patient = chunk.patient
+            if patient is not None:
+                for field_name in ("name", "date_of_birth"):
+                    value = getattr(patient, field_name)
+                    if value is None or field_name in conflicted_patient_fields:
+                        continue
+                    normalized = " ".join(value.split()).casefold()
+                    prior = patient_fields.get(field_name)
+                    if prior is not None and prior[1] != normalized:
+                        patient_fields.pop(field_name, None)
+                        conflicted_patient_fields.add(field_name)
+                        rejected = merged["rejected_fields"]
+                        if not isinstance(rejected, list):
+                            raise LocalValidationError(
+                                "Local extraction merge is invalid."
+                            )
+                        StrictLocalPipeline._append_rejection(
+                            rejected,
+                            f"patient.{field_name}:conflict",
+                        )
+                    if prior is None:
+                        patient_fields[field_name] = (
+                            value,
+                            normalized,
+                        )
+
+            for category in FACT_CATEGORY_NAMES:
+                facts = getattr(chunk, category)
+                target = merged[category]
+                if not isinstance(target, list):
+                    raise LocalValidationError("Local extraction merge is invalid.")
+                for fact in facts:
+                    identity = clinical_fact_duplicate_signature(fact)
+                    if identity in seen_facts[category]:
+                        continue
+                    if len(target) >= MAX_FACTS_PER_CATEGORY:
+                        rejected = merged["rejected_fields"]
+                        if not isinstance(rejected, list):
+                            raise LocalValidationError(
+                                "Local extraction merge is invalid."
+                            )
+                        StrictLocalPipeline._append_rejection(
+                            rejected,
+                            f"{category}:fact_limit_exceeded",
+                        )
+                        continue
+                    seen_facts[category].add(identity)
+                    fact_payload = fact.model_dump(mode="json")
+                    fact_payload["fact_id"] = None
+                    target.append(fact_payload)
+
+            for field_name in (
+                "unresolved_fields",
+                "rejected_fields",
+            ):
+                values = getattr(chunk, field_name)
+                target = merged[field_name]
+                if not isinstance(target, list):
+                    raise LocalValidationError("Local extraction merge is invalid.")
+                for value in values:
+                    if value in seen_fields[field_name]:
+                        continue
+                    if len(target) >= MAX_FIELD_LIST_ITEMS:
+                        continue
+                    seen_fields[field_name].add(value)
+                    if field_name == "rejected_fields":
+                        StrictLocalPipeline._append_rejection(target, value)
+                    else:
+                        target.append(value)
+
+        if patient_fields:
+            merged["patient"] = {
+                "name": (
+                    patient_fields["name"][0] if "name" in patient_fields else None
+                ),
+                "date_of_birth": (
+                    patient_fields["date_of_birth"][0]
+                    if "date_of_birth" in patient_fields
+                    else None
+                ),
+            }
+        return merged
 
     @staticmethod
     def _needs_image_escalation(markdown: str) -> bool:
@@ -629,6 +1398,25 @@ class StrictLocalPipeline:
         if page_total is not None:
             payload["page_total"] = page_total
         value = self.on_progress(payload)
+        if inspect.isawaitable(value):
+            await value
+
+    async def _persisting_extraction_checkpoint_progress(self) -> None:
+        """Publish a content-free stage before the durable extraction commit."""
+
+        await self._extraction_stage_progress("persisting_extraction_checkpoint")
+
+    async def _extraction_stage_progress(self, stage: str) -> None:
+        """Publish one fixed, content-free extraction phase."""
+
+        if self.on_progress is None:
+            return
+        value = self.on_progress(
+            {
+                "stage": stage,
+                "model_role": ModelRole.EXTRACTION.value,
+            }
+        )
         if inspect.isawaitable(value):
             await value
 

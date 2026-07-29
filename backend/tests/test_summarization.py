@@ -254,6 +254,22 @@ async def test_strict_local_summary_persists_job_before_worker_and_renders_typed
     )
     db_session.add(upload)
     await db_session.flush()
+    survivor = HealthRecord(
+        user_id=UUID(user_id),
+        patient_id=patient.id,
+        record_type="condition",
+        fhir_resource_type="Condition",
+        fhir_resource={
+            "resourceType": "Condition",
+            "code": {"text": "Hypertension"},
+        },
+        source_format="fhir",
+        source_file_id=None,
+        display_text="Hypertension",
+        ai_extracted=False,
+    )
+    db_session.add(survivor)
+    await db_session.flush()
     record = HealthRecord(
         user_id=UUID(user_id),
         patient_id=patient.id,
@@ -263,6 +279,9 @@ async def test_strict_local_summary_persists_job_before_worker_and_renders_typed
         source_format="local_ai",
         source_file_id=upload.id,
         display_text="Hypertension",
+        ai_extracted=True,
+        is_duplicate=True,
+        merged_into_id=survivor.id,
     )
     db_session.add(record)
     await db_session.flush()
@@ -271,7 +290,7 @@ async def test_strict_local_summary_persists_job_before_worker_and_renders_typed
             user_id=UUID(user_id),
             upload_id=upload.id,
             health_record_id=record.id,
-            excerpt="Hypertension",
+            excerpt="Hypertension from archived strict evidence.",
             field_paths=["conditions[0].name"],
             source_metadata={"evidence_id": "ev1_test"},
         )
@@ -326,6 +345,10 @@ async def test_strict_local_summary_persists_job_before_worker_and_renders_typed
         assert payload["manifest_identity"]["revision"] == "0" * 40
         assert payload["max_output_tokens"] == 1024
         fact = payload["facts"][0]
+        assert fact["record_id"] == str(survivor.id)
+        assert [item["excerpt"] for item in payload["evidence"]] == [
+            "Hypertension from archived strict evidence."
+        ]
         return {
             "sections": [
                 {

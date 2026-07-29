@@ -21,6 +21,7 @@ from app.services.local_ai.types import ModelRole
 
 PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_PROGRESS_ACTIVITY = 2**63 - 1
 
 Identifier = Annotated[
     str,
@@ -35,8 +36,12 @@ ResponseKind = Literal["ready", "progress", "result", "error"]
 ProgressStage = Literal["starting", "loading", "processing", "finalizing", "cancelling"]
 ErrorCode = Literal[
     "cancelled",
+    "generation_failed",
+    "input_limit_exceeded",
     "invalid_request",
     "protocol_error",
+    "resource_exhausted",
+    "runtime_failed",
     "unavailable",
     "worker_failed",
 ]
@@ -44,8 +49,12 @@ ProtocolVersion = Annotated[StrictInt, Field(ge=PROTOCOL_VERSION, le=PROTOCOL_VE
 
 SAFE_ERROR_MESSAGES: dict[str, str] = {
     "cancelled": "Local worker cancelled.",
+    "generation_failed": "Local worker generation failed.",
+    "input_limit_exceeded": "Local worker input exceeds supported limits.",
     "invalid_request": "Local worker request was rejected.",
     "protocol_error": "Local worker protocol failed.",
+    "resource_exhausted": "Local worker resources were exhausted.",
+    "runtime_failed": "Local worker runtime failed.",
     "unavailable": "Local worker is unavailable.",
     "worker_failed": "Local worker failed.",
 }
@@ -82,6 +91,7 @@ class ProgressPayload(_StrictMessage):
     stage: ProgressStage
     current: Annotated[StrictInt, Field(ge=0)]
     total: Annotated[StrictInt, Field(ge=0)]
+    activity: Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_ACTIVITY)] | None = None
     active_memory_bytes: Annotated[StrictInt, Field(ge=0, le=2**63 - 1)] | None = None
     peak_memory_bytes: Annotated[StrictInt, Field(ge=0, le=2**63 - 1)] | None = None
 

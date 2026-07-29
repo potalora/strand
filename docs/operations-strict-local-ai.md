@@ -157,6 +157,40 @@ The private metrics are gated separately, so they cannot rescue a failed
 synthetic run. The report still contains no OCR text, facts, evidence excerpts,
 or summary output, but it is not the checked-in promotion artifact.
 
+## Run browser tests with local-only enforcement
+
+Create a dedicated PostgreSQL database once, then run the complete Playwright
+directory through the local-only profile:
+
+```bash
+createdb medtimeline_e2e_local
+cd frontend
+E2E_LOCAL_ONLY=1 \
+E2E_DATABASE_URL=postgresql+asyncpg://localhost:5432/medtimeline_e2e_local \
+  npx playwright test --workers=1
+```
+
+The profile accepts only a `postgresql+asyncpg` URL whose host is loopback and
+whose database name contains a `test` or `e2e` segment. It rejects the same URL
+as any `DATABASE_URL` inherited from the launching shell. Migrations and the
+backend run inside an in-process socket guard that blocks DNS and connections
+outside loopback. On macOS, the Next.js process runs under an OS profile that
+permits loopback traffic and denies other outbound sockets. Next telemetry is
+disabled, and the app uses system font stacks instead of fetching Google fonts.
+Every Chromium context uses a closed proxy with loopback bypass, and service
+workers are disabled. Cloud credentials are cleared and Hugging Face offline
+flags remain set.
+
+These controls cover database traffic, the backend, browser requests, and the
+already sandboxed model worker. The local-only profile fails closed before
+starting Next.js when its OS network profile is unavailable. The server binds
+to `127.0.0.1` and does not proxy raw uploads; the browser sends them to the
+backend. The real upload, encryption, job, polling, summary, grounded
+extraction, and persistence paths still run. The E2E worker returns
+deterministic validator-compatible output so the browser suite does not
+repeatedly load the model pack. Use the fidelity gate above for real-model
+quality checks.
+
 Remove model artifacts:
 
 ```bash
@@ -182,7 +216,8 @@ LOCAL_AI_RELEASE_EVIDENCE_PATH=./app/model_manifests/apple-m4-16gb-v1.release.js
 LOCAL_AI_BENCHMARK_PATH=./artifacts/local-ai-benchmark.json
 LOCAL_AI_FIDELITY_PATH=./artifacts/local-ai-fidelity.json
 LOCAL_AI_WORKER_COMMAND=../workers/local_ai/apple_mlx/.venv/bin/local-ai-mlx-worker
-LOCAL_AI_WORKER_TIMEOUT_SECONDS=900
+LOCAL_AI_WORKER_TIMEOUT_SECONDS=1800
+LOCAL_AI_WORKER_HARD_TIMEOUT_SECONDS=7200
 ```
 
 Keep the model directory separate from uploads and scratch. Model files contain
@@ -190,6 +225,14 @@ no medical data. The application creates the model-store control files and
 scratch directories with owner-only permissions. Per-job scratch is plaintext
 only while the owning job runs, uses owner-only directories and files, and is
 removed after success, cancellation, failure, and startup recovery.
+
+`LOCAL_AI_WORKER_TIMEOUT_SECONDS` is the idle deadline. A validated stage,
+completed-page counter, or internal worker-activity heartbeat resets it.
+Activity-only heartbeats refresh the durable job lease without changing
+user-facing progress.
+`LOCAL_AI_WORKER_HARD_TIMEOUT_SECONDS` caps the total request duration. The
+30-minute idle timeout accounts for slower NuExtract decoding on the 16 GB
+profile.
 
 Do not place `LOCAL_AI_MODEL_DIR` or `LOCAL_AI_SCRATCH_DIR` on a
 world-readable shared volume. FileVault remains recommended because plaintext

@@ -31,6 +31,7 @@ from app.services.ai.llm import (
 from app.services.ai.patient_phi import patient_scrub_args
 from app.services.ai.phi_scrubber import scrub_phi
 from app.services.local_ai.grounded_summary import SERVER_MEDICAL_DISCLAIMER
+from app.services.local_ai.evidence_lineage import load_strict_local_evidence_lineage
 from app.services.local_ai.types import ProcessingMode
 
 logger = logging.getLogger(__name__)
@@ -583,7 +584,6 @@ async def generate_summary(
     # Build the same immutable fact/evidence registry used by strict-local
     # summaries. The provider receives only a de-identified transport copy and
     # can select references; validation and prose rendering stay server-side.
-    from app.models.local_ai import ExtractionEvidence
     from app.services.ai.grounded_routing import (
         build_deidentified_grounded_transport,
         compose_grounded_routed_system_prompt,
@@ -603,29 +603,15 @@ async def generate_summary(
         )
     ).scalar_one_or_none()
     scrub_args = patient_scrub_args(patient)
-    evidence_rows = list(
-        (
-            await db.execute(
-                select(ExtractionEvidence)
-                .where(
-                    ExtractionEvidence.user_id == user_id,
-                    ExtractionEvidence.health_record_id.in_(
-                        [record.id for record in records]
-                    ),
-                )
-                .order_by(ExtractionEvidence.id.asc())
-                .limit(_STRICT_LOCAL_EVIDENCE_LIMIT + 1)
-            )
-        )
-        .scalars()
-        .all()
+    lineage = await load_strict_local_evidence_lineage(
+        db,
+        user_id=user_id,
+        survivor_ids=[record.id for record in records],
+        limit=_STRICT_LOCAL_EVIDENCE_LIMIT,
     )
-    if len(evidence_rows) > _STRICT_LOCAL_EVIDENCE_LIMIT:
+    if lineage.overflowed:
         raise ValueError("Too much evidence for a grounded summary")
-    evidence_by_record: dict[UUID, list[ExtractionEvidence]] = {}
-    for item in evidence_rows:
-        if item.health_record_id is not None:
-            evidence_by_record.setdefault(item.health_record_id, []).append(item)
+    evidence_by_record = lineage.by_survivor()
     scope = _grounded_requested_scope(
         summary_type=summary_type,
         category=category,
@@ -1312,7 +1298,7 @@ async def generate_grounded_local_summary(
 ) -> dict:
     """Run the reviewed, evidence-grounded summary path without LLM providers."""
     from app.models.ai_summary import AISummaryPrompt
-    from app.models.local_ai import ExtractionEvidence, LocalAIJob
+    from app.models.local_ai import LocalAIJob
     from app.services.local_ai.artifact_store import ArtifactStore
     from app.services.local_ai.errors import LocalAIError, LocalPolicyError
     from app.services.local_ai.grounded_summary import (
@@ -1369,29 +1355,15 @@ async def generate_grounded_local_summary(
             scope=scope,
             requested_category=category,
         )
-        evidence_rows = list(
-            (
-                await db.execute(
-                    select(ExtractionEvidence)
-                    .where(
-                        ExtractionEvidence.user_id == user_id,
-                        ExtractionEvidence.health_record_id.in_(
-                            [record.id for record in records]
-                        ),
-                    )
-                    .order_by(ExtractionEvidence.id.asc())
-                    .limit(_STRICT_LOCAL_EVIDENCE_LIMIT + 1)
-                )
-            )
-            .scalars()
-            .all()
+        lineage = await load_strict_local_evidence_lineage(
+            db,
+            user_id=user_id,
+            survivor_ids=[record.id for record in records],
+            limit=_STRICT_LOCAL_EVIDENCE_LIMIT,
         )
-        if len(evidence_rows) > _STRICT_LOCAL_EVIDENCE_LIMIT:
+        if lineage.overflowed:
             raise ValueError("Too much evidence for a strict-local summary")
-        evidence_by_record: dict[UUID, list[ExtractionEvidence]] = {}
-        for item in evidence_rows:
-            if item.health_record_id is not None:
-                evidence_by_record.setdefault(item.health_record_id, []).append(item)
+        evidence_by_record = lineage.by_survivor()
         projection = project_summary_records(records, evidence_by_record)
         summary_input = build_grounded_summary_input(
             facts=projection.facts,

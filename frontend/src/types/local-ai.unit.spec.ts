@@ -115,6 +115,24 @@ test("ingestion provenance parsers reject summary roles and more than two models
       ],
     })
   ).toThrow("Invalid ingestion model provenance");
+
+  const lineageModel = {
+    ...ocr,
+    quantization: "4bit",
+    runtime: "mlx-vlm 0.5.0",
+  };
+  expect(
+    parseRecordExtractionProvenance({
+      ...RECORD_PROVENANCE,
+      models: [lineageModel, lineageModel, lineageModel],
+    }).models
+  ).toHaveLength(3);
+  expect(() =>
+    parseRecordExtractionProvenance({
+      ...RECORD_PROVENANCE,
+      models: Array.from({ length: 513 }, () => lineageModel),
+    })
+  ).toThrow("Invalid ingestion model provenance");
 });
 
 test("summary generation types reject backend-invalid mode combinations", () => {
