@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import re
 import stat
 import warnings
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -47,6 +49,16 @@ MAX_DECODE_TOKENS = 1_000_000
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
 STREAM_ACTIVITY_INTERVAL = 32
+MLX_FREE_CACHE_LIMIT_BYTES = 256 * 1024 * 1024
+GENERATION_FAILURE_CATEGORIES = frozenset(
+    {
+        "fragment_conflict",
+        "invalid_structured_output",
+        "output_limit",
+        "stream_contract",
+        "work_limit",
+    }
+)
 
 _TOP_LEVEL_KEYS = frozenset(
     {
@@ -111,6 +123,33 @@ class ArtifactUnavailableError(ValueError):
 class GenerationError(RuntimeError):
     """A model returned unusable content."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "invalid_structured_output",
+    ) -> None:
+        if category not in GENERATION_FAILURE_CATEGORIES:
+            raise ValueError("Local generation failure category is invalid.")
+        super().__init__(message)
+        self.category = category
+
+
+class GeneratedText(str):
+    """Generated text with optional exact, content-free decode metadata."""
+
+    generation_tokens: int | None
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        generation_tokens: int | None = None,
+    ) -> GeneratedText:
+        instance = super().__new__(cls, value)
+        instance.generation_tokens = generation_tokens
+        return instance
+
 
 @dataclass(frozen=True)
 class LoadedRole:
@@ -122,6 +161,122 @@ class LoadedRole:
     model_path: str
     decode_limits: dict[str, int]
     repository_files_used: frozenset[str]
+
+
+def _load_mlx_core() -> object | None:
+    """Load MLX lazily so protocol helpers remain importable away from macOS."""
+
+    try:
+        import mlx.core as mx
+    except Exception:
+        return None
+    return mx
+
+
+def _configure_mlx_memory(mx: object) -> None:
+    """Keep MLX within Apple's recommended working set and a small free cache."""
+
+    recommended: int | None = None
+    device_info = getattr(mx, "device_info", None)
+    if callable(device_info):
+        try:
+            info = device_info()
+        except Exception:
+            info = None
+        if isinstance(info, Mapping):
+            candidate = info.get("max_recommended_working_set_size")
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+                recommended = candidate
+
+    set_memory_limit = getattr(mx, "set_memory_limit", None)
+    if recommended is not None and callable(set_memory_limit):
+        with suppress(Exception):
+            set_memory_limit(recommended)
+
+    cache_limit = MLX_FREE_CACHE_LIMIT_BYTES
+    if recommended is not None:
+        cache_limit = min(cache_limit, max(1, recommended // 16))
+    set_cache_limit = getattr(mx, "set_cache_limit", None)
+    if callable(set_cache_limit):
+        with suppress(Exception):
+            set_cache_limit(cache_limit)
+
+
+def _close_generation_stream(stream: object) -> None:
+    """Best-effort close a generation iterator without masking its result."""
+
+    close = getattr(stream, "close", None)
+    if callable(close):
+        with suppress(Exception):
+            close()
+
+
+def _reclaim_generation_memory(mx: object | None) -> None:
+    """Release dead Python frames before returning free MLX buffers."""
+
+    with suppress(Exception):
+        gc.collect()
+    if mx is None:
+        return
+    clear_cache = getattr(mx, "clear_cache", None)
+    if callable(clear_cache):
+        with suppress(Exception):
+            clear_cache()
+
+
+def _consume_generation_stream(
+    stream: object,
+    *,
+    activity_fn: ActivityCallback | None,
+) -> GeneratedText:
+    """Consume one MLX stream in a short-lived frame that cannot retain results."""
+
+    try:
+        iterator = iter(stream)
+    except TypeError:
+        raise GenerationError("Local generation failed.", category="stream_contract") from None
+
+    fragments: list[str] = []
+    last_activity_fragment = 0
+    generation_tokens: int | None = None
+    exact_metadata_available = True
+    result: object | None = None
+    text: object | None = None
+    try:
+        for fragment_number, result in enumerate(iterator, start=1):
+            text = getattr(result, "text", result)
+            if not isinstance(text, str):
+                raise GenerationError("Local generation failed.", category="stream_contract")
+            fragments.append(text)
+            exact_count = getattr(result, "generation_tokens", None)
+            if (
+                type(exact_count) is not int
+                or exact_count < 0
+                or exact_count > MAX_DECODE_TOKENS
+                or (generation_tokens is not None and exact_count < generation_tokens)
+            ):
+                exact_metadata_available = False
+            else:
+                generation_tokens = exact_count
+            if activity_fn is not None and (
+                fragment_number == 1
+                or fragment_number - last_activity_fragment >= STREAM_ACTIVITY_INTERVAL
+            ):
+                activity_fn()
+                last_activity_fragment = fragment_number
+    finally:
+        if iterator is not stream:
+            _close_generation_stream(iterator)
+        iterator = None
+        result = None
+        text = None
+        stream = None
+    if activity_fn is not None and fragments and last_activity_fragment != len(fragments):
+        activity_fn()
+    return GeneratedText(
+        "".join(fragments),
+        generation_tokens=generation_tokens if exact_metadata_available else None,
+    )
 
 
 def require_offline_environment() -> None:
@@ -730,7 +885,13 @@ def _strip_terminal_eos_suffix(value: str, processor: object) -> str:
     candidate = value.rstrip()
     if not candidate.endswith(eos_token):
         return value
-    return candidate[: -len(eos_token)].rstrip()
+    stripped = candidate[: -len(eos_token)].rstrip()
+    if isinstance(value, GeneratedText):
+        return GeneratedText(
+            stripped,
+            generation_tokens=value.generation_tokens,
+        )
+    return stripped
 
 
 def validate_token_budget(
@@ -862,58 +1023,53 @@ def generate_content(
         raise WorkerInputError("Local worker sampling configuration is forbidden.")
     from mlx_vlm import apply_chat_template, stream_generate
 
-    config = getattr(model, "config", None)
-    if config is None:
-        raise GenerationError("Local generation failed.")
-    template_options: dict[str, object] = {
-        "enable_thinking": enable_thinking,
-    }
-    if template is not None:
-        template_options["template"] = template
-    if mode is not None:
-        template_options["mode"] = mode
-    if instructions is not None:
-        template_options["instructions"] = instructions
-    formatted = apply_chat_template(
-        processor,
-        config,
-        prompt,
-        num_images=len(images),
-        **template_options,
-    )
-    if not isinstance(formatted, str):
-        raise GenerationError("Local generation failed.")
-    count = _token_count(processor, formatted)
-    if count > input_token_limit:
-        raise WorkerInputLimitError("Local worker input exceeds its token limit.")
-    runtime_limit = _runtime_context_limit_for(model, processor)
-    if runtime_limit is not None and count + max_tokens > runtime_limit:
-        raise WorkerInputLimitError("Local worker input exceeds its model context token limit.")
-    stream = stream_generate(
-        model,
-        processor,
-        formatted,
-        image=images or None,
-        max_tokens=max_tokens,
-        temperature=0.0,
-        verbose=False,
-    )
-    if isinstance(stream, str):
-        return _strip_terminal_eos_suffix(stream, processor)
-
-    fragments: list[str] = []
-    last_activity_fragment = 0
-    for fragment_number, result in enumerate(stream, start=1):
-        text = getattr(result, "text", result)
-        if not isinstance(text, str):
-            raise GenerationError("Local generation failed.")
-        fragments.append(text)
-        if activity_fn is not None and (
-            fragment_number == 1
-            or fragment_number - last_activity_fragment >= STREAM_ACTIVITY_INTERVAL
-        ):
-            activity_fn()
-            last_activity_fragment = fragment_number
-    if activity_fn is not None and fragments and last_activity_fragment != len(fragments):
-        activity_fn()
-    return _strip_terminal_eos_suffix("".join(fragments), processor)
+    mx = _load_mlx_core()
+    if mx is not None:
+        _configure_mlx_memory(mx)
+    stream: object | None = None
+    try:
+        config = getattr(model, "config", None)
+        if config is None:
+            raise GenerationError("Local generation failed.", category="stream_contract")
+        template_options: dict[str, object] = {
+            "enable_thinking": enable_thinking,
+        }
+        if template is not None:
+            template_options["template"] = template
+        if mode is not None:
+            template_options["mode"] = mode
+        if instructions is not None:
+            template_options["instructions"] = instructions
+        formatted = apply_chat_template(
+            processor,
+            config,
+            prompt,
+            num_images=len(images),
+            **template_options,
+        )
+        if not isinstance(formatted, str):
+            raise GenerationError("Local generation failed.", category="stream_contract")
+        count = _token_count(processor, formatted)
+        if count > input_token_limit:
+            raise WorkerInputLimitError("Local worker input exceeds its token limit.")
+        runtime_limit = _runtime_context_limit_for(model, processor)
+        if runtime_limit is not None and count + max_tokens > runtime_limit:
+            raise WorkerInputLimitError("Local worker input exceeds its model context token limit.")
+        stream = stream_generate(
+            model,
+            processor,
+            formatted,
+            image=images or None,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            verbose=False,
+        )
+        if isinstance(stream, str):
+            return _strip_terminal_eos_suffix(stream, processor)
+        generated = _consume_generation_stream(stream, activity_fn=activity_fn)
+        return _strip_terminal_eos_suffix(generated, processor)
+    finally:
+        if stream is not None and not isinstance(stream, str):
+            _close_generation_stream(stream)
+        stream = None
+        _reclaim_generation_memory(mx)

@@ -30,7 +30,10 @@ from app.services.ai.llm import (
 )
 from app.services.ai.patient_phi import patient_scrub_args
 from app.services.ai.phi_scrubber import scrub_phi
-from app.services.local_ai.grounded_summary import SERVER_MEDICAL_DISCLAIMER
+from app.services.local_ai.grounded_summary import (
+    SERVER_MEDICAL_DISCLAIMER,
+    GroundedSummaryDocument,
+)
 from app.services.local_ai.evidence_lineage import load_strict_local_evidence_lineage
 from app.services.local_ai.types import ProcessingMode
 
@@ -682,6 +685,7 @@ async def generate_summary(
         max_output_tokens=settings.gemini_summary_max_tokens,
         temperature=0,
         json_mode=True,
+        json_schema=GroundedSummaryDocument,
         # Bound reasoning tokens so they don't consume the output budget and
         # truncate the visible summary (gemini-3.x flash thinks by default).
         reasoning=ReasoningConfig(level=settings.gemini_summary_thinking_level),

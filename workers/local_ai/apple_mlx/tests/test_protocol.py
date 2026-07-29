@@ -354,6 +354,62 @@ def test_runtime_failures_map_to_fixed_non_content_codes() -> None:
     assert worker_main._safe_runtime_error_code(Exception("private")) == ("worker_failed")
 
 
+@pytest.mark.parametrize("category", ["output_limit", "invalid_structured_output"])
+def test_generation_failure_category_survives_worker_terminal_frame(
+    category: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    from local_ai_mlx_worker import __main__ as worker_main
+    from local_ai_mlx_worker.common import GenerationError
+
+    sentinel = "clinical-content-must-not-cross-worker-boundary"
+    emitted: list[tuple[str, str, dict[str, object]]] = []
+    error = GenerationError(sentinel, category=category)
+
+    monkeypatch.setattr(
+        worker_main,
+        "_write",
+        lambda request_id, kind, payload: emitted.append((request_id, kind, payload)),
+    )
+
+    worker_main._error(
+        "request-1",
+        worker_main._safe_runtime_error_code(error),
+        category=worker_main._safe_runtime_error_category(error),
+    )
+
+    assert emitted == [
+        (
+            "request-1",
+            "error",
+            {
+                "code": "generation_failed",
+                "message": "Local worker generation failed.",
+                "category": category,
+            },
+        )
+    ]
+    captured = capfd.readouterr()
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
+
+
+def test_worker_terminal_rejects_arbitrary_generation_failure_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_mlx_worker import __main__ as worker_main
+
+    monkeypatch.setattr(worker_main, "_write", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(worker_main.ProtocolError):
+        worker_main._error(
+            "request-1",
+            "generation_failed",
+            category="patient-content",
+        )
+
+
 def test_role_runtime_output_is_suppressed_from_protocol_and_logs(
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
@@ -735,6 +791,74 @@ def test_extraction_batches_long_documents_without_reloading_the_model(
     ]
 
 
+def test_extraction_isolates_selected_image_pages_without_splitting_text_batches(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    calls: list[tuple[list[int], list[str]]] = []
+
+    def generate(**kwargs: object) -> str:
+        source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
+        page_numbers = [int(item["page_number"]) for item in source["source_pages"]]
+        calls.append((page_numbers, list(kwargs["images"])))  # type: ignore[arg-type]
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [f"page-{page_number}" for page_number in page_numbers],
+            }
+        )
+
+    page_two_image = _png(tmp_path, "page-2.png")
+    page_five_image = _png(tmp_path, "page-5.png")
+    progress: list[tuple[int, int]] = []
+    result = run_extraction(
+        {
+            "page_markdown": [
+                {
+                    "page_number": page_number,
+                    "markdown": "bounded local OCR",
+                }
+                for page_number in range(1, 8)
+            ],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {
+                "2": str(page_two_image),
+                "5": str(page_five_image),
+            },
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            },
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=generate,
+        progress_fn=lambda current, total: progress.append((current, total)),
+    )
+
+    assert calls == [
+        ([1], []),
+        ([2], [str(page_two_image)]),
+        ([3, 4], []),
+        ([5], [str(page_five_image)]),
+        ([6, 7], []),
+    ]
+    assert progress == [(0, 7), (1, 7), (2, 7), (4, 7), (5, 7), (7, 7)]
+    assert result["result_type"] == "chunked_clinical_extraction.v1"
+    assert [page_number for chunk in result["chunks"] for page_number in chunk["page_numbers"]] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+    ]
+    assert [
+        value for chunk in result["chunks"] for value in chunk["extraction"]["unresolved_fields"]
+    ] == [f"page-{page_number}" for page_number in range(1, 8)]
+
+
 def test_extraction_soft_caps_batch_input_for_the_16gb_profile(
     tmp_path: Path,
 ) -> None:
@@ -1102,6 +1226,248 @@ def test_extraction_splits_immediately_after_cap_length_invalid_output(
         "schema_version": "clinical-document-extraction.v1",
         "unresolved_fields": [],
     }
+
+
+def test_extraction_uses_exact_stream_token_count_to_split_truncated_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A real decode-cap hit cannot be hidden by decoded-text re-tokenization."""
+
+    import mlx_vlm
+
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    markdown = ("first bounded section " * 20) + "\n\n" + ("second bounded section " * 20)
+    calls: list[str] = []
+
+    class StreamResult:
+        def __init__(self, text: str, generation_tokens: int) -> None:
+            self.text = text
+            self.generation_tokens = generation_tokens
+
+    monkeypatch.setattr(
+        mlx_vlm,
+        "apply_chat_template",
+        lambda _processor, _config, prompt, **_kwargs: prompt,
+    )
+
+    def stream_generate(
+        _model: object,
+        _processor: object,
+        prompt: str,
+        **_kwargs: object,
+    ) -> Iterator[StreamResult]:
+        source = json.loads(prompt.split("INPUT_JSON=", 1)[1])
+        source_markdown = str(source["source_pages"][0]["markdown"])
+        calls.append(source_markdown)
+        if source_markdown == markdown:
+            yield StreamResult("{", 4_096)
+            return
+        yield StreamResult(
+            json.dumps(
+                {
+                    "schema_version": "clinical-document-extraction.v1",
+                    "unresolved_fields": [],
+                }
+            ),
+            32,
+        )
+
+    monkeypatch.setattr(mlx_vlm, "stream_generate", stream_generate)
+
+    result = run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": markdown}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            },
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+    )
+
+    assert calls.count(markdown) == 1
+    assert all(call in markdown for call in calls[1:])
+    assert result == {
+        "schema_version": "clinical-document-extraction.v1",
+        "unresolved_fields": [],
+    }
+
+
+def test_extraction_preserves_invalid_structured_output_category_below_cap(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    with pytest.raises(GenerationError) as error:
+        run_extraction(
+            {
+                "page_markdown": [{"page_number": 1, "markdown": "bounded OCR"}],
+                "scratch_dir": str(tmp_path),
+                "image_paths": {},
+                "schema": {"schema_version": "clinical-document-extraction.v1"},
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=lambda **_kwargs: "{",
+        )
+
+    assert error.value.category == "invalid_structured_output"
+
+
+def test_extraction_splits_after_two_under_cap_invalid_structured_outputs(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    markdown = ("first bounded section " * 20) + "\n\n" + ("second bounded section " * 20)
+    calls: list[str] = []
+
+    def generate(**kwargs: object) -> str:
+        source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
+        source_markdown = str(source["source_pages"][0]["markdown"])
+        calls.append(source_markdown)
+        if source_markdown == markdown:
+            return "{"
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            }
+        )
+
+    result = run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": markdown}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            },
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert calls.count(markdown) == 2
+    assert all(call in markdown for call in calls[2:])
+    assert result == {
+        "schema_version": "clinical-document-extraction.v1",
+        "unresolved_fields": [],
+    }
+
+
+def test_extraction_does_not_split_non_structured_generation_failures(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    calls = 0
+
+    def generate(**_kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        raise GenerationError("Local generation failed.", category="stream_contract")
+
+    with pytest.raises(GenerationError) as error:
+        run_extraction(
+            {
+                "page_markdown": [
+                    {"page_number": 1, "markdown": "first bounded OCR"},
+                    {"page_number": 2, "markdown": "second bounded OCR"},
+                ],
+                "scratch_dir": str(tmp_path),
+                "image_paths": {},
+                "schema": {"schema_version": "clinical-document-extraction.v1"},
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=generate,
+        )
+
+    assert calls == 1
+    assert error.value.category == "stream_contract"
+
+
+def test_unsplittable_invalid_structured_output_preserves_bounded_category(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    calls = 0
+
+    def generate(**_kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return "{"
+
+    with pytest.raises(GenerationError) as error:
+        run_extraction(
+            {
+                "page_markdown": [{"page_number": 1, "markdown": "x"}],
+                "scratch_dir": str(tmp_path),
+                "image_paths": {},
+                "schema": {"schema_version": "clinical-document-extraction.v1"},
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=generate,
+        )
+
+    assert calls == 2
+    assert error.value.category == "invalid_structured_output"
+
+
+def test_generation_preserves_exact_cap_metadata_without_rejecting_valid_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import mlx_vlm
+
+    from local_ai_mlx_worker.common import generate_content
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    class StreamResult:
+        text = '{"schema_version":"clinical-document-extraction.v1"}'
+        generation_tokens = 4_096
+
+    monkeypatch.setattr(
+        mlx_vlm,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "formatted",
+    )
+    monkeypatch.setattr(
+        mlx_vlm,
+        "stream_generate",
+        lambda *_args, **_kwargs: iter([StreamResult()]),
+    )
+
+    generated = generate_content(
+        model=_Model(),
+        processor=_Processor(),
+        prompt="source",
+        images=[],
+        max_tokens=4_096,
+        temperature=0.0,
+        do_sample=False,
+        input_token_limit=100,
+    )
+
+    assert generated.generation_tokens == 4_096
+    assert run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": "bounded OCR"}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {"schema_version": "clinical-document-extraction.v1"},
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: generated,
+    ) == {"schema_version": "clinical-document-extraction.v1"}
 
 
 def test_extraction_deterministically_grounds_explicit_assertion_phrases(
@@ -1946,6 +2312,202 @@ def test_generation_throttles_stream_activity_without_changing_generated_text(
 
     assert result == "x" * 65
     assert activity == [1, 1, 1]
+
+
+def test_generation_closes_stream_before_collecting_and_clearing_mlx_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed generation releases stream frames before allocator cleanup."""
+
+    import mlx_vlm
+
+    from local_ai_mlx_worker import common
+
+    events: list[str] = []
+
+    class Stream:
+        def __iter__(self) -> Iterator[str]:
+            return iter(["{", "}"])
+
+        def close(self) -> None:
+            events.append("close")
+
+    class FakeMlx:
+        @staticmethod
+        def device_info() -> dict[str, int]:
+            return {"max_recommended_working_set_size": 12 * 1024**3}
+
+        @staticmethod
+        def set_memory_limit(_limit: int) -> None:
+            events.append("memory-limit")
+
+        @staticmethod
+        def set_cache_limit(_limit: int) -> None:
+            events.append("cache-limit")
+
+        @staticmethod
+        def clear_cache() -> None:
+            events.append("clear")
+
+    monkeypatch.setattr(
+        mlx_vlm,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "formatted",
+    )
+    monkeypatch.setattr(
+        mlx_vlm,
+        "stream_generate",
+        lambda *_args, **_kwargs: Stream(),
+    )
+    monkeypatch.setattr(common, "_load_mlx_core", lambda: FakeMlx())
+    monkeypatch.setattr(common.gc, "collect", lambda: events.append("collect"))
+
+    assert (
+        common.generate_content(
+            model=_Model(),
+            processor=_Processor(),
+            prompt="source",
+            images=[],
+            max_tokens=100,
+            temperature=0.0,
+            do_sample=False,
+            input_token_limit=100,
+        )
+        == "{}"
+    )
+    assert events[-3:] == ["close", "collect", "clear"]
+
+
+def test_generation_cleans_mlx_after_stream_error_and_subsequent_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed attempt cannot retain stream frames or cache into its retry."""
+
+    import mlx_vlm
+
+    from local_ai_mlx_worker import common
+
+    events: list[str] = []
+
+    class Stream:
+        def __init__(self, *, fail: bool) -> None:
+            self._fail = fail
+
+        def __iter__(self) -> Iterator[str]:
+            yield "{"
+            if self._fail:
+                raise RuntimeError("private generation failure")
+            yield "}"
+
+        def close(self) -> None:
+            events.append("close")
+
+    class FakeMlx:
+        @staticmethod
+        def device_info() -> dict[str, int]:
+            return {"max_recommended_working_set_size": 12 * 1024**3}
+
+        @staticmethod
+        def set_memory_limit(_limit: int) -> None:
+            return None
+
+        @staticmethod
+        def set_cache_limit(_limit: int) -> None:
+            return None
+
+        @staticmethod
+        def clear_cache() -> None:
+            events.append("clear")
+
+    attempts = iter([Stream(fail=True), Stream(fail=False)])
+    monkeypatch.setattr(
+        mlx_vlm,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "formatted",
+    )
+    monkeypatch.setattr(
+        mlx_vlm,
+        "stream_generate",
+        lambda *_args, **_kwargs: next(attempts),
+    )
+    monkeypatch.setattr(common, "_load_mlx_core", lambda: FakeMlx())
+    monkeypatch.setattr(common.gc, "collect", lambda: events.append("collect"))
+
+    with pytest.raises(RuntimeError, match="private generation failure"):
+        common.generate_content(
+            model=_Model(),
+            processor=_Processor(),
+            prompt="source",
+            images=[],
+            max_tokens=100,
+            temperature=0.0,
+            do_sample=False,
+            input_token_limit=100,
+        )
+    assert events == ["close", "collect", "clear"]
+
+    assert (
+        common.generate_content(
+            model=_Model(),
+            processor=_Processor(),
+            prompt="source",
+            images=[],
+            max_tokens=100,
+            temperature=0.0,
+            do_sample=False,
+            input_token_limit=100,
+        )
+        == "{}"
+    )
+    assert events == [
+        "close",
+        "collect",
+        "clear",
+        "close",
+        "collect",
+        "clear",
+    ]
+
+
+def test_mlx_memory_configuration_uses_working_set_and_bounded_cache() -> None:
+    """The 16 GB runtime avoids MLX's larger default allocator allowance."""
+
+    from local_ai_mlx_worker.common import (
+        MLX_FREE_CACHE_LIMIT_BYTES,
+        _configure_mlx_memory,
+    )
+
+    recommended = 12 * 1024**3
+    calls: list[tuple[str, int]] = []
+
+    class FakeMlx:
+        @staticmethod
+        def device_info() -> dict[str, int]:
+            return {"max_recommended_working_set_size": recommended}
+
+        @staticmethod
+        def set_memory_limit(limit: int) -> None:
+            calls.append(("memory", limit))
+
+        @staticmethod
+        def set_cache_limit(limit: int) -> None:
+            calls.append(("cache", limit))
+
+    _configure_mlx_memory(FakeMlx())
+
+    assert calls == [
+        ("memory", recommended),
+        ("cache", MLX_FREE_CACHE_LIMIT_BYTES),
+    ]
+    assert MLX_FREE_CACHE_LIMIT_BYTES <= 256 * 1024**2
+
+
+def test_mlx_memory_configuration_tolerates_missing_runtime_apis() -> None:
+    """Non-Mac and test fakes remain importable when MLX APIs are absent."""
+
+    from local_ai_mlx_worker.common import _configure_mlx_memory
+
+    _configure_mlx_memory(object())
 
 
 def test_ocr_rejects_image_outside_job_scratch(tmp_path: Path) -> None:

@@ -18,6 +18,7 @@ from app.models.local_ai import LocalAIJob, LocalAIPage
 from app.models.record import HealthRecord
 from app.models.uploaded_file import UploadedFile
 from app.models.user import User
+from app.services.local_ai import pipeline as pipeline_module
 from app.services.extraction.intra_doc_dedup import dedup_within_document
 from app.services.local_ai.adapters import (
     to_extracted_entities,
@@ -516,6 +517,349 @@ def test_chunked_extraction_quarantines_only_invalid_fact_in_chunk() -> None:
     assert [fact.name for fact in result.labs] == ["Glucose"]
     assert len(result.evidence) == 1
     assert result.rejected_fields == ["chunks[0].labs[1]:fact_validation_failed"]
+
+
+def test_quarantine_rebinds_unique_exact_source_segment_and_maps_fact() -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "Glucose value 95 mg/dL",
+            "page_number": 1,
+            "evidence_excerpt": "Glucose value 95 mg/dL",
+        }
+    ]
+    source_row = "| Glucose | 95 | mg/dL |"
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {
+            1: "\n".join(
+                (
+                    "| Test | Value | Unit |",
+                    "| --- | --- | --- |",
+                    source_row,
+                    "| Glucose | 120 | mg/dL |",
+                )
+            )
+        },
+        upload_id="locator-rebind-unique",
+    )
+    records = validated_extraction_to_health_record_dicts(
+        result,
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+
+    assert len(result.labs) == 1
+    assert result.labs[0].verbatim == source_row
+    assert result.labs[0].evidence_excerpt == source_row
+    assert len(result.evidence) == 1
+    assert len(records) == 1
+    assert records[0]["record_type"] == "observation"
+    assert result.rejected_fields == []
+
+
+def test_quarantine_does_not_rewrite_already_valid_normalized_locator() -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "GLUCOSE 95 mg/dL",
+            "page_number": 1,
+            "evidence_excerpt": "panel summary: glucose 95 mg/dl (confirmed)",
+        }
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {1: "Panel summary: GLUCOSE   95 mg/dL (confirmed)"},
+        upload_id="locator-rebind-valid",
+    )
+
+    assert len(result.labs) == 1
+    assert result.labs[0].verbatim == "GLUCOSE 95 mg/dL"
+    assert (
+        result.labs[0].evidence_excerpt == "panel summary: glucose 95 mg/dl (confirmed)"
+    )
+    assert result.rejected_fields == []
+
+
+@pytest.mark.parametrize(
+    "page_text",
+    (
+        "Creatinine 1.0 mg/dL",
+        "Glucose 95 mg/dL\nGlucose 95 mg/dL",
+    ),
+    ids=("absent", "ambiguous"),
+)
+def test_quarantine_does_not_rebind_absent_or_ambiguous_source(
+    page_text: str,
+) -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "invalid locator",
+            "page_number": 1,
+            "evidence_excerpt": "invalid locator",
+        }
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {1: page_text},
+        upload_id="locator-rebind-unresolved",
+    )
+
+    assert result.labs == []
+    assert result.evidence == ()
+    assert result.rejected_fields == ["chunks[0].labs[0]:fact_validation_failed"]
+
+
+def test_quarantine_never_rebinds_locator_across_pages() -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "invalid locator",
+            "page_number": 2,
+            "evidence_excerpt": "invalid locator",
+        }
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {
+            1: "Glucose 95 mg/dL",
+            2: "Creatinine 1.0 mg/dL",
+        },
+        upload_id="locator-rebind-page-boundary",
+    )
+
+    assert result.labs == []
+    assert result.evidence == ()
+    assert result.rejected_fields == ["chunks[0].labs[0]:fact_validation_failed"]
+
+
+def test_quarantine_rebind_does_not_promote_unsupported_optional_fields() -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "invalid locator",
+            "page_number": 1,
+            "evidence_excerpt": "invalid locator",
+            "normalized_value": "95",
+            "normalization_method": "identity",
+            "normalization_version": "model-authored.v1",
+        }
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {1: "Glucose 95 mg/dL"},
+        upload_id="locator-rebind-unsupported",
+    )
+
+    assert result.labs == []
+    assert result.evidence == ()
+    assert result.rejected_fields == ["chunks[0].labs[0]:fact_validation_failed"]
+
+
+def test_evidence_source_scan_discards_partial_index_when_segment_cap_exceeded() -> (
+    None
+):
+    source = "Glucose 95 mg/dL\n" + ("x\n" * (32 * 1024))
+
+    scan = pipeline_module._source_segments(source, limit=32)
+
+    assert scan.overflowed is True
+    assert scan.segments == ()
+    assert scan.candidates_inspected == 33
+
+
+def test_quarantine_does_not_rebind_from_partial_index_after_page_cap() -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "invalid locator",
+            "page_number": 1,
+            "evidence_excerpt": "invalid locator",
+        }
+    ]
+    page_text = "Glucose 95 mg/dL\n" + ("x\n" * (32 * 1024))
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {1: page_text},
+        upload_id="locator-rebind-page-cap",
+    )
+
+    assert result.labs == []
+    assert result.evidence == ()
+    assert result.rejected_fields == ["chunks[0].labs[0]:fact_validation_failed"]
+
+
+def test_quarantine_reuses_bounded_page_index_for_repeated_invalid_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": "Glucose",
+            "value": "95",
+            "unit": "mg/dL",
+            "verbatim": "invalid locator",
+            "page_number": 1,
+            "evidence_excerpt": "invalid locator",
+        },
+        {
+            "name": "Creatinine",
+            "value": "1.0",
+            "unit": "mg/dL",
+            "verbatim": "invalid locator",
+            "page_number": 1,
+            "evidence_excerpt": "invalid locator",
+        },
+    ]
+    original_source_segments = pipeline_module._source_segments
+    calls = 0
+
+    def counting_source_segments(
+        source: str,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal calls
+        calls += 1
+        return original_source_segments(source, *args, **kwargs)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_source_segments",
+        counting_source_segments,
+    )
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {1: "Glucose 95 mg/dL\nCreatinine 1.0 mg/dL"},
+        upload_id="locator-rebind-page-cache",
+    )
+
+    assert [fact.name for fact in result.labs] == ["Glucose", "Creatinine"]
+    assert calls == 1
+
+
+def test_quarantine_fails_closed_when_document_rebind_work_cap_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        pipeline_module,
+        "_MAX_EVIDENCE_SOURCE_SEGMENTS_PER_PAGE",
+        10,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_MAX_EVIDENCE_SOURCE_SEGMENT_WORK_PER_DOCUMENT",
+        5,
+    )
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": name,
+            "value": value,
+            "unit": "mg/dL",
+            "verbatim": "invalid locator",
+            "page_number": page_number,
+            "evidence_excerpt": "invalid locator",
+        }
+        for page_number, name, value in (
+            (1, "Glucose", "95"),
+            (2, "Creatinine", "1.0"),
+            (3, "Sodium", "140"),
+        )
+    ]
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {
+            1: "Glucose 95 mg/dL",
+            2: "Creatinine 1.0 mg/dL",
+            3: "Sodium 140 mg/dL",
+        },
+        upload_id="locator-rebind-document-cap",
+    )
+
+    assert [fact.name for fact in result.labs] == ["Glucose", "Creatinine"]
+    assert result.rejected_fields == ["chunks[0].labs[2]:fact_validation_failed"]
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "page_text"),
+    (
+        ("G" * 513, "95", f"{'G' * 513} 95 mg/dL"),
+        ("Glucose", "9" * 513, f"Glucose {'9' * 513} mg/dL"),
+    ),
+    ids=("subject", "numeric"),
+)
+def test_quarantine_rejects_oversized_match_terms_before_regex_compilation(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+    page_text: str,
+) -> None:
+    extraction = _empty_extraction()
+    extraction["labs"] = [
+        {
+            "name": name,
+            "value": value,
+            "unit": "mg/dL",
+            "verbatim": "invalid locator",
+            "page_number": 1,
+            "evidence_excerpt": "invalid locator",
+        }
+    ]
+    original_exact_term_pattern = pipeline_module._exact_term_pattern
+    calls = 0
+
+    def counting_exact_term_pattern(
+        term: str,
+        *,
+        numeric: bool = False,
+    ) -> object:
+        nonlocal calls
+        calls += 1
+        return original_exact_term_pattern(term, numeric=numeric)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_exact_term_pattern",
+        counting_exact_term_pattern,
+    )
+
+    result = StrictLocalPipeline._validate_extraction_result(
+        extraction,
+        {1: page_text},
+        upload_id="locator-rebind-oversized-term",
+    )
+
+    assert result.labs == []
+    assert calls == 0
 
 
 def test_chunked_extraction_quarantines_adapter_rejected_fact() -> None:

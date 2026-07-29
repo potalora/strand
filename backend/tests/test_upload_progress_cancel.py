@@ -11,7 +11,8 @@ from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.models.uploaded_file import UploadedFile
@@ -335,6 +336,142 @@ async def test_strict_cancel_check_reloads_flags_from_database(
     assert job.cancel_requested is False
     assert await _lock_strict_terminal_state(db_session, upload.id, job.id) is True
     await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_strict_progress_uses_isolated_transaction_when_runner_session_is_poisoned(
+    db_session: AsyncSession,
+) -> None:
+    from app.api import upload as upload_module
+    from app.models.user import User
+
+    user = User(
+        email=f"strict-progress-isolated-{uuid4().hex}@example.com",
+        password_hash="x",
+    )
+    db_session.add(user)
+    await db_session.flush()
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = _mk_upload(
+        user.id,
+        "processing",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user.id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="ocr",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    engine = create_async_engine(TEST_DB_URL)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        with pytest.raises(DBAPIError):
+            await db_session.execute(text("SELECT 1 / 0"))
+
+        await upload_module._persist_strict_local_progress(
+            runner_db=db_session,
+            upload_id=upload.id,
+            job_id=job.id,
+            user_id=user.id,
+            stage="extraction",
+            progress={
+                "stage": "extraction",
+                "model_role": "extraction",
+                "worker_current": 6,
+                "worker_total": 54,
+            },
+        )
+
+        async with factory() as verify:
+            persisted_upload = await verify.get(UploadedFile, upload.id)
+            persisted_job = await verify.get(LocalAIJob, job.id)
+            assert persisted_upload is not None and persisted_job is not None
+            assert persisted_upload.progress_stage == "local_extraction"
+            assert persisted_upload.progress_detail == {
+                "stage": "extraction",
+                "model_role": "extraction",
+                "worker_current": 6,
+                "worker_total": 54,
+            }
+            assert persisted_job.stage == "extraction"
+            assert persisted_job.progress == persisted_upload.progress_detail
+    finally:
+        await db_session.rollback()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_strict_progress_fails_closed_after_cancel_without_partial_write(
+    db_session: AsyncSession,
+) -> None:
+    from app.api import upload as upload_module
+    from app.models.user import User
+    from app.services.local_ai.errors import LocalPolicyError
+
+    user = User(
+        email=f"strict-progress-cancel-{uuid4().hex}@example.com",
+        password_hash="x",
+    )
+    db_session.add(user)
+    await db_session.flush()
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = _mk_upload(
+        user.id,
+        "processing",
+        cancel_requested=True,
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=user.id,
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="ocr",
+        progress={"stage": "ocr"},
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    engine = create_async_engine(TEST_DB_URL)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        with pytest.raises(LocalPolicyError, match="cancelled"):
+            await upload_module._persist_strict_local_progress(
+                runner_db=db_session,
+                upload_id=upload.id,
+                job_id=job.id,
+                user_id=user.id,
+                stage="extraction",
+                progress={"stage": "extraction", "worker_current": 6},
+            )
+
+        async with factory() as verify:
+            persisted_upload = await verify.get(UploadedFile, upload.id)
+            persisted_job = await verify.get(LocalAIJob, job.id)
+            assert persisted_upload is not None and persisted_job is not None
+            assert persisted_upload.progress_stage is None
+            assert persisted_upload.progress_detail is None
+            assert persisted_job.stage == "ocr"
+            assert persisted_job.progress == {"stage": "ocr"}
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

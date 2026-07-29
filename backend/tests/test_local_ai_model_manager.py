@@ -1411,6 +1411,58 @@ def test_activity_counter_extends_idle_without_changing_page_completion() -> Non
         )
 
 
+def test_final_memory_frame_may_omit_optional_activity_counter() -> None:
+    from app.services.local_ai.protocol import ProgressPayload, ProtocolViolation
+
+    processing = ProgressPayload(
+        role=ModelRole.EXTRACTION,
+        stage="processing",
+        current=1,
+        total=1,
+        activity=4,
+    )
+    finalizing = ProgressPayload(
+        role=ModelRole.EXTRACTION,
+        stage="finalizing",
+        current=1,
+        total=1,
+        active_memory_bytes=512 * 1024**2,
+        peak_memory_bytes=6 * 1024**3,
+    )
+
+    assert (
+        ProductionLocalModelManager._validate_progress_sequence(
+            processing,
+            finalizing,
+        )
+        is True
+    )
+    remembered = ProductionLocalModelManager._remember_progress_activity(
+        processing,
+        finalizing,
+    )
+    assert remembered.activity == 4
+    assert (
+        ProductionLocalModelManager._validate_progress_sequence(
+            remembered,
+            finalizing.model_copy(update={"activity": 4}),
+        )
+        is False
+    )
+    assert (
+        ProductionLocalModelManager._validate_progress_sequence(
+            remembered,
+            finalizing.model_copy(update={"activity": 5}),
+        )
+        is True
+    )
+    with pytest.raises(ProtocolViolation, match="progress"):
+        ProductionLocalModelManager._validate_progress_sequence(
+            remembered,
+            finalizing.model_copy(update={"activity": 3}),
+        )
+
+
 @pytest.mark.asyncio
 async def test_activity_only_progress_extends_liveness_without_public_callback(
     monkeypatch: pytest.MonkeyPatch,
@@ -1443,11 +1495,19 @@ async def test_activity_only_progress_extends_liveness_without_public_callback(
     first = ProgressPayload(
         role=ModelRole.EXTRACTION,
         stage="processing",
-        current=0,
-        total=3,
+        current=54,
+        total=54,
         activity=1,
     )
     heartbeat = first.model_copy(update={"activity": 2})
+    finalizing = ProgressPayload(
+        role=ModelRole.EXTRACTION,
+        stage="finalizing",
+        current=1,
+        total=1,
+        active_memory_bytes=512 * 1024**2,
+        peak_memory_bytes=6 * 1024**3,
+    )
     frames = iter(
         [
             encode_message(
@@ -1472,6 +1532,14 @@ async def test_activity_only_progress_extends_liveness_without_public_callback(
                     request_id=request.request_id,
                     kind="progress",
                     payload=heartbeat,
+                )
+            ),
+            encode_message(
+                WorkerResponse(
+                    version=1,
+                    request_id=request.request_id,
+                    kind="progress",
+                    payload=finalizing,
                 )
             ),
             encode_message(
@@ -1507,8 +1575,169 @@ async def test_activity_only_progress_extends_liveness_without_public_callback(
     )
 
     assert result == {"entities": []}
-    assert observed == [first.model_dump(mode="json", exclude_none=True)]
+    assert observed == [
+        first.model_dump(mode="json", exclude_none=True),
+        finalizing.model_copy(update={"current": 54, "total": 54}).model_dump(
+            mode="json",
+            exclude_none=True,
+        ),
+    ]
     assert durable_heartbeats == [1]
+
+
+@pytest.mark.asyncio
+async def test_worker_eof_logs_only_safe_role_and_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.services.local_ai.model_manager import _RunState
+
+    class Input:
+        def write(self, _value: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+    class Process:
+        stdin = Input()
+        stdout = object()
+        returncode = -9
+
+    manager = LocalModelManager([], worker_home=tmp_path / "worker-home")
+    request = manager._build_request(ModelRole.EXTRACTION, {}, "job-1")
+
+    async def eof(_process: object) -> bytes:
+        return b""
+
+    monkeypatch.setattr(manager, "_readline", eof)
+    caplog.set_level("WARNING")
+
+    with pytest.raises(LocalWorkerError, match="failed"):
+        await manager._exchange(
+            Process(),  # type: ignore[arg-type]
+            request,
+            ModelRole.EXTRACTION,
+            None,
+            None,
+            _RunState(job_id="job-1"),
+        )
+
+    assert "role=extraction returncode=-9" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_nonzero_exit_after_terminal_logs_only_safe_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Process:
+        returncode = -9
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    manager = LocalModelManager([], worker_home=tmp_path / "worker-home")
+
+    async def eof(_process: object) -> bytes:
+        return b""
+
+    monkeypatch.setattr(manager, "_readline", eof)
+    caplog.set_level("WARNING")
+
+    with pytest.raises(LocalWorkerError, match="failed"):
+        await manager._drain_and_reap_after_terminal(
+            Process(),  # type: ignore[arg-type]
+            "request-1",
+        )
+
+    assert "category=nonzero_after_terminal returncode=-9" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_generation_failure_logs_only_allowlisted_category_role_and_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.services.local_ai.model_manager import _RunState
+
+    class Input:
+        def write(self, _value: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+    class Process:
+        stdin = Input()
+        stdout = object()
+        returncode = 0
+        private = "clinical-content-must-not-be-logged"
+
+    manager = LocalModelManager([], worker_home=tmp_path / "worker-home")
+    request = manager._build_request(ModelRole.EXTRACTION, {}, "job-1")
+    frames = iter(
+        [
+            (
+                json.dumps(
+                    {
+                        "version": 1,
+                        "request_id": request.request_id,
+                        "kind": "ready",
+                        "payload": {"role": "extraction"},
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            ),
+            (
+                json.dumps(
+                    {
+                        "version": 1,
+                        "request_id": request.request_id,
+                        "kind": "error",
+                        "payload": {
+                            "code": "generation_failed",
+                            "message": "Local worker generation failed.",
+                            "category": "output_limit",
+                        },
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            ),
+        ]
+    )
+
+    async def readline(_process: object) -> bytes:
+        return next(frames)
+
+    async def noop(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_readline", readline)
+    monkeypatch.setattr(manager, "_request_shutdown", noop)
+    monkeypatch.setattr(manager, "_drain_and_reap_after_terminal", noop)
+    caplog.set_level("WARNING")
+
+    with pytest.raises(LocalWorkerError, match="generation failed"):
+        await manager._exchange(
+            Process(),  # type: ignore[arg-type]
+            request,
+            ModelRole.EXTRACTION,
+            None,
+            None,
+            _RunState(job_id="job-1"),
+        )
+
+    assert (
+        "safe error code=generation_failed category=output_limit "
+        "role=extraction returncode=0" in caplog.text
+    )
+    assert Process.private not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1730,6 +1959,10 @@ async def test_callback_failure_reaps_worker_without_exposing_exception(
         await manager.run(ModelRole.OCR, {}, fail_callback)
 
     assert manager.active_pid is None
+    assert (
+        "category=progress_callback_failure role=ocr "
+        "exception_type=RuntimeError" in caplog.text
+    )
     assert canary not in caplog.text
     assert exc_info.value.__cause__ is None
     await manager.stop()

@@ -18,8 +18,8 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, text, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.database import async_session_factory, get_db
@@ -1605,6 +1605,99 @@ async def _refresh_strict_local_job_lease(
     await db.commit()
 
 
+async def _persist_strict_local_progress(
+    *,
+    runner_db: AsyncSession,
+    upload_id: UUID,
+    job_id: UUID,
+    user_id: UUID,
+    stage: str,
+    progress: dict[str, object],
+) -> None:
+    """Atomically persist content-free strict-local progress in its own session.
+
+    Model progress can arrive while the runner's content-bearing session has an
+    unrelated open or failed transaction. Locking and updating only identifiers,
+    status flags, and validated progress keeps callback persistence independent
+    without loading encrypted clinical columns into this short-lived session.
+    """
+
+    from app.models.local_ai import LocalAIJob
+    from app.services.local_ai.errors import LocalPolicyError
+
+    if runner_db.bind is None:
+        raise LocalPolicyError("Strict-local job is unavailable.")
+    progress_session_factory = async_sessionmaker(
+        bind=runner_db.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with progress_session_factory() as progress_db:
+        active_upload_id = (
+            await progress_db.execute(
+                select(UploadedFile.id)
+                .where(
+                    UploadedFile.id == upload_id,
+                    UploadedFile.user_id == user_id,
+                    UploadedFile.processing_mode == "validated_strict_local",
+                    UploadedFile.ingestion_status == "processing",
+                    UploadedFile.cancel_requested.is_(False),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if active_upload_id is None:
+            raise LocalPolicyError("Strict-local job was cancelled.")
+
+        active_job_id = (
+            await progress_db.execute(
+                select(LocalAIJob.id)
+                .where(
+                    LocalAIJob.id == job_id,
+                    LocalAIJob.upload_id == upload_id,
+                    LocalAIJob.user_id == user_id,
+                    LocalAIJob.processing_mode == "validated_strict_local",
+                    LocalAIJob.status == "processing",
+                    LocalAIJob.cancel_requested.is_(False),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if active_job_id is None:
+            raise LocalPolicyError("Strict-local job was cancelled.")
+
+        updated_job_id = (
+            await progress_db.execute(
+                update(LocalAIJob)
+                .where(
+                    LocalAIJob.id == active_job_id,
+                    LocalAIJob.status == "processing",
+                    LocalAIJob.cancel_requested.is_(False),
+                )
+                .values(stage=stage, progress=progress)
+                .returning(LocalAIJob.id)
+            )
+        ).scalar_one_or_none()
+        updated_upload_id = (
+            await progress_db.execute(
+                update(UploadedFile)
+                .where(
+                    UploadedFile.id == active_upload_id,
+                    UploadedFile.ingestion_status == "processing",
+                    UploadedFile.cancel_requested.is_(False),
+                )
+                .values(
+                    progress_stage=f"local_{stage}",
+                    progress_detail=progress,
+                )
+                .returning(UploadedFile.id)
+            )
+        ).scalar_one_or_none()
+        if updated_job_id is None or updated_upload_id is None:
+            raise LocalPolicyError("Strict-local job was cancelled.")
+        await progress_db.commit()
+
+
 async def _lock_strict_terminal_state(
     db: AsyncSession,
     upload_id: UUID,
@@ -2442,8 +2535,6 @@ async def _run_strict_local_ingestion_for_upload(
 
     async def publish_progress(value: dict[str, object]) -> None:
         nonlocal failure_stage
-        if await _strict_cancel_requested(db, upload_id, job_id):
-            raise LocalPolicyError("Strict-local job was cancelled.")
         stage = value.get("stage")
         if stage not in _STRICT_LOCAL_PROGRESS_STAGES:
             raise LocalPolicyError("Strict-local progress stage is invalid.")
@@ -2465,11 +2556,23 @@ async def _run_strict_local_ingestion_for_upload(
                 raise LocalPolicyError("Strict-local progress counter is invalid.")
             safe[key] = item
         failure_stage = stage
+        await _persist_strict_local_progress(
+            runner_db=db,
+            upload_id=upload_id,
+            job_id=job_id,
+            user_id=user_id,
+            stage=failure_stage,
+            progress=safe,
+        )
+        # Keep the runner identity map aligned with the durable isolated write.
+        # These assignments perform no I/O and intentionally do not commit the
+        # content-bearing session. A later encrypted checkpoint/evidence flush
+        # therefore still carries the server-owned failure phase, while callback
+        # persistence remains independent of this transaction's health.
         job.stage = failure_stage
         job.progress = safe
-        upload.progress_stage = f"local_{job.stage}"
+        upload.progress_stage = f"local_{failure_stage}"
         upload.progress_detail = safe
-        await db.commit()
 
     async def publish_liveness() -> None:
         # Use an isolated session so cancellation of a slow durable heartbeat

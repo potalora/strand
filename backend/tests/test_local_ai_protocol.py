@@ -258,6 +258,60 @@ def test_runtime_error_codes_use_only_fixed_non_content_messages(
         )
 
 
+@pytest.mark.parametrize("category", ["output_limit", "invalid_structured_output"])
+def test_generation_failure_accepts_only_allowlisted_content_free_categories(
+    category: str,
+) -> None:
+    response = WorkerResponse.model_validate(
+        _response(
+            "error",
+            {
+                "code": "generation_failed",
+                "message": "Local worker generation failed.",
+                "category": category,
+            },
+        )
+    )
+
+    assert response.payload.category == category
+    with pytest.raises(ValidationError):
+        WorkerResponse.model_validate(
+            _response(
+                "error",
+                {
+                    "code": "generation_failed",
+                    "message": "Local worker generation failed.",
+                    "category": "patient-content",
+                },
+            )
+        )
+
+
+def test_generation_failure_category_is_optional_and_code_scoped() -> None:
+    legacy = WorkerResponse.model_validate(
+        _response(
+            "error",
+            {
+                "code": "generation_failed",
+                "message": "Local worker generation failed.",
+            },
+        )
+    )
+
+    assert legacy.payload.category is None
+    with pytest.raises(ValidationError):
+        WorkerResponse.model_validate(
+            _response(
+                "error",
+                {
+                    "code": "runtime_failed",
+                    "message": "Local worker runtime failed.",
+                    "category": "output_limit",
+                },
+            )
+        )
+
+
 def test_response_kind_must_match_its_bounded_payload_schema() -> None:
     with pytest.raises(ValidationError):
         WorkerResponse.model_validate(

@@ -219,6 +219,9 @@ _STATUS_SIGNALS: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
 class _TruncatedGenerationError(GenerationError):
     """An invalid model response that exhausted its deterministic output bound."""
 
+    def __init__(self, message: str) -> None:
+        super().__init__(message, category="output_limit")
+
 
 @dataclass
 class _ExtractionWorkBudget:
@@ -229,7 +232,10 @@ class _ExtractionWorkBudget:
 
     def consume_attempt(self) -> None:
         if self.remaining_attempts <= 0:
-            raise GenerationError("Local extraction exceeded its generation work limit.")
+            raise GenerationError(
+                "Local extraction exceeded its generation work limit.",
+                category="work_limit",
+            )
         self.remaining_attempts -= 1
 
     def consume_split(self) -> None:
@@ -498,6 +504,7 @@ def _fit_page_fragments(
 def _extraction_batches(
     pages: list[dict[str, object]],
     *,
+    images_by_page: Mapping[int, str],
     loaded: LoadedRole,
     template: str,
     instructions: str,
@@ -520,6 +527,12 @@ def _extraction_batches(
     current: list[dict[str, object]] = []
     for page in prepared:
         if _is_fragment(page):
+            if current:
+                batches.append(current)
+                current = []
+            batches.append([page])
+            continue
+        if int(page["page_number"]) in images_by_page:
             if current:
                 batches.append(current)
                 current = []
@@ -591,10 +604,16 @@ def _run_extraction_batch(
         try:
             value = parse_json_object(raw)
         except GenerationError:
-            if _token_count(selected.processor, raw) >= max(
-                1,
-                max_tokens - _OUTPUT_CAP_TOKEN_TOLERANCE,
-            ):
+            exact_generation_tokens = getattr(raw, "generation_tokens", None)
+            output_limit_reached = (
+                type(exact_generation_tokens) is int and exact_generation_tokens >= max_tokens
+            )
+            if exact_generation_tokens is None:
+                output_limit_reached = _token_count(selected.processor, raw) >= max(
+                    1,
+                    max_tokens - _OUTPUT_CAP_TOKEN_TOLERANCE,
+                )
+            if output_limit_reached:
                 raise _TruncatedGenerationError(
                     "Local extraction exhausted its output token limit."
                 ) from None
@@ -624,6 +643,7 @@ def _run_extraction_batch_with_runtime_splits(
 ) -> list[tuple[list[dict[str, object]], dict[str, object]]]:
     """Split only a formatted batch that the loaded runtime rejects as too large."""
 
+    failure: GenerationError | None = None
     try:
         result = _run_extraction_batch(
             pages,
@@ -636,12 +656,14 @@ def _run_extraction_batch_with_runtime_splits(
             attempt_progress_fn=attempt_progress_fn,
             budget=budget,
         )
-    except _TruncatedGenerationError:
+    except _TruncatedGenerationError as exc:
+        failure = exc
         should_split_page = True
     except WorkerInputLimitError:
         should_split_page = True
-    except GenerationError:
-        should_split_page = False
+    except GenerationError as exc:
+        failure = exc
+        should_split_page = exc.category == "invalid_structured_output"
     else:
         if progress_fn is not None and all(
             not _is_fragment(page) or page.get(_FRAGMENT_FINAL_KEY) is True for page in pages
@@ -649,6 +671,10 @@ def _run_extraction_batch_with_runtime_splits(
             progress_fn(len(pages))
         return [(pages, result)]
 
+    if not should_split_page:
+        if failure is None:
+            raise GenerationError("Local extraction returned invalid JSON.")
+        raise failure
     if len(pages) > 1:
         midpoint = len(pages) // 2
         return [
@@ -677,9 +703,12 @@ def _run_extraction_batch_with_runtime_splits(
                 budget=budget,
             ),
         ]
-    if not should_split_page:
-        raise GenerationError("Local extraction returned invalid JSON.")
-    left, right = _split_page(pages[0], budget=budget)
+    try:
+        left, right = _split_page(pages[0], budget=budget)
+    except WorkerInputLimitError:
+        if failure is not None:
+            raise failure from None
+        raise
     return [
         *_run_extraction_batch_with_runtime_splits(
             [left],
@@ -1126,7 +1155,10 @@ def _merge_fragment_results(results: list[dict[str, object]]) -> dict[str, objec
     """Merge ordered results for fragments of one source page without invention."""
 
     if not results:
-        raise GenerationError("Local extraction returned no fragment results.")
+        raise GenerationError(
+            "Local extraction returned no fragment results.",
+            category="fragment_conflict",
+        )
     merged: dict[str, object] = {}
     for result in results:
         for key, item in result.items():
@@ -1158,7 +1190,10 @@ def _merge_fragment_results(results: list[dict[str, object]]) -> dict[str, objec
                 continue
             if item is None or item == current:
                 continue
-            raise GenerationError("Local extraction fragment results conflict.")
+            raise GenerationError(
+                "Local extraction fragment results conflict.",
+                category="fragment_conflict",
+            )
     for field_name in ("unresolved_fields", "rejected_fields"):
         values = merged.get(field_name)
         if isinstance(values, list):
@@ -1250,6 +1285,7 @@ def run_extraction(
     budget = _ExtractionWorkBudget()
     batches = _extraction_batches(
         pages,
+        images_by_page=images_by_page,
         loaded=selected,
         template=template,
         instructions=instructions,

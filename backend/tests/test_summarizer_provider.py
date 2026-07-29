@@ -18,7 +18,10 @@ from app.services.ai.summarizer import (
     generate_summary,
 )
 from app.services.local_ai.errors import LocalValidationError
-from app.services.local_ai.grounded_summary import SERVER_MEDICAL_DISCLAIMER
+from app.services.local_ai.grounded_summary import (
+    SERVER_MEDICAL_DISCLAIMER,
+    GroundedSummaryDocument,
+)
 from app.services.local_ai.types import ProcessingMode
 from tests.conftest import auth_headers, create_test_patient, seed_test_records
 
@@ -292,6 +295,7 @@ async def test_summary_uses_explicit_provider_and_scrubs_patient_name(
     # The patient's name must NOT appear in the user content; it should have
     # been replaced by the known-patient placeholder before send.
     sent_request = prov.complete.call_args.args[0]
+    assert sent_request.json_schema is GroundedSummaryDocument
     content = sent_request.messages[0].content
     assert "Bartholomew" not in content
     assert "Quibblesworth" not in content

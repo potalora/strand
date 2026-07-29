@@ -45,6 +45,13 @@ ErrorCode = Literal[
     "unavailable",
     "worker_failed",
 ]
+GenerationFailureCategory = Literal[
+    "fragment_conflict",
+    "invalid_structured_output",
+    "output_limit",
+    "stream_contract",
+    "work_limit",
+]
 ProtocolVersion = Annotated[StrictInt, Field(ge=PROTOCOL_VERSION, le=PROTOCOL_VERSION)]
 
 SAFE_ERROR_MESSAGES: dict[str, str] = {
@@ -113,11 +120,14 @@ class ErrorPayload(_StrictMessage):
 
     code: ErrorCode
     message: str
+    category: GenerationFailureCategory | None = None
 
     @model_validator(mode="after")
     def message_is_fixed_for_code(self) -> ErrorPayload:
         if self.message != SAFE_ERROR_MESSAGES[self.code]:
             raise ValueError("error message must match its safe code")
+        if self.category is not None and self.code != "generation_failed":
+            raise ValueError("failure category is valid only for generation failures")
         return self
 
 

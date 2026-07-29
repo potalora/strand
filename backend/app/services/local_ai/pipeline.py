@@ -38,6 +38,8 @@ from app.services.local_ai.extraction_schema import (
     FACT_CATEGORY_NAMES,
     MAX_FACTS_PER_CATEGORY,
     MAX_FIELD_LIST_ITEMS,
+    MAX_LONG_TEXT,
+    MAX_SHORT_TEXT,
     NUEXTRACT_TEMPLATE_V1,
     ClinicalDocumentExtraction,
 )
@@ -82,6 +84,27 @@ _VALIDATION_WORK_OVERFLOW_PATH = "extraction.validation_work:limit_exceeded"
 _MAX_RAW_ITEMS_PER_DOCUMENT = len(FACT_CATEGORY_NAMES) * MAX_FACTS_PER_CATEGORY + (
     2 * MAX_FIELD_LIST_ITEMS
 )
+_MAX_EVIDENCE_SOURCE_SEGMENTS_PER_PAGE = 4_096
+_MAX_EVIDENCE_SOURCE_SEGMENT_WORK_PER_DOCUMENT = 16_384
+_FACT_SUBJECT_FIELDS = {
+    "medications": "name",
+    "conditions": "name",
+    "procedures": "name",
+    "labs": "name",
+    "allergies": "substance",
+    "encounters": "name",
+    "immunizations": "name",
+    "vital_signs": "name",
+    "diagnostic_reports": "name",
+    "care_plans": "title",
+}
+_FACT_NUMERIC_FIELDS = {
+    "medications": ("dose_value",),
+    "labs": ("value",),
+    "immunizations": ("dose",),
+    "vital_signs": ("value",),
+}
+_HTML_TABLE_ROW_RE = re.compile(r"<tr\b[^>]*>.*?</tr>", re.IGNORECASE | re.DOTALL)
 _FHIR_VALIDATION_UUID = uuid.UUID(int=0)
 _TABLE_SEPARATOR_RE = re.compile(r"(?m)^\s*\|?(?:\s*:?-{3,}:?\s*\|){2,}\s*$")
 _IMAGE_ESCALATION_MARKERS = (
@@ -160,6 +183,272 @@ class _ValidationWorkBudget:
         allowed = min(max(self.remaining, 0), max(requested, 0))
         self.remaining -= allowed
         return allowed
+
+
+@dataclass(frozen=True)
+class _EvidenceSourceSegment:
+    """One bounded, exact row or line from a claimed OCR page."""
+
+    text: str
+    start: int
+    end: int
+    priority: int
+
+
+@dataclass(frozen=True)
+class _EvidenceSourceScan:
+    """Bounded source-index result with explicit overflow state."""
+
+    segments: tuple[_EvidenceSourceSegment, ...]
+    candidates_inspected: int
+    overflowed: bool
+
+
+def _locator_text(value: str) -> str:
+    """Mirror the strict validator's evidence-locator representation."""
+
+    return " ".join(value.casefold().split())
+
+
+def _locator_is_valid(
+    raw_fact: Mapping[str, object],
+    normalized_page_text: str,
+) -> bool:
+    verbatim = raw_fact.get("verbatim")
+    excerpt = raw_fact.get("evidence_excerpt")
+    if not isinstance(verbatim, str) or not isinstance(excerpt, str):
+        return False
+    normalized_verbatim = _locator_text(verbatim)
+    normalized_excerpt = _locator_text(excerpt)
+    if not normalized_verbatim or not normalized_excerpt:
+        return False
+    return (
+        normalized_excerpt in normalized_page_text
+        and normalized_verbatim in normalized_excerpt
+    )
+
+
+def _source_segments(source: str, *, limit: int) -> _EvidenceSourceScan:
+    """Collect a bounded source index without retaining partial overflow data."""
+
+    bounded_limit = max(limit, 0)
+    candidates: list[_EvidenceSourceSegment] = []
+    seen_spans: set[tuple[int, int]] = set()
+    candidates_inspected = 0
+
+    def append_candidate(start: int, end: int, *, priority: int) -> bool:
+        nonlocal candidates_inspected
+        candidates_inspected += 1
+        if candidates_inspected > bounded_limit:
+            return False
+        span = (start, end)
+        if end - start > MAX_LONG_TEXT or span in seen_spans:
+            return True
+        seen_spans.add(span)
+        candidates.append(
+            _EvidenceSourceSegment(
+                text=source[start:end],
+                start=start,
+                end=end,
+                priority=priority,
+            )
+        )
+        return True
+
+    for match in _HTML_TABLE_ROW_RE.finditer(source):
+        if not append_candidate(
+            match.start(),
+            match.end(),
+            priority=0,
+        ):
+            return _EvidenceSourceScan(
+                segments=(),
+                candidates_inspected=candidates_inspected,
+                overflowed=True,
+            )
+    for match in re.finditer(r"[^\r\n]+", source):
+        start, end = match.span()
+        while start < end and source[start].isspace():
+            start += 1
+        while end > start and source[end - 1].isspace():
+            end -= 1
+        if start == end:
+            continue
+        if not append_candidate(start, end, priority=1):
+            return _EvidenceSourceScan(
+                segments=(),
+                candidates_inspected=candidates_inspected,
+                overflowed=True,
+            )
+    return _EvidenceSourceScan(
+        segments=tuple(candidates),
+        candidates_inspected=candidates_inspected,
+        overflowed=False,
+    )
+
+
+def _exact_term_pattern(value: str, *, numeric: bool = False) -> re.Pattern[str] | None:
+    if len(value) > MAX_SHORT_TEXT:
+        return None
+    normalized = _locator_text(value)
+    if not normalized:
+        return None
+    boundary = r"[\w.,]" if numeric else r"\w"
+    return re.compile(rf"(?<!{boundary}){re.escape(normalized)}(?!{boundary})")
+
+
+def _numeric_locator_value(
+    raw_fact: Mapping[str, object],
+    category: str,
+) -> str | None:
+    for field_name in _FACT_NUMERIC_FIELDS.get(category, ()):
+        value = raw_fact.get(field_name)
+        if (
+            isinstance(value, str)
+            and value.strip()
+            and any(character.isdigit() for character in value)
+        ):
+            return value
+    return None
+
+
+def _find_rebind_segment(
+    segments: tuple[_EvidenceSourceSegment, ...],
+    raw_fact: Mapping[str, object],
+    category: str,
+) -> str | None:
+    """Find one unambiguous exact source row or line for a raw fact."""
+
+    subject_field = _FACT_SUBJECT_FIELDS.get(category)
+    if subject_field is None:
+        return None
+    subject = raw_fact.get(subject_field)
+    if not isinstance(subject, str) or len(subject) > MAX_SHORT_TEXT:
+        return None
+    numeric_value = _numeric_locator_value(raw_fact, category)
+    if numeric_value is not None and len(numeric_value) > MAX_SHORT_TEXT:
+        return None
+    subject_pattern = _exact_term_pattern(subject)
+    if subject_pattern is None:
+        return None
+    numeric_pattern = (
+        _exact_term_pattern(numeric_value, numeric=True)
+        if numeric_value is not None
+        else None
+    )
+
+    matches: list[_EvidenceSourceSegment] = []
+    for segment in segments:
+        normalized_segment = _locator_text(segment.text)
+        subject_matches = list(subject_pattern.finditer(normalized_segment))
+        numeric_matches = (
+            [True]
+            if numeric_pattern is None
+            else list(numeric_pattern.finditer(normalized_segment))
+        )
+        if len(subject_matches) > 1 and numeric_matches:
+            return None
+        if len(subject_matches) == 1 and numeric_matches:
+            matches.append(segment)
+    if not matches:
+        return None
+
+    groups: list[list[_EvidenceSourceSegment]] = []
+    for segment in sorted(matches, key=lambda item: (item.start, item.end)):
+        if not groups or segment.start >= max(item.end for item in groups[-1]):
+            groups.append([segment])
+        else:
+            groups[-1].append(segment)
+    if len(groups) != 1:
+        return None
+    return min(
+        groups[0],
+        key=lambda item: (item.priority, len(item.text), item.start),
+    ).text
+
+
+class _EvidenceLocatorRebinder:
+    """Cache bounded page indexes and enforce document-global repair work."""
+
+    def __init__(self) -> None:
+        self._remaining_work = _MAX_EVIDENCE_SOURCE_SEGMENT_WORK_PER_DOCUMENT
+        self._normalized_pages: dict[int, str] = {}
+        self._page_segments: dict[
+            int,
+            tuple[_EvidenceSourceSegment, ...] | None,
+        ] = {}
+
+    def _normalized_page(self, page_number: int, page_text: str) -> str:
+        if page_number not in self._normalized_pages:
+            self._normalized_pages[page_number] = _locator_text(page_text)
+        return self._normalized_pages[page_number]
+
+    def _segments_for_page(
+        self,
+        page_number: int,
+        page_text: str,
+    ) -> tuple[_EvidenceSourceSegment, ...] | None:
+        if page_number in self._page_segments:
+            return self._page_segments[page_number]
+        if self._remaining_work <= 0:
+            self._page_segments[page_number] = None
+            return None
+        scan = _source_segments(
+            page_text,
+            limit=min(
+                _MAX_EVIDENCE_SOURCE_SEGMENTS_PER_PAGE,
+                self._remaining_work,
+            ),
+        )
+        self._remaining_work = max(
+            0,
+            self._remaining_work - scan.candidates_inspected,
+        )
+        segments = None if scan.overflowed else scan.segments
+        self._page_segments[page_number] = segments
+        return segments
+
+    def rebind(
+        self,
+        raw_fact: object,
+        pages: Mapping[int, str],
+        category: str,
+    ) -> object:
+        """Repair only an invalid locator with unique evidence on its claimed page."""
+
+        if not isinstance(raw_fact, dict):
+            return raw_fact
+        page_number = raw_fact.get("page_number")
+        if type(page_number) is not int:
+            return raw_fact
+        page_text = pages.get(page_number)
+        if page_text is None:
+            return raw_fact
+        normalized_page = self._normalized_page(page_number, page_text)
+        if _locator_is_valid(raw_fact, normalized_page):
+            return raw_fact
+
+        subject_field = _FACT_SUBJECT_FIELDS.get(category)
+        if subject_field is None:
+            return raw_fact
+        subject = raw_fact.get(subject_field)
+        if not isinstance(subject, str) or len(subject) > MAX_SHORT_TEXT:
+            return raw_fact
+        numeric_value = _numeric_locator_value(raw_fact, category)
+        if numeric_value is not None and len(numeric_value) > MAX_SHORT_TEXT:
+            return raw_fact
+
+        segments = self._segments_for_page(page_number, page_text)
+        if not segments or len(segments) > self._remaining_work:
+            return raw_fact
+        self._remaining_work -= len(segments)
+        segment = _find_rebind_segment(segments, raw_fact, category)
+        if segment is None:
+            return raw_fact
+        rebound = dict(raw_fact)
+        rebound["verbatim"] = segment
+        rebound["evidence_excerpt"] = segment
+        return rebound
 
 
 class StrictLocalJob(Protocol):
@@ -840,6 +1129,7 @@ class StrictLocalPipeline:
         upload_id: str,
     ) -> ClinicalDocumentExtraction:
         work_budget = _ValidationWorkBudget(_MAX_RAW_ITEMS_PER_DOCUMENT)
+        locator_rebinder = _EvidenceLocatorRebinder()
         if not (
             isinstance(raw, dict)
             and raw.get("result_type") == _CHUNKED_EXTRACTION_RESULT_TYPE
@@ -850,6 +1140,7 @@ class StrictLocalPipeline:
                 upload_id=upload_id,
                 chunk_index=0,
                 work_budget=work_budget,
+                locator_rebinder=locator_rebinder,
             )
         if set(raw) != {"result_type", "chunks"}:
             raise LocalValidationError("Local extraction chunk envelope is invalid.")
@@ -900,6 +1191,7 @@ class StrictLocalPipeline:
                     upload_id=upload_id,
                     chunk_index=len(validated_chunks),
                     work_budget=work_budget,
+                    locator_rebinder=locator_rebinder,
                 )
             )
 
@@ -930,6 +1222,7 @@ class StrictLocalPipeline:
         upload_id: str,
         chunk_index: int,
         work_budget: _ValidationWorkBudget,
+        locator_rebinder: _EvidenceLocatorRebinder,
     ) -> ClinicalDocumentExtraction:
         """Keep independently valid facts while quarantining model-local failures."""
         if not isinstance(raw, dict):
@@ -1045,6 +1338,11 @@ class StrictLocalPipeline:
                 raw_fact = raw_facts[fact_index]
                 path = f"chunks[{chunk_index}].{category}[{fact_index}]"
                 try:
+                    raw_fact = locator_rebinder.rebind(
+                        raw_fact,
+                        pages,
+                        category,
+                    )
                     candidate = validate_clinical_extraction(
                         {
                             "schema_version": CLINICAL_EXTRACTION_SCHEMA_VERSION,

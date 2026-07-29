@@ -57,6 +57,25 @@ _INTERPROCESS_LOCK_POLL_SECONDS = 0.05
 _MACOS_SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 _MACOS_NETWORK_DENY_PROFILE = "(version 1) (allow default) (deny network*)"
 _WORKER_PROCESS_LOCK = "worker-process.lock"
+_SAFE_CALLBACK_ERROR_TYPES = frozenset(
+    {
+        "CancelledError",
+        "ConnectionDoesNotExistError",
+        "DBAPIError",
+        "IntegrityError",
+        "InterfaceError",
+        "InvalidRequestError",
+        "MissingGreenlet",
+        "OperationalError",
+        "PendingRollbackError",
+        "PostgresError",
+        "RuntimeError",
+        "SQLAlchemyError",
+        "StaleDataError",
+        "StatementError",
+        "TimeoutError",
+    }
+)
 _PROGRESS_STAGE_ORDER = {
     "starting": 0,
     "loading": 1,
@@ -90,7 +109,9 @@ class _RunState:
 
 
 class _ProgressCallbackFailure(RuntimeError):
-    pass
+    def __init__(self, error_type: str = "OtherError") -> None:
+        super().__init__()
+        self.error_type = error_type
 
 
 class _RunCancelled(RuntimeError):
@@ -476,14 +497,30 @@ class LocalModelManager:
                     on_liveness,
                     state,
                 )
-            except _ProgressCallbackFailure:
+            except _ProgressCallbackFailure as exc:
+                logger.warning(
+                    "Local worker failed category=progress_callback_failure "
+                    "role=%s exception_type=%s",
+                    role.value,
+                    exc.error_type,
+                )
                 raise LocalWorkerError(
                     "Local worker progress callback failed."
                 ) from None
             except ProtocolViolation:
+                logger.warning(
+                    "Local worker failed category=protocol_violation role=%s",
+                    role.value,
+                )
                 raise LocalWorkerError("Local worker protocol failed.") from None
             except (BrokenPipeError, ConnectionError, OSError):
                 self._raise_if_cancelled(state)
+                logger.warning(
+                    "Local worker failed category=transport_failure "
+                    "role=%s returncode=%s",
+                    role.value,
+                    process.returncode,
+                )
                 raise LocalWorkerError("Local worker failed.") from None
             except LocalWorkerError:
                 self._raise_if_cancelled(state)
@@ -516,6 +553,16 @@ class LocalModelManager:
                 else:
                     self._retain_failed_cleanup(cleanup_process, lease)
             if cleanup_error is not None:
+                logger.warning(
+                    "Local worker failed category=cleanup_failure "
+                    "role=%s returncode=%s",
+                    role.value,
+                    (
+                        cleanup_process.returncode
+                        if cleanup_process is not None
+                        else None
+                    ),
+                )
                 raise cleanup_error from None
             if caller_cancelled:
                 raise asyncio.CancelledError
@@ -919,6 +966,12 @@ class LocalModelManager:
                 raise LocalWorkerTimeout("Local worker timed out.") from None
             if not line:
                 self._raise_if_cancelled(state)
+                logger.warning(
+                    "Local worker exited before terminal response "
+                    "role=%s returncode=%s",
+                    role.value,
+                    process.returncode,
+                )
                 raise LocalWorkerError("Local worker failed.")
             response = parse_response_line(line)
             if response.request_id != request.request_id:
@@ -938,6 +991,10 @@ class LocalModelManager:
                     or progress.role is not role
                 ):
                     raise ProtocolViolation("Worker progress response is invalid.")
+                progress = self._normalize_final_extraction_progress(
+                    last_progress,
+                    progress,
+                )
                 liveness_advanced = self._validate_progress_sequence(
                     last_progress,
                     progress,
@@ -965,7 +1022,10 @@ class LocalModelManager:
                         state,
                         deadline=callback_deadline,
                     )
-                last_progress = progress
+                last_progress = self._remember_progress_activity(
+                    last_progress,
+                    progress,
+                )
                 continue
             if response.kind in {"result", "error"}:
                 if not isinstance(response.payload, (ResultPayload, ErrorPayload)):
@@ -978,10 +1038,16 @@ class LocalModelManager:
         await self._drain_and_reap_after_terminal(process, request.request_id)
         self._raise_if_cancelled(state)
         if isinstance(terminal, ErrorPayload):
+            safe_return_code = (
+                process.returncode if type(process.returncode) is int else None
+            )
             logger.warning(
-                "Local worker returned safe error code %s for role %s",
+                "Local worker returned safe error code=%s category=%s "
+                "role=%s returncode=%s",
                 terminal.code,
+                terminal.category or "none",
                 role.value,
+                safe_return_code,
             )
             if terminal.code == "input_limit_exceeded":
                 raise LocalInputLimitError(terminal.message)
@@ -998,7 +1064,9 @@ class LocalModelManager:
         if previous is None:
             return True
         previous_activity = previous.activity or 0
-        current_activity = current.activity or 0
+        current_activity = (
+            previous_activity if current.activity is None else current.activity
+        )
         if current_activity < previous_activity:
             raise ProtocolViolation("Worker progress response is invalid.")
         activity_advanced = current_activity > previous_activity
@@ -1011,6 +1079,42 @@ class LocalModelManager:
         if current.total != previous.total or current.current < previous.current:
             raise ProtocolViolation("Worker progress response is invalid.")
         return current.current > previous.current or activity_advanced
+
+    @staticmethod
+    def _remember_progress_activity(
+        previous: ProgressPayload | None,
+        current: ProgressPayload,
+    ) -> ProgressPayload:
+        """Retain the activity high-water mark across optional metric frames."""
+
+        if (
+            previous is None
+            or previous.activity is None
+            or current.activity is not None
+        ):
+            return current
+        return current.model_copy(update={"activity": previous.activity})
+
+    @staticmethod
+    def _normalize_final_extraction_progress(
+        previous: ProgressPayload | None,
+        current: ProgressPayload,
+    ) -> ProgressPayload:
+        """Keep page counters stable while forwarding terminal memory metrics."""
+
+        if (
+            previous is None
+            or current.role is not ModelRole.EXTRACTION
+            or previous.stage != "processing"
+            or current.stage != "finalizing"
+        ):
+            return current
+        return current.model_copy(
+            update={
+                "current": previous.current,
+                "total": previous.total,
+            }
+        )
 
     @staticmethod
     def _progress_is_visible_advance(
@@ -1039,8 +1143,10 @@ class LocalModelManager:
         safe_progress = progress.model_dump(mode="json", exclude_none=True)
         try:
             callback_result = on_progress(safe_progress)
-        except Exception:
-            raise _ProgressCallbackFailure from None
+        except Exception as exc:
+            raise _ProgressCallbackFailure(
+                self._safe_callback_error_type(exc)
+            ) from None
         await self._await_callback(
             callback_result,
             state,
@@ -1061,8 +1167,10 @@ class LocalModelManager:
         self._prune_detached_callbacks()
         try:
             callback_result = on_liveness()
-        except Exception:
-            raise _ProgressCallbackFailure from None
+        except Exception as exc:
+            raise _ProgressCallbackFailure(
+                self._safe_callback_error_type(exc)
+            ) from None
         await self._await_callback(
             callback_result,
             state,
@@ -1104,7 +1212,7 @@ class LocalModelManager:
             cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)
             if callback_task.cancelled():
-                raise _ProgressCallbackFailure
+                raise _ProgressCallbackFailure("CancelledError")
             callback_task.result()
         except asyncio.CancelledError:
             self._detach_callback(callback_task)
@@ -1119,10 +1227,25 @@ class LocalModelManager:
             cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)
             raise
-        except Exception:
+        except _ProgressCallbackFailure:
             cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)
-            raise _ProgressCallbackFailure from None
+            raise
+        except Exception as exc:
+            cancel_task.cancel()
+            await asyncio.gather(cancel_task, return_exceptions=True)
+            raise _ProgressCallbackFailure(
+                self._safe_callback_error_type(exc)
+            ) from None
+
+    @staticmethod
+    def _safe_callback_error_type(exc: Exception) -> str:
+        """Return only an allowlisted class label for callback diagnostics."""
+
+        for error_type in type(exc).__mro__:
+            if error_type.__name__ in _SAFE_CALLBACK_ERROR_TYPES:
+                return error_type.__name__
+        return "OtherError"
 
     def _detach_callback(self, task: asyncio.Future[object]) -> None:
         if task.done():
@@ -1202,6 +1325,10 @@ class LocalModelManager:
                 raise ProtocolViolation("Worker responded after a terminal response.")
             return_code = await process.wait()
             if return_code != 0:
+                logger.warning(
+                    "Local worker failed category=nonzero_after_terminal returncode=%s",
+                    return_code,
+                )
                 raise LocalWorkerError("Local worker failed.")
 
         try:

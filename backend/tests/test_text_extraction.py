@@ -12,7 +12,9 @@ from app.services.extraction.text_extractor import (
 )
 
 # Path to real test data (may not exist in CI)
-REQUESTED_RECORD_DIR = Path(__file__).resolve().parent.parent.parent / "Requested Record"
+REQUESTED_RECORD_DIR = (
+    Path(__file__).resolve().parent.parent.parent / "Requested Record"
+)
 RTF_DIR = REQUESTED_RECORD_DIR / "Rich Text"
 PDF_DIR = REQUESTED_RECORD_DIR / "Media"
 TIFF_DIR = REQUESTED_RECORD_DIR / "Media"
@@ -22,6 +24,7 @@ HAS_API_KEY = bool(os.environ.get("GEMINI_API_KEY"))
 
 
 # ---------- File type detection ----------
+
 
 def test_detect_pdf():
     assert detect_file_type(Path("report.pdf")) == FileType.PDF
@@ -49,6 +52,7 @@ def test_detect_case_insensitive():
 
 # ---------- RTF extraction (local, no API) ----------
 
+
 @pytest.mark.skipif(not HAS_REAL_DATA, reason="No real test data at Requested Record/")
 def test_rtf_text_extraction():
     """Extract text from a real RTF file and verify it contains clinical content."""
@@ -63,7 +67,18 @@ def test_rtf_text_extraction():
     text_lower = text.lower()
     assert any(
         term in text_lower
-        for term in ["patient", "date", "history", "note", "assessment", "plan", "diagnosis", "provider", "md", "dr"]
+        for term in [
+            "patient",
+            "date",
+            "history",
+            "note",
+            "assessment",
+            "plan",
+            "diagnosis",
+            "provider",
+            "md",
+            "dr",
+        ]
     ), "RTF text doesn't appear to contain clinical content"
 
 
@@ -87,7 +102,9 @@ def test_rtf_extraction_with_synthetic():
 
 # ---------- PDF extraction via Gemini (slow, requires API) ----------
 
+
 @pytest.mark.slow
+@pytest.mark.private_cloud_fidelity
 @pytest.mark.skipif(
     not HAS_REAL_DATA or not HAS_API_KEY,
     reason="Requires real data and GEMINI_API_KEY",
@@ -109,6 +126,7 @@ async def test_pdf_text_extraction_via_gemini():
 
 
 @pytest.mark.slow
+@pytest.mark.private_cloud_fidelity
 @pytest.mark.skipif(
     not HAS_REAL_DATA or not HAS_API_KEY,
     reason="Requires real data and GEMINI_API_KEY",
@@ -132,7 +150,9 @@ async def test_pdf_extraction_preserves_structure():
 
 # ---------- TIFF OCR via Gemini (slow, requires API) ----------
 
+
 @pytest.mark.slow
+@pytest.mark.private_cloud_fidelity
 @pytest.mark.skipif(
     not HAS_REAL_DATA or not HAS_API_KEY,
     reason="Requires real data and GEMINI_API_KEY",
@@ -142,7 +162,12 @@ async def test_tiff_ocr_via_gemini():
     """Send a TIFF to Gemini 3 Flash for OCR and verify text is non-empty."""
     from app.services.extraction.text_extractor import extract_text_from_tiff
 
-    tiff_files = list(TIFF_DIR.glob("**/*.tif")) + list(TIFF_DIR.glob("**/*.tiff")) + list(TIFF_DIR.glob("**/*.TIFF")) + list(TIFF_DIR.glob("**/*.TIF"))
+    tiff_files = (
+        list(TIFF_DIR.glob("**/*.tif"))
+        + list(TIFF_DIR.glob("**/*.tiff"))
+        + list(TIFF_DIR.glob("**/*.TIFF"))
+        + list(TIFF_DIR.glob("**/*.TIF"))
+    )
     if not tiff_files:
         pytest.skip("No TIFF files found")
 
@@ -154,6 +179,7 @@ async def test_tiff_ocr_via_gemini():
 
 
 # ---------- Dispatcher ----------
+
 
 @pytest.mark.asyncio
 async def test_extract_text_unsupported_type():

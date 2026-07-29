@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
+from typing import Any
 
 from openai import (
     APIConnectionError,
@@ -32,6 +34,33 @@ from app.services.ai.llm.types import (
 
 logger = logging.getLogger(__name__)
 _FINISH = {"stop": "stop", "length": "length", "content_filter": "content_filter"}
+_SCHEMA_NAME = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _schema_dict(schema: Any) -> dict:
+    """Return a JSON-schema dict from a raw schema or Pydantic model class."""
+    if isinstance(schema, dict):
+        return schema
+    model_json_schema = getattr(schema, "model_json_schema", None)
+    if callable(model_json_schema):
+        generated = model_json_schema()
+        if isinstance(generated, dict):
+            return generated
+    raise TypeError("json_schema must be a JSON-schema dict or Pydantic model")
+
+
+def _schema_name(schema: Any) -> str:
+    """Build an OpenAI-safe structured-output schema name."""
+    raw = getattr(schema, "__name__", None)
+    if not raw and isinstance(schema, dict):
+        raw = schema.get("title")
+    cleaned = _SCHEMA_NAME.sub("_", str(raw or "response"))
+    return cleaned[:64]
+
+
+def _supports_native_strict_schema(model: str) -> bool:
+    """Return whether the verified OpenAI model family supports strict schemas."""
+    return model == "gpt-5.6" or model.startswith("gpt-5.6-")
 
 
 def _build_content(message: LLMMessage) -> str | list[dict]:
@@ -123,7 +152,16 @@ class OpenAICompatProvider(LLMProvider):
                 if "temperature" in msg and "temperature" in kwargs:
                     kwargs.pop("temperature")
                     continue
-                if "response_format" in msg and "response_format" in kwargs:
+                response_format = kwargs.get("response_format")
+                strict_schema = (
+                    isinstance(response_format, dict)
+                    and response_format.get("type") == "json_schema"
+                )
+                if (
+                    "response_format" in msg
+                    and "response_format" in kwargs
+                    and not strict_schema
+                ):
                     kwargs.pop("response_format")
                     continue
                 raise LLMBadRequestError(str(e)) from e
@@ -149,19 +187,45 @@ class OpenAICompatProvider(LLMProvider):
         messages.extend(
             {"role": m.role, "content": _build_content(m)} for m in request.messages
         )
+        model = request.model or self._model_default
+        is_gpt_5_6 = self.name == "openai" and model.startswith("gpt-5.6")
         kwargs: dict = {
-            "model": request.model or self._model_default,
+            "model": model,
             "messages": messages,
-            "max_tokens": request.max_output_tokens,
         }
-        if request.temperature is not None:
+        if is_gpt_5_6:
+            kwargs["max_completion_tokens"] = request.max_output_tokens
+        else:
+            kwargs["max_tokens"] = request.max_output_tokens
+        if request.temperature is not None and not is_gpt_5_6:
             kwargs["temperature"] = request.temperature
+        if request.reasoning is not None and is_gpt_5_6:
+            kwargs["reasoning_effort"] = request.reasoning.level
         if request.json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
+            if (
+                request.json_schema is not None
+                and self.name == "openai"
+                and _supports_native_strict_schema(model)
+            ):
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": _schema_name(request.json_schema),
+                        "schema": _schema_dict(request.json_schema),
+                        "strict": True,
+                    },
+                }
+            else:
+                kwargs["response_format"] = {"type": "json_object"}
         resp = await self._create_adaptive(kwargs)
         choice = resp.choices[0]
-        text = choice.message.content or ""
-        finish = _FINISH.get(choice.finish_reason or "", "other")
+        refusal = getattr(choice.message, "refusal", None)
+        text = "" if refusal else choice.message.content or ""
+        finish = (
+            "content_filter"
+            if refusal
+            else _FINISH.get(choice.finish_reason or "", "other")
+        )
         u = resp.usage
         usage = (
             LLMUsage(u.prompt_tokens, u.completion_tokens, u.total_tokens)

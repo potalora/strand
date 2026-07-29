@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .common import (
+    GENERATION_FAILURE_CATEGORIES,
     ArtifactUnavailableError,
     GenerationError,
     WorkerInputError,
@@ -174,8 +175,20 @@ def _write_to_descriptor(
         remaining = remaining[written:]
 
 
-def _error(request_id: str, code: str) -> None:
-    _write(request_id, "error", {"code": code, "message": SAFE_MESSAGES[code]})
+def _error(
+    request_id: str,
+    code: str,
+    *,
+    category: str | None = None,
+) -> None:
+    if category is not None and (
+        code != "generation_failed" or category not in GENERATION_FAILURE_CATEGORIES
+    ):
+        raise ProtocolError
+    payload = {"code": code, "message": SAFE_MESSAGES[code]}
+    if category is not None:
+        payload["category"] = category
+    _write(request_id, "error", payload)
     sys.stderr.write(f"local_ai_worker event=terminal_error code={code}\n")
     sys.stderr.flush()
 
@@ -198,6 +211,17 @@ def _safe_runtime_error_code(exc: Exception) -> str:
     if isinstance(exc, RuntimeError):
         return "runtime_failed"
     return "worker_failed"
+
+
+def _safe_runtime_error_category(exc: Exception) -> str | None:
+    """Return only an allowlisted content-free generation failure category."""
+
+    if not isinstance(exc, GenerationError):
+        return None
+    category = exc.category
+    if category not in GENERATION_FAILURE_CATEGORIES:
+        return None
+    return category
 
 
 def _dispatch(
@@ -458,7 +482,11 @@ def main() -> int:
     except ArtifactUnavailableError:
         _error(request.request_id, "unavailable")
     except Exception as exc:
-        _error(request.request_id, _safe_runtime_error_code(exc))
+        _error(
+            request.request_id,
+            _safe_runtime_error_code(exc),
+            category=_safe_runtime_error_category(exc),
+        )
     else:
         try:
             memory_progress = _memory_progress_payload(role)
