@@ -7,6 +7,20 @@
  */
 import type { LocalModelRole } from "@/types/local-ai";
 
+/** Upload states that the page must keep refreshing until they become terminal. */
+export const EXTRACTION_POLL_STATUSES: string[] = [
+  "pending_extraction",
+  "processing",
+  "completed",
+  "failed",
+  "cancelled",
+  "awaiting_confirmation",
+  "awaiting_review",
+  "completed_with_merges",
+  "dedup_scanning",
+  "dedup_processing",
+];
+
 /** Statuses at which a file is DONE — it will not advance on its own. */
 export const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
   "completed",
@@ -21,6 +35,32 @@ export const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
 
 export function isTerminalStatus(status: string | null | undefined): boolean {
   return !!status && TERMINAL_STATUSES.has(status);
+}
+
+/** Dot color for the upload row's neutral status pill. */
+export function statusDotColor(status: string): string {
+  switch (status) {
+    case "completed":
+    case "completed_with_merges":
+    case "awaiting_confirmation":
+    case "awaiting_review":
+    case "parsed":
+      return "var(--success)";
+    case "processing":
+    case "pending_extraction":
+    case "dedup_scanning":
+    case "dedup_processing":
+    case "pending":
+      return "var(--primary)";
+    case "failed":
+      return "var(--danger)";
+    case "cancelled":
+    case "duplicate_file":
+    case "duplicate":
+      return "var(--text-muted)";
+    default:
+      return "var(--text-muted)";
+  }
 }
 
 /** Content-free section/page/model progress emitted by an extraction worker. */

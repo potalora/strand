@@ -1,4 +1,4 @@
-import { test, expect } from "./fixtures/console-gate";
+import { test, expect, type Page } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { browserLogin } from "./helpers/browser-login";
 import { PATHS, uniqueEmail, TEST_PASSWORD } from "./helpers/test-data";
@@ -13,6 +13,116 @@ const SUCCESSFUL_UPLOAD_STATUSES = [
   "awaiting_review",
 ];
 
+type AcceptedSummary = {
+  id: string;
+  job_id: string;
+  status: string;
+};
+
+async function startBackgroundSummary(page: Page): Promise<AcceptedSummary> {
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/api/v1/summary/generate"
+  );
+  await page.getByRole("button", { name: "Generate summary" }).click();
+  const response = await responsePromise;
+
+  expect(response.status()).toBe(202);
+  const accepted = (await response.json()) as AcceptedSummary;
+  expect(accepted.id).toBeTruthy();
+  expect(accepted.job_id).toBeTruthy();
+  expect(accepted.status).toBe("queued");
+  await expect(
+    page.getByText(
+      "Summary is processing in the background. You can leave this page."
+    )
+  ).toBeVisible();
+  const monitor = page.getByRole("region", { name: "Background processing" });
+  await expect(monitor).toContainText("Summary");
+  return accepted;
+}
+
+async function waitForCompletedSummary(
+  page: Page,
+  api: ApiClient,
+  accepted: AcceptedSummary
+): Promise<void> {
+  const job = await api.pollLocalAIJob(accepted.job_id);
+  expect(job.id).toBe(accepted.job_id);
+  expect(job.status).toBe("completed");
+  await expect(
+    page.getByRole("region", { name: "Background processing" })
+  ).toContainText("finished", { timeout: 15_000 });
+}
+
+async function openSavedSummary(
+  page: Page,
+  api: ApiClient,
+  promptId: string
+): Promise<void> {
+  await expect
+    .poll(
+      async () =>
+        (await api.getSummaryPrompts()).items.some(
+          (prompt) => prompt.id === promptId
+        ),
+      { timeout: 15_000 }
+    )
+    .toBe(true);
+  const history = await api.getSummaryPrompts();
+  const generatedIndex = history.items.findIndex(
+    (prompt) => prompt.id === promptId
+  );
+  expect(generatedIndex).toBeGreaterThanOrEqual(0);
+
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "Summary", exact: true })
+  ).toHaveCount(0);
+  await page.getByRole("button", { name: /Show \(\d+\)/ }).click();
+  const detailResponsePromise = page.waitForResponse(
+    (response) =>
+      response.request().method() === "GET" &&
+      new URL(response.url()).pathname ===
+        `/api/v1/summary/prompts/${promptId}`
+  );
+  await page.locator("button.lrow").nth(generatedIndex).click();
+  const detailResponse = await detailResponsePromise;
+  expect(detailResponse.ok()).toBe(true);
+  await expect(
+    page.getByRole("heading", { name: "Summary", exact: true })
+  ).toBeVisible({ timeout: 15_000 });
+}
+
+async function generateAndOpenSummary(
+  page: Page,
+  api: ApiClient
+): Promise<string> {
+  if (process.env.E2E_LOCAL_ONLY === "1") {
+    const accepted = await startBackgroundSummary(page);
+    await waitForCompletedSummary(page, api, accepted);
+    await openSavedSummary(page, api, accepted.id);
+    return accepted.id;
+  }
+
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/api/v1/summary/generate"
+  );
+  await page.getByRole("button", { name: "Generate summary" }).click();
+  const response = await responsePromise;
+  expect(response.ok()).toBe(true);
+  const generated = (await response.json()) as { id: string };
+  expect(generated.id).toBeTruthy();
+  await expect(
+    page.getByRole("heading", { name: "Summary", exact: true })
+  ).toBeVisible({ timeout: 60_000 });
+  await openSavedSummary(page, api, generated.id);
+  return generated.id;
+}
+
 /**
  * Repaired for the current Summaries page labels:
  *  - Summary types: "Full record" / "By category" / "Date range".
@@ -20,6 +130,8 @@ const SUCCESSFUL_UPLOAD_STATUSES = [
  *  - Results card heading is "Summary" (not "Summary results"); the count line is
  *    "{n} records · {model}" (middot, not "|"); result tabs are
  *    "Narrative" / "JSON data".
+ *  - Strict-local generation returns 202 and completes in the background; the
+ *    persisted result is opened from history after completion.
  *  - History toggle is "Show ({n})"; each entry is a row button ("{type} summary").
  */
 test.describe("Summaries page", () => {
@@ -144,16 +256,16 @@ test.describe("Summaries page", () => {
       expect(text).not.toContain("No patients found");
     }).toPass({ timeout: 15_000 });
 
-    await page.getByRole("button", { name: "Generate summary" }).click();
+    await generateAndOpenSummary(page, api);
 
-    // The results card heading is "Summary".
-    await expect(page.getByRole("heading", { name: "Summary", exact: true })).toBeVisible({
-      timeout: 60_000,
-    });
+    // Strict-local results are durable and reopen from saved history.
     // Count line: "{n} records · {model}".
-    await expect(page.getByText(/\d+ record/)).toBeVisible();
+    await expect(page.getByText(/\d+ record/).first()).toBeVisible();
     // Result tabs: "Narrative" / "JSON data".
     await expect(page.getByRole("button", { name: "Narrative" })).toBeVisible();
+    await expect(
+      page.locator(".panel").filter({ hasText: "[Fact:" }).first()
+    ).toContainText("Evidence:");
   });
 
   test("history entry reopens a saved summary without regenerating", async ({
@@ -172,56 +284,20 @@ test.describe("Summaries page", () => {
       expect(text).not.toContain("No patients found");
     }).toPass({ timeout: 15_000 });
 
-    const generationResponsePromise = page.waitForResponse(
-      (response) =>
-        response.request().method() === "POST" &&
-        new URL(response.url()).pathname === "/api/v1/summary/generate"
-    );
-    await page.getByRole("button", { name: "Generate summary" }).click();
-    const generationResponse = await generationResponsePromise;
-    expect(generationResponse.ok()).toBe(true);
-    const generated = (await generationResponse.json()) as { id: string };
-    expect(generated.id).toBeTruthy();
-    await expect(page.getByRole("heading", { name: "Summary", exact: true })).toBeVisible({
-      timeout: 60_000,
+    let generationRequestCount = 0;
+    page.on("request", (request) => {
+      if (
+        request.method() === "POST" &&
+        new URL(request.url()).pathname === "/api/v1/summary/generate"
+      ) {
+        generationRequestCount += 1;
+      }
     });
+    await generateAndOpenSummary(page, api);
 
     await expect
-      .poll(
-        async () =>
-          (await api.getSummaryPrompts()).items.some(
-            (prompt) => prompt.id === generated.id
-          ),
-        { timeout: 15_000 }
-      )
-      .toBe(true);
-    const history = await api.getSummaryPrompts();
-    const generatedIndex = history.items.findIndex(
-      (prompt) => prompt.id === generated.id
-    );
-    expect(generatedIndex).toBeGreaterThanOrEqual(0);
-
-    // Reload so the in-memory result clears — only saved history remains.
-    await page.reload();
-    await expect(select).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByRole("heading", { name: "Summary", exact: true })).toHaveCount(0);
-
-    // Expand history ("Show (N)") and open the saved entry row.
-    await page.getByRole("button", { name: /Show \(\d+\)/ }).click();
-    const detailResponsePromise = page.waitForResponse(
-      (response) =>
-        response.request().method() === "GET" &&
-        new URL(response.url()).pathname ===
-          `/api/v1/summary/prompts/${generated.id}`
-    );
-    await page.locator("button.lrow").nth(generatedIndex).click();
-    const detailResponse = await detailResponsePromise;
-    expect(detailResponse.ok()).toBe(true);
-
-    // It re-renders quickly from the stored summary (not a 60s regeneration).
-    await expect(page.getByRole("heading", { name: "Summary", exact: true })).toBeVisible({
-      timeout: 15_000,
-    });
+      .poll(() => generationRequestCount, { timeout: 2_000 })
+      .toBe(1);
     // Multiple "{n} records" appear (each history row + the result), so scope to first.
     await expect(page.getByText(/\d+ record/).first()).toBeVisible();
     await expect(page.getByRole("button", { name: "Narrative" })).toBeVisible();
@@ -249,10 +325,7 @@ test.describe("Summaries page", () => {
     const select = page.locator("select").first();
     await expect(select).toBeVisible({ timeout: 10_000 });
 
-    await page.getByRole("button", { name: "Generate summary" }).click();
-    await expect(page.getByRole("heading", { name: "Summary", exact: true })).toBeVisible({
-      timeout: 60_000,
-    });
+    await generateAndOpenSummary(page, api);
 
     const deidentReport = page.getByText("De-identification report");
     if (process.env.E2E_LOCAL_ONLY === "1") {

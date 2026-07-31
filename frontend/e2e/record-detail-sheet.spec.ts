@@ -27,7 +27,9 @@ test.describe("Record detail drawer (Admin)", () => {
     const row = page.locator("tr.clickable").first();
     await expect(row).toBeVisible({ timeout: 15_000 });
     await row.click();
-    await expect(page.getByText("Record detail")).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.getByRole("dialog", { name: "Record detail", exact: true })
+    ).toBeVisible({ timeout: 10_000 });
   }
 
   test("opens drawer with header and actions", async ({ page }) => {

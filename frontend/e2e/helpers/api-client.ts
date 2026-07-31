@@ -67,6 +67,11 @@ type SummaryPrompt = {
   id: string;
 };
 
+type LocalAIJobStatus = {
+  id: string;
+  status: string;
+};
+
 const LOCAL_ONLY = process.env.E2E_LOCAL_ONLY === "1";
 
 export class ApiClient {
@@ -271,6 +276,33 @@ export class ApiClient {
       );
     }
     return res.json();
+  }
+
+  async pollLocalAIJob(
+    jobId: string,
+    timeoutMs: number = 60_000
+  ): Promise<LocalAIJobStatus> {
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      const res = await fetch(`${API_BASE}/local-ai/jobs/${jobId}`, {
+        headers: this.headers(),
+      });
+      if (!res.ok) {
+        throw new Error(
+          `Local AI job status failed: ${res.status} ${await res.text()}`
+        );
+      }
+      const job = (await res.json()) as LocalAIJobStatus;
+      if (job.status === "completed") return job;
+      if (job.status === "failed" || job.status === "cancelled") {
+        throw new Error(`Local AI job ${jobId} ended as ${job.status}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new Error(
+      `Local AI job ${jobId} did not complete within ${timeoutMs}ms`
+    );
   }
 
   async getUploadHistory(): Promise<UploadHistoryResponse> {

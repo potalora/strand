@@ -1,8 +1,10 @@
 import { test, expect } from "@playwright/test";
 import {
+  EXTRACTION_POLL_STATUSES,
   isTerminalStatus,
   formatStage,
   deriveBatch,
+  statusDotColor,
 } from "./extraction-progress";
 
 /**
@@ -25,12 +27,23 @@ test.describe("isTerminalStatus", () => {
     expect(isTerminalStatus("pending_extraction")).toBe(false);
     expect(isTerminalStatus("pending")).toBe(false);
     expect(isTerminalStatus("dedup_scanning")).toBe(false);
+    expect(isTerminalStatus("dedup_processing")).toBe(false);
   });
 
   test("nullish is not terminal", () => {
     expect(isTerminalStatus(null)).toBe(false);
     expect(isTerminalStatus(undefined)).toBe(false);
     expect(isTerminalStatus("")).toBe(false);
+  });
+});
+
+test.describe("dedup progress presentation", () => {
+  test("polls and colors both dedup states as active", () => {
+    for (const status of ["dedup_scanning", "dedup_processing"]) {
+      expect(EXTRACTION_POLL_STATUSES).toContain(status);
+      expect(isTerminalStatus(status)).toBe(false);
+      expect(statusDotColor(status)).toBe("var(--primary)");
+    }
   });
 });
 

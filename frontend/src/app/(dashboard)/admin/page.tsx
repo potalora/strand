@@ -604,9 +604,9 @@ function RecordsTab() {
     return records.filter((r) => {
       if (typeFilter && r.record_type !== typeFilter) return false;
       if (q) {
-        const s = `${r.display_text} ${r.code_display || ""} ${r.source_format} ${
-          r.code_value || ""
-        }`.toLowerCase();
+        const s = `${r.display_text} ${r.code_display || ""} ${r.source_format} ${sourceLabel(
+          r.source_format
+        )} ${r.code_value || ""}`.toLowerCase();
         if (!s.includes(q.toLowerCase())) return false;
       }
       return true;

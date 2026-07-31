@@ -24,8 +24,10 @@ import type {
 import { OcrNotices } from "@/components/retro/OcrNotices";
 import {
   deriveBatch,
+  EXTRACTION_POLL_STATUSES,
   formatStage,
   isTerminalStatus,
+  statusDotColor,
 } from "@/lib/extraction-progress";
 import {
   batchIsPollable,
@@ -59,18 +61,6 @@ const UPLOAD_PROCESSING_MODES = new Set<ProcessingMode>([
   "validated_strict_local",
   "cloud_assisted",
 ]);
-const EXTRACTION_POLL_STATUSES = [
-  "pending_extraction",
-  "processing",
-  "completed",
-  "failed",
-  "cancelled",
-  "awaiting_confirmation",
-  "awaiting_review",
-  "completed_with_merges",
-  "dedup_scanning",
-];
-
 function uploadBlockedModeLabel(mode: ProcessingMode): string {
   if (mode === "custom_local") return "Custom local (unverified)";
   if (mode === "prompt_only") return "Prompt only";
@@ -94,36 +84,6 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-/* ==========================================
-   STATUS PILL HELPERS — neutral editorial hues
-   ========================================== */
-
-// Map a status to a tdot color drawn from the design tokens. We keep the pill
-// neutral (.tag) and only color the dot, matching the Overview/admin treatment.
-function statusDotColor(status: string): string {
-  switch (status) {
-    case "completed":
-    case "completed_with_merges":
-    case "awaiting_confirmation":
-    case "awaiting_review":
-    case "parsed":
-      return "var(--success)";
-    case "processing":
-    case "pending_extraction":
-    case "dedup_scanning":
-    case "pending":
-      return "var(--primary)";
-    case "failed":
-      return "var(--danger)";
-    case "cancelled":
-    case "duplicate_file":
-    case "duplicate":
-      return "var(--text-muted)";
-    default:
-      return "var(--text-muted)";
-  }
 }
 
 /* ==========================================
