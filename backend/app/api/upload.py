@@ -1231,6 +1231,19 @@ async def trigger_extraction(
             if upload.processing_mode == ProcessingMode.VALIDATED_STRICT_LOCAL.value
             else None
         )
+        if strict_job is not None and status_ in ("failed", "awaiting_confirmation"):
+            # Strict-local retries share the durable job/upload transition used
+            # by the dedicated Local AI job API. This preserves encrypted page
+            # checkpoints and refuses non-retryable or terminal jobs.
+            from app.api.local_ai import _retry_local_ai_job
+
+            try:
+                await _retry_local_ai_job(db, job=strict_job)
+            except HTTPException:
+                failed.append({"upload_id": str(uid), "status": status_})
+                continue
+            triggered.append(upload)
+            continue
         if status_ == "processing":
             heartbeat = (
                 strict_job.updated_at
@@ -1255,6 +1268,12 @@ async def trigger_extraction(
                     }
                 )
                 continue
+            if strict_job is not None:
+                # Strict jobs are retried only once their terminal job state
+                # marks them retryable; stale active jobs are recovered by the
+                # worker's lease-recovery path rather than revived here.
+                failed.append({"upload_id": str(uid), "status": "processing"})
+                continue
             upload.ingestion_status = "pending_extraction"
         elif status_ in ("pending_extraction", "failed", "awaiting_confirmation"):
             # The DB-polling worker picks up pending_extraction automatically.
@@ -1275,21 +1294,6 @@ async def trigger_extraction(
         else:
             failed.append({"upload_id": str(uid), "status": status_})
             continue
-        if strict_job is not None and status_ != "pending_extraction":
-            strict_job.status = "queued"
-            strict_job.stage = "queued"
-            strict_job.progress = {}
-            strict_job.failure = None
-            strict_job.cancel_requested = False
-            strict_job.started_at = None
-            strict_job.completed_at = None
-            upload.cancel_requested = False
-            upload.processing_started_at = None
-            upload.processing_completed_at = None
-            upload.progress_stage = None
-            upload.progress_detail = None
-            upload.ingestion_errors = []
-            upload.retry_count = 0
         triggered.append(upload)
 
     if triggered:

@@ -18,7 +18,10 @@ from app.database import get_db
 from app.dependencies import get_authenticated_user_id
 from app.middleware.audit import log_audit_event
 from app.models.local_ai import LocalAIJob
+from app.models.uploaded_file import UploadedFile
 from app.schemas.local_ai import (
+    LocalAIJobFailure,
+    LocalAIJobProgress,
     LocalAIJobResponse,
     LocalModelArtifactResponse,
     LocalPackOperationCreated,
@@ -134,18 +137,87 @@ def _operation_response(
     )
 
 
+def _bounded_job_state(
+    model_type: type[LocalAIJobProgress] | type[LocalAIJobFailure],
+    value: object,
+) -> LocalAIJobProgress | LocalAIJobFailure | None:
+    """Validate only allowlisted, content-free fields from JSON job state."""
+    if not isinstance(value, dict):
+        return None
+    allowed = {
+        field_name: value[field_name]
+        for field_name in model_type.model_fields
+        if field_name in value
+    }
+    if not allowed:
+        return None
+    try:
+        return model_type.model_validate(allowed)
+    except ValueError:
+        return None
+
+
 def _job_response(job: LocalAIJob) -> LocalAIJobResponse:
     """Project a job without prompts, clinical content, or provenance."""
+
     return LocalAIJobResponse(
         id=job.id,
+        upload_id=job.upload_id,
+        summary_prompt_id=job.summary_prompt_id,
         kind=job.kind,
+        processing_mode=job.processing_mode,
         status=job.status,
         stage=job.stage,
+        progress=_bounded_job_state(LocalAIJobProgress, job.progress),
+        failure=_bounded_job_state(LocalAIJobFailure, job.failure),
         cancel_requested=job.cancel_requested,
         created_at=job.created_at,
+        updated_at=job.updated_at,
         started_at=job.started_at,
         completed_at=job.completed_at,
     )
+
+
+async def _retry_local_ai_job(
+    db: AsyncSession,
+    *,
+    job: LocalAIJob,
+) -> None:
+    """Atomically requeue one failed, retryable strict-local ingestion job."""
+    failure = job.failure if isinstance(job.failure, dict) else {}
+    if job.status != "failed" or failure.get("retryable") is not True:
+        raise HTTPException(status_code=409, detail="This job cannot be retried.")
+    if job.cancel_requested or job.kind != "ingestion" or job.upload_id is None:
+        raise HTTPException(status_code=409, detail="This job cannot be retried.")
+
+    upload = (
+        await db.execute(
+            select(UploadedFile)
+            .where(
+                UploadedFile.id == job.upload_id,
+                UploadedFile.user_id == job.user_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(status_code=409, detail="This job cannot be retried.")
+
+    job.status = "queued"
+    job.stage = "queued"
+    job.progress = {}
+    job.failure = None
+    job.started_at = None
+    job.completed_at = None
+
+    upload.ingestion_status = "pending_extraction"
+    upload.cancel_requested = False
+    upload.processing_started_at = None
+    upload.processing_completed_at = None
+    upload.progress_stage = None
+    upload.progress_detail = None
+    upload.ingestion_errors = []
+    upload.retry_count = 0
 
 
 async def verify_installed_pack(
@@ -654,6 +726,46 @@ async def get_local_ai_job(
     ).scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=404, detail="Local AI job not found.")
+    return _job_response(job)
+
+
+@router.post("/jobs/{job_id}/retry", response_model=LocalAIJobResponse)
+async def retry_local_ai_job(
+    job_id: UUID,
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> LocalAIJobResponse:
+    """Requeue one failed, retryable ingestion job without exposing diagnostics."""
+    job = (
+        await db.execute(
+            select(LocalAIJob)
+            .where(
+                LocalAIJob.id == job_id,
+                LocalAIJob.user_id == user_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Local AI job not found.")
+
+    await _retry_local_ai_job(db, job=job)
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="local_ai.job_retry",
+        resource_type="local_ai_job",
+        resource_id=job.id,
+        ip_address=request.client.host if request.client else None,
+        details={"kind": job.kind, "status": job.status},
+    )
+    await db.refresh(job)
+
+    # The worker is started only after the paired job/upload state is durable.
+    from app.api.upload import start_extraction_worker
+
+    start_extraction_worker()
     return _job_response(job)
 
 

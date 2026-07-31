@@ -695,10 +695,17 @@ strict-local job admission share a database advisory lock. Mutations return
 | --- | --- | --- |
 | `GET` | `/local-ai/jobs` | List owner-scoped, content-free job status |
 | `GET` | `/local-ai/jobs/{job_id}` | Read one owner-scoped job |
+| `POST` | `/local-ai/jobs/{job_id}/retry` | Requeue one failed, retryable ingestion job |
 | `POST` | `/local-ai/jobs/{job_id}/cancel` | Persist cancellation and terminate the active worker |
 
-Jobs report kind, status, stage, cancellation state, and timestamps. Clinical
-payloads and excerpts are excluded.
+Jobs report target UUIDs, processing mode, kind, status, stage, cancellation
+state, timestamps, and bounded progress/failure taxonomy. Progress exposes only
+stable model-role and numeric counters; failure exposes only stage, code,
+model-role, retryability, checkpoint, and fallback flags. Stored failure
+messages, clinical payloads, prompts, excerpts, evidence, manifests, and model
+output are excluded. Retry is owner-scoped, accepts only failed retryable
+ingestion jobs, resets the paired upload/job together, retains strict-local
+checkpoints, and returns `409` for all other job states.
 
 ### GET `/records/{record_id}/evidence`
 

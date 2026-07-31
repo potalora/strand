@@ -16,9 +16,49 @@ from app.models.local_ai import LocalAIJob
 from app.models.patient import Patient
 from app.models.uploaded_file import UploadedFile
 from app.models.user import User
+from app.api.local_ai import _job_response
 from app.services.local_ai.errors import LocalWorkerError
 from app.services.local_ai.manifest import canonicalize_manifest_snapshot
 from tests.test_strict_local_pipeline import _manifest_payload
+
+
+def test_job_projection_drops_untrusted_failure_and_progress_content() -> None:
+    """The public job projection must never serialize stored diagnostic text."""
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    job = LocalAIJob(
+        user_id=uuid4(),
+        upload_id=uuid4(),
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="failed",
+        stage="failed",
+        progress={"page_index": 1, "private": "sensitive patient content"},
+        failure={
+            "stage": "extracting",
+            "code": "local_worker_error",
+            "retryable": True,
+            "message": "sensitive patient content",
+        },
+    )
+    job.id = uuid4()
+    job.cancel_requested = False
+    job.created_at = datetime.now(timezone.utc)
+    job.updated_at = datetime.now(timezone.utc)
+
+    payload = _job_response(job).model_dump(mode="json")
+
+    encoded = json.dumps(payload)
+    assert payload["progress"] == {"page_index": 1}
+    assert payload["failure"] == {
+        "stage": "extracting",
+        "code": "local_worker_error",
+        "retryable": True,
+        "checkpoint_preserved": False,
+        "cloud_fallback_attempted": False,
+    }
+    assert "message" not in encoded
+    assert "sensitive patient content" not in encoded
 
 
 @pytest.mark.asyncio

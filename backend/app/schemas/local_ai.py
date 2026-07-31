@@ -6,7 +6,14 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    model_serializer,
+)
 
 from app.services.local_ai.types import ModelRole, ProcessingMode
 
@@ -34,6 +41,14 @@ LocalJobStatus = Literal["queued", "processing", "completed", "failed", "cancell
 
 class _StrictResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class _SparseStrictResponse(_StrictResponse):
+    """Strict nested response that leaves absent optional fields absent on the wire."""
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_none(self, handler):
+        return {key: value for key, value in handler(self).items() if value is not None}
 
 
 class LocalPackOperationCreated(_StrictResponse):
@@ -93,15 +108,46 @@ class LocalPackStatusResponse(_StrictResponse):
     operation: LocalPackOperationResponse | None = None
 
 
+class LocalAIJobProgress(_SparseStrictResponse):
+    """Bounded, content-free progress counters for one local processing job."""
+
+    model_role: Literal["ocr", "extraction", "summary"] | None = None
+    page_index: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    page_total: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    worker_current: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    worker_total: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    attempt: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    input_tokens: StrictInt | None = Field(default=None, ge=0, le=10_000_000)
+    output_tokens: StrictInt | None = Field(default=None, ge=0, le=10_000_000)
+    splits_used: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+
+
+class LocalAIJobFailure(_SparseStrictResponse):
+    """Stable failure taxonomy without diagnostics or document content."""
+
+    stage: StrictStr = Field(min_length=1, max_length=32)
+    code: StrictStr = Field(min_length=1, max_length=64)
+    model_role: Literal["ocr", "extraction", "summary"] | None = None
+    retryable: bool
+    checkpoint_preserved: bool = False
+    cloud_fallback_attempted: bool = False
+
+
 class LocalAIJobResponse(_StrictResponse):
     """Content-free status for one owner-scoped local processing job."""
 
     id: UUID
+    upload_id: UUID | None = None
+    summary_prompt_id: UUID | None = None
     kind: LocalJobKind
+    processing_mode: ProcessingMode
     status: LocalJobStatus
     stage: StrictStr = Field(min_length=1, max_length=32)
+    progress: LocalAIJobProgress | None = None
+    failure: LocalAIJobFailure | None = None
     cancel_requested: bool
     created_at: datetime
+    updated_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
 

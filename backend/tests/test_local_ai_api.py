@@ -8,7 +8,7 @@ import json
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -149,7 +149,7 @@ async def test_retrying_failed_strict_upload_requeues_its_existing_job(
         status="failed",
         stage="failed",
         progress={"stage": "extraction"},
-        failure={"code": "local_worker_error"},
+        failure={"code": "local_worker_error", "retryable": True},
         started_at=datetime.now(timezone.utc),
         completed_at=datetime.now(timezone.utc),
     )
@@ -180,6 +180,219 @@ async def test_retrying_failed_strict_upload_requeues_its_existing_job(
     assert job.failure is None
     assert job.started_at is None
     assert job.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_ingestion_job_status_is_bounded_and_never_returns_failure_message(
+    client,
+    db_session,
+) -> None:
+    """Job status projects only bounded counters and stable failure taxonomy."""
+    headers, user_id = await auth_headers(client, email="bounded-job@example.com")
+    manifest, _contents = _manifest()
+    upload = UploadedFile(
+        id=uuid4(),
+        user_id=UUID(user_id),
+        filename="bounded.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=100,
+        file_hash="b" * 64,
+        storage_path="/tmp/bounded.pdf",
+        ingestion_status="failed",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=_manifest_dict(manifest),
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=_manifest_dict(manifest),
+        status="failed",
+        stage="failed",
+        progress={
+            "model_role": "extraction",
+            "page_index": 2,
+            "page_total": 8,
+            "attempt": 1,
+            "sensitive": "sensitive patient content",
+        },
+        failure={
+            "stage": "extracting",
+            "code": "local_worker_error",
+            "retryable": True,
+            "checkpoint_preserved": True,
+            "cloud_fallback_attempted": False,
+            "message": "sensitive patient content",
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/v1/local-ai/jobs?kind=ingestion&active_only=false",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()[0]
+    assert payload["upload_id"] == str(upload.id)
+    assert payload["summary_prompt_id"] is None
+    assert payload["processing_mode"] == "validated_strict_local"
+    assert payload["progress"] == {
+        "model_role": "extraction",
+        "page_index": 2,
+        "page_total": 8,
+        "attempt": 1,
+    }
+    assert payload["failure"] == {
+        "stage": "extracting",
+        "code": "local_worker_error",
+        "retryable": True,
+        "checkpoint_preserved": True,
+        "cloud_fallback_attempted": False,
+    }
+    assert payload["updated_at"]
+    assert "message" not in json.dumps(payload)
+    assert "sensitive patient content" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_retry_ingestion_job_requeues_owned_pair_and_preserves_pages(
+    client,
+    db_session,
+) -> None:
+    """Only a retryable failed ingestion job can atomically re-enter the worker queue."""
+    from app.models.local_ai import LocalAIPage
+
+    headers, user_id = await auth_headers(client, email="retry-job-owner@example.com")
+    other_headers, _other_id = await auth_headers(
+        client,
+        email="retry-job-other@example.com",
+    )
+    manifest, _contents = _manifest()
+
+    async def make_job(
+        *,
+        status: str,
+        retryable: bool = True,
+        cancel_requested: bool = False,
+    ) -> tuple[UploadedFile, LocalAIJob]:
+        upload = UploadedFile(
+            id=uuid4(),
+            user_id=UUID(user_id),
+            filename=f"retry-{status}-{uuid4().hex}.pdf",
+            mime_type="application/pdf",
+            file_size_bytes=100,
+            file_hash=uuid4().hex * 2,
+            storage_path=f"/tmp/retry-{uuid4().hex}.pdf",
+            ingestion_status="failed",
+            file_category="unstructured",
+            processing_mode="validated_strict_local",
+            processing_manifest=_manifest_dict(manifest),
+            processing_schema_version="clinical-document-extraction.v1",
+            processing_started_at=datetime.now(timezone.utc),
+            processing_completed_at=datetime.now(timezone.utc),
+            progress_stage="failed",
+            progress_detail={"sensitive": "patient content"},
+            ingestion_errors=[{"error": "terminal failure"}],
+            retry_count=3,
+        )
+        db_session.add(upload)
+        await db_session.flush()
+        job = LocalAIJob(
+            user_id=UUID(user_id),
+            upload_id=upload.id,
+            kind="ingestion",
+            processing_mode="validated_strict_local",
+            manifest_snapshot=_manifest_dict(manifest),
+            status=status,
+            stage=status,
+            failure={
+                "stage": status,
+                "code": "local_worker_error",
+                "retryable": retryable,
+            },
+            cancel_requested=cancel_requested,
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        )
+        db_session.add(job)
+        await db_session.flush()
+        return upload, job
+
+    upload, retryable_job = await make_job(status="failed")
+    page = LocalAIPage(
+        job_id=retryable_job.id,
+        page_number=1,
+        checkpoint_key="1" * 64,
+        image_sha256="2" * 64,
+        ocr_result={"markdown": "retained checkpoint"},
+        warnings=[],
+    )
+    db_session.add(page)
+    _active_upload, active_job = await make_job(status="processing")
+    _completed_upload, completed_job = await make_job(status="completed")
+    _cancelled_upload, cancelled_job = await make_job(status="cancelled")
+    _non_retryable_upload, non_retryable_job = await make_job(
+        status="failed", retryable=False
+    )
+    await db_session.commit()
+
+    with patch("app.api.upload.start_extraction_worker", new=Mock()) as wake_worker:
+        cross_owner = await client.post(
+            f"/api/v1/local-ai/jobs/{retryable_job.id}/retry",
+            headers=other_headers,
+        )
+        response = await client.post(
+            f"/api/v1/local-ai/jobs/{retryable_job.id}/retry",
+            headers=headers,
+        )
+        active = await client.post(
+            f"/api/v1/local-ai/jobs/{active_job.id}/retry", headers=headers
+        )
+        completed = await client.post(
+            f"/api/v1/local-ai/jobs/{completed_job.id}/retry", headers=headers
+        )
+        cancelled = await client.post(
+            f"/api/v1/local-ai/jobs/{cancelled_job.id}/retry", headers=headers
+        )
+        non_retryable = await client.post(
+            f"/api/v1/local-ai/jobs/{non_retryable_job.id}/retry", headers=headers
+        )
+
+    assert cross_owner.status_code == 404
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+    for rejected in (active, completed, cancelled, non_retryable):
+        assert rejected.status_code == 409
+        assert rejected.json()["detail"] == "This job cannot be retried."
+    wake_worker.assert_called_once()
+    await db_session.refresh(upload)
+    await db_session.refresh(retryable_job)
+    assert upload.ingestion_status == "pending_extraction"
+    assert upload.processing_started_at is None
+    assert upload.processing_completed_at is None
+    assert upload.progress_stage is None
+    assert upload.progress_detail is None
+    assert upload.ingestion_errors == []
+    assert upload.retry_count == 0
+    assert retryable_job.status == "queued"
+    assert retryable_job.stage == "queued"
+    assert retryable_job.progress == {}
+    assert retryable_job.failure is None
+    assert retryable_job.started_at is None
+    assert retryable_job.completed_at is None
+    retained_page = await db_session.get(LocalAIPage, page.id)
+    assert retained_page is not None
+    assert retained_page.checkpoint_key == "1" * 64
+    assert retained_page.image_sha256 == "2" * 64
+    assert retained_page.ocr_result == {"markdown": "retained checkpoint"}
+    assert retained_page.warnings == []
 
 
 @pytest.mark.asyncio
@@ -255,27 +468,39 @@ async def test_summary_job_status_and_cancel_are_owner_scoped_and_content_free(
     assert other_get.status_code == 404
     assert other_cancel.status_code == 404
     assert owner_list.status_code == 200
-    assert owner_list.json() == [
-        {
-            "id": str(job.id),
-            "kind": "summary",
-            "status": "processing",
-            "stage": "summary",
-            "cancel_requested": False,
-            "created_at": job.created_at.isoformat().replace("+00:00", "Z"),
-            "started_at": None,
-            "completed_at": None,
-        }
-    ]
+    assert len(owner_list.json()) == 1
+    owner_payload = owner_list.json()[0]
+    assert owner_payload["id"] == str(job.id)
+    assert owner_payload["upload_id"] is None
+    assert owner_payload["summary_prompt_id"] == str(prompt.id)
+    assert owner_payload["kind"] == "summary"
+    assert owner_payload["processing_mode"] == "validated_strict_local"
+    assert owner_payload["status"] == "processing"
+    assert owner_payload["stage"] == "summary"
+    assert owner_payload["progress"] is None
+    assert owner_payload["failure"] is None
+    assert owner_payload["cancel_requested"] is False
+    assert owner_payload["created_at"] == job.created_at.isoformat().replace(
+        "+00:00", "Z"
+    )
+    assert owner_payload["updated_at"]
+    assert owner_payload["started_at"] is None
+    assert owner_payload["completed_at"] is None
     assert owner_cancel.status_code == 200
     assert owner_cancel.json()["cancel_requested"] is True
     assert set(owner_cancel.json()) == {
         "id",
+        "upload_id",
+        "summary_prompt_id",
         "kind",
+        "processing_mode",
         "status",
         "stage",
+        "progress",
+        "failure",
         "cancel_requested",
         "created_at",
+        "updated_at",
         "started_at",
         "completed_at",
     }
