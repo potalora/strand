@@ -1612,12 +1612,16 @@ async def _refresh_strict_local_job_lease(
     upload_id: UUID,
     job_id: UUID,
     user_id: UUID,
+    claim_started_at: datetime | None = None,
 ) -> None:
     """Durably renew one active strict job without changing visible progress."""
 
     from app.services.local_ai.errors import LocalPolicyError
 
     refreshed_at = datetime.now(timezone.utc)
+    attempt_clause = (
+        "AND j.started_at = :claim_started_at " if claim_started_at is not None else ""
+    )
     refreshed = (
         await db.execute(
             text(
@@ -1630,6 +1634,7 @@ async def _refresh_strict_local_job_lease(
                 "AND j.processing_mode = 'validated_strict_local' "
                 "AND j.status = 'processing' "
                 "AND j.cancel_requested = false "
+                f"{attempt_clause}"
                 "AND u.id = j.upload_id "
                 "AND u.user_id = j.user_id "
                 "AND u.ingestion_status = 'processing' "
@@ -1641,6 +1646,7 @@ async def _refresh_strict_local_job_lease(
                 "job_id": job_id,
                 "upload_id": upload_id,
                 "user_id": user_id,
+                "claim_started_at": claim_started_at,
             },
         )
     ).scalar_one_or_none()
@@ -1658,6 +1664,7 @@ async def _persist_strict_local_progress(
     user_id: UUID,
     stage: str,
     progress: dict[str, object],
+    claim_started_at: datetime | None = None,
 ) -> None:
     """Atomically persist content-free strict-local progress in its own session.
 
@@ -1694,34 +1701,40 @@ async def _persist_strict_local_progress(
         if active_upload_id is None:
             raise LocalPolicyError("Strict-local job was cancelled.")
 
-        active_job_id = (
-            await progress_db.execute(
-                select(LocalAIJob.id)
-                .where(
-                    LocalAIJob.id == job_id,
-                    LocalAIJob.upload_id == upload_id,
-                    LocalAIJob.user_id == user_id,
-                    LocalAIJob.processing_mode == "validated_strict_local",
-                    LocalAIJob.status == "processing",
-                    LocalAIJob.cancel_requested.is_(False),
-                )
-                .with_for_update()
+        active_job_query = select(LocalAIJob.id).where(
+            LocalAIJob.id == job_id,
+            LocalAIJob.upload_id == upload_id,
+            LocalAIJob.user_id == user_id,
+            LocalAIJob.processing_mode == "validated_strict_local",
+            LocalAIJob.status == "processing",
+            LocalAIJob.cancel_requested.is_(False),
+        )
+        if claim_started_at is not None:
+            active_job_query = active_job_query.where(
+                LocalAIJob.started_at == claim_started_at
             )
+        active_job_id = (
+            await progress_db.execute(active_job_query.with_for_update())
         ).scalar_one_or_none()
         if active_job_id is None:
             raise LocalPolicyError("Strict-local job was cancelled.")
 
-        updated_job_id = (
-            await progress_db.execute(
-                update(LocalAIJob)
-                .where(
-                    LocalAIJob.id == active_job_id,
-                    LocalAIJob.status == "processing",
-                    LocalAIJob.cancel_requested.is_(False),
-                )
-                .values(stage=stage, progress=progress)
-                .returning(LocalAIJob.id)
+        update_job_query = (
+            update(LocalAIJob)
+            .where(
+                LocalAIJob.id == active_job_id,
+                LocalAIJob.status == "processing",
+                LocalAIJob.cancel_requested.is_(False),
             )
+            .values(stage=stage, progress=progress)
+            .returning(LocalAIJob.id)
+        )
+        if claim_started_at is not None:
+            update_job_query = update_job_query.where(
+                LocalAIJob.started_at == claim_started_at
+            )
+        updated_job_id = (
+            await progress_db.execute(update_job_query)
         ).scalar_one_or_none()
         updated_upload_id = (
             await progress_db.execute(
@@ -1747,32 +1760,61 @@ async def _lock_strict_terminal_state(
     db: AsyncSession,
     upload_id: UUID,
     job_id: UUID,
-) -> bool:
+    *,
+    claim_started_at: datetime | None = None,
+) -> bool | None:
     """Lock upload then job and return their fresh cancellation decision."""
-    locked_upload_id = (
+    terminal_attempt = await _lock_strict_terminal_attempt(
+        db,
+        upload_id,
+        job_id,
+        claim_started_at=claim_started_at,
+    )
+    if claim_started_at is None:
+        return terminal_attempt is not False
+    return terminal_attempt
+
+
+async def _lock_strict_terminal_attempt(
+    db: AsyncSession,
+    upload_id: UUID,
+    job_id: UUID,
+    *,
+    claim_started_at: datetime | None,
+) -> bool | None:
+    """Lock one terminal pair; return ``None`` when its claim is stale."""
+    locked_upload = (
         await db.execute(
-            select(UploadedFile.id)
+            select(UploadedFile)
             .where(UploadedFile.id == upload_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if locked_upload_id is None:
-        return True
+    if locked_upload is None:
+        return None
 
     from app.models.local_ai import LocalAIJob
 
-    locked_job_id = (
+    locked_job = (
         await db.execute(
-            select(LocalAIJob.id)
+            select(LocalAIJob)
             .where(
                 LocalAIJob.id == job_id,
                 LocalAIJob.upload_id == upload_id,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if locked_job_id is None:
-        return True
+    if locked_job is None:
+        return None
+    if claim_started_at is not None and (
+        locked_upload.ingestion_status != "processing"
+        or locked_job.status != "processing"
+        or locked_job.started_at != claim_started_at
+    ):
+        return None
     return await _strict_cancel_requested(db, upload_id, job_id)
 
 
@@ -2409,9 +2451,10 @@ async def _run_strict_local_ingestion_for_upload(
 
     upload_id = upload.id
     job_id: UUID | None = None
+    claim_started_at: datetime | None = None
     failure_stage = "preflight"
 
-    async def terminalize_failure(exc: Exception) -> None:
+    async def terminalize_failure(exc: Exception) -> bool:
         """Persist paired, content-free failure state after any strict phase."""
         nonlocal job_id
         await db.rollback()
@@ -2449,16 +2492,21 @@ async def _run_strict_local_ingestion_for_upload(
             "completed",
             "failed",
         }:
-            return
+            return True
 
         cancelled_under_lock = False
         if current_job is not None and job_id is not None:
             try:
-                cancelled_under_lock = await _lock_strict_terminal_state(
+                terminal_attempt = await _lock_strict_terminal_state(
                     db,
                     upload_id,
                     job_id,
+                    claim_started_at=claim_started_at,
                 )
+                if terminal_attempt is None:
+                    await db.rollback()
+                    return False
+                cancelled_under_lock = terminal_attempt
             except Exception:
                 await db.rollback()
 
@@ -2488,7 +2536,7 @@ async def _run_strict_local_ingestion_for_upload(
                 current_upload.ingestion_errors = []
                 current_upload.processing_completed_at = completed_at
             await db.commit()
-            return
+            return True
 
         error_code = (
             exc.code
@@ -2523,6 +2571,7 @@ async def _run_strict_local_ingestion_for_upload(
             ]
             current_upload.processing_completed_at = completed_at
         await db.commit()
+        return True
 
     try:
         locked_upload_id = (
@@ -2561,20 +2610,24 @@ async def _run_strict_local_ingestion_for_upload(
         if job is None:
             raise LocalPolicyError("Strict-local job snapshot is unavailable.")
         job_id = job.id
-        if job.status not in (
-            "queued",
-            "processing",
-        ) or await _strict_cancel_requested(db, upload_id, job_id):
+        if job.status == "processing":
+            await db.rollback()
+            return
+        if job.status != "queued" or await _strict_cancel_requested(
+            db, upload_id, job_id
+        ):
             raise LocalPolicyError("Strict-local job was cancelled.")
     except Exception as exc:
-        await terminalize_failure(exc)
+        if not await terminalize_failure(exc):
+            return
         if isinstance(exc, LocalAIError):
             raise
         raise LocalAIError("Strict-local processing did not complete.") from None
 
+    claim_started_at = datetime.now(timezone.utc)
     job.status = "processing"
     job.stage = failure_stage
-    job.started_at = job.started_at or datetime.now(timezone.utc)
+    job.started_at = claim_started_at
     job.failure = None
     await db.commit()
 
@@ -2608,6 +2661,7 @@ async def _run_strict_local_ingestion_for_upload(
             user_id=user_id,
             stage=failure_stage,
             progress=safe,
+            claim_started_at=claim_started_at,
         )
         # Keep the runner identity map aligned with the durable isolated write.
         # These assignments perform no I/O and intentionally do not commit the
@@ -2628,6 +2682,7 @@ async def _run_strict_local_ingestion_for_upload(
                 upload_id=upload_id,
                 job_id=job_id,
                 user_id=user_id,
+                claim_started_at=claim_started_at,
             )
 
     try:
@@ -2792,7 +2847,16 @@ async def _run_strict_local_ingestion_for_upload(
         else:
             dedup_summary = None
             upload.dedup_summary = None
-        if await _lock_strict_terminal_state(db, upload_id, job_id):
+        terminal_attempt = await _lock_strict_terminal_state(
+            db,
+            upload_id,
+            job_id,
+            claim_started_at=claim_started_at,
+        )
+        if terminal_attempt is None:
+            await db.rollback()
+            return
+        if terminal_attempt:
             raise LocalPolicyError("Strict-local job was cancelled.")
 
         completed_at = datetime.now(timezone.utc)
@@ -2815,7 +2879,8 @@ async def _run_strict_local_ingestion_for_upload(
         job.completed_at = completed_at
         await db.commit()
     except Exception as exc:
-        await terminalize_failure(exc)
+        if not await terminalize_failure(exc):
+            return
         if isinstance(exc, LocalAIError):
             raise
         raise LocalAIError("Strict-local processing did not complete.") from None
@@ -3053,6 +3118,8 @@ async def _process_unstructured(
                         "completed",
                         "failed",
                     }:
+                        return
+                    if is_strict_local and upload.ingestion_status != "processing":
                         return
                     cancelled = (
                         upload.processing_mode == "validated_strict_local"

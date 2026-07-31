@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import event
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.local_ai import ExtractionEvidence, LocalAIJob
 from app.models.uploaded_file import UploadedFile
@@ -178,6 +180,119 @@ async def test_durable_liveness_failure_rolls_back_main_content_transaction(
     assert job.failure["stage"] == "extraction"
     assert job.failure["code"] == "local_ai_extraction_failed"
     assert canary not in _persisted_failure_state(upload, job)
+
+
+@pytest.mark.asyncio
+async def test_stale_strict_worker_failure_after_shutdown_recovery_preserves_queued_work(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation-resistant old worker cannot overwrite shutdown recovery."""
+    from app.api import upload as upload_module
+    from app.main import _recover_unstructured_jobs_on_startup
+
+    upload, job = await _strict_job(db_session, label="stale-worker-recovery")
+    manifest = parse_manifest(upload.processing_manifest)
+    monkeypatch.setattr(
+        "app.services.local_ai.artifact_store.ArtifactStore.active_manifest",
+        lambda _self: manifest,
+    )
+
+    pipeline_started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_worker = asyncio.Event()
+    new_pipeline_started = asyncio.Event()
+    release_new_worker = asyncio.Event()
+    pipeline_calls = 0
+
+    async def resist_shutdown(_self, _job, _upload, _file_path):
+        nonlocal pipeline_calls
+        pipeline_calls += 1
+        if pipeline_calls == 2:
+            new_pipeline_started.set()
+            await release_new_worker.wait()
+            return _pipeline_result()
+        pipeline_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release_worker.wait()
+        raise LocalAIError("late strict worker failure")
+
+    monkeypatch.setattr(
+        "app.services.local_ai.pipeline.StrictLocalPipeline.run_ingestion",
+        resist_shutdown,
+    )
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+    async def run_old_worker() -> None:
+        await upload_module._process_unstructured(
+            upload.id,
+            Path(upload.storage_path),
+            upload.user_id,
+        )
+
+    monkeypatch.setattr(upload_module, "async_session_factory", session_factory)
+    worker = asyncio.create_task(run_old_worker())
+    new_worker: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(pipeline_started.wait(), timeout=1)
+        async with session_factory() as verify:
+            old_job = await verify.get(LocalAIJob, job.id)
+            assert old_job is not None and old_job.started_at is not None
+            old_claim_started_at = old_job.started_at
+        worker.cancel()
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=1)
+
+        async with session_factory() as recovery_db:
+            await _recover_unstructured_jobs_on_startup(recovery_db)
+            await recovery_db.commit()
+
+        async with session_factory() as verify:
+            recovered_upload = await verify.get(UploadedFile, upload.id)
+            recovered_job = await verify.get(LocalAIJob, job.id)
+            assert recovered_upload is not None and recovered_job is not None
+            assert recovered_upload.ingestion_status == "pending_extraction"
+            assert (recovered_job.status, recovered_job.stage) == ("queued", "recovery")
+
+        new_worker = asyncio.create_task(run_old_worker())
+        await asyncio.wait_for(new_pipeline_started.wait(), timeout=1)
+        async with session_factory() as verify:
+            new_upload = await verify.get(UploadedFile, upload.id)
+            new_job = await verify.get(LocalAIJob, job.id)
+            assert new_upload is not None and new_job is not None
+            assert new_upload.ingestion_status == "processing"
+            assert new_job.status == "processing"
+            new_claim_started_at = new_job.started_at
+            assert new_claim_started_at is not None
+            assert new_claim_started_at != old_claim_started_at
+
+        release_worker.set()
+        await asyncio.wait_for(worker, timeout=1)
+
+        async with session_factory() as verify:
+            new_upload = await verify.get(UploadedFile, upload.id)
+            new_job = await verify.get(LocalAIJob, job.id)
+            assert new_upload is not None and new_job is not None
+            assert new_upload.ingestion_status == "processing"
+            assert new_job.status == "processing"
+            assert new_job.started_at == new_claim_started_at
+    finally:
+        release_worker.set()
+        release_new_worker.set()
+        if not worker.done():
+            worker.cancel()
+        if new_worker is not None and not new_worker.done():
+            new_worker.cancel()
+        pending = [worker]
+        if new_worker is not None:
+            pending.append(new_worker)
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
