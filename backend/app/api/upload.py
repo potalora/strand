@@ -1238,7 +1238,7 @@ async def trigger_extraction(
             from app.api.local_ai import _retry_local_ai_job
 
             try:
-                await _retry_local_ai_job(db, job=strict_job)
+                await _retry_local_ai_job(db, job=strict_job, upload=upload)
             except HTTPException:
                 failed.append({"upload_id": str(uid), "status": status_})
                 continue

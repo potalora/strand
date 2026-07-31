@@ -182,25 +182,37 @@ async def _retry_local_ai_job(
     db: AsyncSession,
     *,
     job: LocalAIJob,
+    upload: UploadedFile | None = None,
 ) -> None:
     """Atomically requeue one failed, retryable strict-local ingestion job."""
     failure = job.failure if isinstance(job.failure, dict) else {}
     if job.status != "failed" or failure.get("retryable") is not True:
         raise HTTPException(status_code=409, detail="This job cannot be retried.")
-    if job.cancel_requested or job.kind != "ingestion" or job.upload_id is None:
+    if (
+        job.cancel_requested
+        or job.kind != "ingestion"
+        or job.upload_id is None
+        or job.processing_mode != "validated_strict_local"
+    ):
         raise HTTPException(status_code=409, detail="This job cannot be retried.")
 
-    upload = (
-        await db.execute(
-            select(UploadedFile)
-            .where(
-                UploadedFile.id == job.upload_id,
-                UploadedFile.user_id == job.user_id,
-            )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
     if upload is None:
+        upload = (
+            await db.execute(
+                select(UploadedFile)
+                .where(
+                    UploadedFile.id == job.upload_id,
+                    UploadedFile.user_id == job.user_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+    if (
+        upload is None
+        or upload.id != job.upload_id
+        or upload.user_id != job.user_id
+        or upload.processing_mode != "validated_strict_local"
+    ):
         raise HTTPException(status_code=409, detail="This job cannot be retried.")
 
     job.status = "queued"
@@ -737,12 +749,47 @@ async def retry_local_ai_job(
     db: AsyncSession = Depends(get_db),
 ) -> LocalAIJobResponse:
     """Requeue one failed, retryable ingestion job without exposing diagnostics."""
+    target = (
+        await db.execute(
+            select(
+                LocalAIJob.upload_id,
+                LocalAIJob.kind,
+                LocalAIJob.processing_mode,
+            ).where(
+                LocalAIJob.id == job_id,
+                LocalAIJob.user_id == user_id,
+            )
+        )
+    ).one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Local AI job not found.")
+    if (
+        target.kind != "ingestion"
+        or target.upload_id is None
+        or target.processing_mode != "validated_strict_local"
+    ):
+        raise HTTPException(status_code=409, detail="This job cannot be retried.")
+
+    upload = (
+        await db.execute(
+            select(UploadedFile)
+            .where(
+                UploadedFile.id == target.upload_id,
+                UploadedFile.user_id == user_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if upload is None:
+        raise HTTPException(status_code=409, detail="This job cannot be retried.")
+
     job = (
         await db.execute(
             select(LocalAIJob)
             .where(
                 LocalAIJob.id == job_id,
                 LocalAIJob.user_id == user_id,
+                LocalAIJob.upload_id == upload.id,
             )
             .with_for_update()
         )
@@ -750,7 +797,10 @@ async def retry_local_ai_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Local AI job not found.")
 
-    await _retry_local_ai_job(db, job=job)
+    await _retry_local_ai_job(db, job=job, upload=upload)
+    await db.commit()
+    await db.refresh(job)
+
     await log_audit_event(
         db,
         user_id=user_id,
@@ -760,7 +810,6 @@ async def retry_local_ai_job(
         ip_address=request.client.host if request.client else None,
         details={"kind": job.kind, "status": job.status},
     )
-    await db.refresh(job)
 
     # The worker is started only after the paired job/upload state is durable.
     from app.api.upload import start_extraction_worker

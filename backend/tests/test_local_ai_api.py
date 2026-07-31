@@ -396,6 +396,209 @@ async def test_retry_ingestion_job_requeues_owned_pair_and_preserves_pages(
 
 
 @pytest.mark.asyncio
+async def test_retry_ingestion_job_locks_upload_before_job(
+    client,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The job-ID retry path uses the same upload-then-job lock order as upload retry."""
+    headers, user_id = await auth_headers(client, email="retry-lock-order@example.com")
+    manifest, _contents = _manifest()
+    upload = UploadedFile(
+        id=uuid4(),
+        user_id=UUID(user_id),
+        filename="retry-lock-order.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=100,
+        file_hash="c" * 64,
+        storage_path="/tmp/retry-lock-order.pdf",
+        ingestion_status="failed",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=_manifest_dict(manifest),
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=_manifest_dict(manifest),
+        status="failed",
+        stage="failed",
+        failure={"stage": "failed", "code": "local_worker_error", "retryable": True},
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    lock_order: list[str] = []
+    original_execute = db_session.execute
+
+    async def track_execute(statement, *args, **kwargs):
+        sql = str(statement)
+        if "FOR UPDATE" in sql:
+            if "FROM uploaded_files" in sql:
+                lock_order.append("upload")
+            elif "FROM local_ai_jobs" in sql:
+                lock_order.append("job")
+        return await original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "execute", track_execute)
+    with patch("app.api.upload.start_extraction_worker", new=Mock()):
+        response = await client.post(
+            f"/api/v1/local-ai/jobs/{job.id}/retry",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert lock_order[:2] == ["upload", "job"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("job_mode", "upload_mode"),
+    [
+        ("cloud_assisted", "validated_strict_local"),
+        ("validated_strict_local", "cloud_assisted"),
+    ],
+)
+async def test_retry_ingestion_job_rejects_mismatched_strict_local_modes(
+    client,
+    db_session,
+    job_mode: str,
+    upload_mode: str,
+) -> None:
+    """Both halves of a strict-local retry must retain the validated mode."""
+    headers, user_id = await auth_headers(
+        client,
+        email=f"retry-mode-{job_mode}-{upload_mode}@example.com",
+    )
+    manifest, _contents = _manifest()
+    upload = UploadedFile(
+        id=uuid4(),
+        user_id=UUID(user_id),
+        filename="retry-mode.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=100,
+        file_hash=uuid4().hex * 2,
+        storage_path="/tmp/retry-mode.pdf",
+        ingestion_status="failed",
+        file_category="unstructured",
+        processing_mode=upload_mode,
+        processing_manifest=(
+            _manifest_dict(manifest)
+            if upload_mode == "validated_strict_local"
+            else None
+        ),
+        processing_schema_version=(
+            "clinical-document-extraction.v1"
+            if upload_mode == "validated_strict_local"
+            else None
+        ),
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode=job_mode,
+        manifest_snapshot=_manifest_dict(manifest),
+        status="failed",
+        stage="failed",
+        failure={"stage": "failed", "code": "local_worker_error", "retryable": True},
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch("app.api.upload.start_extraction_worker", new=Mock()) as wake_worker:
+        response = await client.post(
+            f"/api/v1/local-ai/jobs/{job.id}/retry",
+            headers=headers,
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "This job cannot be retried."
+    wake_worker.assert_not_called()
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert upload.ingestion_status == "failed"
+    assert job.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_retry_commit_precedes_audit_and_worker_wake(
+    client,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An audit failure cannot roll back the paired retry or wake an uncommitted job."""
+    headers, user_id = await auth_headers(client, email="retry-commit@example.com")
+    manifest, _contents = _manifest()
+    upload = UploadedFile(
+        id=uuid4(),
+        user_id=UUID(user_id),
+        filename="retry-commit.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=100,
+        file_hash="d" * 64,
+        storage_path="/tmp/retry-commit.pdf",
+        ingestion_status="failed",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=_manifest_dict(manifest),
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=_manifest_dict(manifest),
+        status="failed",
+        stage="failed",
+        failure={"stage": "failed", "code": "local_worker_error", "retryable": True},
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    events: list[str] = []
+    original_commit = db_session.commit
+
+    async def track_commit() -> None:
+        await original_commit()
+        events.append("commit")
+
+    async def fail_audit(*_args, **_kwargs) -> None:
+        events.append("audit")
+        raise RuntimeError("synthetic audit failure")
+
+    def wake_worker() -> None:
+        events.append("wake")
+
+    monkeypatch.setattr(db_session, "commit", track_commit)
+    monkeypatch.setattr("app.api.local_ai.log_audit_event", fail_audit)
+    monkeypatch.setattr("app.api.upload.start_extraction_worker", wake_worker)
+
+    with pytest.raises(RuntimeError, match="synthetic audit failure"):
+        await client.post(
+            f"/api/v1/local-ai/jobs/{job.id}/retry",
+            headers=headers,
+        )
+
+    assert events == ["commit", "audit"]
+    await db_session.rollback()
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert upload.ingestion_status == "pending_extraction"
+    assert job.status == "queued"
+
+
+@pytest.mark.asyncio
 async def test_summary_job_status_and_cancel_are_owner_scoped_and_content_free(
     client,
     db_session,
