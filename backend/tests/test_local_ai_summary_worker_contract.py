@@ -120,25 +120,19 @@ def test_reviewed_backend_grounding_contract_is_accepted_by_real_qwen_worker() -
         calls.append(kwargs)
         return json.dumps(
             {
-                "sections": [
-                    {
-                        "heading": "Medications",
-                        "claims": [
-                            {
-                                "fact_id": fact.fact_id,
-                                "field_paths": [
-                                    "/name",
-                                    "/dose_value",
-                                    "/dose_unit",
-                                    "/end_date",
-                                    "/status",
-                                ],
-                                "evidence_ids": list(fact.evidence_ids),
-                            }
+                "claims": {
+                    fact.fact_id: {
+                        "field_paths": [
+                            "/name",
+                            "/dose_value",
+                            "/dose_unit",
+                            "/end_date",
+                            "/status",
                         ],
+                        "evidence_ids": list(fact.evidence_ids),
                     }
-                ],
-                "uncertainties": [],
+                },
+                "uncertainties": {},
             }
         )
 
@@ -154,6 +148,7 @@ def test_reviewed_backend_grounding_contract_is_accepted_by_real_qwen_worker() -
     schema = calls[0]["json_schema"]
     assert isinstance(schema, dict)
     assert schema["type"] == "object"
+    assert schema["x-guidance"] == {"whitespace_flexible": False}
     assert fact.fact_id in json.dumps(schema)
 
 
@@ -258,26 +253,20 @@ def test_qwen_worker_accepts_typed_comparator_and_ratio_observation_values() -> 
         loaded=loaded,
         generate_fn=lambda **_kwargs: json.dumps(
             {
-                "sections": [
-                    {
-                        "heading": "Observations",
-                        "claims": [
-                            {
-                                "fact_id": fact.fact_id,
-                                "field_paths": [
-                                    next(
-                                        field.path
-                                        for field in fact.fields
-                                        if field.path.startswith("/value/")
-                                    )
-                                ],
-                                "evidence_ids": list(fact.evidence_ids),
-                            }
-                            for fact in summary_input.facts
+                "claims": {
+                    fact.fact_id: {
+                        "field_paths": [
+                            next(
+                                field.path
+                                for field in fact.fields
+                                if field.path.startswith("/value/")
+                            )
                         ],
+                        "evidence_ids": list(fact.evidence_ids),
                     }
-                ],
-                "uncertainties": [],
+                    for fact in summary_input.facts
+                },
+                "uncertainties": {},
             }
         ),
     )

@@ -1065,7 +1065,11 @@ async def extraction_progress(
             .filter(UploadedFile.ingestion_status.in_(_PROGRESS_DONE_STATUSES))
             .label("completed"),
             func.count()
-            .filter(UploadedFile.ingestion_status == "processing")
+            .filter(
+                UploadedFile.ingestion_status.in_(
+                    ("processing", "dedup_scanning", "dedup_processing")
+                )
+            )
             .label("processing"),
             func.count()
             .filter(UploadedFile.ingestion_status == "failed")
@@ -2533,9 +2537,9 @@ async def _autoconfirm_and_finish(
         await db.commit()
 
         if run_dedup:
-            from app.services.ingestion.coordinator import _run_dedup_background
+            from app.services.ingestion.coordinator import schedule_dedup_background
 
-            asyncio.create_task(_run_dedup_background(upload_id, patient.id, user_id))
+            schedule_dedup_background(upload_id, patient.id, user_id)
     else:
         upload.ingestion_status = "awaiting_confirmation"
 
@@ -3809,9 +3813,9 @@ async def confirm_extraction(
     upload.record_count = created_count
     await db.commit()
 
-    from app.services.ingestion.coordinator import _run_dedup_background
+    from app.services.ingestion.coordinator import schedule_dedup_background
 
-    asyncio.create_task(_run_dedup_background(upload_id, patient_uuid, user_id))
+    schedule_dedup_background(upload_id, patient_uuid, user_id)
 
     await log_audit_event(
         db,

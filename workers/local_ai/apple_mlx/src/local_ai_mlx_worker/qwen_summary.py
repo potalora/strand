@@ -991,6 +991,8 @@ def _validated_output(
         facts = {str(item["fact_id"]): item for item in facts_value}
         evidence = {str(item["evidence_id"]): item for item in evidence_value}
         uncertainties = {str(item["uncertainty_id"]): item for item in uncertainties_value}
+        seen_headings: set[str] = set()
+        seen_fact_ids: set[str] = set()
         for section in sections:
             if type(section) is not dict or set(section) != {"heading", "claims"}:
                 raise ValueError
@@ -998,10 +1000,12 @@ def _validated_output(
             claims = section.get("claims")
             if (
                 heading not in SUMMARY_HEADINGS
+                or heading in seen_headings
                 or not isinstance(claims, list)
                 or len(claims) > MAX_CLAIMS_PER_SECTION
             ):
                 raise ValueError
+            seen_headings.add(str(heading))
             for claim in claims:
                 if type(claim) is not dict or set(claim) != {
                     "fact_id",
@@ -1013,8 +1017,9 @@ def _validated_output(
                 field_paths = _field_path_list(claim.get("field_paths"))
                 evidence_ids = _identifier_list(claim.get("evidence_ids"))
                 fact = facts.get(fact_id)
-                if fact is None:
+                if fact is None or fact_id in seen_fact_ids:
                     raise ValueError
+                seen_fact_ids.add(fact_id)
                 known_paths = {
                     str(field["path"]) for field in fact["fields"] if isinstance(field, dict)
                 }
@@ -1060,6 +1065,152 @@ def _validated_output(
     ):
         raise GenerationError("Local summary returned invalid JSON.") from None
     return value
+
+
+def _selection_to_public_output(
+    raw: str,
+    safe_input: Mapping[str, object],
+) -> str:
+    """Expand compact keyed model selections into the public reference document."""
+
+    try:
+        value = parse_json_object(raw)
+        _validate_plain_json(value)
+        if set(value) != {"claims", "uncertainties"}:
+            raise ValueError
+        selected_claims = value["claims"]
+        selected_uncertainties = value["uncertainties"]
+        facts_value = safe_input["facts"]
+        evidence_value = safe_input["evidence"]
+        uncertainties_value = safe_input["uncertainty_labels"]
+        if (
+            type(selected_claims) is not dict
+            or len(selected_claims) > MAX_FACTS
+            or type(selected_uncertainties) is not dict
+            or len(selected_uncertainties) > MAX_UNCERTAINTIES
+            or not isinstance(facts_value, list)
+            or not isinstance(evidence_value, list)
+            or not isinstance(uncertainties_value, list)
+        ):
+            raise ValueError
+        facts = {str(item["fact_id"]): item for item in facts_value}
+        evidence = {
+            str(item["evidence_id"]): item for item in evidence_value
+        }
+        uncertainties = {
+            str(item["uncertainty_id"]): item for item in uncertainties_value
+        }
+
+        claims_by_heading: dict[str, list[dict[str, object]]] = {}
+        selected_fact_ids: set[str] = set()
+        for raw_fact_id in sorted(selected_claims):
+            fact_id = _identifier(raw_fact_id)
+            selection = selected_claims[raw_fact_id]
+            fact = facts.get(fact_id)
+            if fact is None or type(selection) is not dict:
+                raise ValueError
+            selection_keys = set(selection)
+            if selection_keys not in (
+                {"field_paths", "evidence_ids"},
+                {"field_paths", "evidence_ids", "overview"},
+            ):
+                raise ValueError
+            if "overview" in selection and selection["overview"] is not True:
+                raise ValueError
+            heading = "Overview" if selection.get("overview") is True else fact["allowed_heading"]
+            if heading not in SUMMARY_HEADINGS:
+                raise ValueError
+            selected_fact_ids.add(fact_id)
+            public_claims = claims_by_heading.setdefault(str(heading), [])
+            public_claims.append(
+                {
+                    "fact_id": fact_id,
+                    "field_paths": _field_path_list(selection["field_paths"]),
+                    "evidence_ids": _identifier_list(selection["evidence_ids"]),
+                }
+            )
+            if len(public_claims) > MAX_CLAIMS_PER_SECTION:
+                raise ValueError
+
+        for fact_id in sorted(set(facts) - selected_fact_ids):
+            fact = facts[fact_id]
+            evidence_ids = _identifier_list(fact["evidence_ids"])
+            known_paths = {
+                str(field["path"])
+                for field in fact["fields"]
+                if isinstance(field, Mapping)
+            }
+            supported_paths = sorted(
+                {
+                    str(path)
+                    for evidence_id in evidence_ids
+                    for path in evidence[evidence_id]["field_paths"]
+                    if str(path) in known_paths
+                }
+            )
+            if not evidence_ids or not supported_paths:
+                raise ValueError
+            heading = str(fact["allowed_heading"])
+            public_claims = claims_by_heading.setdefault(heading, [])
+            public_claims.append(
+                {
+                    "fact_id": fact_id,
+                    "field_paths": supported_paths,
+                    "evidence_ids": evidence_ids,
+                }
+            )
+            if len(public_claims) > MAX_CLAIMS_PER_SECTION:
+                raise ValueError
+
+        if len(claims_by_heading) > MAX_SECTIONS:
+            raise ValueError
+        for claims in claims_by_heading.values():
+            claims.sort(key=lambda claim: str(claim["fact_id"]))
+        public_sections = [
+            {"heading": heading, "claims": claims_by_heading[heading]}
+            for heading in sorted(claims_by_heading)
+        ]
+
+        public_uncertainties: list[dict[str, object]] = []
+        selected_uncertainty_ids: set[str] = set()
+        for raw_uncertainty_id in sorted(selected_uncertainties):
+            uncertainty_id = _identifier(raw_uncertainty_id)
+            uncertainty = uncertainties.get(uncertainty_id)
+            if uncertainty is None or selected_uncertainties[raw_uncertainty_id] is not True:
+                raise ValueError
+            selected_uncertainty_ids.add(uncertainty_id)
+            public_uncertainties.append(
+                {
+                    "uncertainty_id": uncertainty_id,
+                    "fact_ids": uncertainty["fact_ids"],
+                    "evidence_ids": uncertainty["evidence_ids"],
+                }
+            )
+        for uncertainty_id in sorted(set(uncertainties) - selected_uncertainty_ids):
+            uncertainty = uncertainties[uncertainty_id]
+            public_uncertainties.append(
+                {
+                    "uncertainty_id": uncertainty_id,
+                    "fact_ids": uncertainty["fact_ids"],
+                    "evidence_ids": uncertainty["evidence_ids"],
+                }
+            )
+        public_uncertainties.sort(key=lambda item: str(item["uncertainty_id"]))
+        return bounded_json(
+            {
+                "sections": public_sections,
+                "uncertainties": public_uncertainties,
+            },
+            max_bytes=MAX_SUMMARY_INPUT_BYTES,
+        )
+    except (
+        GenerationError,
+        KeyError,
+        TypeError,
+        ValueError,
+        WorkerInputError,
+    ):
+        raise GenerationError("Local summary returned invalid JSON.") from None
 
 
 def _validated_reference_document(value: object) -> dict[str, object]:
@@ -1148,19 +1299,10 @@ def count_summary_reference_tokens(
     return {"token_count": _token_count(processor, compact)}
 
 
-def _contains_once(item_schema: Mapping[str, object]) -> dict[str, object]:
-    return {
-        "contains": dict(item_schema),
-        "minContains": 0,
-        "maxContains": 1,
-    }
-
-
 def _claim_schema(
     fact: Mapping[str, object],
     evidence: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
-    fact_id = str(fact["fact_id"])
     linked_evidence_ids = sorted(str(item) for item in fact["evidence_ids"])
     fact_paths = {str(field["path"]) for field in fact["fields"] if isinstance(field, Mapping)}
     evidence_paths = {
@@ -1173,67 +1315,25 @@ def _claim_schema(
     if not supported_paths or any(not paths for paths in evidence_paths.values()):
         raise WorkerInputError("Summary schema has invalid evidence bindings.")
 
-    link_conditions: list[dict[str, object]] = []
-    for path in supported_paths:
-        supporting_evidence = sorted(
-            evidence_id for evidence_id, paths in evidence_paths.items() if path in paths
-        )
-        link_conditions.append(
-            {
-                "if": {
-                    "properties": {
-                        "field_paths": {"contains": {"const": path}},
-                    },
-                    "required": ["field_paths"],
-                },
-                "then": {
-                    "properties": {
-                        "evidence_ids": {
-                            "contains": {"enum": supporting_evidence},
-                        }
-                    }
-                },
-            }
-        )
-    for evidence_id, paths in evidence_paths.items():
-        link_conditions.append(
-            {
-                "if": {
-                    "properties": {
-                        "evidence_ids": {"contains": {"const": evidence_id}},
-                    },
-                    "required": ["evidence_ids"],
-                },
-                "then": {
-                    "properties": {
-                        "field_paths": {"contains": {"enum": paths}},
-                    }
-                },
-            }
-        )
-
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["fact_id", "field_paths", "evidence_ids"],
+        "required": ["field_paths", "evidence_ids"],
         "properties": {
-            "fact_id": {"const": fact_id},
             "field_paths": {
                 "type": "array",
                 "items": {"enum": supported_paths},
                 "minItems": 1,
                 "maxItems": min(32, len(supported_paths)),
-                "uniqueItems": True,
             },
             "evidence_ids": {
                 "type": "array",
                 "items": {"enum": linked_evidence_ids},
                 "minItems": 1,
                 "maxItems": min(32, len(linked_evidence_ids)),
-                "uniqueItems": True,
             },
+            "overview": {"const": True},
         },
-        "allOf": link_conditions,
     }
 
 
@@ -1269,126 +1369,44 @@ def _summary_output_schema(
         str(item["evidence_id"]): item for item in evidence_value if isinstance(item, Mapping)
     }
     claim_schemas = {fact_id: _claim_schema(fact, evidence) for fact_id, fact in facts.items()}
-    facts_by_heading: dict[str, list[str]] = {"Overview": sorted(facts)}
+    facts_by_heading: dict[str, list[str]] = {}
     for fact_id, fact in facts.items():
         facts_by_heading.setdefault(str(fact["allowed_heading"]), []).append(fact_id)
     for fact_ids in facts_by_heading.values():
         fact_ids.sort()
 
-    section_variants: list[dict[str, object]] = []
-    for heading in sorted(facts_by_heading):
-        fact_ids = facts_by_heading[heading]
-        if not fact_ids:
-            continue
-        claims: dict[str, object] = {
-            "type": "array",
-            "items": {
-                "oneOf": [claim_schemas[fact_id] for fact_id in fact_ids],
-            },
-            "maxItems": min(MAX_CLAIMS_PER_SECTION, len(fact_ids)),
-            "uniqueItems": True,
-            "allOf": [
-                _contains_once(
-                    {
-                        "properties": {"fact_id": {"const": fact_id}},
-                        "required": ["fact_id"],
-                    }
-                )
-                for fact_id in fact_ids
-            ],
-        }
-        section_variants.append(
-            {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["heading", "claims"],
-                "properties": {
-                    "heading": {"const": heading},
-                    "claims": claims,
-                },
-            }
-        )
+    if len(facts_by_heading) > MAX_SECTIONS or any(
+        len(fact_ids) > MAX_CLAIMS_PER_SECTION for fact_ids in facts_by_heading.values()
+    ):
+        raise WorkerInputLimitError("Summary output exceeds its validated section limits.")
 
-    sections: dict[str, object] = {
-        "type": "array",
-        "maxItems": min(MAX_SECTIONS, len(section_variants)),
-        "uniqueItems": True,
+    claims: dict[str, object] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {fact_id: claim_schemas[fact_id] for fact_id in sorted(claim_schemas)},
     }
-    if section_variants:
-        sections["items"] = {"oneOf": section_variants}
-        sections["allOf"] = [
-            _contains_once(
-                {
-                    "properties": {"heading": {"const": heading}},
-                    "required": ["heading"],
-                }
-            )
-            for heading in sorted(facts_by_heading)
-            if facts_by_heading[heading]
-        ]
-        sections["allOf"].extend(  # type: ignore[union-attr]
-            _contains_once(
-                {
-                    "properties": {
-                        "claims": {
-                            "contains": {
-                                "properties": {
-                                    "fact_id": {"const": fact_id},
-                                },
-                                "required": ["fact_id"],
-                            }
-                        }
-                    },
-                    "required": ["claims"],
-                }
-            )
-            for fact_id in sorted(facts)
-        )
 
-    uncertainty_schemas: list[dict[str, object]] = []
+    uncertainty_properties: dict[str, object] = {}
     for item in sorted(
         uncertainties_value,
         key=lambda value: str(value["uncertainty_id"]) if isinstance(value, Mapping) else "",
     ):
         if not isinstance(item, Mapping):
             raise WorkerInputError("Summary schema input is invalid.")
-        uncertainty_schemas.append(
-            {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["uncertainty_id", "fact_ids", "evidence_ids"],
-                "properties": {
-                    "uncertainty_id": {"const": item["uncertainty_id"]},
-                    "fact_ids": {"const": item["fact_ids"]},
-                    "evidence_ids": {"const": item["evidence_ids"]},
-                },
-            }
-        )
+        uncertainty_properties[str(item["uncertainty_id"])] = {"const": True}
     uncertainties: dict[str, object] = {
-        "type": "array",
-        "maxItems": min(MAX_UNCERTAINTIES, len(uncertainty_schemas)),
-        "uniqueItems": True,
-    }
-    if uncertainty_schemas:
-        uncertainties["items"] = {"oneOf": uncertainty_schemas}
-        uncertainties["allOf"] = [
-            _contains_once(
-                {
-                    "properties": {
-                        "uncertainty_id": {"const": item["properties"]["uncertainty_id"]["const"]}
-                    },
-                    "required": ["uncertainty_id"],
-                }
-            )
-            for item in uncertainty_schemas
-        ]
-
-    schema: dict[str, object] = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["sections", "uncertainties"],
+        "properties": uncertainty_properties,
+    }
+
+    schema: dict[str, object] = {
+        "x-guidance": {"whitespace_flexible": False},
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["claims", "uncertainties"],
         "properties": {
-            "sections": sections,
+            "claims": claims,
             "uncertainties": uncertainties,
         },
     }
@@ -1426,18 +1444,21 @@ def run_summary(
     serialized = bounded_json(safe_input, max_bytes=MAX_SUMMARY_INPUT_BYTES)
     max_tokens = requested_output_tokens(payload, selected, role_cap=SUMMARY_OUTPUT_CAP)
     base_prompt = (
-        "Return exactly one JSON object with keys sections and uncertainties. "
-        "sections MUST be a JSON array of objects with exactly heading and claims; "
-        "uncertainties MUST be a JSON array. Never emit clinical free text. "
-        "A claim contains exactly fact_id, field_paths, and evidence_ids copied from "
-        "mutually linked INPUT_JSON values. Each claim's field_paths MUST be a subset "
+        "Return exactly one JSON object with keys claims and uncertainties. "
+        "claims MUST be an object whose optional keys are supplied fact_id values. "
+        "Each fact selection contains field_paths and evidence_ids copied from mutually "
+        "linked INPUT_JSON values, plus optional overview:true to place it in Overview; "
+        "otherwise it is placed under its supplied allowed_heading. Select only facts "
+        "that need emphasis; the server appends every omitted validated fact and "
+        "uncertainty without model-authored text. Select each emphasized fact at most "
+        "once. Each selection's "
+        "field_paths MUST be a subset "
         "of BOTH the selected fact's fields.path values and every selected evidence's "
         "field_paths; omit /record_type unless evidence explicitly supports it. "
         "Treat the leaves of a typed observation value as one measurement and select "
-        "only its supplied leaves. Use the selected fact's allowed_heading exactly as "
-        "its section heading; use Overview only when grouping claims across record "
-        "types. An uncertainty contains exactly uncertainty_id and its exact fact_ids "
-        "and evidence_ids. Follow safety_rules exactly. "
+        "only its supplied leaves. uncertainties MUST be an object whose optional keys "
+        "are supplied uncertainty_id values and whose selected values are true. Never "
+        "emit clinical free text. Follow safety_rules exactly. "
     )
     prompt = f"{base_prompt}INPUT_JSON={serialized}"
     validate_token_budget(selected, [prompt], max_output_tokens=max_tokens)
@@ -1486,4 +1507,7 @@ def run_summary(
             generated_tokens = max_tokens
     publish("generating", generated_tokens)
     publish("validating", generated_tokens)
-    return _validated_output(raw, safe_input)
+    return _validated_output(
+        _selection_to_public_output(raw, safe_input),
+        safe_input,
+    )

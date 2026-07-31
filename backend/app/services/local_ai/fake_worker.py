@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import select
 import socket
@@ -16,6 +17,7 @@ from app.services.local_ai.extraction_schema import (
     CLINICAL_EXTRACTION_SCHEMA_VERSION,
     FACT_CATEGORY_NAMES,
 )
+from app.services.local_ai.grounded_summary import GroundedSummaryDocument
 from app.services.local_ai.protocol import (
     MAX_MESSAGE_BYTES,
     ErrorPayload,
@@ -116,6 +118,25 @@ def _pipeline_valid_summary(payload: dict[str, object]) -> dict[str, object]:
     return {"sections": sections, "uncertainties": []}
 
 
+def _pipeline_valid_summary_token_count(
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Validate and conservatively estimate tokens without model dependencies."""
+
+    reference = GroundedSummaryDocument.model_validate(
+        payload.get("reference_document")
+    )
+    compact = json.dumps(
+        reference.model_dump(mode="json"),
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    byte_count = len(compact.encode("utf-8"))
+    return {"token_count": (byte_count + 1) // 2}
+
+
 def _pipeline_valid_extraction(payload: dict[str, object]) -> dict[str, object]:
     """Return one grounded fictional fact only for synthetic OCR pages."""
 
@@ -178,6 +199,7 @@ def _fixed_result(
     role: ModelRole,
     payload: dict[str, object],
     *,
+    command: str | None = None,
     pipeline_valid: bool = False,
 ) -> dict[str, object]:
     if payload.get("fake_token_count") is not None:
@@ -240,6 +262,8 @@ def _fixed_result(
             "path_is_fixed": os.environ.get("PATH") == os.defpath,
             "secret_names_present": sorted(forbidden_names.intersection(os.environ)),
         }
+    if pipeline_valid and command == "count_summary_tokens":
+        return _pipeline_valid_summary_token_count(payload)
     if pipeline_valid:
         return _pipeline_valid_result(role, payload)
     if role is ModelRole.OCR:
@@ -541,6 +565,7 @@ def _main(*, pipeline_valid: bool = False) -> int:
             terminal_data = _fixed_result(
                 role,
                 payload,
+                command=request.command,
                 pipeline_valid=pipeline_valid,
             )
         terminal = _response(

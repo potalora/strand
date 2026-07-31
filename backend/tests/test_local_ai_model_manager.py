@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -24,6 +25,7 @@ from app.services.local_ai.model_manager import (
     LocalModelManager as ProductionLocalModelManager,
 )
 from app.services.local_ai.types import ModelRole
+from app.services.ai.summarizer import _bounded_summary_output_tokens
 
 
 class LocalModelManager(ProductionLocalModelManager):
@@ -66,6 +68,65 @@ async def test_summary_token_count_uses_separate_worker_command(
 
     assert count == 173
     assert type(count) is int
+    assert manager.metrics.roles_started == [ModelRole.SUMMARY]
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_valid_worker_counts_a_valid_summary_reference(
+    fake_worker_command: list[str], worker_home: Path
+) -> None:
+    manager = LocalModelManager(
+        [*fake_worker_command, "--pipeline-valid"],
+        worker_home=worker_home,
+    )
+    await manager.start()
+    claims = [
+        {
+            "fact_id": f"fact1_{index:040d}",
+            "field_paths": [
+                "/record_type",
+                "/name",
+                "/status",
+                "/date",
+                "/value",
+                "/unit",
+                "/interpretation",
+                "/reference_range",
+                "/provider",
+                "/category",
+            ],
+            "evidence_ids": [f"evidence1_{index:040d}"],
+        }
+        for index in range(17)
+    ]
+    reference_document = {
+        "sections": [{"heading": "Overview", "claims": claims}],
+        "uncertainties": [],
+    }
+
+    count = await manager.count_summary_tokens(
+        {
+            "job_id": "token-job",
+            "reference_document": reference_document,
+        }
+    )
+
+    compact = json.dumps(
+        reference_document,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert len(compact) > 4096
+    assert count == (len(compact.encode("utf-8")) + 1) // 2
+    assert (
+        _bounded_summary_output_tokens(
+            reference_tokens=count,
+            manifest_max_output_tokens=4096,
+        )
+        == count + 128
+    )
     assert manager.metrics.roles_started == [ModelRole.SUMMARY]
     await manager.stop()
 
@@ -2266,6 +2327,7 @@ async def test_enabled_app_lifespan_starts_and_always_stops_manager(
         assert events == ["reconcile-pack", "start"]
 
     assert events == ["reconcile-pack", "start", "stop"]
+    assert not main_module._background_tasks
 
 
 @pytest.mark.asyncio
@@ -2273,24 +2335,96 @@ async def test_enabled_lifespan_attempts_stop_after_partial_start_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import app.main as main_module
+    import app.services.auth_service as auth_service
+    import app.services.extraction.terminology as terminology
 
     events: list[str] = []
+    purge_started = asyncio.Event()
+    purge_cancelled = asyncio.Event()
+    refresh_cancelled = asyncio.Event()
+    refresh_task: asyncio.Task[None] | None = None
 
     class FailingManager:
         async def start(self) -> None:
+            await purge_started.wait()
             events.append("start")
             raise LocalWorkerError("Local worker is unavailable.")
 
         async def stop(self) -> None:
             events.append("stop")
 
+    class FakeSession:
+        async def commit(self) -> None:
+            return None
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> FakeSession:
+            return FakeSession()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    async def blocked_purge(_db: object) -> int:
+        purge_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            purge_cancelled.set()
+            raise
+
+    async def blocked_refresh() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            refresh_cancelled.set()
+            raise
+
+    def schedule_refresh() -> asyncio.Task[None]:
+        nonlocal refresh_task
+        refresh_task = asyncio.create_task(blocked_refresh())
+        return refresh_task
+
     monkeypatch.setattr(main_module.settings, "local_ai_enabled", True)
     monkeypatch.setattr(main_module.settings, "phi_ner_enabled", False)
     monkeypatch.setattr(main_module.settings, "extraction_engine", "gemini")
     monkeypatch.setattr(main_module, "local_model_manager", FailingManager())
+    monkeypatch.setattr(main_module, "async_session_factory", FakeSessionContext)
+    monkeypatch.setattr(
+        main_module, "reconcile_zip_child_sets", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        main_module, "_recover_unstructured_jobs_on_startup", AsyncMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_recover_strict_local_summary_jobs_on_startup",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        main_module, "_active_strict_local_job_ids", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        main_module, "_reconcile_model_pack_operations_on_startup", lambda: 0
+    )
+    monkeypatch.setattr(main_module, "acquire_local_ai_lifecycle_lock", AsyncMock())
+    monkeypatch.setattr(terminology, "schedule_medication_refresh", schedule_refresh)
+    monkeypatch.setattr(auth_service, "purge_expired_revoked_tokens", blocked_purge)
 
-    with pytest.raises(LocalWorkerError, match="unavailable"):
-        async with main_module.lifespan(FastAPI()):
-            pass
+    try:
+        with pytest.raises(LocalWorkerError, match="unavailable"):
+            async with main_module.lifespan(FastAPI()):
+                pass
 
-    assert events == ["start", "stop"]
+        assert events == ["start", "stop"]
+        assert purge_cancelled.is_set()
+        assert refresh_cancelled.is_set()
+        assert not main_module._background_tasks
+    finally:
+        tasks = [*main_module._background_tasks]
+        if refresh_task is not None:
+            tasks.append(refresh_task)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        main_module._background_tasks.clear()

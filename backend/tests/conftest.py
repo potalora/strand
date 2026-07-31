@@ -193,21 +193,32 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     # request rollback can't drop the audit row). Point that factory at the test
     # DB for the duration of the test, otherwise it writes api.access rows to the
     # real database during the suite.
+    import app.database as _database
     import app.middleware.audit as _audit
+    from app.services.ingestion.coordinator import stop_dedup_background_tasks
 
     _audit_engine = create_async_engine(TEST_DB_URL, echo=False)
+    _dedup_engine = create_async_engine(TEST_DB_URL, echo=False)
     _orig_audit_factory = _audit.async_session_factory
+    _orig_database_factory = _database.async_session_factory
     _audit.async_session_factory = async_sessionmaker(
         _audit_engine, class_=AsyncSession, expire_on_commit=False
     )
+    _database.async_session_factory = async_sessionmaker(
+        _dedup_engine, class_=AsyncSession, expire_on_commit=False
+    )
 
     transport = ASGITransport(app=fastapi_app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
-
-    fastapi_app.dependency_overrides.clear()
-    _audit.async_session_factory = _orig_audit_factory
-    await _audit_engine.dispose()
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+    finally:
+        await stop_dedup_background_tasks(cancel=True)
+        fastapi_app.dependency_overrides.clear()
+        _audit.async_session_factory = _orig_audit_factory
+        _database.async_session_factory = _orig_database_factory
+        await _audit_engine.dispose()
+        await _dedup_engine.dispose()
 
 
 @pytest.fixture
@@ -258,6 +269,7 @@ async def reset_extraction_worker():
     bound to its own loop.
     """
     import app.api.upload as upload_module
+    from app.services.ingestion.coordinator import stop_dedup_background_tasks
 
     async def _cancel_task(task: asyncio.Task | None) -> None:
         if task is None or task.done():
@@ -277,6 +289,8 @@ async def reset_extraction_worker():
         upload_module._extraction_semaphores.clear()
         upload_module._gemini_semaphores.clear()
         upload_module._strict_extraction_semaphores.clear()
+
+        await stop_dedup_background_tasks(cancel=True)
 
         from app.services.local_ai.summary_runner import local_summary_runner
 

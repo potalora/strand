@@ -13,7 +13,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import AsyncMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -832,9 +832,11 @@ async def test_shutdown_drains_work_and_requeues_before_stopping_model_manager(
     import app.services.auth_service as auth_service
     import app.services.extraction.terminology as terminology
     from app.api import upload
+    from app.services.ingestion import coordinator
     from app.services.local_ai.summary_runner import local_summary_runner
 
     events: list[str] = []
+    recovered_dedup = (uuid4(), uuid4(), uuid4())
 
     class FakeResult:
         rowcount = 0
@@ -871,11 +873,26 @@ async def test_shutdown_drains_work_and_requeues_before_stopping_model_manager(
         events.append("recover-summary")
         return []
 
+    async def recover_dedup(_db: object) -> list[tuple[UUID, UUID, UUID]]:
+        events.append("recover-dedup")
+        return [recovered_dedup]
+
     async def active_ids(_db: object) -> list[str]:
         return []
 
     async def stop_extraction() -> None:
         events.append("extraction-drained")
+
+    async def stop_dedup() -> None:
+        events.append("dedup-drained")
+
+    def schedule_dedup(
+        upload_id: UUID,
+        patient_id: UUID,
+        user_id: UUID,
+    ) -> None:
+        assert (upload_id, patient_id, user_id) == recovered_dedup
+        events.append("dedup-resumed")
 
     async def stop_summaries() -> None:
         events.append("summaries-requeued")
@@ -914,6 +931,13 @@ async def test_shutdown_drains_work_and_requeues_before_stopping_model_manager(
     monkeypatch.setattr(upload, "reset_extraction_worker_shutdown", lambda: None)
     monkeypatch.setattr(upload, "start_extraction_worker", lambda: None)
     monkeypatch.setattr(upload, "stop_extraction_worker", stop_extraction)
+    monkeypatch.setattr(
+        coordinator,
+        "recover_dedup_background_specs",
+        recover_dedup,
+    )
+    monkeypatch.setattr(coordinator, "schedule_dedup_background", schedule_dedup)
+    monkeypatch.setattr(coordinator, "stop_dedup_background_tasks", stop_dedup)
     monkeypatch.setattr(local_summary_runner, "start", lambda _ids: None)
     monkeypatch.setattr(local_summary_runner, "stop_and_requeue", stop_summaries)
 
@@ -923,9 +947,12 @@ async def test_shutdown_drains_work_and_requeues_before_stopping_model_manager(
     shutdown_recovery = [
         index for index, event in enumerate(events) if event == "recover-ingestion"
     ][-1]
-    assert events.index("extraction-drained") < events.index("summaries-requeued")
+    assert events.index("extraction-drained") < events.index("dedup-drained")
+    assert events.index("dedup-drained") < events.index("summaries-requeued")
     assert events.index("summaries-requeued") < shutdown_recovery
     assert shutdown_recovery < events.index("manager-stop")
+    assert events.index("recover-dedup") < events.index("dedup-resumed")
+    assert events.index("dedup-resumed") < events.index("extraction-drained")
 
 
 @pytest.mark.asyncio

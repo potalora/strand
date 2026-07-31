@@ -53,6 +53,35 @@ _MAX_ACTIVE_LOCAL_AI_SCRATCH_JOBS = 10_000
 logger = logging.getLogger(__name__)
 
 
+def _track_background_task(task: asyncio.Task | None) -> None:
+    """Retain a startup task until shutdown can cancel and await it."""
+    if task is None:
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _drain_background_tasks() -> None:
+    """Boundedly cancel and await startup tasks before their event loop closes."""
+    tasks = [task for task in _background_tasks if not task.done()]
+    if not tasks:
+        _background_tasks.clear()
+        return
+
+    for task in tasks:
+        task.cancel()
+    drain = asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(drain),
+            timeout=settings.local_ai_shutdown_drain_seconds,
+        )
+    except TimeoutError:
+        logger.warning("Startup background-task shutdown drain timed out")
+    finally:
+        _background_tasks.difference_update(task for task in tasks if task.done())
+
+
 def _reconcile_model_pack_operations_on_startup() -> int:
     """Resolve crash-interrupted model-pack operations before job admission."""
     model_root = Path(settings.local_ai_model_dir)
@@ -225,11 +254,16 @@ async def _active_strict_local_job_ids(db: AsyncSession) -> list[str] | None:
 async def _shutdown_local_ai_workers(*, local_ai_started: bool) -> None:
     """Drain tracked work, recover durable state, then stop model processes."""
     from app.api.upload import stop_extraction_worker
+    from app.services.ingestion.coordinator import stop_dedup_background_tasks
 
     try:
         await stop_extraction_worker()
     except Exception:
         logger.exception("Failed to drain extraction work during shutdown")
+    try:
+        await stop_dedup_background_tasks()
+    except Exception:
+        logger.exception("Failed to drain dedup work during shutdown")
     if not local_ai_started:
         return
 
@@ -268,6 +302,7 @@ def build_cors_config(cors_origins: str) -> tuple[list[str], bool]:
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle handler."""
     summary_jobs_to_resume: list[UUID] = []
+    dedup_jobs_to_resume: list[tuple[UUID, UUID, UUID]] = []
     active_strict_local_job_ids: list[str] | None = None
     strict_local_recovery_succeeded = False
     reconciled_operations = 0
@@ -317,6 +352,17 @@ async def lifespan(app: FastAPI):
             strict_local_recovery_succeeded = settings.local_ai_enabled
     except Exception:
         logger.exception("Failed to recover stuck files on startup")
+
+    try:
+        from app.services.ingestion.coordinator import (
+            recover_dedup_background_specs,
+        )
+
+        async with async_session_factory() as db:
+            dedup_jobs_to_resume = await recover_dedup_background_specs(db)
+            await db.commit()
+    except Exception:
+        logger.exception("Failed to recover interrupted dedup scans on startup")
 
     # Warm-load the spaCy PHI-NER model at boot (memory free, no GIL contention)
     # so name redaction is a reliable cached singleton — not a first-load that
@@ -372,7 +418,7 @@ async def lifespan(app: FastAPI):
     try:
         from app.services.extraction.terminology import schedule_medication_refresh
 
-        schedule_medication_refresh()
+        _track_background_task(schedule_medication_refresh())
     except Exception:
         logger.exception("medication index refresh scheduling failed at startup")
 
@@ -391,44 +437,44 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Failed to purge expired revoked tokens on startup")
 
-    purge_task = asyncio.create_task(_purge_revoked_tokens())
-    _background_tasks.add(purge_task)
-    purge_task.add_done_callback(_background_tasks.discard)
+    _track_background_task(asyncio.create_task(_purge_revoked_tokens()))
 
     local_ai_started = False
-    if settings.local_ai_enabled:
-        try:
-            if reconciled_operations:
-                logger.info(
-                    "Reconciled %d interrupted model-pack operations",
-                    reconciled_operations,
-                )
-            if (
-                strict_local_recovery_succeeded
-                and active_strict_local_job_ids is not None
-            ):
-                removed = sweep_stale_scratch(
-                    Path(settings.local_ai_scratch_dir),
-                    stale_after_seconds=_STALE_LOCAL_AI_SCRATCH_SECONDS,
-                    active_job_ids=active_strict_local_job_ids,
-                )
-                if removed:
-                    logger.info("Removed %d stale strict-local scratch jobs", removed)
-            else:
-                logger.warning(
-                    "Skipped strict-local scratch sweep because active jobs "
-                    "could not be verified"
-                )
-            await local_model_manager.start()
-            local_ai_started = True
-            from app.services.local_ai.summary_runner import local_summary_runner
-
-            local_summary_runner.start(summary_jobs_to_resume)
-        except BaseException:
-            await local_model_manager.stop()
-            raise
-
     try:
+        if settings.local_ai_enabled:
+            try:
+                if reconciled_operations:
+                    logger.info(
+                        "Reconciled %d interrupted model-pack operations",
+                        reconciled_operations,
+                    )
+                if (
+                    strict_local_recovery_succeeded
+                    and active_strict_local_job_ids is not None
+                ):
+                    removed = sweep_stale_scratch(
+                        Path(settings.local_ai_scratch_dir),
+                        stale_after_seconds=_STALE_LOCAL_AI_SCRATCH_SECONDS,
+                        active_job_ids=active_strict_local_job_ids,
+                    )
+                    if removed:
+                        logger.info(
+                            "Removed %d stale strict-local scratch jobs", removed
+                        )
+                else:
+                    logger.warning(
+                        "Skipped strict-local scratch sweep because active jobs "
+                        "could not be verified"
+                    )
+                await local_model_manager.start()
+                local_ai_started = True
+                from app.services.local_ai.summary_runner import local_summary_runner
+
+                local_summary_runner.start(summary_jobs_to_resume)
+            except BaseException:
+                await local_model_manager.stop()
+                raise
+
         # Start the extraction worker
         from app.api.upload import (
             reset_extraction_worker_shutdown,
@@ -437,6 +483,11 @@ async def lifespan(app: FastAPI):
 
         reset_extraction_worker_shutdown()
         start_extraction_worker()
+
+        from app.services.ingestion.coordinator import schedule_dedup_background
+
+        for upload_id, patient_id, user_id in dedup_jobs_to_resume:
+            schedule_dedup_background(upload_id, patient_id, user_id)
 
         import sys
 
@@ -448,7 +499,10 @@ async def lifespan(app: FastAPI):
 
         yield
     finally:
-        await _shutdown_local_ai_workers(local_ai_started=local_ai_started)
+        try:
+            await _shutdown_local_ai_workers(local_ai_started=local_ai_started)
+        finally:
+            await _drain_background_tasks()
 
 
 def create_app() -> FastAPI:

@@ -7,16 +7,17 @@ import logging
 import os
 import shutil
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.patient import Patient
+from app.models.record import HealthRecord
 from app.models.uploaded_file import UploadedFile
 from app.services.ingestion.cda_dedup import deduplicate_across_documents
 from app.services.ingestion.cda_parser import parse_cda_document
@@ -47,6 +48,12 @@ from app.utils.file_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Keep ownership of work that outlives the request which scheduled it. This lets
+# shutdown drain the tasks cleanly instead of closing their database connections
+# beneath a still-running coroutine.
+_dedup_tasks: set[asyncio.Task[None]] = set()
+_DEDUP_RECOVERY_BATCH_SIZE = 1_000
 
 # --- SEC-DOS-02: zip-bomb defenses ---------------------------------------
 #
@@ -377,7 +384,7 @@ async def ingest_file(
             upload.ingestion_status = "dedup_scanning"
             await db.commit()
 
-            asyncio.create_task(_run_dedup_background(upload.id, patient.id, user_id))
+            schedule_dedup_background(upload.id, patient.id, user_id)
 
             return {
                 "upload_id": str(upload.id),
@@ -411,9 +418,14 @@ async def _run_dedup_background(
 
     try:
         async with async_session_factory() as db:
-            upload = await db.get(UploadedFile, upload_id)
+            upload = await _claim_dedup_upload(db, upload_id, user_id)
             if not upload:
-                logger.error("Background dedup: upload %s not found", upload_id)
+                logger.info(
+                    "Background dedup: upload %s was absent, terminal, or already claimed "
+                    "for owner %s",
+                    upload_id,
+                    user_id,
+                )
                 return
 
             dedup_summary = await run_upload_dedup(
@@ -422,6 +434,7 @@ async def _run_dedup_background(
                 user_id,
                 db,
                 processing_mode=upload.processing_mode,
+                commit=False,
             )
             upload.dedup_summary = dedup_summary.to_dict()
 
@@ -441,17 +454,192 @@ async def _run_dedup_background(
                 dedup_summary.auto_merged,
                 dedup_summary.needs_review,
             )
+    except asyncio.CancelledError:
+        logger.info("Background dedup cancelled for %s", upload_id)
+        await _mark_dedup_interrupted(upload_id, user_id, retryable=True)
+        raise
     except Exception:
         logger.exception("Background dedup failed for %s", upload_id)
-        try:
-            async with async_session_factory() as db:
-                upload = await db.get(UploadedFile, upload_id)
-                if upload:
-                    upload.ingestion_status = "completed"
+        await _mark_dedup_interrupted(upload_id, user_id, retryable=False)
+
+
+async def _owned_processing_upload(
+    db: AsyncSession,
+    upload_id: UUID,
+    user_id: UUID,
+) -> UploadedFile | None:
+    """Lock one active scan without weakening the tenant boundary."""
+    return (
+        await db.execute(
+            select(UploadedFile)
+            .where(
+                UploadedFile.id == upload_id,
+                UploadedFile.user_id == user_id,
+                UploadedFile.ingestion_status == "dedup_processing",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+
+
+async def _claim_dedup_upload(
+    db: AsyncSession,
+    upload_id: UUID,
+    user_id: UUID,
+) -> UploadedFile | None:
+    """Claim one tenant-owned scan while holding its row lock through completion."""
+    upload = (
+        await db.execute(
+            select(UploadedFile)
+            .where(
+                UploadedFile.id == upload_id,
+                UploadedFile.user_id == user_id,
+                UploadedFile.ingestion_status.in_(
+                    ("dedup_scanning", "dedup_processing")
+                ),
+            )
+            .with_for_update(skip_locked=True)
+        )
+    ).scalar_one_or_none()
+    if upload is not None:
+        upload.ingestion_status = "dedup_processing"
+        upload.processing_started_at = datetime.now(timezone.utc)
+        upload.processing_completed_at = None
+    return upload
+
+
+async def _mark_dedup_interrupted(
+    upload_id: UUID,
+    user_id: UUID,
+    *,
+    retryable: bool,
+) -> None:
+    """Persist truthful state after a cancelled or failed dedup pass."""
+    from app.database import async_session_factory
+
+    try:
+        async with async_session_factory() as db:
+            upload = await _owned_processing_upload(db, upload_id, user_id)
+            if upload:
+                if retryable:
+                    upload.ingestion_status = "dedup_scanning"
+                    upload.processing_started_at = None
+                    upload.processing_completed_at = None
+                else:
+                    upload.ingestion_status = "failed"
                     upload.processing_completed_at = datetime.now(timezone.utc)
-                    await db.commit()
-        except Exception:
-            logger.exception("Failed to update upload status after dedup error")
+                await db.commit()
+    except Exception:
+        logger.exception("Failed to update upload status after interrupted dedup")
+
+
+async def recover_dedup_background_specs(
+    db: AsyncSession,
+) -> list[tuple[UUID, UUID, UUID]]:
+    """Claim a bounded batch of crash-interrupted dedup tasks to resume."""
+    recovered_at = datetime.now(timezone.utc)
+    stale_before = recovered_at - timedelta(
+        minutes=settings.extraction_timeout_minutes
+    )
+    patient_id = (
+        select(HealthRecord.patient_id)
+        .where(
+            HealthRecord.source_file_id == UploadedFile.id,
+            HealthRecord.user_id == UploadedFile.user_id,
+            HealthRecord.deleted_at.is_(None),
+        )
+        .order_by(HealthRecord.created_at.asc(), HealthRecord.id.asc())
+        .limit(1)
+        .correlate(UploadedFile)
+        .scalar_subquery()
+    )
+    rows = (
+        await db.execute(
+            select(UploadedFile, patient_id.label("patient_id"))
+            .where(
+                or_(
+                    UploadedFile.ingestion_status == "dedup_scanning",
+                    (
+                        UploadedFile.ingestion_status == "dedup_processing"
+                    )
+                    & or_(
+                        UploadedFile.processing_started_at.is_(None),
+                        UploadedFile.processing_started_at <= stale_before,
+                    ),
+                ),
+                UploadedFile.deleted_at.is_(None),
+            )
+            .order_by(UploadedFile.created_at.asc(), UploadedFile.id.asc())
+            .limit(_DEDUP_RECOVERY_BATCH_SIZE + 1)
+            .with_for_update(skip_locked=True)
+        )
+    ).all()
+    if len(rows) > _DEDUP_RECOVERY_BATCH_SIZE:
+        logger.warning(
+            "Dedup recovery reached its %d-upload safety bound",
+            _DEDUP_RECOVERY_BATCH_SIZE,
+        )
+        rows = rows[:_DEDUP_RECOVERY_BATCH_SIZE]
+
+    resumable: list[tuple[UUID, UUID, UUID]] = []
+    for upload, recovered_patient_id in rows:
+        if recovered_patient_id is None:
+            # There is no record to compare. Finish truthfully instead of
+            # leaving a permanently spinning recovery row.
+            upload.ingestion_status = "completed"
+            upload.processing_completed_at = recovered_at
+            continue
+        upload.ingestion_status = "dedup_processing"
+        upload.processing_started_at = recovered_at
+        upload.processing_completed_at = None
+        resumable.append((upload.id, recovered_patient_id, upload.user_id))
+    return resumable
+
+
+def schedule_dedup_background(
+    upload_id: UUID,
+    patient_id: UUID,
+    user_id: UUID,
+) -> None:
+    """Schedule upload deduplication and retain it until it reaches a terminal state."""
+    task = asyncio.create_task(_run_dedup_background(upload_id, patient_id, user_id))
+    _dedup_tasks.add(task)
+    task.add_done_callback(_dedup_tasks.discard)
+
+
+async def stop_dedup_background_tasks(*, cancel: bool = False) -> None:
+    """Drain dedup work, cancelling only when callers require immediate teardown."""
+    tasks = [task for task in _dedup_tasks if not task.done()]
+    if not tasks:
+        _dedup_tasks.clear()
+        return
+
+    if cancel:
+        for task in tasks:
+            task.cancel()
+
+    drain = asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(drain),
+            timeout=settings.local_ai_shutdown_drain_seconds,
+        )
+    except TimeoutError:
+        if cancel:
+            logger.warning("Dedup shutdown cancellation drain timed out")
+        else:
+            logger.warning("Dedup shutdown drain timed out; cancelling remaining work")
+            for task in tasks:
+                task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(drain),
+                    timeout=settings.local_ai_shutdown_drain_seconds,
+                )
+            except TimeoutError:
+                logger.warning("Dedup shutdown cancellation drain timed out")
+    finally:
+        _dedup_tasks.difference_update(task for task in tasks if task.done())
 
 
 async def _ingest_fhir(

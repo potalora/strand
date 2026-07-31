@@ -156,6 +156,73 @@ def _summary_payload() -> dict[str, object]:
     }
 
 
+def _summary_payload_with_fact_count(count: int) -> dict[str, object]:
+    payload = _summary_payload()
+    facts: list[dict[str, object]] = []
+    evidence_items: list[dict[str, object]] = []
+    for index in range(count):
+        record_id = f"record-{index}"
+        source_id = f"source-evidence-{index}"
+        name = f"Medication {index}"
+        content_json = json.dumps(
+            {"name": name, "record_type": "medication"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        evidence_snapshot = json.dumps(
+            {
+                "excerpt": f"{name} is listed as active.",
+                "field_paths": ["/name"],
+                "page_number": 1,
+                "section": "Medications",
+                "source_id": source_id,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        evidence_id = "evidence1_" + hashlib.sha256(evidence_snapshot.encode()).hexdigest()[:40]
+        fact_snapshot = json.dumps(
+            {
+                "content_json": content_json,
+                "evidence_ids": [evidence_id],
+                "record_id": record_id,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        fact_id = "fact1_" + hashlib.sha256(fact_snapshot.encode()).hexdigest()[:40]
+        facts.append(
+            {
+                "fact_id": fact_id,
+                "record_id": record_id,
+                "content_json": content_json,
+                "fields": [
+                    {"path": "/name", "value_json": json.dumps(name)},
+                    {"path": "/record_type", "value_json": '"medication"'},
+                ],
+                "evidence_ids": [evidence_id],
+            }
+        )
+        evidence_items.append(
+            {
+                "evidence_id": evidence_id,
+                "source_id": source_id,
+                "excerpt": f"{name} is listed as active.",
+                "page_number": 1,
+                "section": "Medications",
+                "fact_ids": [fact_id],
+                "field_paths": ["/name"],
+            }
+        )
+    payload["facts"] = facts
+    payload["evidence"] = evidence_items
+    payload["uncertainty_labels"] = []
+    return payload
+
+
 def _maximal_summary_reference() -> dict[str, object]:
     payload = _summary_payload()
     fact = payload["facts"][0]  # type: ignore[index]
@@ -2195,19 +2262,13 @@ def test_summary_accepts_only_validated_fact_and_evidence_inputs() -> None:
         calls.append(kwargs)
         return json.dumps(
             {
-                "sections": [
-                    {
-                        "heading": "Medications",
-                        "claims": [
-                            {
-                                "fact_id": fact["fact_id"],
-                                "field_paths": ["/name"],
-                                "evidence_ids": fact["evidence_ids"],
-                            }
-                        ],
+                "claims": {
+                    fact["fact_id"]: {
+                        "field_paths": ["/name"],
+                        "evidence_ids": fact["evidence_ids"],
                     }
-                ],
-                "uncertainties": [],
+                },
+                "uncertainties": {},
             },
             separators=(",", ":"),
         )
@@ -2234,64 +2295,305 @@ def test_summary_accepts_only_validated_fact_and_evidence_inputs() -> None:
     schema = calls[0]["json_schema"]
     assert isinstance(schema, dict)
     assert schema["type"] == "object"
-    section_schema = next(
-        item
-        for item in schema["properties"]["sections"]["items"]["oneOf"]
-        if item["properties"]["heading"] == {"const": "Medications"}
-    )
-    assert section_schema["properties"]["heading"] == {"const": "Medications"}
-    claim_schema = section_schema["properties"]["claims"]["items"]["oneOf"][0]
-    assert claim_schema["properties"]["fact_id"] == {"const": fact["fact_id"]}
+    claim_schema = schema["properties"]["claims"]["properties"][fact["fact_id"]]
     assert claim_schema["properties"]["field_paths"]["items"] == {"enum": ["/name"]}
     assert claim_schema["properties"]["evidence_ids"] == {
         "type": "array",
         "items": {"enum": fact["evidence_ids"]},
         "minItems": 1,
         "maxItems": 1,
-        "uniqueItems": True,
     }
-    evidence_id = fact["evidence_ids"][0]
-    assert {
-        "if": {
-            "properties": {
-                "field_paths": {"contains": {"const": "/name"}},
-            },
-            "required": ["field_paths"],
-        },
-        "then": {
-            "properties": {
-                "evidence_ids": {"contains": {"enum": [evidence_id]}},
-            }
-        },
-    } in claim_schema["allOf"]
-    assert {
-        "if": {
-            "properties": {
-                "evidence_ids": {"contains": {"const": evidence_id}},
-            },
-            "required": ["evidence_ids"],
-        },
-        "then": {
-            "properties": {
-                "field_paths": {"contains": {"enum": ["/name"]}},
-            }
-        },
-    } in claim_schema["allOf"]
+    assert claim_schema["properties"]["overview"] == {"const": True}
     uncertainty = payload["uncertainty_labels"][0]  # type: ignore[index]
-    uncertainty_schema = schema["properties"]["uncertainties"]["items"]["oneOf"][0]
-    assert uncertainty_schema["properties"]["uncertainty_id"] == {
-        "const": uncertainty["uncertainty_id"]
-    }
-    assert uncertainty_schema["properties"]["fact_ids"] == {"const": uncertainty["fact_ids"]}
-    assert uncertainty_schema["properties"]["evidence_ids"] == {
-        "const": uncertainty["evidence_ids"]
-    }
+    uncertainty_schema = schema["properties"]["uncertainties"]["properties"]
+    assert uncertainty_schema[uncertainty["uncertainty_id"]] == {"const": True}
     assert "fabricated" not in json.dumps(schema)
     assert '"summary_type":"full_health"' in str(calls[0]["prompt"])
     assert '"allowed_heading":"Medications"' in str(calls[0]["prompt"])
-    assert "sections MUST be a JSON array" in str(calls[0]["prompt"])
+    assert "claims MUST be an object" in str(calls[0]["prompt"])
     assert "subset of BOTH" in str(calls[0]["prompt"])
     assert "Do not emit free-text" in str(calls[0]["prompt"])
+
+
+def test_summary_internal_schema_keys_each_fact_and_uncertainty() -> None:
+    from local_ai_mlx_worker.qwen_summary import (
+        _summary_output_schema,
+        _validated_input,
+    )
+
+    payload = _summary_payload()
+    safe_input = _validated_input(payload)
+    fact = safe_input["facts"][0]  # type: ignore[index]
+    uncertainty = safe_input["uncertainty_labels"][0]  # type: ignore[index]
+
+    schema = _summary_output_schema(safe_input)
+
+    assert schema["x-guidance"] == {"whitespace_flexible": False}
+    claims = schema["properties"]["claims"]  # type: ignore[index]
+    assert claims["type"] == "object"  # type: ignore[index]
+    assert set(claims["properties"]) == {fact["fact_id"]}  # type: ignore[index]
+    selection = claims["properties"][fact["fact_id"]]  # type: ignore[index]
+    assert set(selection["properties"]) == {"field_paths", "evidence_ids", "overview"}
+    assert "fact_id" not in selection["properties"]
+    assert selection["properties"]["overview"] == {"const": True}
+
+    uncertainties = schema["properties"]["uncertainties"]  # type: ignore[index]
+    assert uncertainties["type"] == "object"  # type: ignore[index]
+    assert uncertainties["properties"] == {  # type: ignore[index]
+        uncertainty["uncertainty_id"]: {"const": True}
+    }
+
+
+def test_summary_transforms_keyed_selection_to_public_grounded_document() -> None:
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    fact = payload["facts"][0]  # type: ignore[index]
+    uncertainty = payload["uncertainty_labels"][0]  # type: ignore[index]
+    internal_selection = {
+        "claims": {
+            fact["fact_id"]: {
+                "field_paths": ["/name"],
+                "evidence_ids": fact["evidence_ids"],
+            }
+        },
+        "uncertainties": {uncertainty["uncertainty_id"]: True},
+    }
+
+    result = run_summary(
+        payload,
+        loaded=_loaded("summary"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: json.dumps(
+            internal_selection,
+            separators=(",", ":"),
+        ),
+    )
+
+    assert result == _maximal_summary_reference()
+
+
+def test_summary_deterministically_backfills_unselected_facts_and_uncertainties() -> None:
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    result = run_summary(
+        _summary_payload(),
+        loaded=_loaded("summary"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: '{"claims":{},"uncertainties":{}}',
+    )
+
+    assert result == _maximal_summary_reference()
+
+
+def test_summary_transforms_overview_selection_without_changing_public_contract() -> None:
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    payload = _summary_payload()
+    fact = payload["facts"][0]  # type: ignore[index]
+    internal_selection = {
+        "claims": {
+            fact["fact_id"]: {
+                "field_paths": ["/name"],
+                "evidence_ids": fact["evidence_ids"],
+                "overview": True,
+            }
+        },
+        "uncertainties": {},
+    }
+
+    result = run_summary(
+        payload,
+        loaded=_loaded("summary"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: json.dumps(internal_selection, separators=(",", ":")),
+    )
+
+    assert result["sections"] == [
+        {
+            "heading": "Overview",
+            "claims": [
+                {
+                    "fact_id": fact["fact_id"],
+                    "field_paths": ["/name"],
+                    "evidence_ids": fact["evidence_ids"],
+                }
+            ],
+        }
+    ]
+    assert result["uncertainties"] == _maximal_summary_reference()["uncertainties"]
+
+
+def test_summary_schema_avoids_unsupported_llguidance_keywords_recursively() -> None:
+    from local_ai_mlx_worker.qwen_summary import run_summary
+
+    calls: list[dict[str, object]] = []
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return '{"claims":{},"uncertainties":{}}'
+
+    run_summary(
+        _summary_payload(),
+        loaded=_loaded("summary"),  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    def assert_supported(value: object) -> None:
+        if isinstance(value, dict):
+            assert {
+                "contains",
+                "if",
+                "maxContains",
+                "minContains",
+                "then",
+                "uniqueItems",
+            }.isdisjoint(value)
+            for nested in value.values():
+                assert_supported(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                assert_supported(nested)
+
+    assert_supported(calls[0]["json_schema"])
+
+
+def test_summary_internal_schema_structurally_bounds_nineteen_facts() -> None:
+    from local_ai_mlx_worker.qwen_summary import (
+        _summary_output_schema,
+        _validated_input,
+        run_summary,
+    )
+
+    payload = _summary_payload_with_fact_count(19)
+    safe_input = _validated_input(payload)
+    facts = safe_input["facts"]
+    assert isinstance(facts, list)
+    fact_ids = {str(fact["fact_id"]) for fact in facts}
+
+    schema = _summary_output_schema(safe_input)
+    claim_properties = schema["properties"]["claims"]["properties"]  # type: ignore[index]
+    assert set(claim_properties) == fact_ids
+    assert all(
+        set(claim_properties[fact_id]["properties"])
+        == {"field_paths", "evidence_ids", "overview"}
+        for fact_id in fact_ids
+    )
+
+    selection = {
+        "claims": {
+            fact["fact_id"]: {
+                "field_paths": ["/name"],
+                "evidence_ids": fact["evidence_ids"],
+            }
+            for fact in facts
+        },
+        "uncertainties": {},
+    }
+    result = run_summary(
+        payload,
+        loaded=_loaded("summary"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: json.dumps(selection, separators=(",", ":")),
+    )
+
+    sections = result["sections"]
+    assert isinstance(sections, list)
+    assert len(sections) == 1
+    assert sections[0]["heading"] == "Medications"
+    claims = sections[0]["claims"]
+    assert len(claims) == 19
+    assert {claim["fact_id"] for claim in claims} == fact_ids
+
+
+def test_summary_schema_fails_closed_instead_of_slicing_overfull_heading() -> None:
+    from local_ai_mlx_worker.common import WorkerInputLimitError
+    from local_ai_mlx_worker.qwen_summary import _summary_output_schema, _validated_input
+
+    safe_input = _validated_input(_summary_payload_with_fact_count(101))
+
+    with pytest.raises(WorkerInputLimitError, match="section limits"):
+        _summary_output_schema(safe_input)
+
+
+def test_summary_final_public_validation_rejects_duplicate_section_headings() -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.qwen_summary import _validated_input, _validated_output
+
+    with pytest.raises(GenerationError, match="invalid JSON"):
+        _validated_output(
+            json.dumps(
+                {
+                    "sections": [
+                        {"heading": "Medications", "claims": []},
+                        {"heading": "Medications", "claims": []},
+                    ],
+                    "uncertainties": [],
+                },
+                separators=(",", ":"),
+            ),
+            _validated_input(_summary_payload()),
+        )
+
+
+def test_summary_final_public_validation_rejects_duplicate_fact_ids() -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.qwen_summary import _validated_input, _validated_output
+
+    payload = _summary_payload()
+    fact = payload["facts"][0]  # type: ignore[index]
+    claim = {
+        "fact_id": fact["fact_id"],
+        "field_paths": ["/name"],
+        "evidence_ids": fact["evidence_ids"],
+    }
+
+    with pytest.raises(GenerationError, match="invalid JSON"):
+        _validated_output(
+            json.dumps(
+                {
+                    "sections": [
+                        {
+                            "heading": "Medications",
+                            "claims": [claim, claim],
+                        }
+                    ],
+                    "uncertainties": [],
+                },
+                separators=(",", ":"),
+            ),
+            _validated_input(payload),
+        )
+
+
+@pytest.mark.parametrize("duplicate_key", ["field_paths", "evidence_ids"])
+def test_summary_final_public_validation_rejects_duplicate_selected_bindings(
+    duplicate_key: str,
+) -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.qwen_summary import _validated_input, _validated_output
+
+    payload = _summary_payload()
+    fact = payload["facts"][0]  # type: ignore[index]
+    claim = {
+        "fact_id": fact["fact_id"],
+        "field_paths": ["/name"],
+        "evidence_ids": fact["evidence_ids"],
+    }
+    claim[duplicate_key] = [claim[duplicate_key][0], claim[duplicate_key][0]]
+
+    with pytest.raises(GenerationError, match="invalid JSON"):
+        _validated_output(
+            json.dumps(
+                {
+                    "sections": [
+                        {
+                            "heading": "Medications",
+                            "claims": [claim],
+                        }
+                    ],
+                    "uncertainties": [],
+                },
+                separators=(",", ":"),
+            ),
+            _validated_input(payload),
+        )
 
 
 def test_summary_invalid_constrained_output_is_terminal_after_one_attempt() -> None:
@@ -2412,19 +2714,13 @@ def test_summary_typed_observation_unit_bound_matches_server_contract(
     fact = payload["facts"][0]  # type: ignore[index]
     raw = json.dumps(
         {
-            "sections": [
-                {
-                    "heading": "Observations",
-                    "claims": [
-                        {
-                            "fact_id": fact["fact_id"],
-                            "field_paths": ["/name"],
-                            "evidence_ids": fact["evidence_ids"],
-                        }
-                    ],
+            "claims": {
+                fact["fact_id"]: {
+                    "field_paths": ["/name"],
+                    "evidence_ids": fact["evidence_ids"],
                 }
-            ],
-            "uncertainties": [],
+            },
+            "uncertainties": {},
         },
         separators=(",", ":"),
     )
@@ -2561,19 +2857,13 @@ def test_summary_rejects_claim_without_field_specific_evidence_support() -> None
             loaded=_loaded("summary"),  # type: ignore[arg-type]
             generate_fn=lambda **_kwargs: json.dumps(
                 {
-                    "sections": [
-                        {
-                            "heading": "Medications",
-                            "claims": [
-                                {
-                                    "fact_id": fact["fact_id"],
-                                    "field_paths": ["/record_type"],
-                                    "evidence_ids": [evidence["evidence_id"]],
-                                }
-                            ],
+                    "claims": {
+                        fact["fact_id"]: {
+                            "field_paths": ["/record_type"],
+                            "evidence_ids": [evidence["evidence_id"]],
                         }
-                    ],
-                    "uncertainties": [],
+                    },
+                    "uncertainties": {},
                 },
                 separators=(",", ":"),
             ),
@@ -3227,19 +3517,13 @@ def test_summary_progress_precedes_loader_and_reports_one_bounded_generation(
         return GeneratedText(
             json.dumps(
                 {
-                    "sections": [
-                        {
-                            "heading": "Medications",
-                            "claims": [
-                                {
-                                    "fact_id": fact["fact_id"],
-                                    "field_paths": ["/name"],
-                                    "evidence_ids": fact["evidence_ids"],
-                                }
-                            ],
+                    "claims": {
+                        fact["fact_id"]: {
+                            "field_paths": ["/name"],
+                            "evidence_ids": fact["evidence_ids"],
                         }
-                    ],
-                    "uncertainties": [],
+                    },
+                    "uncertainties": {},
                 }
             ),
             generation_tokens=7,

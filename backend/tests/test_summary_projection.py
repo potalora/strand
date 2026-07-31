@@ -800,6 +800,82 @@ def test_extracted_observation_projects_ratio_as_typed_evidence_linked_value() -
     _ground(projection)
 
 
+def test_extracted_observation_omits_derived_status_without_source_support() -> None:
+    record = _record(
+        "observation",
+        source_format="local_ai",
+        ai_extracted=True,
+        display="Hemoglobin A1c",
+        status="present",
+        fhir={
+            "resourceType": "Observation",
+            "status": "final",
+            "code": {"text": "Hemoglobin A1c"},
+            "effectiveDateTime": "2026-07-01",
+            "valueQuantity": {"value": 6.8, "unit": "%"},
+        },
+    )
+    source = _evidence(
+        record.id,
+        [
+            "laboratory[0].name",
+            "laboratory[0].value",
+            "laboratory[0].unit",
+            "laboratory[0].date",
+        ],
+    )
+
+    projection = project_summary_records([record], {record.id: [source]})
+
+    assert "status" not in projection.facts[0]["content"]
+    assert projection.evidence[0]["field_paths"] == [
+        "/name",
+        "/value",
+        "/unit",
+        "/date",
+    ]
+    assert any(
+        item["template_id"] == "record_status_missing"
+        for item in projection.uncertainty_labels
+    )
+    _ground(projection)
+
+
+def test_structured_observation_with_inherited_local_evidence_keeps_status_guard() -> None:
+    """A structured merge survivor must not inherit the local derived-status exception."""
+    record = _record(
+        "observation",
+        source_format="fhir",
+        ai_extracted=False,
+        display="Hemoglobin A1c",
+        fhir={
+            "resourceType": "Observation",
+            "status": "final",
+            "code": {"text": "Hemoglobin A1c"},
+            "effectiveDateTime": "2026-07-01",
+            "valueQuantity": {"value": 6.8, "unit": "%"},
+        },
+    )
+    inherited_local_source = _evidence(
+        record.id,
+        [
+            "laboratory[0].name",
+            "laboratory[0].value",
+            "laboratory[0].unit",
+            "laboratory[0].date",
+        ],
+    )
+
+    with pytest.raises(
+        LocalValidationError,
+        match="safety qualifier lacks evidence support",
+    ):
+        project_summary_records(
+            [record],
+            {record.id: [inherited_local_source]},
+        )
+
+
 def test_structured_observation_projects_fhir_ratio_without_losing_units() -> None:
     record = _record(
         "observation",

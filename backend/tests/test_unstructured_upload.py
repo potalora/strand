@@ -883,7 +883,15 @@ async def test_extraction_progress_returns_counts(
 
     # Create files in various statuses
     for i, status in enumerate(
-        ["completed", "completed", "processing", "failed", "pending_extraction"]
+        [
+            "completed",
+            "completed",
+            "processing",
+            "dedup_scanning",
+            "dedup_processing",
+            "failed",
+            "pending_extraction",
+        ]
     ):
         upload = UploadedFile(
             id=uuid4(),
@@ -903,9 +911,9 @@ async def test_extraction_progress_returns_counts(
     resp = await client.get("/api/v1/upload/extraction-progress", headers=headers)
     assert resp.status_code == 200
     data = resp.json()
-    assert data["total"] == 5
+    assert data["total"] == 7
     assert data["completed"] == 2
-    assert data["processing"] == 1
+    assert data["processing"] == 3
     assert data["failed"] == 1
     assert data["pending"] == 1
     assert data["records_created"] == 6

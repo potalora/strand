@@ -374,7 +374,7 @@ Poll for ingestion progress on large imports. Frontend polls every 2 seconds.
 }
 ```
 
-**Status values:** `pending`, `processing`, `dedup_scanning`, `completed`, `completed_with_merges`, `awaiting_review`, `failed`, `partial`
+**Status values:** `pending`, `processing`, `dedup_scanning`, `dedup_processing`, `completed`, `completed_with_merges`, `awaiting_review`, `failed`, `partial`
 
 For strict-local unstructured jobs, `local_run.models` contains the captured OCR
 and extraction model identities only. Summary-model provenance is reported on

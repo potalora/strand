@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from types import SimpleNamespace
@@ -431,7 +432,9 @@ class TestRunUploadDedup:
             processing_completed_at=None,
         )
         mock_db = AsyncMock()
-        mock_db.get.return_value = upload
+        upload_result = MagicMock()
+        upload_result.scalar_one_or_none.return_value = upload
+        mock_db.execute.return_value = upload_result
 
         class SessionFactory:
             def __call__(self):
@@ -459,7 +462,234 @@ class TestRunUploadDedup:
             user_id,
             mock_db,
             processing_mode="validated_strict_local",
+            commit=False,
         )
+        lookup = mock_db.execute.await_args.args[0]
+        assert "uploaded_files.user_id" in str(lookup)
+        assert "FOR UPDATE" in str(lookup)
+
+    @pytest.mark.asyncio
+    async def test_schedule_dedup_background_tracks_task_until_completion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Scheduled dedup remains owned until its background work finishes."""
+        from app.services.ingestion import coordinator
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_dedup(*_args: object) -> None:
+            started.set()
+            await release.wait()
+
+        await coordinator.stop_dedup_background_tasks()
+        monkeypatch.setattr(coordinator, "_run_dedup_background", blocked_dedup)
+
+        coordinator.schedule_dedup_background(uuid4(), uuid4(), uuid4())
+
+        assert len(coordinator._dedup_tasks) == 1
+        await started.wait()
+        task = next(iter(coordinator._dedup_tasks))
+        release.set()
+        await task
+        await asyncio.sleep(0)
+
+        assert not coordinator._dedup_tasks
+
+    @pytest.mark.asyncio
+    async def test_stop_dedup_background_tasks_cancels_and_drains(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Shutdown cancels retained dedup work instead of leaving a live task."""
+        from app.services.ingestion import coordinator
+
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked_dedup(*_args: object) -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        await coordinator.stop_dedup_background_tasks()
+        monkeypatch.setattr(coordinator, "_run_dedup_background", blocked_dedup)
+
+        coordinator.schedule_dedup_background(uuid4(), uuid4(), uuid4())
+        await started.wait()
+        await coordinator.stop_dedup_background_tasks(cancel=True)
+
+        assert cancelled.is_set()
+        assert not coordinator._dedup_tasks
+
+    @pytest.mark.asyncio
+    async def test_stop_dedup_background_tasks_drains_before_cancelling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Production shutdown lets an in-flight dedup finish when it can."""
+        from app.services.ingestion import coordinator
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked_dedup(*_args: object) -> None:
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        await coordinator.stop_dedup_background_tasks(cancel=True)
+        monkeypatch.setattr(coordinator, "_run_dedup_background", blocked_dedup)
+
+        coordinator.schedule_dedup_background(uuid4(), uuid4(), uuid4())
+        await started.wait()
+        release.set()
+        await coordinator.stop_dedup_background_tasks()
+
+        assert not cancelled.is_set()
+        assert not coordinator._dedup_tasks
+
+    @pytest.mark.asyncio
+    async def test_cancelled_background_dedup_stays_retryable_and_owner_scoped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Forced shutdown preserves a tenant-scoped scan for startup recovery."""
+        from app.services.ingestion import coordinator
+
+        upload_id = uuid4()
+        patient_id = uuid4()
+        user_id = uuid4()
+        upload = SimpleNamespace(
+            processing_mode="cloud_assisted",
+            dedup_summary=None,
+            ingestion_status="dedup_scanning",
+            processing_started_at=None,
+            processing_completed_at=None,
+        )
+        mock_db = AsyncMock()
+        upload_result = MagicMock()
+        upload_result.scalar_one_or_none.return_value = upload
+        mock_db.execute.return_value = upload_result
+        started = asyncio.Event()
+
+        class SessionFactory:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                return mock_db
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def blocked_dedup(*_args: object, **_kwargs: object) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch("app.database.async_session_factory", new=SessionFactory()),
+            patch(
+                "app.services.dedup.orchestrator.run_upload_dedup",
+                new=blocked_dedup,
+            ),
+        ):
+            task = asyncio.create_task(
+                coordinator._run_dedup_background(upload_id, patient_id, user_id)
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert upload.ingestion_status == "dedup_scanning"
+        assert upload.processing_started_at is None
+        assert upload.processing_completed_at is None
+        mock_db.commit.assert_awaited_once()
+        assert mock_db.execute.await_count == 2
+        for call in mock_db.execute.await_args_list:
+            lookup = call.args[0]
+            assert "uploaded_files.user_id" in str(lookup)
+        marker_query = mock_db.execute.await_args_list[1].args[0]
+        assert "dedup_processing" in marker_query.compile().params.values()
+
+    @pytest.mark.asyncio
+    async def test_interruption_marker_does_not_rewrite_a_terminal_upload(
+        self,
+    ) -> None:
+        """Late cancellation cannot turn a committed terminal result retryable."""
+        from app.services.ingestion import coordinator
+
+        mock_db = AsyncMock()
+        no_processing_row = MagicMock()
+        no_processing_row.scalar_one_or_none.return_value = None
+        mock_db.execute.return_value = no_processing_row
+
+        class SessionFactory:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                return mock_db
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        with patch(
+            "app.database.async_session_factory",
+            new=SessionFactory(),
+        ):
+            await coordinator._mark_dedup_interrupted(
+                uuid4(),
+                uuid4(),
+                retryable=True,
+            )
+
+        query = mock_db.execute.await_args.args[0]
+        assert "uploaded_files.user_id" in str(query)
+        assert "dedup_processing" in query.compile().params.values()
+        assert "FOR UPDATE" in str(query)
+        mock_db.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recover_dedup_background_specs_is_bounded_and_owner_scoped(
+        self,
+    ) -> None:
+        """Startup derives resumable task identities from owner-scoped source records."""
+        from app.services.ingestion import coordinator
+
+        upload_id = uuid4()
+        patient_id = uuid4()
+        user_id = uuid4()
+        mock_db = AsyncMock()
+        rows = MagicMock()
+        upload = SimpleNamespace(
+            id=upload_id,
+            user_id=user_id,
+            ingestion_status="dedup_scanning",
+            processing_started_at=None,
+            processing_completed_at=None,
+        )
+        rows.all.return_value = [
+            (upload, patient_id)
+        ]
+        mock_db.execute.return_value = rows
+
+        recovered = await coordinator.recover_dedup_background_specs(mock_db)
+
+        assert recovered == [(upload_id, patient_id, user_id)]
+        query = mock_db.execute.await_args.args[0]
+        rendered = str(query)
+        assert "uploaded_files.user_id" in rendered
+        assert "health_records.user_id" in rendered
+        assert "health_records.source_file_id" in rendered
+        assert "FOR UPDATE" in rendered
+        assert upload.ingestion_status == "dedup_processing"
+        assert upload.processing_started_at is not None
 
     @pytest.mark.asyncio
     async def test_no_candidates_returns_empty_summary(self):

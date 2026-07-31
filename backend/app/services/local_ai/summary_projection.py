@@ -918,7 +918,20 @@ def project_summary_records(
             if path in {"/assertion", "/relationship", "/status"}
             or path.startswith("/statuses/")
         }
-        if qualifier_paths - supported_paths:
+        unsupported_qualifiers = qualifier_paths - supported_paths
+        if (
+            linked
+            and record_type == "observation"
+            and bool(record.ai_extracted)
+            and unsupported_qualifiers == {"/status"}
+        ):
+            # AI-extracted observations use the required FHIR lifecycle
+            # status ``final`` even when the source page did not state one.
+            # Do not summarize that server-derived value as source-backed;
+            # omit it and emit the ordinary missing-status uncertainty below.
+            content.pop("status", None)
+            unsupported_qualifiers.clear()
+        if unsupported_qualifiers:
             raise LocalValidationError(
                 "Summary fact safety qualifier lacks evidence support."
             )
