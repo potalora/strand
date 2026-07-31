@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import hashlib
 import json
@@ -11,6 +12,7 @@ import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -755,6 +757,9 @@ async def test_startup_reconciles_pack_and_strict_jobs_under_database_lock(
         events.append("recover-summary")
         return []
 
+    async def active_ids(_db: object) -> list[str]:
+        return []
+
     async def reconcile_zip(_db: object, _root: Path) -> None:
         events.append("zip")
 
@@ -785,6 +790,7 @@ async def test_startup_reconciles_pack_and_strict_jobs_under_database_lock(
         "_recover_strict_local_summary_jobs_on_startup",
         recover_summaries,
     )
+    monkeypatch.setattr(main_module, "_active_strict_local_job_ids", active_ids)
     monkeypatch.setattr(
         main_module,
         "_reconcile_model_pack_operations_on_startup",
@@ -865,6 +871,9 @@ async def test_shutdown_drains_work_and_requeues_before_stopping_model_manager(
         events.append("recover-summary")
         return []
 
+    async def active_ids(_db: object) -> list[str]:
+        return []
+
     async def stop_extraction() -> None:
         events.append("extraction-drained")
 
@@ -893,6 +902,7 @@ async def test_shutdown_drains_work_and_requeues_before_stopping_model_manager(
         "_recover_strict_local_summary_jobs_on_startup",
         recover_summaries,
     )
+    monkeypatch.setattr(main_module, "_active_strict_local_job_ids", active_ids)
     monkeypatch.setattr(main_module, "acquire_local_ai_lifecycle_lock", acquire)
     monkeypatch.setattr(
         main_module,
@@ -916,3 +926,95 @@ async def test_shutdown_drains_work_and_requeues_before_stopping_model_manager(
     assert events.index("extraction-drained") < events.index("summaries-requeued")
     assert events.index("summaries-requeued") < shutdown_recovery
     assert shutdown_recovery < events.index("manager-stop")
+
+
+@pytest.mark.asyncio
+async def test_shutdown_awaits_tracked_extraction_child_then_requeues_before_model_stop(
+    client,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claimed extraction child is drained before its durable recovery and model stop."""
+    import app.main as main_module
+    from app.api import upload as upload_module
+    from app.models.local_ai import LocalAIJob
+    from app.models.uploaded_file import UploadedFile
+    from app.services.local_ai.summary_runner import local_summary_runner
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+    from tests.conftest import auth_headers
+
+    _headers, user_id = await auth_headers(
+        client,
+        email="tracked-extraction-shutdown@example.com",
+    )
+    manifest, _contents = _manifest()
+    upload = UploadedFile(
+        user_id=UUID(user_id),
+        filename="tracked.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=100,
+        file_hash="c" * 64,
+        storage_path="/tmp/tracked.pdf",
+        ingestion_status="processing",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=json.loads(json.dumps(asdict(manifest))),
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=json.loads(json.dumps(asdict(manifest))),
+        status="processing",
+        stage="extraction",
+        progress={"stage": "extraction"},
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    child_awaited = asyncio.Event()
+
+    async def live_child() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            child_awaited.set()
+
+    child = asyncio.create_task(live_child())
+    upload_module._extraction_tasks.add(child)
+    child.add_done_callback(upload_module._extraction_tasks.discard)
+    await asyncio.sleep(0)
+
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+    class FakeManager:
+        async def stop(self) -> None:
+            assert child_awaited.is_set()
+            async with session_factory() as verify:
+                current_upload = await verify.get(UploadedFile, upload.id)
+                current_job = await verify.get(LocalAIJob, job.id)
+                assert current_upload.ingestion_status == "pending_extraction"
+                assert (current_job.status, current_job.stage) == (
+                    "queued",
+                    "recovery",
+                )
+
+    async def acquire(_db: object) -> None:
+        return None
+
+    monkeypatch.setattr(main_module, "async_session_factory", session_factory)
+    monkeypatch.setattr(main_module, "local_model_manager", FakeManager())
+    monkeypatch.setattr(main_module, "acquire_local_ai_lifecycle_lock", acquire)
+    monkeypatch.setattr(local_summary_runner, "stop_and_requeue", AsyncMock())
+
+    await main_module._shutdown_local_ai_workers(local_ai_started=True)
+
+    assert child.done()

@@ -139,15 +139,14 @@ async def test_unexpected_runner_failure_is_consumed_and_logged_without_content(
 
 
 @pytest.mark.asyncio
-async def test_shutdown_requeue_stops_at_the_summary_recovery_safety_bound(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Shutdown recovery handles a bounded batch and leaves later work queued."""
+async def test_shutdown_requeue_processes_every_job_across_bounded_batches() -> None:
+    """Shutdown recovery continues after a full batch without stranding work."""
     from app.services.ai.summarizer import requeue_interrupted_summary_jobs
 
     jobs = [
         SimpleNamespace(
             id=uuid4(),
+            created_at=datetime.now(timezone.utc),
             cancel_requested=False,
             status="processing",
             stage="summary",
@@ -159,17 +158,26 @@ async def test_shutdown_requeue_stops_at_the_summary_recovery_safety_bound(
     ]
 
     class Result:
+        def __init__(self, page):
+            self.page = page
+
         def scalars(self):
             return self
 
         def all(self):
-            return jobs
+            return self.page
 
     class Session:
         committed = False
+        calls = 0
 
         async def execute(self, _statement):
-            return Result()
+            self.calls += 1
+            if self.calls == 1:
+                return Result(jobs[:1000])
+            if self.calls == 2:
+                return Result(jobs[1000:])
+            return Result([])
 
         async def commit(self):
             self.committed = True
@@ -185,13 +193,91 @@ async def test_shutdown_requeue_stops_at_the_summary_recovery_safety_bound(
 
     resumed = await requeue_interrupted_summary_jobs(session_factory=SessionContext)
 
-    assert len(resumed) == 1000
+    assert len(resumed) == 1001
     assert jobs[0].stage == "recovery"
-    assert jobs[-1].stage == "summary"
+    assert jobs[-1].stage == "recovery"
     assert SessionContext.session.committed is True
-    assert (
-        "Strict-local summary shutdown recovery reached its safety bound" in caplog.text
-    )
+
+
+@pytest.mark.asyncio
+async def test_startup_requeue_processes_every_job_across_bounded_batches() -> None:
+    """Startup recovery returns all active summary IDs through keyset pages."""
+    from app.main import _recover_strict_local_summary_jobs_on_startup
+
+    jobs = [
+        SimpleNamespace(
+            id=uuid4(),
+            created_at=datetime.now(timezone.utc),
+            cancel_requested=False,
+            status="processing",
+            stage="summary",
+            progress={"stage": "summary"},
+            failure=None,
+            completed_at=None,
+        )
+        for _ in range(1001)
+    ]
+
+    class Result:
+        def __init__(self, page):
+            self.page = page
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self.page
+
+    class Session:
+        calls = 0
+
+        async def execute(self, _statement):
+            self.calls += 1
+            if self.calls == 1:
+                return Result(jobs[:1000])
+            if self.calls == 2:
+                return Result(jobs[1000:])
+            return Result([])
+
+        async def flush(self):
+            return None
+
+    resumable = await _recover_strict_local_summary_jobs_on_startup(Session())
+
+    assert len(resumable) == 1001
+    assert jobs[0].stage == "recovery"
+    assert jobs[-1].stage == "recovery"
+
+
+@pytest.mark.asyncio
+async def test_active_scratch_inventory_fails_safe_above_sweep_bound() -> None:
+    """An oversized active set disables sweeping instead of aborting startup."""
+    from app.main import _active_strict_local_job_ids
+
+    created_at = datetime.now(timezone.utc)
+    jobs = [SimpleNamespace(id=uuid4(), created_at=created_at) for _ in range(10_001)]
+
+    class Result:
+        def __init__(self, page):
+            self.page = page
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self.page
+
+    class Session:
+        calls = 0
+
+        async def execute(self, _statement):
+            start = self.calls * 1000
+            self.calls += 1
+            return Result(jobs[start : start + 1000])
+
+    session = Session()
+    assert await _active_strict_local_job_ids(session) is None
+    assert session.calls == 11
 
 
 @pytest.mark.asyncio

@@ -209,6 +209,11 @@ GenerateSummaryResponse = Annotated[
     Field(discriminator="processing_mode"),
 ]
 
+CompletedGenerateSummaryResponse = Annotated[
+    CustomLocalGenerateSummaryResponse | CloudAssistedGenerateSummaryResponse,
+    Field(discriminator="processing_mode"),
+]
+
 
 class SummaryItemCreate(BaseModel):
     record_id: UUID

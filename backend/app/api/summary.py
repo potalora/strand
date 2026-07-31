@@ -21,10 +21,10 @@ from app.models.summary_item import SummaryItem
 from app.schemas.summary import (
     BuildPromptRequest,
     CloudAssistedGenerateSummaryResponse,
+    CompletedGenerateSummaryResponse,
     CustomLocalGenerateSummaryResponse,
     DuplicateWarning,
     GenerateSummaryRequest,
-    GenerateSummaryResponse,
     PasteResponseRequest,
     PasteResponseResponse,
     PromptDetailResponse,
@@ -507,7 +507,7 @@ async def list_providers(
 
 @router.post(
     "/generate",
-    response_model=GenerateSummaryResponse,
+    response_model=CompletedGenerateSummaryResponse,
     responses={status.HTTP_202_ACCEPTED: {"model": StrictLocalSummaryAccepted}},
 )
 async def generate_summary_endpoint(
@@ -515,7 +515,7 @@ async def generate_summary_endpoint(
     request: Request,
     user_id: UUID = Depends(get_authenticated_user_id),
     db: AsyncSession = Depends(get_db),
-) -> GenerateSummaryResponse | StrictLocalSummaryAccepted:
+) -> CompletedGenerateSummaryResponse | StrictLocalSummaryAccepted:
     """Generate a summary using the selected explicit processing mode."""
     if body.processing_mode is ProcessingMode.PROMPT_ONLY:
         raise HTTPException(
@@ -606,8 +606,6 @@ async def generate_summary_endpoint(
         except (ValueError, LocalAIError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        local_summary_runner.enqueue(job.id)
-
         await log_audit_event(
             db,
             user_id=user_id,
@@ -621,6 +619,7 @@ async def generate_summary_endpoint(
                 "processing_mode": ProcessingMode.VALIDATED_STRICT_LOCAL.value,
             },
         )
+        local_summary_runner.enqueue(job.id)
         return Response(
             content=StrictLocalSummaryAccepted(
                 id=prompt_record.id,

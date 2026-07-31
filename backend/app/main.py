@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.router import api_router
@@ -46,6 +46,8 @@ logging.basicConfig(
 # pending (asyncio only holds a weak reference to scheduled tasks).
 _background_tasks: set[asyncio.Task] = set()
 _STALE_LOCAL_AI_SCRATCH_SECONDS = 24 * 60 * 60
+_LOCAL_AI_RECOVERY_BATCH_SIZE = 1_000
+_MAX_ACTIVE_LOCAL_AI_SCRATCH_JOBS = 10_000
 
 
 logger = logging.getLogger(__name__)
@@ -121,45 +123,131 @@ async def _recover_strict_local_summary_jobs_on_startup(
     """Requeue interrupted strict-local summaries and return resumable job IDs."""
     from app.models.local_ai import LocalAIJob
 
-    jobs = list(
-        (
-            await db.execute(
-                select(LocalAIJob)
-                .where(
-                    LocalAIJob.kind == "summary",
-                    LocalAIJob.processing_mode == "validated_strict_local",
-                    LocalAIJob.status.in_(("queued", "processing")),
-                )
-                .order_by(LocalAIJob.created_at.asc(), LocalAIJob.id.asc())
-                .limit(1001)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    if len(jobs) > 1000:
-        logger.warning(
-            "Strict-local summary recovery reached its 1000-job safety bound"
-        )
-        jobs = jobs[:1000]
-    recovered_at = datetime.now(timezone.utc)
     resumable: list[UUID] = []
-    for job in jobs:
-        if job.cancel_requested:
-            job.status = "cancelled"
-            job.stage = "cancelled"
-            job.progress = {"stage": "cancelled"}
-            job.failure = None
-            job.completed_at = recovered_at
-            continue
-        if job.status == "processing":
-            job.status = "queued"
-            job.stage = "recovery"
-            job.progress = {"stage": "recovery"}
-            job.failure = None
-            job.completed_at = None
-        resumable.append(job.id)
+    cursor: tuple[datetime, UUID] | None = None
+    while True:
+        query = select(LocalAIJob).where(
+            LocalAIJob.kind == "summary",
+            LocalAIJob.processing_mode == "validated_strict_local",
+            LocalAIJob.status.in_(("queued", "processing")),
+        )
+        if cursor is not None:
+            created_at, cursor_id = cursor
+            query = query.where(
+                or_(
+                    LocalAIJob.created_at > created_at,
+                    (LocalAIJob.created_at == created_at) & (LocalAIJob.id > cursor_id),
+                )
+            )
+        jobs = list(
+            (
+                await db.execute(
+                    query.order_by(
+                        LocalAIJob.created_at.asc(),
+                        LocalAIJob.id.asc(),
+                    ).limit(_LOCAL_AI_RECOVERY_BATCH_SIZE)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not jobs:
+            break
+        cursor = (jobs[-1].created_at, jobs[-1].id)
+        recovered_at = datetime.now(timezone.utc)
+        for job in jobs:
+            if job.cancel_requested:
+                job.status = "cancelled"
+                job.stage = "cancelled"
+                job.progress = {"stage": "cancelled"}
+                job.failure = None
+                job.completed_at = recovered_at
+                continue
+            if job.status == "processing":
+                job.status = "queued"
+                job.stage = "recovery"
+                job.progress = {"stage": "recovery"}
+                job.failure = None
+                job.completed_at = None
+            resumable.append(job.id)
+        await db.flush()
+        if len(jobs) < _LOCAL_AI_RECOVERY_BATCH_SIZE:
+            break
     return resumable
+
+
+async def _active_strict_local_job_ids(db: AsyncSession) -> list[str] | None:
+    """Load active IDs boundedly, or return ``None`` when sweep is unsafe."""
+    from app.models.local_ai import LocalAIJob
+
+    active_ids: list[str] = []
+    cursor: tuple[datetime, UUID] | None = None
+    while True:
+        query = select(LocalAIJob).where(
+            LocalAIJob.processing_mode == "validated_strict_local",
+            LocalAIJob.status.in_(("queued", "processing")),
+        )
+        if cursor is not None:
+            created_at, cursor_id = cursor
+            query = query.where(
+                or_(
+                    LocalAIJob.created_at > created_at,
+                    (LocalAIJob.created_at == created_at) & (LocalAIJob.id > cursor_id),
+                )
+            )
+        jobs = list(
+            (
+                await db.execute(
+                    query.order_by(
+                        LocalAIJob.created_at.asc(),
+                        LocalAIJob.id.asc(),
+                    ).limit(_LOCAL_AI_RECOVERY_BATCH_SIZE)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not jobs:
+            break
+        active_ids.extend(str(job.id) for job in jobs)
+        if len(active_ids) > _MAX_ACTIVE_LOCAL_AI_SCRATCH_JOBS:
+            logger.warning(
+                "Skipped strict-local scratch inventory because active jobs "
+                "exceeded its safety bound"
+            )
+            return None
+        cursor = (jobs[-1].created_at, jobs[-1].id)
+        if len(jobs) < _LOCAL_AI_RECOVERY_BATCH_SIZE:
+            break
+    return active_ids
+
+
+async def _shutdown_local_ai_workers(*, local_ai_started: bool) -> None:
+    """Drain tracked work, recover durable state, then stop model processes."""
+    from app.api.upload import stop_extraction_worker
+
+    try:
+        await stop_extraction_worker()
+    except Exception:
+        logger.exception("Failed to drain extraction work during shutdown")
+    if not local_ai_started:
+        return
+
+    from app.services.local_ai.summary_runner import local_summary_runner
+
+    try:
+        await local_summary_runner.stop_and_requeue()
+    except Exception:
+        logger.exception("Failed to drain summary work during shutdown")
+    try:
+        async with async_session_factory() as db:
+            await acquire_local_ai_lifecycle_lock(db)
+            await _recover_unstructured_jobs_on_startup(db)
+            await db.commit()
+    except Exception:
+        logger.exception("Failed to requeue strict-local work during shutdown")
+    finally:
+        await local_model_manager.stop()
 
 
 def build_cors_config(cors_origins: str) -> tuple[list[str], bool]:
@@ -180,6 +268,8 @@ def build_cors_config(cors_origins: str) -> tuple[list[str], bool]:
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle handler."""
     summary_jobs_to_resume: list[UUID] = []
+    active_strict_local_job_ids: list[str] | None = None
+    strict_local_recovery_succeeded = False
     reconciled_operations = 0
     # Reconcile ZIP child sets independently so one malformed set cannot prevent
     # the globally locked local-AI recovery pass.
@@ -221,7 +311,10 @@ async def lifespan(app: FastAPI):
             summary_jobs_to_resume = (
                 await _recover_strict_local_summary_jobs_on_startup(db)
             )
+            if settings.local_ai_enabled:
+                active_strict_local_job_ids = await _active_strict_local_job_ids(db)
             await db.commit()
+            strict_local_recovery_succeeded = settings.local_ai_enabled
     except Exception:
         logger.exception("Failed to recover stuck files on startup")
 
@@ -310,13 +403,22 @@ async def lifespan(app: FastAPI):
                     "Reconciled %d interrupted model-pack operations",
                     reconciled_operations,
                 )
-            removed = sweep_stale_scratch(
-                Path(settings.local_ai_scratch_dir),
-                stale_after_seconds=_STALE_LOCAL_AI_SCRATCH_SECONDS,
-                active_job_ids=(),
-            )
-            if removed:
-                logger.info("Removed %d stale strict-local scratch jobs", removed)
+            if (
+                strict_local_recovery_succeeded
+                and active_strict_local_job_ids is not None
+            ):
+                removed = sweep_stale_scratch(
+                    Path(settings.local_ai_scratch_dir),
+                    stale_after_seconds=_STALE_LOCAL_AI_SCRATCH_SECONDS,
+                    active_job_ids=active_strict_local_job_ids,
+                )
+                if removed:
+                    logger.info("Removed %d stale strict-local scratch jobs", removed)
+            else:
+                logger.warning(
+                    "Skipped strict-local scratch sweep because active jobs "
+                    "could not be verified"
+                )
             await local_model_manager.start()
             local_ai_started = True
             from app.services.local_ai.summary_runner import local_summary_runner
@@ -346,28 +448,7 @@ async def lifespan(app: FastAPI):
 
         yield
     finally:
-        from app.api.upload import stop_extraction_worker
-
-        try:
-            await stop_extraction_worker()
-        except Exception:
-            logger.exception("Failed to drain extraction work during shutdown")
-        if local_ai_started:
-            from app.services.local_ai.summary_runner import local_summary_runner
-
-            try:
-                await local_summary_runner.stop_and_requeue()
-            except Exception:
-                logger.exception("Failed to drain summary work during shutdown")
-            try:
-                async with async_session_factory() as db:
-                    await acquire_local_ai_lifecycle_lock(db)
-                    await _recover_unstructured_jobs_on_startup(db)
-                    await db.commit()
-            except Exception:
-                logger.exception("Failed to requeue strict-local work during shutdown")
-            finally:
-                await local_model_manager.stop()
+        await _shutdown_local_ai_workers(local_ai_started=local_ai_started)
 
 
 def create_app() -> FastAPI:

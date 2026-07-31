@@ -6,6 +6,7 @@ import os
 import stat
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -700,6 +701,15 @@ async def test_enabled_startup_sweeps_immediately_before_model_manager_start(
     async def reconcile(_db: object, _root: Path) -> None:
         events.append("reconcile")
 
+    async def recover_uploads(_db: object) -> int:
+        return 0
+
+    async def recover_summaries(_db: object) -> list:
+        return []
+
+    async def active_ids(_db: object) -> list[str]:
+        return []
+
     monkeypatch.setattr(main_module.settings, "local_ai_enabled", True)
     monkeypatch.setattr(
         main_module.settings, "local_ai_scratch_dir", str(tmp_path / "scratch")
@@ -708,6 +718,17 @@ async def test_enabled_startup_sweeps_immediately_before_model_manager_start(
     monkeypatch.setattr(main_module.settings, "extraction_engine", "gemini")
     monkeypatch.setattr(main_module, "local_model_manager", FakeManager())
     monkeypatch.setattr(main_module, "reconcile_zip_child_sets", reconcile)
+    monkeypatch.setattr(
+        main_module,
+        "_recover_unstructured_jobs_on_startup",
+        recover_uploads,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_recover_strict_local_summary_jobs_on_startup",
+        recover_summaries,
+    )
+    monkeypatch.setattr(main_module, "_active_strict_local_job_ids", active_ids)
     monkeypatch.setattr(
         main_module,
         "sweep_stale_scratch",
@@ -726,6 +747,171 @@ async def test_enabled_startup_sweeps_immediately_before_model_manager_start(
         assert events == ["reconcile", "sweep", "start", "worker"]
 
     assert events == ["reconcile", "sweep", "start", "worker", "stop"]
+
+
+@pytest.mark.asyncio
+async def test_enabled_startup_preserves_active_scratch_and_removes_orphan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Recovered active IDs protect stale scratch while stale orphans are swept."""
+    import app.main as main_module
+    import app.services.auth_service as auth_service
+    import app.services.extraction.terminology as terminology
+    from app.api import upload
+    from app.services.local_ai.summary_runner import local_summary_runner
+
+    active_id = "11111111-1111-4111-8111-111111111111"
+    orphan_id = "22222222-2222-4222-8222-222222222222"
+    scratch_root = tmp_path / "scratch"
+    active_path = _abandon_job(scratch_root, active_id)
+    orphan_path = _abandon_job(scratch_root, orphan_id)
+    old = time.time() - 100_000
+    os.utime(active_path, (old, old))
+    os.utime(orphan_path, (old, old))
+
+    class FakeManager:
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    class FakeSession:
+        async def commit(self) -> None:
+            return None
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> FakeSession:
+            return FakeSession()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    async def recover_uploads(_db: object) -> int:
+        return 0
+
+    async def recover_summaries(_db: object) -> list:
+        return []
+
+    async def active_ids(_db: object) -> list[str]:
+        return [active_id]
+
+    async def no_purge(_db: object) -> int:
+        return 0
+
+    async def no_reconcile(_db: object, _root: Path) -> None:
+        return None
+
+    monkeypatch.setattr(main_module.settings, "local_ai_enabled", True)
+    monkeypatch.setattr(main_module.settings, "local_ai_scratch_dir", str(scratch_root))
+    monkeypatch.setattr(
+        main_module.settings, "local_ai_model_dir", str(tmp_path / "models")
+    )
+    monkeypatch.setattr(main_module.settings, "phi_ner_enabled", False)
+    monkeypatch.setattr(main_module.settings, "extraction_engine", "gemini")
+    monkeypatch.setattr(main_module, "local_model_manager", FakeManager())
+    monkeypatch.setattr(main_module, "async_session_factory", FakeSessionContext)
+    monkeypatch.setattr(main_module, "reconcile_zip_child_sets", no_reconcile)
+    monkeypatch.setattr(
+        main_module, "_recover_unstructured_jobs_on_startup", recover_uploads
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_recover_strict_local_summary_jobs_on_startup",
+        recover_summaries,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_active_strict_local_job_ids",
+        active_ids,
+        raising=False,
+    )
+    monkeypatch.setattr(main_module, "acquire_local_ai_lifecycle_lock", AsyncMock())
+    monkeypatch.setattr(terminology, "schedule_medication_refresh", lambda: None)
+    monkeypatch.setattr(auth_service, "purge_expired_revoked_tokens", no_purge)
+    monkeypatch.setattr(upload, "reset_extraction_worker_shutdown", lambda: None)
+    monkeypatch.setattr(upload, "start_extraction_worker", lambda: None)
+    monkeypatch.setattr(upload, "stop_extraction_worker", AsyncMock())
+    monkeypatch.setattr(local_summary_runner, "start", lambda _ids: None)
+    monkeypatch.setattr(local_summary_runner, "stop_and_requeue", AsyncMock())
+
+    async with main_module.lifespan(FastAPI()):
+        assert active_path.exists()
+        assert not orphan_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_enabled_startup_skips_scratch_sweep_when_db_recovery_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unknown active IDs make startup leave every scratch directory untouched."""
+    import app.main as main_module
+    import app.services.auth_service as auth_service
+    import app.services.extraction.terminology as terminology
+    from app.api import upload
+    from app.services.local_ai.summary_runner import local_summary_runner
+
+    scratch_root = tmp_path / "scratch"
+    stale_path = _abandon_job(
+        scratch_root,
+        "33333333-3333-4333-8333-333333333333",
+    )
+    old = time.time() - 100_000
+    os.utime(stale_path, (old, old))
+
+    class FakeManager:
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    class FakeSession:
+        async def commit(self) -> None:
+            return None
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> FakeSession:
+            return FakeSession()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    async def fail_recovery(_db: object) -> int:
+        raise RuntimeError("database unavailable")
+
+    async def no_purge(_db: object) -> int:
+        return 0
+
+    async def no_reconcile(_db: object, _root: Path) -> None:
+        return None
+
+    monkeypatch.setattr(main_module.settings, "local_ai_enabled", True)
+    monkeypatch.setattr(main_module.settings, "local_ai_scratch_dir", str(scratch_root))
+    monkeypatch.setattr(
+        main_module.settings, "local_ai_model_dir", str(tmp_path / "models")
+    )
+    monkeypatch.setattr(main_module.settings, "phi_ner_enabled", False)
+    monkeypatch.setattr(main_module.settings, "extraction_engine", "gemini")
+    monkeypatch.setattr(main_module, "local_model_manager", FakeManager())
+    monkeypatch.setattr(main_module, "async_session_factory", FakeSessionContext)
+    monkeypatch.setattr(main_module, "reconcile_zip_child_sets", no_reconcile)
+    monkeypatch.setattr(
+        main_module, "_recover_unstructured_jobs_on_startup", fail_recovery
+    )
+    monkeypatch.setattr(main_module, "acquire_local_ai_lifecycle_lock", AsyncMock())
+    monkeypatch.setattr(terminology, "schedule_medication_refresh", lambda: None)
+    monkeypatch.setattr(auth_service, "purge_expired_revoked_tokens", no_purge)
+    monkeypatch.setattr(upload, "reset_extraction_worker_shutdown", lambda: None)
+    monkeypatch.setattr(upload, "start_extraction_worker", lambda: None)
+    monkeypatch.setattr(upload, "stop_extraction_worker", AsyncMock())
+    monkeypatch.setattr(local_summary_runner, "start", lambda _ids: None)
+    monkeypatch.setattr(local_summary_runner, "stop_and_requeue", AsyncMock())
+
+    async with main_module.lifespan(FastAPI()):
+        assert stale_path.exists()
 
 
 @pytest.mark.asyncio

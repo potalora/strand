@@ -345,7 +345,7 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         assert payload["manifest_identity"]["revision"] == "0" * 40
         assert payload["max_output_tokens"] == 1024
         fact = payload["facts"][0]
-        assert fact["record_id"] == str(survivor.id)
+        assert fact["record_id"] == str(survivor_id)
         assert [item["excerpt"] for item in payload["evidence"]] == [
             "Hypertension from archived strict evidence."
         ]
@@ -412,6 +412,128 @@ async def test_strict_local_summary_commits_then_queues_background_work(
     assert job.kind == "summary"
     enqueue.assert_called_once_with(job.id)
     model_run.assert_not_awaited()
+    job_id = job.id
+    patient_id = patient.id
+    survivor_id = survivor.id
+    await db_session.rollback()
+
+    from app.services.ai.summarizer import generate_grounded_local_summary
+
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with session_factory() as session:
+        assert (await session.get(LocalAIJob, job_id)).status == "queued"
+        await generate_grounded_local_summary(
+            session,
+            user_id=UUID(user_id),
+            patient_id=patient_id,
+            job_id=job_id,
+            summary_type="full",
+        )
+
+    model_run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_two_sessions_atomically_claim_one_strict_summary_attempt(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """Two stale sessions still admit exactly one durable model attempt."""
+    from app.services.ai.summarizer import _claim_strict_summary_job
+
+    _headers, user_id = await auth_headers(
+        client,
+        email="strict-summary-atomic-claim@example.com",
+    )
+    patient = await create_test_patient(db_session, user_id)
+    snapshot, digest = canonicalize_manifest_snapshot(_strict_manifest())
+    prompt = AISummaryPrompt(
+        id=uuid4(),
+        user_id=UUID(user_id),
+        patient_id=patient.id,
+        summary_type="full",
+        processing_mode="validated_strict_local",
+        scope_filter={},
+        system_prompt="Locked policy",
+        user_prompt="Grounded facts",
+        target_model="locked-local-summary",
+        suggested_config={},
+        record_count=0,
+        generated_at=datetime.now(timezone.utc),
+    )
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        summary_prompt_id=prompt.id,
+        kind="summary",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        manifest_sha256=digest,
+        status="queued",
+        stage="queued",
+        progress={"stage": "queued"},
+    )
+    db_session.add_all([prompt, job])
+    await db_session.commit()
+    job_id = job.id
+    await db_session.rollback()
+
+    model_call = AsyncMock()
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with session_factory() as session_a, session_factory() as session_b:
+        assert (await session_a.get(LocalAIJob, job_id)).status == "queued"
+        assert (await session_b.get(LocalAIJob, job_id)).status == "queued"
+
+        async def claim_and_run(session: AsyncSession):
+            claim = await _claim_strict_summary_job(
+                session,
+                job_id=job_id,
+                user_id=UUID(user_id),
+            )
+            if claim is not None:
+                await model_call()
+            return claim
+
+        tasks = [
+            asyncio.create_task(claim_and_run(session_a)),
+            asyncio.create_task(claim_and_run(session_b)),
+        ]
+        try:
+            claims = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert sum(claim is not None for claim in claims) == 1
+    model_call.assert_awaited_once()
+    await db_session.refresh(job)
+    assert (job.status, job.stage) == ("processing", "preflight")
+    assert job.started_at is not None
+
+
+def test_generate_openapi_reserves_strict_local_for_202() -> None:
+    """Generated clients see strict-local acceptance only under HTTP 202."""
+    from app.main import app
+
+    responses = app.openapi()["paths"]["/api/v1/summary/generate"]["post"]["responses"]
+    completed_schema = json.dumps(
+        responses["200"]["content"]["application/json"]["schema"]
+    )
+    accepted_schema = json.dumps(
+        responses["202"]["content"]["application/json"]["schema"]
+    )
+
+    assert "StrictLocalGenerateSummaryResponse" not in completed_schema
+    assert "StrictLocalSummaryAccepted" in accepted_schema
 
 
 @pytest.mark.asyncio
@@ -488,6 +610,77 @@ async def test_startup_requeues_and_resumes_strict_local_summary_job(
     generate.assert_awaited_once()
     assert generate.await_args.kwargs["job_id"] == job.id
     assert generate.await_args.kwargs["summary_type"] == "full"
+
+
+@pytest.mark.asyncio
+async def test_old_summary_attempt_cannot_terminalize_a_new_claim(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """Finalization is conditional on the attempt's durable claim timestamp."""
+    from app.services.ai.summarizer import _finish_strict_summary_job
+
+    _headers, user_id = await auth_headers(
+        client,
+        email="strict-summary-stale-finalizer@example.com",
+    )
+    patient = await create_test_patient(db_session, user_id)
+    snapshot, digest = canonicalize_manifest_snapshot(_strict_manifest())
+    prompt = AISummaryPrompt(
+        id=uuid4(),
+        user_id=UUID(user_id),
+        patient_id=patient.id,
+        summary_type="full",
+        processing_mode="validated_strict_local",
+        scope_filter={},
+        system_prompt="Locked policy",
+        user_prompt="Grounded facts",
+        target_model="locked-local-summary",
+        suggested_config={},
+        record_count=0,
+        generated_at=datetime.now(timezone.utc),
+    )
+    old_started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    new_started_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        summary_prompt_id=prompt.id,
+        kind="summary",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        manifest_sha256=digest,
+        status="processing",
+        stage="summary",
+        progress={"stage": "summary"},
+        started_at=old_started_at,
+    )
+    db_session.add_all([prompt, job])
+    await db_session.commit()
+
+    async with AsyncSession(db_session.bind, expire_on_commit=False) as stale_session:
+        stale_job = await stale_session.get(LocalAIJob, job.id)
+        assert stale_job is not None
+        job.status = "queued"
+        job.stage = "recovery"
+        await db_session.commit()
+        job.status = "processing"
+        job.stage = "preflight"
+        job.started_at = new_started_at
+        await db_session.commit()
+
+        await _finish_strict_summary_job(
+            stale_session,
+            job_id=job.id,
+            error=RuntimeError("old attempt failed"),
+            claim_started_at=old_started_at,
+        )
+
+    await db_session.refresh(job)
+    assert (job.status, job.stage, job.started_at) == (
+        "processing",
+        "preflight",
+        new_started_at,
+    )
 
 
 @pytest.mark.asyncio

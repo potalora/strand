@@ -10,9 +10,10 @@ from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -36,6 +37,9 @@ from app.services.local_ai.grounded_summary import (
 )
 from app.services.local_ai.evidence_lineage import load_strict_local_evidence_lineage
 from app.services.local_ai.types import ProcessingMode
+
+if TYPE_CHECKING:
+    from app.models.local_ai import LocalAIJob
 
 logger = logging.getLogger(__name__)
 
@@ -1177,19 +1181,81 @@ async def _is_strict_summary_cancelled(db: AsyncSession, job_id: UUID) -> bool:
     return value is True
 
 
+async def _claim_strict_summary_job(
+    db: AsyncSession,
+    *,
+    job_id: UUID,
+    user_id: UUID,
+) -> tuple[LocalAIJob, datetime] | None:
+    """Atomically claim one queued summary before any preflight can fail."""
+    from app.models.local_ai import LocalAIJob
+
+    claim_started_at = datetime.now().astimezone()
+    result = await db.execute(
+        update(LocalAIJob)
+        .where(
+            LocalAIJob.id == job_id,
+            LocalAIJob.user_id == user_id,
+            LocalAIJob.kind == "summary",
+            LocalAIJob.processing_mode == ProcessingMode.VALIDATED_STRICT_LOCAL.value,
+            LocalAIJob.status == "queued",
+            LocalAIJob.cancel_requested.is_(False),
+        )
+        .values(
+            status="processing",
+            stage="preflight",
+            progress={"stage": "preflight", "model_role": "summary"},
+            failure=None,
+            started_at=claim_started_at,
+            completed_at=None,
+        )
+        .returning(LocalAIJob.id)
+    )
+    if result.scalar_one_or_none() is None:
+        await db.rollback()
+        return None
+    await db.commit()
+    job = (
+        await db.execute(
+            select(LocalAIJob)
+            .where(LocalAIJob.id == job_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    return job, claim_started_at
+
+
 async def _finish_strict_summary_job(
     db: AsyncSession,
     *,
     job_id: UUID,
     error: BaseException | None,
     cancelled: bool = False,
+    claim_started_at: datetime | None = None,
+    expected_status: str | None = None,
 ) -> None:
     """Persist a safe terminal state after a strict-local summary attempt."""
     from app.models.local_ai import LocalAIJob
     from app.services.local_ai.errors import LocalAIError
 
-    job = await db.get(LocalAIJob, job_id)
+    job = (
+        await db.execute(
+            select(LocalAIJob)
+            .where(LocalAIJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if job is None:
+        await db.rollback()
+        return
+    if claim_started_at is not None and (
+        job.status != "processing" or job.started_at != claim_started_at
+    ):
+        await db.rollback()
+        return
+    if expected_status is not None and job.status != expected_status:
+        await db.rollback()
         return
     completed_at = datetime.now().astimezone()
     cancelled = bool(cancelled or job.cancel_requested)
@@ -1241,6 +1307,7 @@ async def resume_grounded_local_summary_jobs(
                     db,
                     job_id=job.id,
                     error=LocalAIError("Strict-local summary target is unavailable."),
+                    expected_status="queued",
                 )
                 continue
             scope = prompt.scope_filter if isinstance(prompt.scope_filter, dict) else {}
@@ -1260,6 +1327,19 @@ async def resume_grounded_local_summary_jobs(
                     if isinstance(scope.get("record_ids"), list)
                     else None
                 )
+            except (ValueError, TypeError) as exc:
+                await _finish_strict_summary_job(
+                    db,
+                    job_id=job_id,
+                    error=exc,
+                    expected_status="queued",
+                )
+                logger.error(
+                    "Recovered strict-local summary job %s did not complete",
+                    job_id,
+                )
+                continue
+            try:
                 await generate_grounded_local_summary(
                     db,
                     user_id=job.user_id,
@@ -1273,16 +1353,9 @@ async def resume_grounded_local_summary_jobs(
                 )
             except asyncio.CancelledError:
                 raise
-            except (LocalAIError, ValueError) as exc:
-                # The generator persists its terminal failure. Keep recovery
-                # moving so one bad job cannot strand the remaining queue.
-                current = await db.get(LocalAIJob, job_id)
-                if current is not None and current.status in {"queued", "processing"}:
-                    await _finish_strict_summary_job(
-                        db,
-                        job_id=job_id,
-                        error=exc,
-                    )
+            except (LocalAIError, ValueError):
+                # The claimed generator conditionally persists its own terminal
+                # state. Recovery only needs to keep moving to the next job.
                 logger.error(
                     "Recovered strict-local summary job %s did not complete",
                     job_id,
@@ -1298,46 +1371,59 @@ async def requeue_interrupted_summary_jobs(*, session_factory=None) -> list[UUID
 
         session_factory = async_session_factory
     async with session_factory() as db:
-        jobs = list(
-            (
-                await db.execute(
-                    select(LocalAIJob)
-                    .where(
-                        LocalAIJob.kind == "summary",
-                        LocalAIJob.processing_mode
-                        == ProcessingMode.VALIDATED_STRICT_LOCAL.value,
-                        LocalAIJob.status.in_(("queued", "processing")),
-                    )
-                    .order_by(LocalAIJob.created_at.asc(), LocalAIJob.id.asc())
-                    .limit(_STRICT_LOCAL_SUMMARY_RECOVERY_LIMIT + 1)
-                    .with_for_update()
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if len(jobs) > _STRICT_LOCAL_SUMMARY_RECOVERY_LIMIT:
-            logger.warning(
-                "Strict-local summary shutdown recovery reached its safety bound"
-            )
-            jobs = jobs[:_STRICT_LOCAL_SUMMARY_RECOVERY_LIMIT]
-        recovered_at = datetime.now().astimezone()
         resumable: list[UUID] = []
-        for job in jobs:
-            if job.cancel_requested:
-                job.status = "cancelled"
-                job.stage = "cancelled"
-                job.progress = {"stage": "cancelled"}
+        cursor: tuple[datetime, UUID] | None = None
+        while True:
+            query = select(LocalAIJob).where(
+                LocalAIJob.kind == "summary",
+                LocalAIJob.processing_mode
+                == ProcessingMode.VALIDATED_STRICT_LOCAL.value,
+                LocalAIJob.status.in_(("queued", "processing")),
+            )
+            if cursor is not None:
+                created_at, cursor_id = cursor
+                query = query.where(
+                    or_(
+                        LocalAIJob.created_at > created_at,
+                        (LocalAIJob.created_at == created_at)
+                        & (LocalAIJob.id > cursor_id),
+                    )
+                )
+            jobs = list(
+                (
+                    await db.execute(
+                        query.order_by(
+                            LocalAIJob.created_at.asc(),
+                            LocalAIJob.id.asc(),
+                        )
+                        .limit(_STRICT_LOCAL_SUMMARY_RECOVERY_LIMIT)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not jobs:
+                break
+            cursor = (jobs[-1].created_at, jobs[-1].id)
+            recovered_at = datetime.now().astimezone()
+            for job in jobs:
+                if job.cancel_requested:
+                    job.status = "cancelled"
+                    job.stage = "cancelled"
+                    job.progress = {"stage": "cancelled"}
+                    job.failure = None
+                    job.completed_at = recovered_at
+                    continue
+                job.status = "queued"
+                job.stage = "recovery"
+                job.progress = {"stage": "recovery"}
                 job.failure = None
-                job.completed_at = recovered_at
-                continue
-            job.status = "queued"
-            job.stage = "recovery"
-            job.progress = {"stage": "recovery"}
-            job.failure = None
-            job.completed_at = None
-            resumable.append(job.id)
-        await db.commit()
+                job.completed_at = None
+                resumable.append(job.id)
+            await db.commit()
+            if len(jobs) < _STRICT_LOCAL_SUMMARY_RECOVERY_LIMIT:
+                break
     return resumable
 
 
@@ -1369,30 +1455,38 @@ async def generate_grounded_local_summary(
     from app.services.local_ai.summary_projection import project_summary_records
     from app.services.local_ai.types import ModelRole
 
-    job = (
-        await db.execute(
-            select(LocalAIJob)
-            .where(
-                LocalAIJob.id == job_id,
-                LocalAIJob.user_id == user_id,
-                LocalAIJob.kind == "summary",
-                LocalAIJob.processing_mode == "validated_strict_local",
+    claim = await _claim_strict_summary_job(db, job_id=job_id, user_id=user_id)
+    if claim is None:
+        current = (
+            await db.execute(
+                select(LocalAIJob)
+                .where(
+                    LocalAIJob.id == job_id,
+                    LocalAIJob.user_id == user_id,
+                    LocalAIJob.kind == "summary",
+                    LocalAIJob.processing_mode
+                    == ProcessingMode.VALIDATED_STRICT_LOCAL.value,
+                )
+                .execution_options(populate_existing=True)
             )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if job is None:
-        raise LocalPolicyError("Strict-local summary job is unavailable.")
-    if job.cancel_requested:
-        await _finish_strict_summary_job(db, job_id=job.id, error=None)
-        raise LocalPolicyError("Strict-local summary job was cancelled.")
-    if job.status == "processing":
-        # Another process owns the database claim. This wake is deliberately a
-        # no-op rather than a second model invocation.
-        return {"already_processing": True}
-    if job.status != "queued":
+        ).scalar_one_or_none()
+        if current is not None and current.status == "processing":
+            return {"already_processing": True}
+        if (
+            current is not None
+            and current.status == "queued"
+            and current.cancel_requested
+        ):
+            await _finish_strict_summary_job(
+                db,
+                job_id=current.id,
+                error=None,
+                expected_status="queued",
+            )
+            raise LocalPolicyError("Strict-local summary job was cancelled.")
         raise LocalPolicyError("Strict-local summary job is unavailable.")
 
+    job, claim_started_at = claim
     stable_job_id = job.id
     try:
         snapshot = job.revalidate_manifest_snapshot()
@@ -1435,14 +1529,25 @@ async def generate_grounded_local_summary(
             uncertainty_labels=projection.uncertainty_labels,
         )
 
-        job.status = "processing"
-        job.stage = "summary"
-        job.started_at = job.started_at or datetime.now().astimezone()
-        job.failure = None
-        job.progress = {
-            "stage": "summary",
-            "model_role": ModelRole.SUMMARY.value,
-        }
+        stage_result = await db.execute(
+            update(LocalAIJob)
+            .where(
+                LocalAIJob.id == stable_job_id,
+                LocalAIJob.status == "processing",
+                LocalAIJob.started_at == claim_started_at,
+            )
+            .values(
+                stage="summary",
+                failure=None,
+                progress={
+                    "stage": "summary",
+                    "model_role": ModelRole.SUMMARY.value,
+                },
+            )
+        )
+        if stage_result.rowcount != 1:
+            await db.rollback()
+            return {"superseded": True}
         await db.commit()
         if await _is_strict_summary_cancelled(db, job.id):
             raise LocalPolicyError("Strict-local summary job was cancelled.")
@@ -1507,6 +1612,21 @@ async def generate_grounded_local_summary(
             },
         )
 
+        current_job = (
+            await db.execute(
+                select(LocalAIJob)
+                .where(LocalAIJob.id == stable_job_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if current_job is None or (
+            current_job.status != "processing"
+            or current_job.started_at != claim_started_at
+        ):
+            await db.rollback()
+            return {"superseded": True}
+        job = current_job
         prompt = await db.get(AISummaryPrompt, job.summary_prompt_id)
         if prompt is None or prompt.user_id != user_id:
             raise LocalPolicyError("Strict-local summary target is unavailable.")
@@ -1568,6 +1688,7 @@ async def generate_grounded_local_summary(
                     job_id=stable_job_id,
                     error=exc,
                     cancelled=is_task_cancel,
+                    claim_started_at=claim_started_at,
                 )
             )
         if is_task_cancel or not isinstance(exc, Exception):
