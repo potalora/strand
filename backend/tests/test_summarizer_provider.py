@@ -284,7 +284,12 @@ async def test_summary_uses_explicit_provider_and_scrubs_patient_name(
         patch("app.services.ai.summarizer._provider_by_name", return_value=prov),
     ):
         out = await generate_summary(
-            db_session, UUID(user_id), patient.id, provider="anthropic"
+            db_session,
+            UUID(user_id),
+            patient.id,
+            provider="anthropic",
+            model="claude-haiku-4-5-20251001",
+            processing_mode=ProcessingMode.CLOUD_ASSISTED,
         )
 
     assert out["natural_language"].startswith("## Overview")

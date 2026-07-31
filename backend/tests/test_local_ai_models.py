@@ -926,7 +926,7 @@ def test_processing_mode_defaults_match_database_defaults() -> None:
     upload_mode = UploadedFile.__table__.c.processing_mode
     summary_mode = AISummaryPrompt.__table__.c.processing_mode
 
-    assert upload_mode.default.arg == "cloud_assisted"
-    assert upload_mode.server_default.arg == "cloud_assisted"
-    assert summary_mode.default.arg == "cloud_assisted"
-    assert summary_mode.server_default.arg == "cloud_assisted"
+    assert upload_mode.default.arg == "prompt_only"
+    assert upload_mode.server_default.arg == "prompt_only"
+    assert summary_mode.default.arg == "prompt_only"
+    assert summary_mode.server_default.arg == "prompt_only"

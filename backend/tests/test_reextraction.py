@@ -160,6 +160,7 @@ async def test_find_prior_extracted_upload_matches_completed(db_session, client)
         file_category="unstructured",
         record_count=5,
         mime_type="application/pdf",
+        processing_mode="cloud_assisted",
     )
     db_session.add(prior)
     await db_session.commit()

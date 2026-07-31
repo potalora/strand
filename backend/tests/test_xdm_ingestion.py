@@ -93,6 +93,7 @@ async def test_coordinator_detects_xdm_in_zip(
         resp = await client.post(
             "/api/v1/upload",
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
             files={"file": ("xdm_export.zip", zip_data, "application/zip")},
         )
 
@@ -143,6 +144,7 @@ async def test_xdm_skips_pdf_in_package(client: AsyncClient, db_session: AsyncSe
         resp = await client.post(
             "/api/v1/upload",
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
             files={"file": ("xdm_export.zip", zip_data, "application/zip")},
         )
 
@@ -198,6 +200,7 @@ async def test_xdm_creates_cda_records(client: AsyncClient, db_session: AsyncSes
         resp = await client.post(
             "/api/v1/upload",
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
             files={"file": ("xdm_export.zip", zip_data, "application/zip")},
         )
 
@@ -278,6 +281,7 @@ async def test_xdm_intra_upload_dedup(client: AsyncClient, db_session: AsyncSess
         resp = await client.post(
             "/api/v1/upload",
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
             files={"file": ("xdm_export.zip", zip_data, "application/zip")},
         )
 
@@ -301,6 +305,7 @@ async def test_non_xdm_zip_uses_existing_pipeline(
         resp = await client.post(
             "/api/v1/upload",
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
             files={"file": ("fhir_bundle.zip", zip_data, "application/zip")},
         )
 

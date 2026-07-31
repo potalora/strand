@@ -122,6 +122,7 @@ async def test_auto_confirm_attaches_document_provider(db_session: AsyncSession)
         storage_path=str(rtf_path),
         ingestion_status="pending_extraction",
         file_category="unstructured",
+        processing_mode="cloud_assisted",
     )
     db_session.add(upload)
     await db_session.commit()

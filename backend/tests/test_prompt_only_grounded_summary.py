@@ -133,7 +133,11 @@ async def test_prompt_survivor_inherits_owner_scoped_archived_strict_evidence_un
             excerpt=marker,
             start_offset=0,
             end_offset=len(marker),
-            field_paths=["medications[0].name", "medications[0].dose"],
+            field_paths=[
+                "medications[0].name",
+                "medications[0].dose",
+                "medications[0].status",
+            ],
             source_metadata={"evidence_id": "archived-evidence"},
         )
     )

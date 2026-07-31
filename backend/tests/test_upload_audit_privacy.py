@@ -54,6 +54,7 @@ async def test_single_unstructured_upload_audit_excludes_raw_filename(
     response = await client.post(
         "/api/v1/upload/unstructured",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files={
             "file": (
                 _PHI_FILENAME,
@@ -96,6 +97,7 @@ async def test_structured_upload_audit_excludes_raw_filename(
     response = await client.post(
         "/api/v1/upload",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files={
             "file": (
                 _STRUCTURED_PHI_FILENAME,
@@ -136,6 +138,7 @@ async def test_batch_unstructured_upload_audits_exclude_raw_filenames(
     response = await client.post(
         "/api/v1/upload/unstructured-batch",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files=[
             (
                 "files",

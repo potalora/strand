@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.ai.llm.config import LLMConfig, ProviderCreds
 from app.services.ai.llm.types import LLMRequest, LLMResponse, LLMUsage
+from app.services.local_ai.types import ProcessingMode
 from tests.conftest import auth_headers, create_test_patient, seed_test_records
 
 
@@ -83,7 +84,12 @@ async def test_summary_loads_user_config(client: AsyncClient, db_session: AsyncS
             summarizer, "get_provider", return_value=fake_provider
         ) as mock_get_provider,
     ):
-        out = await summarizer.generate_summary(db_session, UUID(user_id), patient.id)
+        out = await summarizer.generate_summary(
+            db_session,
+            UUID(user_id),
+            patient.id,
+            processing_mode=ProcessingMode.CLOUD_ASSISTED,
+        )
 
         assert out["model_used"] == "claude-x"
         # get_provider was called WITH the operation key and the loaded config object.

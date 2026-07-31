@@ -33,6 +33,7 @@ async def test_upload_synthetic_fhir(client: AsyncClient, db_session: AsyncSessi
     resp = await client.post(
         "/api/v1/upload",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files={"file": ("sample_fhir_bundle.json", fhir_data, "application/json")},
     )
     assert resp.status_code == 202
@@ -54,6 +55,7 @@ async def test_upload_creates_patient(client: AsyncClient, db_session: AsyncSess
     await client.post(
         "/api/v1/upload",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files={"file": ("test.json", fhir_data, "application/json")},
     )
 
@@ -72,6 +74,7 @@ async def test_upload_records_appear_in_records(client: AsyncClient, db_session:
     await client.post(
         "/api/v1/upload",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files={"file": ("test.json", fhir_data, "application/json")},
     )
 
@@ -95,6 +98,7 @@ async def test_upload_status(client: AsyncClient, db_session: AsyncSession):
     upload_resp = await client.post(
         "/api/v1/upload",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files={"file": ("test.json", fhir_data, "application/json")},
     )
     upload_id = upload_resp.json()["upload_id"]
@@ -130,6 +134,7 @@ async def test_upload_history(client: AsyncClient, db_session: AsyncSession):
     await client.post(
         "/api/v1/upload",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files={"file": ("test.json", fhir_data, "application/json")},
     )
 
@@ -164,6 +169,7 @@ async def test_zip_upload_returns_unstructured_uploads(
         "/api/v1/upload",
         files={"file": ("mixed.zip", buf, "application/zip")},
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
     )
     assert resp.status_code == 202
     data = resp.json()
@@ -186,6 +192,7 @@ async def test_upload_errors_endpoint(client: AsyncClient, db_session: AsyncSess
     upload_resp = await client.post(
         "/api/v1/upload",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files={"file": ("test.json", fhir_data, "application/json")},
     )
     upload_id = upload_resp.json()["upload_id"]

@@ -36,6 +36,7 @@ async def test_upload_rtf_creates_record(client: AsyncClient, db_session: AsyncS
             "/api/v1/upload/unstructured",
             files={"file": ("note.rtf", io.BytesIO(rtf_content), "application/rtf")},
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 202
     data = resp.json()
@@ -100,6 +101,7 @@ async def test_extraction_results_for_uploaded_file(
             "/api/v1/upload/unstructured",
             files={"file": ("note.rtf", io.BytesIO(rtf_content), "application/rtf")},
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     upload_id = upload_resp.json()["upload_id"]
 
@@ -133,6 +135,7 @@ async def test_confirm_extraction_missing_patient(
             "/api/v1/upload/unstructured",
             files={"file": ("note.rtf", io.BytesIO(rtf_content), "application/rtf")},
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     upload_id = upload_resp.json()["upload_id"]
 
@@ -158,6 +161,7 @@ async def test_confirm_extraction_creates_records(
             "/api/v1/upload/unstructured",
             files={"file": ("note.rtf", io.BytesIO(rtf_content), "application/rtf")},
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     upload_id = upload_resp.json()["upload_id"]
 
@@ -209,6 +213,7 @@ async def test_upload_pdf_accepted(client: AsyncClient, db_session: AsyncSession
                 "file": ("report.pdf", io.BytesIO(b"%PDF-1.4 test"), "application/pdf")
             },
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 202
     data = resp.json()
@@ -237,6 +242,7 @@ async def test_concurrent_uploads_respect_semaphore(
                     "file": (f"note_{i}.rtf", io.BytesIO(content), "application/rtf")
                 },
                 headers=headers,
+                data={"processing_mode": "cloud_assisted"},
             )
             assert resp.status_code == 202
             data = resp.json()
@@ -266,6 +272,7 @@ async def test_batch_upload_endpoint(client: AsyncClient, db_session: AsyncSessi
                 ("files", ("batch3.pdf", io.BytesIO(pdf1), "application/pdf")),
             ],
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 202
     data = resp.json()
@@ -374,6 +381,7 @@ async def test_batch_upload_skips_invalid_files(
                 ("files", ("invalid.txt", io.BytesIO(txt_invalid), "text/plain")),
             ],
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 202
     data = resp.json()
@@ -404,6 +412,7 @@ async def test_trigger_extraction_starts_processing(
             storage_path=f"/tmp/note_{i}.rtf",
             ingestion_status="pending_extraction",
             file_category="unstructured",
+            processing_mode="cloud_assisted",
             manual_extraction_required=True,
         )
         db_session.add(upload)
@@ -450,6 +459,7 @@ async def test_trigger_extraction_rejects_auto_claimable_pending_upload(
         storage_path="/tmp/direct.pdf",
         ingestion_status="pending_extraction",
         file_category="unstructured",
+        processing_mode="cloud_assisted",
     )
     db_session.add(upload)
     await db_session.commit()
@@ -589,6 +599,7 @@ async def test_trigger_extraction_allows_retry_of_processing(
         storage_path="/tmp/stuck.pdf",
         ingestion_status="processing",
         file_category="unstructured",
+        processing_mode="cloud_assisted",
     )
     db_session.add(upload)
     await db_session.commit()
@@ -633,6 +644,7 @@ async def test_trigger_extraction_skips_actively_processing(
         storage_path="/tmp/active.pdf",
         ingestion_status="processing",
         file_category="unstructured",
+        processing_mode="cloud_assisted",
         processing_started_at=datetime.now(timezone.utc),  # actively processing now
     )
     db_session.add(upload)
@@ -674,6 +686,7 @@ async def test_trigger_extraction_allows_retry_of_failed(
         storage_path="/tmp/failed.rtf",
         ingestion_status="failed",
         file_category="unstructured",
+        processing_mode="cloud_assisted",
     )
     db_session.add(upload)
     await db_session.commit()
@@ -711,6 +724,7 @@ async def test_trigger_extraction_allows_retry_of_awaiting_confirmation(
         storage_path="/tmp/awaiting.rtf",
         ingestion_status="awaiting_confirmation",
         file_category="unstructured",
+        processing_mode="cloud_assisted",
     )
     db_session.add(upload)
     await db_session.commit()
