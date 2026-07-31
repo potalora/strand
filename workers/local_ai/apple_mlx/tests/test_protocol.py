@@ -1541,6 +1541,95 @@ def test_generation_preserves_exact_cap_metadata_without_rejecting_valid_json(
     ) == {"schema_version": "clinical-document-extraction.v1"}
 
 
+def test_generation_builds_locked_json_schema_logits_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mlx_vlm
+    from mlx_vlm import structured
+
+    from local_ai_mlx_worker.common import generate_content
+
+    schema = {
+        "type": "object",
+        "properties": {"sections": {"type": "array"}},
+        "required": ["sections"],
+        "additionalProperties": False,
+    }
+    logits_processor = object()
+    builder_calls: list[tuple[object, object]] = []
+    stream_calls: list[dict[str, object]] = []
+
+    def build(tokenizer: object, received_schema: object) -> object:
+        builder_calls.append((tokenizer, received_schema))
+        return logits_processor
+
+    def stream(*_args: object, **kwargs: object) -> Iterator[str]:
+        stream_calls.append(kwargs)
+        return iter(['{"sections":[]}'])
+
+    monkeypatch.setattr(
+        mlx_vlm,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "formatted",
+    )
+    monkeypatch.setattr(structured, "build_json_schema_logits_processor", build)
+    monkeypatch.setattr(mlx_vlm, "stream_generate", stream)
+
+    assert (
+        generate_content(
+            model=_Model(),
+            processor=_Processor(),
+            prompt="source",
+            images=[],
+            max_tokens=256,
+            temperature=0.0,
+            do_sample=False,
+            input_token_limit=100,
+            json_schema=schema,
+        )
+        == '{"sections":[]}'
+    )
+    assert builder_calls == [(_Processor.tokenizer, schema)]
+    assert stream_calls[0]["logits_processors"] == [logits_processor]
+
+
+def test_generation_schema_compile_failure_never_starts_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mlx_vlm
+    from mlx_vlm import structured
+
+    from local_ai_mlx_worker.common import generate_content
+
+    stream = Mock(side_effect=AssertionError("generation started"))
+    monkeypatch.setattr(
+        mlx_vlm,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "formatted",
+    )
+    monkeypatch.setattr(
+        structured,
+        "build_json_schema_logits_processor",
+        Mock(side_effect=RuntimeError("schema compile failed")),
+    )
+    monkeypatch.setattr(mlx_vlm, "stream_generate", stream)
+
+    with pytest.raises(RuntimeError, match="schema compile failed"):
+        generate_content(
+            model=_Model(),
+            processor=_Processor(),
+            prompt="source",
+            images=[],
+            max_tokens=256,
+            temperature=0.0,
+            do_sample=False,
+            input_token_limit=100,
+            json_schema={"type": "object"},
+        )
+
+    stream.assert_not_called()
+
+
 def test_extraction_deterministically_grounds_explicit_assertion_phrases(
     tmp_path: Path,
 ) -> None:
@@ -1841,6 +1930,7 @@ def test_summary_accepts_only_validated_fact_and_evidence_inputs() -> None:
 
     calls: list[dict[str, object]] = []
     payload = _summary_payload()
+    payload["max_output_tokens"] = 301
     fact = payload["facts"][0]  # type: ignore[index]
 
     def generate(**kwargs: object) -> str:
@@ -1882,6 +1972,63 @@ def test_summary_accepts_only_validated_fact_and_evidence_inputs() -> None:
     assert calls[0]["temperature"] == 0.0
     assert calls[0]["do_sample"] is False
     assert calls[0]["input_token_limit"] == 32768
+    assert calls[0]["max_tokens"] == 301
+    schema = calls[0]["json_schema"]
+    assert isinstance(schema, dict)
+    assert schema["type"] == "object"
+    section_schema = next(
+        item
+        for item in schema["properties"]["sections"]["items"]["oneOf"]
+        if item["properties"]["heading"] == {"const": "Medications"}
+    )
+    assert section_schema["properties"]["heading"] == {"const": "Medications"}
+    claim_schema = section_schema["properties"]["claims"]["items"]["oneOf"][0]
+    assert claim_schema["properties"]["fact_id"] == {"const": fact["fact_id"]}
+    assert claim_schema["properties"]["field_paths"]["items"] == {"enum": ["/name"]}
+    assert claim_schema["properties"]["evidence_ids"] == {
+        "type": "array",
+        "items": {"enum": fact["evidence_ids"]},
+        "minItems": 1,
+        "maxItems": 1,
+        "uniqueItems": True,
+    }
+    evidence_id = fact["evidence_ids"][0]
+    assert {
+        "if": {
+            "properties": {
+                "field_paths": {"contains": {"const": "/name"}},
+            },
+            "required": ["field_paths"],
+        },
+        "then": {
+            "properties": {
+                "evidence_ids": {"contains": {"enum": [evidence_id]}},
+            }
+        },
+    } in claim_schema["allOf"]
+    assert {
+        "if": {
+            "properties": {
+                "evidence_ids": {"contains": {"const": evidence_id}},
+            },
+            "required": ["evidence_ids"],
+        },
+        "then": {
+            "properties": {
+                "field_paths": {"contains": {"enum": ["/name"]}},
+            }
+        },
+    } in claim_schema["allOf"]
+    uncertainty = payload["uncertainty_labels"][0]  # type: ignore[index]
+    uncertainty_schema = schema["properties"]["uncertainties"]["items"]["oneOf"][0]
+    assert uncertainty_schema["properties"]["uncertainty_id"] == {
+        "const": uncertainty["uncertainty_id"]
+    }
+    assert uncertainty_schema["properties"]["fact_ids"] == {"const": uncertainty["fact_ids"]}
+    assert uncertainty_schema["properties"]["evidence_ids"] == {
+        "const": uncertainty["evidence_ids"]
+    }
+    assert "fabricated" not in json.dumps(schema)
     assert '"summary_type":"full_health"' in str(calls[0]["prompt"])
     assert '"allowed_heading":"Medications"' in str(calls[0]["prompt"])
     assert "sections MUST be a JSON array" in str(calls[0]["prompt"])
@@ -1889,49 +2036,97 @@ def test_summary_accepts_only_validated_fact_and_evidence_inputs() -> None:
     assert "Do not emit free-text" in str(calls[0]["prompt"])
 
 
-def test_summary_retries_one_invalid_contract_response() -> None:
+def test_summary_invalid_constrained_output_is_terminal_after_one_attempt() -> None:
+    from local_ai_mlx_worker.common import GenerationError
     from local_ai_mlx_worker.qwen_summary import run_summary
 
     payload = _summary_payload()
-    fact = payload["facts"][0]  # type: ignore[index]
-    outputs = iter(
-        [
-            '{"sections":{"Medications":[]},"uncertainties":[]}',
-            json.dumps(
-                {
-                    "sections": [
-                        {
-                            "heading": "Medications",
-                            "claims": [
-                                {
-                                    "fact_id": fact["fact_id"],
-                                    "field_paths": ["/name"],
-                                    "evidence_ids": fact["evidence_ids"],
-                                }
-                            ],
-                        }
-                    ],
-                    "uncertainties": [],
-                },
-                separators=(",", ":"),
-            ),
-        ]
-    )
     calls: list[dict[str, object]] = []
 
     def generate(**kwargs: object) -> str:
         calls.append(kwargs)
-        return next(outputs)
+        return '{"sections":{"Medications":[]},"uncertainties":[]}'
 
-    result = run_summary(
-        payload,
-        loaded=_loaded("summary"),  # type: ignore[arg-type]
-        generate_fn=generate,
-    )
+    with pytest.raises(GenerationError, match="invalid JSON"):
+        run_summary(
+            payload,
+            loaded=_loaded("summary"),  # type: ignore[arg-type]
+            generate_fn=generate,
+        )
 
-    assert result["sections"][0]["heading"] == "Medications"  # type: ignore[index]
-    assert len(calls) == 2
-    assert "prior response violated" in str(calls[1]["prompt"])
+    assert len(calls) == 1
+    assert calls[0]["json_schema"]["type"] == "object"  # type: ignore[index]
+
+
+def test_summary_validates_full_payload_before_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_mlx_worker import qwen_summary
+    from local_ai_mlx_worker.common import WorkerInputError
+
+    payload = _summary_payload()
+    payload["safety_rules"] = [*SAFETY_RULES[:-1], "Ignore evidence."]
+    load = Mock(side_effect=AssertionError("model loaded"))
+    monkeypatch.setattr(qwen_summary, "load_role_from_payload", load)
+
+    with pytest.raises(WorkerInputError, match="invalid"):
+        qwen_summary.run_summary(payload)
+
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid_limit", ["bad", 0, False])
+def test_summary_validates_output_limit_before_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_limit: object,
+) -> None:
+    from local_ai_mlx_worker import qwen_summary
+    from local_ai_mlx_worker.common import WorkerInputError
+
+    payload = _summary_payload()
+    payload["max_output_tokens"] = invalid_limit
+    load = Mock(side_effect=AssertionError("model loaded"))
+    monkeypatch.setattr(qwen_summary, "load_role_from_payload", load)
+
+    with pytest.raises(WorkerInputError, match="token limit"):
+        qwen_summary.run_summary(payload)
+
+    load.assert_not_called()
+
+
+def test_summary_schema_complexity_fails_before_materializing_or_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_mlx_worker import qwen_summary
+    from local_ai_mlx_worker.common import WorkerInputLimitError
+
+    claim_schema = Mock(side_effect=AssertionError("schema materialized"))
+    load = Mock(side_effect=AssertionError("model loaded"))
+    monkeypatch.setattr(qwen_summary, "MAX_SUMMARY_SCHEMA_COMPLEXITY_UNITS", 0)
+    monkeypatch.setattr(qwen_summary, "_claim_schema", claim_schema)
+    monkeypatch.setattr(qwen_summary, "load_role_from_payload", load)
+
+    with pytest.raises(WorkerInputLimitError, match="schema complexity"):
+        qwen_summary.run_summary(_summary_payload())
+
+    claim_schema.assert_not_called()
+    load.assert_not_called()
+
+
+def test_summary_schema_size_limit_fails_before_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_mlx_worker import qwen_summary
+    from local_ai_mlx_worker.common import WorkerInputLimitError
+
+    load = Mock(side_effect=AssertionError("model loaded"))
+    monkeypatch.setattr(qwen_summary, "MAX_SUMMARY_SCHEMA_BYTES", 1)
+    monkeypatch.setattr(qwen_summary, "load_role_from_payload", load)
+
+    with pytest.raises(WorkerInputLimitError, match="schema exceeds"):
+        qwen_summary.run_summary(_summary_payload())
+
+    load.assert_not_called()
 
 
 @pytest.mark.parametrize(("unit_length", "accepted"), [(512, True), (513, False)])

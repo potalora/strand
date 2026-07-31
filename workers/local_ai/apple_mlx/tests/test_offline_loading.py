@@ -189,6 +189,7 @@ def test_processor_only_loader_never_constructs_model_weights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mlx_vlm import utils
+    from transformers import AutoTokenizer
 
     from local_ai_mlx_worker.common import _processor_only_loader
 
@@ -196,24 +197,20 @@ def test_processor_only_loader_never_constructs_model_weights(
         '{"text_config":{"eos_token_id":248044}}',
         encoding="utf-8",
     )
-    processor = object()
-    calls: list[tuple[Path, object]] = []
+    tokenizer = object()
+    calls: list[tuple[Path, dict[str, object]]] = []
 
     def reject_model_load(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("token preflight loaded model weights")
 
-    def load_processor(
-        path: Path,
-        _add_detokenizer: bool,
-        eos_token_ids: object,
-        **_kwargs: object,
-    ) -> object:
-        calls.append((path, eos_token_ids))
-        return processor
+    def load_tokenizer(path: Path, **kwargs: object) -> object:
+        calls.append((path, kwargs))
+        return tokenizer
 
     monkeypatch.setattr(utils, "load_model", reject_model_load)
     monkeypatch.setattr(utils, "load_image_processor", reject_model_load)
-    monkeypatch.setattr(utils, "load_processor", load_processor)
+    monkeypatch.setattr(utils, "load_processor", reject_model_load)
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", load_tokenizer)
 
     _model_sentinel, loaded_processor = _processor_only_loader(
         str(tmp_path),
@@ -222,8 +219,17 @@ def test_processor_only_loader_never_constructs_model_weights(
         trust_remote_code=False,
     )
 
-    assert loaded_processor is processor
-    assert calls == [(tmp_path.resolve(), 248044)]
+    assert loaded_processor is tokenizer
+    assert calls == [
+        (
+            tmp_path.resolve(),
+            {
+                "local_files_only": True,
+                "trust_remote_code": False,
+                "use_fast": True,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -639,3 +645,47 @@ def test_exact_manifest_artifact_loads_without_remote_code(role: str) -> None:
             trust_remote_code=False,
         )
     assert not any(path.endswith(".py") for path in loaded.repository_files_used)
+
+
+@pytest.mark.local_model
+def test_locked_summary_schema_compiles_offline_without_loading_weights() -> None:
+    from mlx_vlm.structured import build_json_schema_logits_processor
+
+    from local_ai_mlx_worker.common import load_summary_processor
+    from local_ai_mlx_worker.qwen_summary import _summary_output_schema
+
+    manifest_path, model_dir = _locked_artifacts()
+    if not manifest_path.is_file():
+        pytest.skip(f"locked manifest absent: {manifest_path}")
+    if not (model_dir / "summary").is_dir():
+        pytest.skip(f"locked summary artifact absent: {model_dir / 'summary'}")
+
+    safe_input = {
+        "facts": [
+            {
+                "fact_id": "fact1_offline_compile",
+                "fields": [{"path": "/name", "value_json": '"Example"'}],
+                "evidence_ids": ["evidence1_offline_compile"],
+                "allowed_heading": "Medications",
+            }
+        ],
+        "evidence": [
+            {
+                "evidence_id": "evidence1_offline_compile",
+                "field_paths": ["/name"],
+            }
+        ],
+        "uncertainty_labels": [],
+    }
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    with deny_all_network():
+        processor = load_summary_processor(manifest_path, model_dir)
+        schema = _summary_output_schema(safe_input)
+        logits_processor = build_json_schema_logits_processor(
+            getattr(processor, "tokenizer", processor),
+            schema,
+        )
+
+    assert callable(logits_processor)

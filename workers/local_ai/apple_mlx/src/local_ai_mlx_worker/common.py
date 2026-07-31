@@ -667,30 +667,19 @@ def _default_loader(path: str, **kwargs: object) -> tuple[object, object]:
 
 
 def _processor_only_loader(path: str, **kwargs: object) -> tuple[object, object]:
-    """Load the verified tokenizer/processor without constructing model weights."""
-
-    from mlx_vlm import utils
+    """Load the verified fast tokenizer without constructing model weights."""
 
     model_path = _assert_real_directory(Path(path))
     options = dict(kwargs)
     options.pop("lazy", None)
-    eos_token_id: object = None
-    try:
-        config = _strict_json_loads((model_path / "config.json").read_text(encoding="utf-8"))
-        if isinstance(config, Mapping):
-            eos_token_id = config.get("eos_token_id")
-            text_config = config.get("text_config")
-            if eos_token_id is None and isinstance(text_config, Mapping):
-                eos_token_id = text_config.get("eos_token_id")
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
-        raise ArtifactUnavailableError("Model JSON artifact is invalid.") from None
-    processor = utils.load_processor(
+    options["use_fast"] = True
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
         model_path,
-        True,
-        eos_token_ids=eos_token_id,
         **options,
     )
-    return object(), processor
+    return object(), tokenizer
 
 
 def load_role(
@@ -894,10 +883,21 @@ def requested_output_tokens(
 ) -> int:
     """Return the smallest positive request, manifest, and role token bound."""
 
+    requested = validated_requested_output_tokens(payload, role_cap=role_cap)
+    return min(requested, loaded.decode_limits["max_output_tokens"])
+
+
+def validated_requested_output_tokens(
+    payload: Mapping[str, object],
+    *,
+    role_cap: int,
+) -> int:
+    """Validate an output-token request without loading model artifacts."""
+
     requested = payload.get("max_output_tokens", role_cap)
     if not isinstance(requested, int) or isinstance(requested, bool) or requested <= 0:
         raise WorkerInputError("Local worker output token limit is invalid.")
-    return min(requested, loaded.decode_limits["max_output_tokens"], role_cap)
+    return min(requested, role_cap)
 
 
 def bounded_json(value: object, *, max_bytes: int) -> str:
@@ -1138,6 +1138,7 @@ def generate_content(
     mode: str | None = None,
     instructions: str | None = None,
     activity_fn: ActivityCallback | None = None,
+    json_schema: Mapping[str, object] | None = None,
 ) -> str:
     """Apply the local chat template and run quiet, bounded MLX generation."""
 
@@ -1177,14 +1178,26 @@ def generate_content(
         runtime_limit = _runtime_context_limit_for(model, processor)
         if runtime_limit is not None and count + max_tokens > runtime_limit:
             raise WorkerInputLimitError("Local worker input exceeds its model context token limit.")
+        generation_options: dict[str, object] = {
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "verbose": False,
+        }
+        if json_schema is not None:
+            if not isinstance(json_schema, Mapping):
+                raise WorkerInputError("Local worker JSON schema is invalid.")
+            from mlx_vlm.structured import build_json_schema_logits_processor
+
+            tokenizer = getattr(processor, "tokenizer", processor)
+            generation_options["logits_processors"] = [
+                build_json_schema_logits_processor(tokenizer, dict(json_schema))
+            ]
         stream = stream_generate(
             model,
             processor,
             formatted,
             image=images or None,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            verbose=False,
+            **generation_options,
         )
         if isinstance(stream, str):
             return _strip_terminal_eos_suffix(stream, processor)

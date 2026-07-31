@@ -15,6 +15,7 @@ from .common import (
     GenerationError,
     LoadedRole,
     WorkerInputError,
+    WorkerInputLimitError,
     _token_count,
     bounded_json,
     generate_content,
@@ -23,10 +24,13 @@ from .common import (
     parse_json_object,
     requested_output_tokens,
     validate_token_budget,
+    validated_requested_output_tokens,
 )
 
 SUMMARY_OUTPUT_CAP = 4096
 MAX_SUMMARY_INPUT_BYTES = 4 * 1024 * 1024
+MAX_SUMMARY_SCHEMA_BYTES = 8 * 1024 * 1024
+MAX_SUMMARY_SCHEMA_COMPLEXITY_UNITS = 16_384
 MAX_FACTS = 512
 MAX_EVIDENCE = 512
 MAX_JSON_DEPTH = 12
@@ -1143,6 +1147,257 @@ def count_summary_reference_tokens(
     return {"token_count": _token_count(processor, compact)}
 
 
+def _contains_once(item_schema: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "contains": dict(item_schema),
+        "minContains": 0,
+        "maxContains": 1,
+    }
+
+
+def _claim_schema(
+    fact: Mapping[str, object],
+    evidence: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    fact_id = str(fact["fact_id"])
+    linked_evidence_ids = sorted(str(item) for item in fact["evidence_ids"])
+    fact_paths = {str(field["path"]) for field in fact["fields"] if isinstance(field, Mapping)}
+    evidence_paths = {
+        evidence_id: sorted(
+            fact_paths.intersection(str(path) for path in evidence[evidence_id]["field_paths"])
+        )
+        for evidence_id in linked_evidence_ids
+    }
+    supported_paths = sorted({path for paths in evidence_paths.values() for path in paths})
+    if not supported_paths or any(not paths for paths in evidence_paths.values()):
+        raise WorkerInputError("Summary schema has invalid evidence bindings.")
+
+    link_conditions: list[dict[str, object]] = []
+    for path in supported_paths:
+        supporting_evidence = sorted(
+            evidence_id for evidence_id, paths in evidence_paths.items() if path in paths
+        )
+        link_conditions.append(
+            {
+                "if": {
+                    "properties": {
+                        "field_paths": {"contains": {"const": path}},
+                    },
+                    "required": ["field_paths"],
+                },
+                "then": {
+                    "properties": {
+                        "evidence_ids": {
+                            "contains": {"enum": supporting_evidence},
+                        }
+                    }
+                },
+            }
+        )
+    for evidence_id, paths in evidence_paths.items():
+        link_conditions.append(
+            {
+                "if": {
+                    "properties": {
+                        "evidence_ids": {"contains": {"const": evidence_id}},
+                    },
+                    "required": ["evidence_ids"],
+                },
+                "then": {
+                    "properties": {
+                        "field_paths": {"contains": {"enum": paths}},
+                    }
+                },
+            }
+        )
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["fact_id", "field_paths", "evidence_ids"],
+        "properties": {
+            "fact_id": {"const": fact_id},
+            "field_paths": {
+                "type": "array",
+                "items": {"enum": supported_paths},
+                "minItems": 1,
+                "maxItems": min(32, len(supported_paths)),
+                "uniqueItems": True,
+            },
+            "evidence_ids": {
+                "type": "array",
+                "items": {"enum": linked_evidence_ids},
+                "minItems": 1,
+                "maxItems": min(32, len(linked_evidence_ids)),
+                "uniqueItems": True,
+            },
+        },
+        "allOf": link_conditions,
+    }
+
+
+def _summary_output_schema(
+    safe_input: Mapping[str, object],
+) -> dict[str, object]:
+    """Build a bounded schema containing only validated reference bindings."""
+
+    facts_value = safe_input["facts"]
+    evidence_value = safe_input["evidence"]
+    uncertainties_value = safe_input["uncertainty_labels"]
+    if (
+        not isinstance(facts_value, list)
+        or not isinstance(evidence_value, list)
+        or not isinstance(uncertainties_value, list)
+    ):
+        raise WorkerInputError("Summary schema input is invalid.")
+    complexity_units = len(uncertainties_value)
+    for item in facts_value:
+        if not isinstance(item, Mapping):
+            raise WorkerInputError("Summary schema input is invalid.")
+        fields = item.get("fields")
+        evidence_ids = item.get("evidence_ids")
+        if not isinstance(fields, list) or not isinstance(evidence_ids, list):
+            raise WorkerInputError("Summary schema input is invalid.")
+        complexity_units += 1 + len(fields) + len(evidence_ids) + (len(fields) * len(evidence_ids))
+        if complexity_units > MAX_SUMMARY_SCHEMA_COMPLEXITY_UNITS:
+            raise WorkerInputLimitError(
+                "Summary output schema complexity exceeds its validated limit."
+            )
+    facts = {str(item["fact_id"]): item for item in facts_value if isinstance(item, Mapping)}
+    evidence = {
+        str(item["evidence_id"]): item for item in evidence_value if isinstance(item, Mapping)
+    }
+    claim_schemas = {fact_id: _claim_schema(fact, evidence) for fact_id, fact in facts.items()}
+    facts_by_heading: dict[str, list[str]] = {"Overview": sorted(facts)}
+    for fact_id, fact in facts.items():
+        facts_by_heading.setdefault(str(fact["allowed_heading"]), []).append(fact_id)
+    for fact_ids in facts_by_heading.values():
+        fact_ids.sort()
+
+    section_variants: list[dict[str, object]] = []
+    for heading in sorted(facts_by_heading):
+        fact_ids = facts_by_heading[heading]
+        if not fact_ids:
+            continue
+        claims: dict[str, object] = {
+            "type": "array",
+            "items": {
+                "oneOf": [claim_schemas[fact_id] for fact_id in fact_ids],
+            },
+            "maxItems": min(MAX_CLAIMS_PER_SECTION, len(fact_ids)),
+            "uniqueItems": True,
+            "allOf": [
+                _contains_once(
+                    {
+                        "properties": {"fact_id": {"const": fact_id}},
+                        "required": ["fact_id"],
+                    }
+                )
+                for fact_id in fact_ids
+            ],
+        }
+        section_variants.append(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["heading", "claims"],
+                "properties": {
+                    "heading": {"const": heading},
+                    "claims": claims,
+                },
+            }
+        )
+
+    sections: dict[str, object] = {
+        "type": "array",
+        "maxItems": min(MAX_SECTIONS, len(section_variants)),
+        "uniqueItems": True,
+    }
+    if section_variants:
+        sections["items"] = {"oneOf": section_variants}
+        sections["allOf"] = [
+            _contains_once(
+                {
+                    "properties": {"heading": {"const": heading}},
+                    "required": ["heading"],
+                }
+            )
+            for heading in sorted(facts_by_heading)
+            if facts_by_heading[heading]
+        ]
+        sections["allOf"].extend(  # type: ignore[union-attr]
+            _contains_once(
+                {
+                    "properties": {
+                        "claims": {
+                            "contains": {
+                                "properties": {
+                                    "fact_id": {"const": fact_id},
+                                },
+                                "required": ["fact_id"],
+                            }
+                        }
+                    },
+                    "required": ["claims"],
+                }
+            )
+            for fact_id in sorted(facts)
+        )
+
+    uncertainty_schemas: list[dict[str, object]] = []
+    for item in sorted(
+        uncertainties_value,
+        key=lambda value: str(value["uncertainty_id"]) if isinstance(value, Mapping) else "",
+    ):
+        if not isinstance(item, Mapping):
+            raise WorkerInputError("Summary schema input is invalid.")
+        uncertainty_schemas.append(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["uncertainty_id", "fact_ids", "evidence_ids"],
+                "properties": {
+                    "uncertainty_id": {"const": item["uncertainty_id"]},
+                    "fact_ids": {"const": item["fact_ids"]},
+                    "evidence_ids": {"const": item["evidence_ids"]},
+                },
+            }
+        )
+    uncertainties: dict[str, object] = {
+        "type": "array",
+        "maxItems": min(MAX_UNCERTAINTIES, len(uncertainty_schemas)),
+        "uniqueItems": True,
+    }
+    if uncertainty_schemas:
+        uncertainties["items"] = {"oneOf": uncertainty_schemas}
+        uncertainties["allOf"] = [
+            _contains_once(
+                {
+                    "properties": {
+                        "uncertainty_id": {"const": item["properties"]["uncertainty_id"]["const"]}
+                    },
+                    "required": ["uncertainty_id"],
+                }
+            )
+            for item in uncertainty_schemas
+        ]
+
+    schema: dict[str, object] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["sections", "uncertainties"],
+        "properties": {
+            "sections": sections,
+            "uncertainties": uncertainties,
+        },
+    }
+    try:
+        bounded_json(schema, max_bytes=MAX_SUMMARY_SCHEMA_BYTES)
+    except WorkerInputError:
+        raise WorkerInputLimitError("Summary output schema exceeds its validated limit.") from None
+    return schema
+
+
 def run_summary(
     payload: Mapping[str, object],
     *,
@@ -1151,8 +1406,10 @@ def run_summary(
 ) -> dict[str, object]:
     """Select typed references without allowing model-authored clinical prose."""
 
-    selected = loaded or load_role_from_payload("summary", payload)
     safe_input = _validated_input(payload)
+    validated_requested_output_tokens(payload, role_cap=SUMMARY_OUTPUT_CAP)
+    json_schema = _summary_output_schema(safe_input)
+    selected = loaded or load_role_from_payload("summary", payload)
     serialized = bounded_json(safe_input, max_bytes=MAX_SUMMARY_INPUT_BYTES)
     max_tokens = requested_output_tokens(payload, selected, role_cap=SUMMARY_OUTPUT_CAP)
     base_prompt = (
@@ -1169,27 +1426,18 @@ def run_summary(
         "types. An uncertainty contains exactly uncertainty_id and its exact fact_ids "
         "and evidence_ids. Follow safety_rules exactly. "
     )
-    for retry in (False, True):
-        correction = (
-            "The prior response violated the required reference-only JSON contract. "
-            if retry
-            else ""
-        )
-        prompt = f"{correction}{base_prompt}INPUT_JSON={serialized}"
-        validate_token_budget(selected, [prompt], max_output_tokens=max_tokens)
-        raw = generate_fn(
-            model=selected.model,
-            processor=selected.processor,
-            prompt=prompt,
-            images=[],
-            max_tokens=max_tokens,
-            temperature=0.0,
-            do_sample=False,
-            input_token_limit=selected.decode_limits["max_input_tokens"],
-            enable_thinking=False,
-        )
-        try:
-            return _validated_output(raw, safe_input)
-        except GenerationError:
-            continue
-    raise GenerationError("Local summary returned invalid JSON.")
+    prompt = f"{base_prompt}INPUT_JSON={serialized}"
+    validate_token_budget(selected, [prompt], max_output_tokens=max_tokens)
+    raw = generate_fn(
+        model=selected.model,
+        processor=selected.processor,
+        prompt=prompt,
+        images=[],
+        max_tokens=max_tokens,
+        temperature=0.0,
+        do_sample=False,
+        input_token_limit=selected.decode_limits["max_input_tokens"],
+        enable_thinking=False,
+        json_schema=json_schema,
+    )
+    return _validated_output(raw, safe_input)

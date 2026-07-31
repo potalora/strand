@@ -114,10 +114,11 @@ def test_reviewed_backend_grounding_contract_is_accepted_by_real_qwen_worker() -
         decode_limits={"max_input_tokens": 32_768, "max_output_tokens": 4096},
         repository_files_used=frozenset({"config.json", "model.safetensors"}),
     )
-    result = run_summary(
-        payload,
-        loaded=loaded,
-        generate_fn=lambda **_kwargs: json.dumps(
+    calls: list[dict[str, object]] = []
+
+    def generate(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return json.dumps(
             {
                 "sections": [
                     {
@@ -139,10 +140,21 @@ def test_reviewed_backend_grounding_contract_is_accepted_by_real_qwen_worker() -
                 ],
                 "uncertainties": [],
             }
-        ),
+        )
+
+    result = run_summary(
+        payload,
+        loaded=loaded,
+        generate_fn=generate,
     )
 
     assert result["sections"][0]["claims"][0]["fact_id"] == fact.fact_id
+    assert len(calls) == 1
+    assert calls[0]["max_tokens"] == payload["max_output_tokens"]
+    schema = calls[0]["json_schema"]
+    assert isinstance(schema, dict)
+    assert schema["type"] == "object"
+    assert fact.fact_id in json.dumps(schema)
 
 
 def test_qwen_worker_accepts_typed_comparator_and_ratio_observation_values() -> None:
