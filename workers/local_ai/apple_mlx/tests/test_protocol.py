@@ -510,7 +510,7 @@ def test_role_runtime_output_is_suppressed_from_protocol_and_logs(
     assert sentinel not in captured.err
 
 
-def test_quiet_extraction_dispatch_preserves_page_counters_and_activity_only(
+def test_quiet_extraction_dispatch_preserves_page_and_budget_counters_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Progress frames distinguish completed pages from content-free activity."""
@@ -526,12 +526,24 @@ def test_quiet_extraction_dispatch_preserves_page_counters_and_activity_only(
         extraction_progress: object = None,
         extraction_heartbeat: object = None,
         extraction_lifecycle: object = None,
+        extraction_budget_progress: object = None,
     ) -> dict[str, object]:
         assert callable(extraction_lifecycle)
         assert callable(extraction_progress)
         assert callable(extraction_heartbeat)
+        assert callable(extraction_budget_progress)
         extraction_lifecycle()
         extraction_progress(0, 3)
+        extraction_budget_progress(
+            {
+                "attempt": 1,
+                "attempt_limit": 12,
+                "output_tokens": 17,
+                "output_token_limit": 16_384,
+                "splits_used": 0,
+                "split_limit": 7,
+            }
+        )
         extraction_heartbeat()
         extraction_progress(1, 3)
         return {"ok": True, "private": sentinel}
@@ -581,6 +593,28 @@ def test_quiet_extraction_dispatch_preserves_page_counters_and_activity_only(
                 "current": 0,
                 "total": 3,
                 "activity": 3,
+                "attempt": 1,
+                "attempt_limit": 12,
+                "output_tokens": 17,
+                "output_token_limit": 16_384,
+                "splits_used": 0,
+                "split_limit": 7,
+            },
+        },
+        {
+            "kind": "progress",
+            "payload": {
+                "role": "extraction",
+                "stage": "processing",
+                "current": 0,
+                "total": 3,
+                "activity": 4,
+                "attempt": 1,
+                "attempt_limit": 12,
+                "output_tokens": 17,
+                "output_token_limit": 16_384,
+                "splits_used": 0,
+                "split_limit": 7,
             },
         },
         {
@@ -590,7 +624,13 @@ def test_quiet_extraction_dispatch_preserves_page_counters_and_activity_only(
                 "stage": "processing",
                 "current": 1,
                 "total": 3,
-                "activity": 4,
+                "activity": 5,
+                "attempt": 1,
+                "attempt_limit": 12,
+                "output_tokens": 17,
+                "output_token_limit": 16_384,
+                "splits_used": 0,
+                "split_limit": 7,
             },
         },
     ]
@@ -975,18 +1015,35 @@ def test_extraction_soft_caps_batch_input_for_the_16gb_profile(
 
 def test_extraction_recursively_splits_a_formatted_batch_over_the_runtime_limit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from local_ai_mlx_worker import nuextract3
     from local_ai_mlx_worker.common import WorkerInputLimitError
     from local_ai_mlx_worker.nuextract3 import run_extraction
 
     calls: list[list[int]] = []
+    runtime_batches: list[list[int]] = []
+
+    original_validate = nuextract3.validate_token_budget
+
+    def validate(loaded: object, values: list[object], **kwargs: object) -> int:
+        prompt = str(values[0])
+        source = json.loads(prompt.split("INPUT_JSON=", 1)[1])
+        page_numbers = [int(item["page_number"]) for item in source["source_pages"]]
+        if "The prior response violated" not in prompt:
+            runtime_batches.append(page_numbers)
+            if len(page_numbers) > 2:
+                raise WorkerInputLimitError(
+                    "Formatted multimodal request exceeds the runtime limit."
+                )
+        return original_validate(loaded, values, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(nuextract3, "validate_token_budget", validate)
 
     def generate(**kwargs: object) -> str:
         source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
         page_numbers = [int(item["page_number"]) for item in source["source_pages"]]
         calls.append(page_numbers)
-        if len(page_numbers) > 2:
-            raise WorkerInputLimitError("Formatted multimodal request exceeds the runtime limit.")
         return json.dumps(
             {
                 "schema_version": "clinical-document-extraction.v1",
@@ -996,6 +1053,7 @@ def test_extraction_recursively_splits_a_formatted_batch_over_the_runtime_limit(
 
     loaded = _loaded("extraction")
     progress: list[tuple[int, int]] = []
+    budget_progress: list[dict[str, int]] = []
     result = run_extraction(
         {
             "page_markdown": [
@@ -1015,9 +1073,10 @@ def test_extraction_recursively_splits_a_formatted_batch_over_the_runtime_limit(
         loaded=loaded,  # type: ignore[arg-type]
         generate_fn=generate,
         progress_fn=lambda current, total: progress.append((current, total)),
+        budget_progress_fn=budget_progress.append,
     )
 
-    assert calls == [
+    assert runtime_batches == [
         [1, 2, 3, 4, 5, 6],
         [1, 2, 3],
         [1],
@@ -1026,6 +1085,7 @@ def test_extraction_recursively_splits_a_formatted_batch_over_the_runtime_limit(
         [4],
         [5, 6],
     ]
+    assert calls == [[1], [2, 3], [4], [5, 6]]
     assert result["result_type"] == "chunked_clinical_extraction.v1"
     assert [page_number for chunk in result["chunks"] for page_number in chunk["page_numbers"]] == [
         1,
@@ -1040,6 +1100,7 @@ def test_extraction_recursively_splits_a_formatted_batch_over_the_runtime_limit(
         for chunk in result["chunks"]
     )
     assert progress == [(0, 6), (1, 6), (3, 6), (4, 6), (6, 6)]
+    assert budget_progress[-1]["splits_used"] == 3
 
 
 def test_extraction_recursively_splits_a_batch_that_cannot_finish_valid_json(
@@ -1368,7 +1429,7 @@ def test_extraction_uses_exact_stream_token_count_to_split_truncated_output(
     }
 
 
-def test_extraction_preserves_invalid_structured_output_category_below_cap(
+def test_extraction_stops_at_fragment_depth_after_repeated_invalid_output(
     tmp_path: Path,
 ) -> None:
     from local_ai_mlx_worker.common import GenerationError
@@ -1386,7 +1447,7 @@ def test_extraction_preserves_invalid_structured_output_category_below_cap(
             generate_fn=lambda **_kwargs: "{",
         )
 
-    assert error.value.category == "invalid_structured_output"
+    assert error.value.category == "fragment_depth_limit"
 
 
 def test_extraction_splits_after_two_under_cap_invalid_structured_outputs(
@@ -1464,6 +1525,42 @@ def test_extraction_does_not_split_non_structured_generation_failures(
     assert error.value.category == "stream_contract"
 
 
+def test_extraction_does_not_split_runtime_input_failures(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.common import WorkerInputLimitError
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    calls = 0
+    budget_progress: list[dict[str, int]] = []
+
+    def generate(**_kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        raise WorkerInputLimitError("Runtime rejected a generated request.")
+
+    with pytest.raises(WorkerInputLimitError):
+        run_extraction(
+            {
+                "page_markdown": [
+                    {"page_number": 1, "markdown": "first bounded OCR"},
+                    {"page_number": 2, "markdown": "second bounded OCR"},
+                ],
+                "scratch_dir": str(tmp_path),
+                "image_paths": {},
+                "schema": {"schema_version": "clinical-document-extraction.v1"},
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=generate,
+            budget_progress_fn=budget_progress.append,
+        )
+
+    assert calls == 1
+    assert budget_progress[-1]["attempt"] == 1
+    assert budget_progress[-1]["output_tokens"] == 4_096
+    assert budget_progress[-1]["splits_used"] == 0
+
+
 def test_unsplittable_invalid_structured_output_preserves_bounded_category(
     tmp_path: Path,
 ) -> None:
@@ -1539,6 +1636,167 @@ def test_generation_preserves_exact_cap_metadata_without_rejecting_valid_json(
         loaded=_loaded("extraction"),  # type: ignore[arg-type]
         generate_fn=lambda **_kwargs: generated,
     ) == {"schema_version": "clinical-document-extraction.v1"}
+
+
+def test_extraction_work_budget_enforces_exact_independent_limits() -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.nuextract3 import (
+        MAX_EXTRACTION_GENERATION_ATTEMPTS,
+        MAX_EXTRACTION_RUNTIME_SPLITS,
+        _ExtractionWorkBudget,
+    )
+
+    token_budget = _ExtractionWorkBudget()
+    for _ in range(4):
+        assert token_budget.next_output_cap(8_192) == 4_096
+        token_budget.reserve_attempt()
+        token_budget.charge_generation(4_096)
+    with pytest.raises(GenerationError) as token_error:
+        token_budget.next_output_cap(8_192)
+    assert token_error.value.category == "work_token_limit"
+
+    attempt_budget = _ExtractionWorkBudget()
+    for _ in range(MAX_EXTRACTION_GENERATION_ATTEMPTS):
+        attempt_budget.reserve_attempt()
+    with pytest.raises(GenerationError) as attempt_error:
+        attempt_budget.reserve_attempt()
+    assert attempt_error.value.category == "work_attempt_limit"
+    assert attempt_budget.attempts == MAX_EXTRACTION_GENERATION_ATTEMPTS
+
+    split_budget = _ExtractionWorkBudget()
+    for _ in range(MAX_EXTRACTION_RUNTIME_SPLITS):
+        split_budget.reserve_runtime_split()
+    with pytest.raises(GenerationError) as split_error:
+        split_budget.reserve_runtime_split()
+    assert split_error.value.category == "work_split_limit"
+    assert split_budget.runtime_splits == MAX_EXTRACTION_RUNTIME_SPLITS
+
+
+def test_extraction_fragment_depth_three_is_private_and_depth_four_fails() -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.nuextract3 import _prompt_pages, _split_page
+
+    fragment = {"page_number": 1, "markdown": "bounded clinical text " * 128}
+    for _ in range(3):
+        fragment, _right = _split_page(fragment)
+
+    assert set(_prompt_pages([fragment])[0]) == {"page_number", "markdown"}
+    with pytest.raises(GenerationError) as error:
+        _split_page(fragment)
+    assert error.value.category == "fragment_depth_limit"
+
+
+def test_extraction_shrinks_call_cap_and_stops_at_exact_token_budget(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.common import GeneratedText, GenerationError
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    call_caps: list[int] = []
+
+    def generate(**kwargs: object) -> GeneratedText:
+        call_cap = int(kwargs["max_tokens"])
+        call_caps.append(call_cap)
+        source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
+        if len(source["source_pages"]) > 1:
+            return GeneratedText("{", generation_tokens=call_cap - 1)
+        return GeneratedText(
+            '{"schema_version":"clinical-document-extraction.v1"}',
+            generation_tokens=call_cap,
+        )
+
+    with pytest.raises(GenerationError) as error:
+        run_extraction(
+            {
+                "page_markdown": [
+                    {"page_number": page, "markdown": f"bounded OCR page {page}"}
+                    for page in range(1, 5)
+                ],
+                "scratch_dir": str(tmp_path),
+                "image_paths": {},
+                "schema": {"schema_version": "clinical-document-extraction.v1"},
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=generate,
+        )
+
+    assert error.value.category == "work_token_limit"
+    assert call_caps == [4_096, 4_096, 4_096, 4_096, 4]
+
+
+def test_extraction_budget_progress_is_monotonic_and_content_free(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.common import GeneratedText
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    events: list[dict[str, int]] = []
+    outputs = iter(
+        [
+            GeneratedText("{", generation_tokens=7),
+            GeneratedText(
+                '{"schema_version":"clinical-document-extraction.v1"}',
+                generation_tokens=11,
+            ),
+        ]
+    )
+
+    assert run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": "private clinical OCR"}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {"schema_version": "clinical-document-extraction.v1"},
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: next(outputs),
+        budget_progress_fn=events.append,
+    ) == {"schema_version": "clinical-document-extraction.v1"}
+
+    assert events
+    assert all(
+        set(event)
+        == {
+            "attempt",
+            "attempt_limit",
+            "output_tokens",
+            "output_token_limit",
+            "splits_used",
+            "split_limit",
+        }
+        for event in events
+    )
+    assert [event["attempt"] for event in events] == sorted(event["attempt"] for event in events)
+    assert [event["output_tokens"] for event in events] == sorted(
+        event["output_tokens"] for event in events
+    )
+    assert events[-1]["attempt"] == 2
+    assert events[-1]["output_tokens"] == 18
+    assert "private clinical OCR" not in json.dumps(events)
+
+
+def test_extraction_conservatively_charges_oversized_exact_metadata(
+    tmp_path: Path,
+) -> None:
+    from local_ai_mlx_worker.common import GeneratedText
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    events: list[dict[str, int]] = []
+    assert run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": "bounded OCR"}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {"schema_version": "clinical-document-extraction.v1"},
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=lambda **_kwargs: GeneratedText(
+            '{"schema_version":"clinical-document-extraction.v1"}',
+            generation_tokens=99_999,
+        ),
+        budget_progress_fn=events.append,
+    ) == {"schema_version": "clinical-document-extraction.v1"}
+    assert events[-1]["output_tokens"] == 4_096
 
 
 def test_generation_builds_locked_json_schema_logits_processor(

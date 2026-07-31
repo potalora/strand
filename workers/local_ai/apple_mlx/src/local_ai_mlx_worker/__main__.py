@@ -22,7 +22,12 @@ from .common import (
     WorkerInputError,
     WorkerInputLimitError,
 )
-from .nuextract3 import run_extraction
+from .nuextract3 import (
+    MAX_EXTRACTION_GENERATED_TOKENS,
+    MAX_EXTRACTION_GENERATION_ATTEMPTS,
+    MAX_EXTRACTION_RUNTIME_SPLITS,
+    run_extraction,
+)
 from .ovisocr2 import run_ocr
 from .qwen_summary import count_summary_reference_tokens, run_summary
 
@@ -241,6 +246,7 @@ def _dispatch(
     extraction_progress: Callable[[int, int], None] | None = None,
     extraction_heartbeat: Callable[[], None] | None = None,
     extraction_lifecycle: Callable[[], None] | None = None,
+    extraction_budget_progress: Callable[[dict[str, int]], None] | None = None,
     summary_progress: Callable[[dict[str, int | str]], None] | None = None,
 ) -> object:
     if request.command == "ocr":
@@ -251,6 +257,7 @@ def _dispatch(
             progress_fn=extraction_progress,
             attempt_progress_fn=extraction_heartbeat,
             lifecycle_progress_fn=extraction_lifecycle,
+            budget_progress_fn=extraction_budget_progress,
         )
     if request.command == "summarize":
         return run_summary(request.payload, progress_fn=summary_progress)
@@ -271,8 +278,19 @@ def _quiet_dispatch(request: Request) -> object:
         page_current = 0
         page_total = 0
         processing_started = False
+        extraction_budget_counters = {
+            "attempt": 0,
+            "output_tokens": 0,
+            "splits_used": 0,
+        }
+        extraction_budget_snapshot: dict[str, int] | None = None
 
-        def publish_extraction_progress(stage: str, current: int, total: int) -> None:
+        def publish_extraction_progress(
+            stage: str,
+            current: int,
+            total: int,
+            counters: dict[str, int] | None = None,
+        ) -> None:
             nonlocal activity
             if (
                 type(current) is not int
@@ -294,6 +312,7 @@ def _quiet_dispatch(request: Request) -> object:
                     "current": current,
                     "total": total,
                     "activity": activity,
+                    **(counters if counters is not None else extraction_budget_snapshot or {}),
                 },
             )
 
@@ -315,6 +334,41 @@ def _quiet_dispatch(request: Request) -> object:
         def publish_activity() -> None:
             stage = "processing" if processing_started else "loading"
             publish_extraction_progress(stage, page_current, page_total)
+
+        def publish_extraction_budget_progress(payload: dict[str, int]) -> None:
+            nonlocal extraction_budget_snapshot
+            expected = {
+                "attempt",
+                "attempt_limit",
+                "output_tokens",
+                "output_token_limit",
+                "splits_used",
+                "split_limit",
+            }
+            if (
+                set(payload) != expected
+                or any(type(payload[name]) is not int or payload[name] < 0 for name in expected)
+                or payload["attempt_limit"] != MAX_EXTRACTION_GENERATION_ATTEMPTS
+                or payload["output_token_limit"] != MAX_EXTRACTION_GENERATED_TOKENS
+                or payload["split_limit"] != MAX_EXTRACTION_RUNTIME_SPLITS
+                or payload["attempt"] < extraction_budget_counters["attempt"]
+                or payload["output_tokens"] < extraction_budget_counters["output_tokens"]
+                or payload["splits_used"] < extraction_budget_counters["splits_used"]
+                or payload["attempt"] > payload["attempt_limit"]
+                or payload["output_tokens"] > payload["output_token_limit"]
+                or payload["splits_used"] > payload["split_limit"]
+            ):
+                raise WorkerInputError("Local worker progress is invalid.")
+            extraction_budget_counters.update(
+                {
+                    "attempt": payload["attempt"],
+                    "output_tokens": payload["output_tokens"],
+                    "splits_used": payload["splits_used"],
+                }
+            )
+            extraction_budget_snapshot = dict(payload)
+            stage = "processing" if processing_started else "loading"
+            publish_extraction_progress(stage, page_current, page_total, payload)
 
         def publish_summary_progress(payload: dict[str, int | str]) -> None:
             nonlocal activity
@@ -368,6 +422,7 @@ def _quiet_dispatch(request: Request) -> object:
                 "extraction_progress": publish_page_progress,
                 "extraction_heartbeat": publish_activity,
                 "extraction_lifecycle": publish_activity,
+                "extraction_budget_progress": publish_extraction_budget_progress,
             }
         # Test doubles predating summary telemetry may deliberately expose a
         # narrower signature; production dispatch always receives it.

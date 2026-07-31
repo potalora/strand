@@ -1472,6 +1472,38 @@ def test_progress_work_limits_are_immutable_and_counters_do_not_disappear() -> N
             )
 
 
+def test_extraction_budget_snapshot_survives_heartbeat_and_page_progress() -> None:
+    from app.services.local_ai.protocol import ProgressPayload
+
+    budget = {
+        "attempt": 1,
+        "attempt_limit": 12,
+        "output_tokens": 17,
+        "output_token_limit": 16_384,
+        "splits_used": 0,
+        "split_limit": 7,
+    }
+    budget_frame = ProgressPayload(
+        role=ModelRole.EXTRACTION,
+        stage="processing",
+        current=0,
+        total=3,
+        activity=3,
+        **budget,
+    )
+    heartbeat = budget_frame.model_copy(update={"activity": 4})
+    page_advance = heartbeat.model_copy(update={"current": 1, "activity": 5})
+
+    assert ProductionLocalModelManager._validate_progress_sequence(
+        budget_frame,
+        heartbeat,
+    )
+    assert ProductionLocalModelManager._validate_progress_sequence(
+        heartbeat,
+        page_advance,
+    )
+
+
 @pytest.mark.parametrize(
     ("role", "stage"),
     [

@@ -27,6 +27,10 @@ from .common import (
 )
 
 EXTRACTION_OUTPUT_CAP = 4096
+MAX_EXTRACTION_GENERATED_TOKENS = 16_384
+MAX_EXTRACTION_GENERATION_ATTEMPTS = 12
+MAX_EXTRACTION_RUNTIME_SPLITS = 7
+MAX_EXTRACTION_FRAGMENT_DEPTH = 3
 MAX_EXTRACTION_INPUT_BYTES = 4 * 1024 * 1024
 MAX_SELECTED_IMAGES = 8
 MAX_SELECTED_IMAGE_BYTES = 64 * 1024 * 1024
@@ -34,10 +38,8 @@ MAX_SELECTED_IMAGE_PIXELS = 40_000_000
 CHUNKED_EXTRACTION_RESULT_TYPE = "chunked_clinical_extraction.v1"
 _CHAT_TEMPLATE_TOKEN_RESERVE = 1024
 _EXTRACTION_BATCH_INPUT_CAP = 4_096
-_MAX_EXTRACTION_GENERATION_ATTEMPTS = 256
-_MAX_EXTRACTION_SPLITS = 255
-_OUTPUT_CAP_TOKEN_TOLERANCE = 8
 _FRAGMENT_FINAL_KEY = "_fragment_final"
+_FRAGMENT_DEPTH_KEY = "_fragment_depth"
 _MAX_FRAGMENT_OVERLAP_CHARS = 512
 _EXTRACTION_INPUT_KEYS = frozenset({"page_markdown", "scratch_dir", "image_paths", "schema"})
 _EXTRACTION_TRANSPORT_KEYS = frozenset(
@@ -223,25 +225,73 @@ class _TruncatedGenerationError(GenerationError):
         super().__init__(message, category="output_limit")
 
 
+class _FormattedInputLimitError(WorkerInputLimitError):
+    """A formatted extraction prompt that cannot fit the loaded runtime."""
+
+
 @dataclass
 class _ExtractionWorkBudget:
-    """Bound split recursion and decode attempts for one extraction request."""
+    """Bound all generation and runtime-split work for one extraction request."""
 
-    remaining_attempts: int = _MAX_EXTRACTION_GENERATION_ATTEMPTS
-    remaining_splits: int = _MAX_EXTRACTION_SPLITS
+    generated_tokens: int = 0
+    attempts: int = 0
+    runtime_splits: int = 0
+    progress_fn: Callable[[dict[str, int]], None] | None = None
 
-    def consume_attempt(self) -> None:
-        if self.remaining_attempts <= 0:
+    def progress_snapshot(self) -> dict[str, int]:
+        return {
+            "attempt": self.attempts,
+            "attempt_limit": MAX_EXTRACTION_GENERATION_ATTEMPTS,
+            "output_tokens": self.generated_tokens,
+            "output_token_limit": MAX_EXTRACTION_GENERATED_TOKENS,
+            "splits_used": self.runtime_splits,
+            "split_limit": MAX_EXTRACTION_RUNTIME_SPLITS,
+        }
+
+    def publish_progress(self) -> None:
+        if self.progress_fn is not None:
+            self.progress_fn(self.progress_snapshot())
+
+    def next_output_cap(self, requested_cap: int) -> int:
+        remaining = MAX_EXTRACTION_GENERATED_TOKENS - self.generated_tokens
+        if remaining <= 0:
             raise GenerationError(
-                "Local extraction exceeded its generation work limit.",
-                category="work_limit",
+                "Local extraction exceeded its token work limit.",
+                category="work_token_limit",
             )
-        self.remaining_attempts -= 1
+        return min(requested_cap, EXTRACTION_OUTPUT_CAP, remaining)
 
-    def consume_split(self) -> None:
-        if self.remaining_splits <= 0:
-            raise WorkerInputLimitError("Local extraction exceeded its split work limit.")
-        self.remaining_splits -= 1
+    def reserve_attempt(self) -> None:
+        if self.attempts >= MAX_EXTRACTION_GENERATION_ATTEMPTS:
+            raise GenerationError(
+                "Local extraction exceeded its attempt work limit.",
+                category="work_attempt_limit",
+            )
+        self.attempts += 1
+        self.publish_progress()
+
+    def charge_generation(self, generated_tokens: int) -> None:
+        remaining = MAX_EXTRACTION_GENERATED_TOKENS - self.generated_tokens
+        if (
+            type(generated_tokens) is not int
+            or generated_tokens < 0
+            or generated_tokens > remaining
+        ):
+            raise GenerationError(
+                "Local extraction exceeded its token work limit.",
+                category="work_token_limit",
+            )
+        self.generated_tokens += generated_tokens
+        self.publish_progress()
+
+    def reserve_runtime_split(self) -> None:
+        if self.runtime_splits >= MAX_EXTRACTION_RUNTIME_SPLITS:
+            raise GenerationError(
+                "Local extraction exceeded its split work limit.",
+                category="work_split_limit",
+            )
+        self.runtime_splits += 1
+        self.publish_progress()
 
 
 def _source_pages(value: object) -> list[dict[str, object]]:
@@ -433,23 +483,37 @@ def _split_markdown(markdown: str) -> tuple[str, str]:
 def _split_page(
     page: dict[str, object],
     *,
-    budget: _ExtractionWorkBudget,
+    budget: _ExtractionWorkBudget | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     markdown = page.get("markdown")
     if not isinstance(markdown, str):
         raise WorkerInputError("Extraction OCR input is invalid.")
-    budget.consume_split()
+    raw_depth = page.get(_FRAGMENT_DEPTH_KEY, 0)
+    if type(raw_depth) is not int or raw_depth < 0:
+        raise WorkerInputError("Extraction OCR fragment is invalid.")
+    if raw_depth >= MAX_EXTRACTION_FRAGMENT_DEPTH:
+        raise GenerationError(
+            "Local extraction exceeded its fragment depth limit.",
+            category="fragment_depth_limit",
+        )
+    if len(markdown) < 2:
+        raise WorkerInputLimitError("Local extraction page cannot be split further.")
+    if budget is not None:
+        budget.reserve_runtime_split()
     left_markdown, right_markdown = _split_markdown(markdown)
     final_fragment = page.get(_FRAGMENT_FINAL_KEY, True)
+    next_depth = raw_depth + 1
     left = {
         "page_number": page["page_number"],
         "markdown": left_markdown,
         _FRAGMENT_FINAL_KEY: False,
+        _FRAGMENT_DEPTH_KEY: next_depth,
     }
     right = {
         "page_number": page["page_number"],
         "markdown": right_markdown,
         _FRAGMENT_FINAL_KEY: final_fragment,
+        _FRAGMENT_DEPTH_KEY: next_depth,
     }
     return left, right
 
@@ -574,45 +638,63 @@ def _run_extraction_batch(
         else [path for page_number, path in images_by_page.items() if page_number in page_numbers]
     )
     for retry in (False, True):
+        call_cap = budget.next_output_cap(max_tokens)
         prompt = _prompt(pages, retry=retry)
-        validate_token_budget(
-            selected,
-            [prompt, template, instructions],
-            max_output_tokens=max_tokens,
-        )
-        budget.consume_attempt()
-        raw = generate_fn(
-            model=selected.model,
-            processor=selected.processor,
-            prompt=prompt,
-            images=images,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            do_sample=False,
-            input_token_limit=min(
-                selected.decode_limits["max_input_tokens"],
-                _EXTRACTION_BATCH_INPUT_CAP,
-            ),
-            enable_thinking=False,
-            template=template,
-            mode="structured",
-            instructions=instructions,
-            activity_fn=attempt_progress_fn,
-        )
+        try:
+            validate_token_budget(
+                selected,
+                [prompt, template, instructions],
+                max_output_tokens=call_cap,
+            )
+        except WorkerInputLimitError:
+            raise _FormattedInputLimitError(
+                "Local extraction formatted input exceeds its runtime limit."
+            ) from None
+        budget.reserve_attempt()
+        try:
+            raw = generate_fn(
+                model=selected.model,
+                processor=selected.processor,
+                prompt=prompt,
+                images=images,
+                max_tokens=call_cap,
+                temperature=0.0,
+                do_sample=False,
+                input_token_limit=min(
+                    selected.decode_limits["max_input_tokens"],
+                    _EXTRACTION_BATCH_INPUT_CAP,
+                ),
+                enable_thinking=False,
+                template=template,
+                mode="structured",
+                instructions=instructions,
+                activity_fn=attempt_progress_fn,
+            )
+        except Exception:
+            budget.charge_generation(call_cap)
+            raise
         if attempt_progress_fn is not None:
             attempt_progress_fn()
+        exact_generation_tokens = getattr(raw, "generation_tokens", None)
+        if type(exact_generation_tokens) is int and 0 <= exact_generation_tokens <= call_cap:
+            generated_tokens = exact_generation_tokens
+            output_limit_reached = generated_tokens >= call_cap
+        elif type(exact_generation_tokens) is int and exact_generation_tokens > call_cap:
+            generated_tokens = call_cap
+            output_limit_reached = True
+        else:
+            try:
+                counted_tokens = _token_count(selected.processor, str(raw))
+            except WorkerInputError:
+                generated_tokens = call_cap
+                output_limit_reached = True
+            else:
+                generated_tokens = min(counted_tokens, call_cap)
+                output_limit_reached = counted_tokens >= call_cap
+        budget.charge_generation(generated_tokens)
         try:
             value = parse_json_object(raw)
         except GenerationError:
-            exact_generation_tokens = getattr(raw, "generation_tokens", None)
-            output_limit_reached = (
-                type(exact_generation_tokens) is int and exact_generation_tokens >= max_tokens
-            )
-            if exact_generation_tokens is None:
-                output_limit_reached = _token_count(selected.processor, raw) >= max(
-                    1,
-                    max_tokens - _OUTPUT_CAP_TOKEN_TOLERANCE,
-                )
             if output_limit_reached:
                 raise _TruncatedGenerationError(
                     "Local extraction exhausted its output token limit."
@@ -659,7 +741,7 @@ def _run_extraction_batch_with_runtime_splits(
     except _TruncatedGenerationError as exc:
         failure = exc
         should_split_page = True
-    except WorkerInputLimitError:
+    except _FormattedInputLimitError:
         should_split_page = True
     except GenerationError as exc:
         failure = exc
@@ -676,6 +758,7 @@ def _run_extraction_batch_with_runtime_splits(
             raise GenerationError("Local extraction returned invalid JSON.")
         raise failure
     if len(pages) > 1:
+        budget.reserve_runtime_split()
         midpoint = len(pages) // 2
         return [
             *_run_extraction_batch_with_runtime_splits(
@@ -1239,6 +1322,7 @@ def run_extraction(
     progress_fn: Callable[[int, int], None] | None = None,
     attempt_progress_fn: Callable[[], None] | None = None,
     lifecycle_progress_fn: Callable[[], None] | None = None,
+    budget_progress_fn: Callable[[dict[str, int]], None] | None = None,
 ) -> dict[str, object]:
     """Extract one schema-bounded clinical JSON document."""
 
@@ -1282,7 +1366,7 @@ def run_extraction(
         "Preserve verbatim clinical values."
     )
 
-    budget = _ExtractionWorkBudget()
+    budget = _ExtractionWorkBudget(progress_fn=budget_progress_fn)
     batches = _extraction_batches(
         pages,
         images_by_page=images_by_page,
@@ -1304,6 +1388,7 @@ def run_extraction(
 
     if progress_fn is not None:
         progress_fn(0, len(pages))
+    budget.publish_progress()
     resolved_batches = [
         item
         for batch in batches
