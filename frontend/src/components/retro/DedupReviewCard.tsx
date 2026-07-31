@@ -2,8 +2,7 @@
 
 import { useState } from "react";
 import { ChevronDown, ChevronRight, ArrowRight } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { RetroCard, RetroCardHeader, RetroCardContent } from "@/components/retro/RetroCard";
+import { RetroCard, RetroCardHeader } from "@/components/retro/RetroCard";
 import { RetroButton } from "@/components/retro/RetroButton";
 
 /* ==========================================

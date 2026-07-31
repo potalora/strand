@@ -32,7 +32,7 @@ function apiOrigin(): string {
  *    script loading and (in prod) eval blocked, which is the high-value win.
  *  - connect-src: same-origin + the backend API. Dev also opens an HMR
  *    websocket to the dev server, so ws:/wss: are allowed in dev only.
- *  - style-src: Tailwind, next/font, and inline style attributes inject inline
+ *  - style-src: Tailwind and inline style attributes inject inline
  *    <style>/style="" — these need 'unsafe-inline' in every mode.
  */
 function buildCsp(): string {

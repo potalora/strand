@@ -13,6 +13,12 @@ from app.models.token_blacklist import RevokedToken
 from app.models.cross_reference import RecordCrossReference
 from app.models.summary_item import SummaryItem
 from app.models.llm_settings import LLMProviderConfig, UserLLMPreferences
+from app.models.local_ai import (
+    ExtractionEvidence,
+    LocalAIExtractionCheckpoint,
+    LocalAIJob,
+    LocalAIPage,
+)
 
 __all__ = [
     "User",
@@ -29,4 +35,8 @@ __all__ = [
     "SummaryItem",
     "LLMProviderConfig",
     "UserLLMPreferences",
+    "LocalAIJob",
+    "LocalAIPage",
+    "LocalAIExtractionCheckpoint",
+    "ExtractionEvidence",
 ]

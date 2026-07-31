@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
 
 from app.middleware.encryption import encrypt_field
 from app.models.patient import Patient

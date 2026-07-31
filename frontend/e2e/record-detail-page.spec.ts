@@ -7,7 +7,7 @@ const email = testEmail("record-detail-page");
 
 test.describe("Record Detail Page (/records/[id])", () => {
   const api = new ApiClient();
-  let recordsByType: Record<string, string[]> = {};
+  const recordsByType: Record<string, string[]> = {};
 
   test.beforeAll(async () => {
     await api.register(email, TEST_PASSWORD);

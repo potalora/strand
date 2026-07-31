@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { useDropzone } from "react-dropzone";
 import {
   FolderUp,
@@ -15,25 +16,34 @@ import {
 } from "lucide-react";
 import { useDirectoryUpload } from "@/hooks/useDirectoryUpload";
 import { getFilesFromDrop } from "@/lib/getFilesFromDrop";
-import { api, type OcrNotice } from "@/lib/api";
+import { api, getLlmSettings, type OcrNotice } from "@/lib/api";
 import type {
   UploadResponse,
   UnstructuredUploadResponse,
-  TriggerExtractionResponse,
 } from "@/types/api";
 import { OcrNotices } from "@/components/retro/OcrNotices";
 import {
   deriveBatch,
+  EXTRACTION_POLL_STATUSES,
   formatStage,
   isTerminalStatus,
+  statusDotColor,
 } from "@/lib/extraction-progress";
 import {
+  batchIsPollable,
   statusMapFromFiles,
   useExtractionStore,
   type TrackedFileInput,
 } from "@/stores/useExtractionStore";
+import { useBackgroundProcessingStore } from "@/stores/useBackgroundProcessingStore";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
+import { LocalProcessingDetails } from "@/components/retro/LocalProcessingDetails";
+import type {
+  LocalProcessingFailure,
+  LocalRunInfo,
+  ProcessingMode,
+} from "@/types/local-ai";
 
 /* ==========================================
    FILE CLASSIFICATION HELPERS
@@ -41,6 +51,21 @@ import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
 
 const STRUCTURED_EXTENSIONS = new Set([".json", ".zip", ".tsv"]);
 const UNSTRUCTURED_EXTENSIONS = new Set([".pdf", ".rtf", ".tif", ".tiff"]);
+const PROCESSING_MODES = new Set<ProcessingMode>([
+  "validated_strict_local",
+  "custom_local",
+  "cloud_assisted",
+  "prompt_only",
+]);
+const UPLOAD_PROCESSING_MODES = new Set<ProcessingMode>([
+  "validated_strict_local",
+  "cloud_assisted",
+]);
+function uploadBlockedModeLabel(mode: ProcessingMode): string {
+  if (mode === "custom_local") return "Custom local (unverified)";
+  if (mode === "prompt_only") return "Prompt only";
+  return mode;
+}
 
 function getExtension(filename: string): string {
   const dot = filename.lastIndexOf(".");
@@ -62,36 +87,6 @@ function formatFileSize(bytes: number): string {
 }
 
 /* ==========================================
-   STATUS PILL HELPERS — neutral editorial hues
-   ========================================== */
-
-// Map a status to a tdot color drawn from the design tokens. We keep the pill
-// neutral (.tag) and only color the dot, matching the Overview/admin treatment.
-function statusDotColor(status: string): string {
-  switch (status) {
-    case "completed":
-    case "completed_with_merges":
-    case "awaiting_confirmation":
-    case "awaiting_review":
-    case "parsed":
-      return "var(--success)";
-    case "processing":
-    case "pending_extraction":
-    case "dedup_scanning":
-    case "pending":
-      return "var(--primary)";
-    case "failed":
-      return "var(--danger)";
-    case "cancelled":
-    case "duplicate_file":
-    case "duplicate":
-      return "var(--text-muted)";
-    default:
-      return "var(--text-muted)";
-  }
-}
-
-/* ==========================================
    UPLOAD HISTORY TYPES
    ========================================== */
 
@@ -100,7 +95,7 @@ interface UploadHistoryItem {
   filename: string;
   ingestion_status: string;
   records_inserted?: number;
-  created_at: string;
+  created_at: string | null;
   file_category?: string;
   record_count?: number;
   ingestion_progress?: {
@@ -115,6 +110,10 @@ interface UploadHistoryItem {
   ingestion_errors?: Array<Record<string, unknown>>;
   // Per-file OCR provider notices (fallback/unreadable). Default [].
   notices?: OcrNotice[];
+  local_run?: LocalRunInfo | null;
+  local_failure?: LocalProcessingFailure | null;
+  local_job_id?: string | null;
+  manual_extraction_required: boolean;
 }
 
 function statusLabel(status: string): string {
@@ -160,7 +159,7 @@ interface UploadResult {
 function SecureChip() {
   return (
     <span className="secure">
-      <Lock size={13} strokeWidth={1.9} /> End-to-end encrypted
+      <Lock size={13} strokeWidth={1.9} /> Application-layer encrypted at rest
     </span>
   );
 }
@@ -184,6 +183,48 @@ export default function UploadPage() {
   const [uploading, setUploading] = useState(false);
   const [uploadResults, setUploadResults] = useState<UploadResult[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [processingMode, setProcessingMode] =
+    useState<ProcessingMode | null>(null);
+  const [processingModeLoading, setProcessingModeLoading] = useState(true);
+  const [processingModeError, setProcessingModeError] =
+    useState<string | null>(null);
+  const [blockedProcessingMode, setBlockedProcessingMode] =
+    useState<ProcessingMode | null>(null);
+
+  const loadProcessingMode = useCallback(async () => {
+    setProcessingModeLoading(true);
+    setProcessingModeError(null);
+    setProcessingMode(null);
+    setBlockedProcessingMode(null);
+    try {
+      const settings = await getLlmSettings();
+      const mode = settings?.routing?.processing_mode;
+      if (!mode || !PROCESSING_MODES.has(mode)) {
+        throw new Error("invalid processing mode");
+      }
+      if (!UPLOAD_PROCESSING_MODES.has(mode)) {
+        setBlockedProcessingMode(mode);
+        return;
+      }
+      setProcessingMode(mode);
+    } catch {
+      setProcessingModeError(
+        "Privacy settings are unavailable. Uploads are blocked until the processing mode can be verified."
+      );
+    } finally {
+      setProcessingModeLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      if (active) await loadProcessingMode();
+    })();
+    return () => {
+      active = false;
+    };
+  }, [loadProcessingMode]);
 
   // --- Upload history ---
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -195,6 +236,9 @@ export default function UploadPage() {
   const [deleteTarget, setDeleteTarget] = useState<UploadHistoryItem | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [historyActionError, setHistoryActionError] = useState<string | null>(
+    null
+  );
 
   // --- Current extraction batch (shared with the global status bar) ---
   // The store is the single source of truth: starting a batch RESETS the prior
@@ -211,6 +255,49 @@ export default function UploadPage() {
   const markTriggered = useExtractionStore((s) => s.markTriggered);
   const markCancelling = useExtractionStore((s) => s.markCancelling);
   const dismissBatch = useExtractionStore((s) => s.dismiss);
+
+  const pollableBatch = batchIsPollable(files);
+  const batchKey = batchIds.join(",");
+  useEffect(() => {
+    if (!pollableBatch || batchKey === "" || dismissed) return;
+    let mounted = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = async () => {
+      try {
+        const [nextProgress, statuses] = await Promise.all([
+          api.getExtractionProgress(batchIds),
+          api.getExtractionFileStatuses(EXTRACTION_POLL_STATUSES),
+        ]);
+        if (!mounted) return;
+        useExtractionStore.getState().setProgress(nextProgress);
+        mergeFileStatuses(
+          statuses.files.map((file) => ({
+            id: file.id,
+            ingestion_status: file.ingestion_status,
+            progress_stage: file.progress_stage,
+            progress_detail: file.progress_detail,
+            local_run: file.local_run,
+            local_failure: file.local_failure,
+          }))
+        );
+      } catch {
+        // Keep the last server state visible and retry after the interval.
+      } finally {
+        if (mounted) timer = setTimeout(() => void tick(), 2000);
+      }
+    };
+    void tick();
+    return () => {
+      mounted = false;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [
+    batchIds,
+    batchKey,
+    dismissed,
+    mergeFileStatuses,
+    pollableBatch,
+  ]);
 
   // ZIP-extracted children that still need a manual Extract click.
   const [selectedForExtraction, setSelectedForExtraction] = useState<Set<string>>(
@@ -240,10 +327,8 @@ export default function UploadPage() {
   const fetchHistory = useCallback(async () => {
     setHistoryLoading(true);
     try {
-      const data = await api.get<{ items: UploadHistoryItem[]; total: number }>(
-        "/upload/history"
-      );
-      setHistory(data.items || []);
+      const data = await api.getUploadHistory();
+      setHistory((data.items || []) as unknown as UploadHistoryItem[]);
       setHistoryLoaded(true);
     } catch {
       setHistory([]);
@@ -331,11 +416,18 @@ export default function UploadPage() {
   // --- Upload all files ---
   const handleUploadAll = useCallback(async () => {
     if (selectedFiles.length === 0) return;
+    if (!processingMode || !UPLOAD_PROCESSING_MODES.has(processingMode)) {
+      setUploadError(
+        "Upload blocked because ingestion does not support the saved processing mode."
+      );
+      return;
+    }
     setUploading(true);
     setUploadError(null);
     setUploadResults([]);
 
     const results: UploadResult[] = [];
+    const uploadProcessingMode = processingMode;
     // Every unstructured upload ID produced by THIS action — direct files,
     // batch files, and ZIP-extracted children — becomes the new batch.
     const batchInputs: TrackedFileInput[] = [];
@@ -349,6 +441,7 @@ export default function UploadPage() {
       try {
         const formData = new FormData();
         formData.append("file", file);
+        formData.append("processing_mode", uploadProcessingMode);
         const resp = await api.postForm<UploadResponse>("/upload", formData);
         results.push({ type: "structured", filename: file.name, response: resp });
         if (resp.unstructured_uploads && resp.unstructured_uploads.length > 0) {
@@ -359,7 +452,7 @@ export default function UploadPage() {
               upload_id: u.upload_id,
               filename: u.filename,
               status: u.status || "pending_extraction",
-              needsTrigger: true,
+              needsTrigger: u.manual_extraction_required === true,
             });
           }
         }
@@ -378,6 +471,7 @@ export default function UploadPage() {
       try {
         const formData = new FormData();
         formData.append("file", file);
+        formData.append("processing_mode", uploadProcessingMode);
         const resp = await api.postForm<UnstructuredUploadResponse>(
           "/upload/unstructured",
           formData
@@ -387,7 +481,7 @@ export default function UploadPage() {
           upload_id: resp.upload_id,
           filename: file.name,
           status: resp.status || "pending_extraction",
-          needsTrigger: false,
+          needsTrigger: resp.manual_extraction_required === true,
         });
       } catch (err) {
         results.push({
@@ -402,6 +496,7 @@ export default function UploadPage() {
         for (const file of unstructured) {
           formData.append("files", file);
         }
+        formData.append("processing_mode", uploadProcessingMode);
         const resp = await api.postForm<{
           uploads: UnstructuredUploadResponse[];
         }>("/upload/unstructured-batch", formData);
@@ -413,7 +508,7 @@ export default function UploadPage() {
             upload_id: upload.upload_id,
             filename,
             status: upload.status || "pending_extraction",
-            needsTrigger: false,
+            needsTrigger: upload.manual_extraction_required === true,
           });
         }
       } catch (err) {
@@ -432,33 +527,70 @@ export default function UploadPage() {
     if (batchInputs.length > 0) {
       startBatch(batchInputs);
       setSelectedForExtraction(new Set());
+      const labels = Object.fromEntries(
+        batchInputs.map((input) => [input.upload_id, input.filename])
+      );
+      try {
+        const serverJobs = await api.getLocalAIJobs(true);
+        const background = useBackgroundProcessingStore.getState();
+        background.applyServerJobs(serverJobs);
+        background.registerUploadLabels(labels);
+      } catch {
+        // The authenticated monitor will discover durable jobs on its next load.
+      }
     }
 
     setUploadResults(results);
     setSelectedFiles([]);
     setUploading(false);
     setHistoryLoaded(false);
-  }, [selectedFiles, startBatch]);
+  }, [processingMode, selectedFiles, startBatch]);
 
   // --- Trigger extraction for the selected ZIP children ---
   const handleTriggerExtraction = useCallback(async () => {
     if (selectedForExtraction.size === 0) return;
     const ids = Array.from(selectedForExtraction);
-    // Optimistically reflect the trigger; polling refines from here.
-    markTriggered(ids);
-    mergeFileStatuses(ids.map((id) => ({ id, ingestion_status: "processing" })));
+    setUploadError(null);
     try {
-      const resp = await api.post<TriggerExtractionResponse>(
-        "/upload/trigger-extraction",
-        { upload_ids: ids }
-      );
+      const resp = await api.triggerExtraction(ids);
+      const accepted = resp.results
+        .filter((result) => result.status === "pending_extraction")
+        .map((result) => result.upload_id);
+      if (accepted.length === 0) {
+        throw new Error("The selected files are not available for extraction.");
+      }
+      markTriggered(accepted);
       mergeFileStatuses(
         resp.results.map((r) => ({ id: r.upload_id, ingestion_status: r.status }))
       );
-    } catch {
-      /* the file stays tracked; the next poll reflects reality */
+      const serverJobs = await api.getLocalAIJobs(true);
+      const background = useBackgroundProcessingStore.getState();
+      background.applyServerJobs(serverJobs);
+      background.registerUploadLabels(
+        Object.fromEntries(
+          accepted
+            .map((id) => files[id])
+            .filter((file) => file !== undefined)
+            .map((file) => [file.upload_id, file.filename])
+        )
+      );
+      setSelectedForExtraction(
+        (current) =>
+          new Set([...current].filter((id) => !accepted.includes(id)))
+      );
+      if (resp.failed > 0) {
+        setUploadError(
+          `${resp.failed} selected file${resp.failed === 1 ? "" : "s"} could not be started.`
+        );
+      }
+    } catch (error) {
+      setUploadError(
+        error instanceof Error
+          ? error.message
+          : "Extraction could not be started."
+      );
     }
-  }, [selectedForExtraction, markTriggered, mergeFileStatuses]);
+  }, [selectedForExtraction, markTriggered, mergeFileStatuses, files]);
 
   // --- Cancel in-flight extractions ---
   const handleCancel = useCallback(
@@ -487,33 +619,79 @@ export default function UploadPage() {
         status: "processing",
         needsTrigger: false,
       }));
-      await api.post<TriggerExtractionResponse>("/upload/trigger-extraction", {
-        upload_ids: inputs.map((f) => f.upload_id),
-      });
-      startBatch(inputs);
-    } catch {
-      /* silently fail */
+      const triggered = await api.triggerExtraction(
+        inputs.map((input) => input.upload_id)
+      );
+      const acceptedIds = new Set(
+        triggered.results
+          .filter((result) => result.status === "pending_extraction")
+          .map((result) => result.upload_id)
+      );
+      const accepted = inputs.filter((input) =>
+        acceptedIds.has(input.upload_id)
+      );
+      if (accepted.length > 0) startBatch(accepted);
+      if (triggered.failed > 0 || accepted.length === 0) {
+        setUploadError("Some failed extractions could not be retried.");
+      }
+    } catch (error) {
+      setUploadError(
+        error instanceof Error ? error.message : "Retry could not be started."
+      );
     }
   }, [startBatch]);
 
   // --- Retry / extract a single history row ---
   const handleHistoryExtract = useCallback(
     async (upload: UploadHistoryItem) => {
+      setHistoryActionError(null);
       try {
-        await api.post<TriggerExtractionResponse>("/upload/trigger-extraction", {
-          upload_ids: [upload.id],
-        });
+        if (
+          upload.local_run?.privacy_mode === "validated_strict_local" &&
+          upload.ingestion_status === "failed"
+        ) {
+          if (
+            !upload.local_job_id ||
+            upload.local_failure?.retryable !== true
+          ) {
+            throw new Error("This background job cannot be retried.");
+          }
+          const retried = await api.retryLocalAIJob(upload.local_job_id);
+          useBackgroundProcessingStore.getState().applyServerJobs([retried]);
+        } else {
+          const response = await api.triggerExtraction([upload.id]);
+          const result = response.results.find(
+            (item) => item.upload_id === upload.id
+          );
+          if (
+            response.failed > 0 ||
+            result?.status !== "pending_extraction"
+          ) {
+            throw new Error("This file is not available for extraction.");
+          }
+          const serverJobs = await api.getLocalAIJobs(true);
+          useBackgroundProcessingStore
+            .getState()
+            .applyServerJobs(serverJobs);
+        }
+        useBackgroundProcessingStore
+          .getState()
+          .registerUploadLabels({ [upload.id]: upload.filename });
         startBatch([
           {
             upload_id: upload.id,
             filename: upload.filename,
-            status: "processing",
+            status: "pending_extraction",
             needsTrigger: false,
           },
         ]);
         setHistoryLoaded(false);
-      } catch {
-        /* silently fail */
+      } catch (error) {
+        setHistoryActionError(
+          error instanceof Error
+            ? error.message
+            : "The extraction action could not be completed."
+        );
       }
     },
     [startBatch]
@@ -587,6 +765,64 @@ export default function UploadPage() {
         </div>
         <SecureChip />
       </div>
+
+      {(processingModeLoading ||
+        processingModeError ||
+        blockedProcessingMode) && (
+        <div
+          className="card-surface pad"
+          role={processingModeError || blockedProcessingMode ? "alert" : "status"}
+          style={{ marginBottom: 16 }}
+        >
+          <div
+            className="between"
+            style={{ alignItems: "center", gap: 12 }}
+          >
+            <p
+              className="dim"
+              style={{ fontSize: 13, lineHeight: 1.5, margin: 0 }}
+            >
+              {blockedProcessingMode
+                ? `Uploads do not support ${uploadBlockedModeLabel(
+                    blockedProcessingMode
+                  )} processing. Choose Cloud assisted or Validated strict local in Admin > System before uploading. No upload was sent.`
+                : processingModeError ??
+                  "Loading privacy settings before uploads are enabled…"}
+            </p>
+            {processingModeError && (
+              <button
+                type="button"
+                className="btn ghost sm"
+                onClick={() => void loadProcessingMode()}
+                disabled={processingModeLoading}
+              >
+                Retry privacy settings
+              </button>
+            )}
+            {blockedProcessingMode && (
+              <Link className="btn ghost sm" href="/admin?tab=sys">
+                Open AI settings
+              </Link>
+            )}
+          </div>
+        </div>
+      )}
+
+      {processingMode === "cloud_assisted" && (
+        <div
+          className="card-surface pad"
+          role="note"
+          aria-label="Cloud-assisted OCR privacy"
+          style={{ marginBottom: 16 }}
+        >
+          <p className="dim" style={{ fontSize: 13, lineHeight: 1.5, margin: 0 }}>
+            Scanned PDF and TIFF pages are sent in their original, unredacted form
+            to the selected vision provider so it can read them. Text sent for later
+            extraction is de-identified first. Choose the strict-local mode if the
+            original document must stay on this machine.
+          </p>
+        </div>
+      )}
 
       {/* ==========================================
           HERO DROPZONE
@@ -728,7 +964,11 @@ export default function UploadPage() {
 
           {/* Upload All button */}
           <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
-            <button className="btn" onClick={handleUploadAll} disabled={uploading}>
+            <button
+              className="btn"
+              onClick={handleUploadAll}
+              disabled={uploading || processingMode === null}
+            >
               {uploading ? "Uploading…" : "Upload all"}
             </button>
           </div>
@@ -856,7 +1096,11 @@ export default function UploadPage() {
           EXTRACTION PROGRESS / SUMMARY (scoped to the current batch)
           ========================================== */}
       {showProgressCard && (
-        <div className="card-surface pad">
+        <div
+          className="card-surface pad"
+          role="region"
+          aria-label="Extraction status"
+        >
           <div className="card-h">
             <h3 className="sec-title">
               {batch.allTerminal
@@ -976,6 +1220,12 @@ export default function UploadPage() {
                                 {stage}
                               </div>
                             )}
+                            <LocalProcessingDetails
+                              compact
+                              localRun={f.local_run}
+                              failure={f.local_failure}
+                              progressDetail={f.progress_detail}
+                            />
                           </td>
                           <td>
                             <span className="tag">
@@ -1166,13 +1416,13 @@ export default function UploadPage() {
 
         {historyOpen && (
           <div style={{ padding: "0 22px 22px" }}>
-            {deleteError && (
+            {(deleteError || historyActionError) && (
               <div
                 className="tag"
                 style={{ color: "var(--danger)", marginBottom: 12 }}
               >
                 <span className="tdot" style={{ background: "var(--danger)" }} />
-                {deleteError}
+                {deleteError || historyActionError}
               </div>
             )}
             {historyLoading ? (
@@ -1198,6 +1448,21 @@ export default function UploadPage() {
                     {history.map((upload) => {
                       const ext =
                         upload.filename.split(".").pop()?.toLowerCase() || "—";
+                      const canExtract =
+                        upload.ingestion_status === "pending_extraction" &&
+                        upload.manual_extraction_required === true;
+                      const canRetryStrict =
+                        upload.ingestion_status === "failed" &&
+                        upload.local_run?.privacy_mode ===
+                          "validated_strict_local" &&
+                        typeof upload.local_job_id === "string" &&
+                        upload.local_failure?.retryable === true;
+                      const canRetryNonStrict =
+                        upload.ingestion_status === "failed" &&
+                        upload.local_run?.privacy_mode !==
+                          "validated_strict_local";
+                      const showExtractionAction =
+                        canExtract || canRetryStrict || canRetryNonStrict;
                       return (
                         <tr key={upload.id}>
                           <td className="desc">
@@ -1222,6 +1487,11 @@ export default function UploadPage() {
                               </div>
                             )}
                             <OcrNotices notices={upload.notices} />
+                            <LocalProcessingDetails
+                              compact
+                              localRun={upload.local_run}
+                              failure={upload.local_failure}
+                            />
                           </td>
                           <td>
                             <span className="tag" style={{ textTransform: "uppercase" }}>
@@ -1252,9 +1522,7 @@ export default function UploadPage() {
                                 gap: 8,
                               }}
                             >
-                              {(upload.ingestion_status === "pending_extraction" ||
-                                upload.ingestion_status === "failed" ||
-                                upload.ingestion_status === "processing") && (
+                              {showExtractionAction && (
                                 <button
                                   className="btn ghost sm"
                                   onClick={(e: React.MouseEvent) => {
@@ -1263,7 +1531,9 @@ export default function UploadPage() {
                                   }}
                                 >
                                   <RotateCcw size={13} />
-                                  {upload.ingestion_status === "failed" ? "Retry" : "Extract"}
+                                  {upload.ingestion_status === "failed"
+                                    ? "Retry"
+                                    : "Extract"}
                                 </button>
                               )}
                               <button

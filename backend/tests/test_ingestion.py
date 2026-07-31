@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -30,7 +31,11 @@ class TestFHIRParser:
             "resourceType": "Condition",
             "code": {
                 "coding": [
-                    {"system": "http://snomed.info/sct", "code": "44054006", "display": "Type 2 diabetes mellitus"}
+                    {
+                        "system": "http://snomed.info/sct",
+                        "code": "44054006",
+                        "display": "Type 2 diabetes mellitus",
+                    }
                 ]
             },
             "clinicalStatus": {"coding": [{"code": "active"}]},
@@ -53,7 +58,11 @@ class TestFHIRParser:
             "status": "final",
             "code": {
                 "coding": [
-                    {"system": "http://loinc.org", "code": "4548-4", "display": "Hemoglobin A1c"}
+                    {
+                        "system": "http://loinc.org",
+                        "code": "4548-4",
+                        "display": "Hemoglobin A1c",
+                    }
                 ]
             },
             "effectiveDateTime": "2024-01-10T10:30:00Z",
@@ -77,9 +86,14 @@ class TestFHIRParser:
 
     def test_extract_dates(self):
         """Extract dates from various FHIR date fields."""
-        assert extract_effective_date({"effectiveDateTime": "2024-01-10T10:30:00Z"}) is not None
+        assert (
+            extract_effective_date({"effectiveDateTime": "2024-01-10T10:30:00Z"})
+            is not None
+        )
         assert extract_effective_date({"onsetDateTime": "2020-03-15"}) is not None
-        assert extract_effective_date({"issued": "2024-01-10T10:30:00+00:00"}) is not None
+        assert (
+            extract_effective_date({"issued": "2024-01-10T10:30:00+00:00"}) is not None
+        )
         assert extract_effective_date({}) is None
 
     def test_extract_dates_period(self):
@@ -117,7 +131,10 @@ class TestFHIRParser:
     def test_extract_status(self):
         """Extract status from different FHIR patterns."""
         assert extract_status({"status": "active"}) == "active"
-        assert extract_status({"clinicalStatus": {"coding": [{"code": "active"}]}}) == "active"
+        assert (
+            extract_status({"clinicalStatus": {"coding": [{"code": "active"}]}})
+            == "active"
+        )
         assert extract_status({}) is None
 
     def test_build_display_text_encounter(self):
@@ -301,6 +318,82 @@ class TestEpicMappers:
         mapper = VitalsMapper()
         assert mapper.to_fhir({"FLO_MEAS_NAME": "BP", "MEAS_VALUE": ""}) is None
 
+    def test_vitals_companion_values_join_by_primary_key_not_row_order(
+        self,
+        tmp_path: Path,
+    ):
+        """Epic's external value companion must enrich the matching measurement."""
+        from app.services.ingestion import epic_parser
+        from app.services.ingestion.epic_mappers.vitals import VitalsMapper
+
+        companion = tmp_path / "V_EHI_FLO_MEAS_VALUE.tsv"
+        companion.write_text(
+            "FSD_ID\tLINE\tMEAS_VALUE_EXTERNAL\tUNITS\tVALUE_TYPE_C_NAME\n"
+            "record-b\t2\t98.6\tF\tTemperature\n"
+            "record-a\t1\t120\tmmHg\tNumeric\n",
+            encoding="utf-8",
+        )
+        measurement = {
+            "FSD_ID": "record-a",
+            "LINE": "1",
+            "FLO_MEAS_ID_FLO_MEAS_NAME": "Blood Pressure Systolic",
+            "RECORDED_TIME": "2/15/2024 10:30:00 AM",
+        }
+
+        with epic_parser._VitalsValueIndex(tmp_path) as values:
+            enriched = epic_parser._enrich_epic_row(
+                "IP_FLWSHT_MEAS",
+                measurement,
+                values,
+            )
+
+        result = VitalsMapper().to_fhir(enriched)
+        assert result is not None
+        assert result["valueQuantity"] == {"value": 120.0, "unit": "mmHg"}
+
+    @pytest.mark.asyncio
+    async def test_epic_parser_joins_vitals_companion_before_mapping(
+        self,
+        tmp_path: Path,
+    ):
+        """The export parser must join Epic's separate external-value table."""
+        from app.services.ingestion.epic_parser import parse_epic_export
+
+        (tmp_path / "IP_FLWSHT_MEAS.tsv").write_text(
+            "FSD_ID\tLINE\tFLO_MEAS_ID_FLO_MEAS_NAME\tRECORDED_TIME\n"
+            "record-a\t1\tBlood Pressure Systolic\t2/15/2024 10:30:00 AM\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "V_EHI_FLO_MEAS_VALUE.tsv").write_text(
+            "FSD_ID\tLINE\tMEAS_VALUE_EXTERNAL\tUNITS\tVALUE_TYPE_C_NAME\n"
+            "record-a\t1\t120\tmmHg\tNumeric\n",
+            encoding="utf-8",
+        )
+        inserted: list[dict] = []
+
+        async def capture_insert(_db, batch):
+            inserted.extend(batch)
+            return {"inserted": len(batch), "updated": 0, "unchanged": 0}
+
+        db = AsyncMock()
+        with patch(
+            "app.services.ingestion.epic_parser.idempotent_insert_records",
+            side_effect=capture_insert,
+        ):
+            stats = await parse_epic_export(
+                tmp_path,
+                uuid4(),
+                uuid4(),
+                None,
+                db,
+            )
+
+        assert stats["records_inserted"] == 1
+        assert inserted[0]["fhir_resource"]["valueQuantity"] == {
+            "value": 120.0,
+            "unit": "mmHg",
+        }
+
     def test_referral_mapper(self):
         """ReferralMapper produces ServiceRequest."""
         from app.services.ingestion.epic_mappers.referrals import ReferralMapper
@@ -327,10 +420,15 @@ class TestEpicMappers:
         from app.services.ingestion.epic_mappers.referrals import ReferralMapper
 
         mapper = ReferralMapper()
-        assert mapper.to_fhir({
-            "RSN_FOR_RFL_C_NAME": "",
-            "REFERRAL_PROV_ID_PROV_NAME": "",
-        }) is None
+        assert (
+            mapper.to_fhir(
+                {
+                    "RSN_FOR_RFL_C_NAME": "",
+                    "REFERRAL_PROV_ID_PROV_NAME": "",
+                }
+            )
+            is None
+        )
 
     def test_encounter_dx_mapper(self):
         """EncounterDxMapper produces Condition with encounter-diagnosis category."""
@@ -566,7 +664,10 @@ class TestEpicMappers:
         result = mapper.to_fhir(row)
         assert result is not None
         assert result["resourceType"] == "MedicationRequest"
-        assert result["medicationCodeableConcept"]["text"] == "Lisinopril 10 MG Oral Tablet"
+        assert (
+            result["medicationCodeableConcept"]["text"]
+            == "Lisinopril 10 MG Oral Tablet"
+        )
         assert result["status"] == "completed"
         assert result["intent"] == "order"
         assert result["authoredOn"] is not None
@@ -645,7 +746,9 @@ class TestEpicMappers:
         assert result["category"][0]["coding"][0]["code"] == "laboratory"
         assert result["code"]["text"] == "Glucose"
         assert result["code"]["coding"][0]["system"] == "http://loinc.org"
-        assert result["code"]["coding"][0]["display"] == "Glucose [Mass/volume] in Blood"
+        assert (
+            result["code"]["coding"][0]["display"] == "Glucose [Mass/volume] in Blood"
+        )
         assert result["valueQuantity"]["value"] == 95.0
         assert result["valueQuantity"]["unit"] == "mg/dL"
         assert result["effectiveDateTime"] is not None
@@ -836,10 +939,21 @@ class TestEpicMapperRegistration:
         from app.services.ingestion.epic_parser import EPIC_TABLE_MAPPERS
 
         expected_tables = {
-            "PROBLEM_LIST", "PROBLEM_LIST_ALL", "MEDICAL_HX",
-            "ORDER_MED", "ORDER_RESULTS", "PAT_ENC", "DOC_INFORMATION",
-            "ALLERGY", "IMMUNE", "ORDER_PROC", "IP_FLWSHT_MEAS",
-            "REFERRAL", "PAT_ENC_DX", "SOCIAL_HX", "FAMILY_HX",
+            "PROBLEM_LIST",
+            "PROBLEM_LIST_ALL",
+            "MEDICAL_HX",
+            "ORDER_MED",
+            "ORDER_RESULTS",
+            "PAT_ENC",
+            "DOC_INFORMATION",
+            "ALLERGY",
+            "IMMUNE",
+            "ORDER_PROC",
+            "IP_FLWSHT_MEAS",
+            "REFERRAL",
+            "PAT_ENC_DX",
+            "SOCIAL_HX",
+            "FAMILY_HX",
         }
         assert expected_tables.issubset(set(EPIC_TABLE_MAPPERS.keys()))
 
@@ -861,8 +975,14 @@ class TestEpicFixtures:
         tsv_dir = FIXTURES_DIR / "sample_epic_tsv"
         if not tsv_dir.exists():
             pytest.skip("No sample Epic TSV directory")
-        expected = {"PATIENT.tsv", "PROBLEM_LIST.tsv", "ORDER_RESULTS.tsv",
-                    "MEDICATIONS.tsv", "ENCOUNTERS.tsv", "ALLERGIES.tsv"}
+        expected = {
+            "PATIENT.tsv",
+            "PROBLEM_LIST.tsv",
+            "ORDER_RESULTS.tsv",
+            "MEDICATIONS.tsv",
+            "ENCOUNTERS.tsv",
+            "ALLERGIES.tsv",
+        }
         actual = {f.name for f in tsv_dir.glob("*.tsv")}
         assert expected.issubset(actual)
 

@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import logging
+import os
 import shutil
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.patient import Patient
+from app.models.record import HealthRecord
 from app.models.uploaded_file import UploadedFile
 from app.services.ingestion.cda_dedup import deduplicate_across_documents
 from app.services.ingestion.cda_parser import parse_cda_document
@@ -27,9 +30,30 @@ from app.services.ingestion.patient_demographics import (
     extract_fhir_demographics,
 )
 from app.services.ingestion.xdm_parser import parse_xdm_metadata
-from app.utils.file_utils import decrypt_file_to, is_encrypted_file
+from app.services.ingestion.zip_child_sets import (
+    STAGING_EXTRACTION_STATUS,
+    ZipChildSet,
+)
+from app.services.local_ai.manifest import canonicalize_manifest_snapshot
+from app.services.local_ai.processing_snapshot import (
+    ProcessingSnapshot,
+    build_ingestion_job,
+    revalidate_strict_snapshot_admission,
+)
+from app.services.local_ai.types import ProcessingMode
+from app.utils.file_utils import (
+    EncryptedFileWriter,
+    decrypt_file_to,
+    is_encrypted_file,
+)
 
 logger = logging.getLogger(__name__)
+
+# Keep ownership of work that outlives the request which scheduled it. This lets
+# shutdown drain the tasks cleanly instead of closing their database connections
+# beneath a still-running coroutine.
+_dedup_tasks: set[asyncio.Task[None]] = set()
+_DEDUP_RECOVERY_BATCH_SIZE = 1_000
 
 # --- SEC-DOS-02: zip-bomb defenses ---------------------------------------
 #
@@ -43,6 +67,31 @@ _ZIP_MAX_MEMBER_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB / member
 _ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024 * 1024  # 50 GiB total
 _ZIP_MAX_COMPRESSION_RATIO = 100.0  # reject members inflating > 100x
 _ZIP_EXTRACT_CHUNK = 1024 * 1024  # 1 MiB streaming chunk
+
+
+def _encrypt_zip_child(source: Path, destination: Path) -> tuple[int, int]:
+    """Encrypt privately, then atomically publish one complete ZIP child."""
+    staging = ZipChildSet(
+        destination.parent,
+        writer_factory=EncryptedFileWriter,
+    )
+    try:
+        identity = staging.encrypt(source, destination.name)
+        staging.seal()
+        staging.publish()
+        published = staging.final_path / destination.name
+        try:
+            os.link(published, destination, follow_symlinks=False)
+        except BaseException:
+            staging.remove_published()
+            raise
+        published.unlink()
+        os.fsync(staging.pending_fd)
+        os.rmdir(staging.final_name, dir_fd=staging.root_fd)
+        os.fsync(staging.root_fd)
+        return identity
+    finally:
+        staging.close()
 
 
 def _zip_safe_target(temp_dir: Path, member_name: str) -> Path | None:
@@ -87,7 +136,8 @@ def _safe_extract_zip(zf: zipfile.ZipFile, temp_dir: Path) -> None:
             ratio = info.file_size / info.compress_size
             if ratio > _ZIP_MAX_COMPRESSION_RATIO:
                 raise HTTPException(
-                    status_code=413, detail="ZIP compression ratio too high (suspected zip bomb)"
+                    status_code=413,
+                    detail="ZIP compression ratio too high (suspected zip bomb)",
                 )
         declared_total += info.file_size
     if declared_total > _ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES:
@@ -137,7 +187,10 @@ def _find_patient_resource_streaming(file_path: Path) -> dict | None:
                 if not isinstance(entry, dict):
                     continue
                 resource = entry.get("resource")
-                if isinstance(resource, dict) and resource.get("resourceType") == "Patient":
+                if (
+                    isinstance(resource, dict)
+                    and resource.get("resourceType") == "Patient"
+                ):
                     return resource
     except Exception as e:  # noqa: BLE001 - fail-open; never block ingestion
         logger.warning("Streaming Patient lookup failed for %s: %s", file_path, e)
@@ -157,9 +210,12 @@ async def get_or_create_patient(
         # the deterministic PHI scrubber can strip the patient's own name.
         if demo:
             await backfill_patient_demographics(
-                db, patient,
-                name=demo.get("name"), mrn=demo.get("mrn"),
-                dob=demo.get("dob"), gender=demo.get("gender"),
+                db,
+                patient,
+                name=demo.get("name"),
+                mrn=demo.get("mrn"),
+                dob=demo.get("dob"),
+                gender=demo.get("gender"),
             )
         return patient
 
@@ -173,9 +229,12 @@ async def get_or_create_patient(
     await db.refresh(patient)
     if demo:
         await backfill_patient_demographics(
-            db, patient,
-            name=demo.get("name"), mrn=demo.get("mrn"),
-            dob=demo.get("dob"), gender=demo.get("gender"),
+            db,
+            patient,
+            name=demo.get("name"),
+            mrn=demo.get("mrn"),
+            dob=demo.get("dob"),
+            gender=demo.get("gender"),
         )
     return patient
 
@@ -238,6 +297,10 @@ async def ingest_file(
     file_path: Path,
     original_filename: str,
     mime_type: str = "application/octet-stream",
+    *,
+    processing_mode: str = "cloud_assisted",
+    processing_manifest: dict | None = None,
+    processing_schema_version: str | None = None,
 ) -> dict:
     """Main ingestion entry point. Detects file type and routes to appropriate parser."""
     # CRYPTO-02 (issue #54): structured uploads are encrypted at rest in the
@@ -278,6 +341,9 @@ async def ingest_file(
             storage_path=str(file_path),
             ingestion_status="processing",
             processing_started_at=datetime.now(timezone.utc),
+            processing_mode=processing_mode,
+            processing_manifest=copy.deepcopy(processing_manifest),
+            processing_schema_version=processing_schema_version,
         )
         db.add(upload)
         await db.commit()
@@ -287,13 +353,19 @@ async def ingest_file(
 
         try:
             if file_type == "fhir_r4":
-                stats = await _ingest_fhir(db, user_id, patient.id, upload.id, work_path)
+                stats = await _ingest_fhir(
+                    db, user_id, patient.id, upload.id, work_path
+                )
             elif file_type == "epic_ehi":
-                stats = await _ingest_epic_dir(db, user_id, patient.id, upload.id, work_path)
+                stats = await _ingest_epic_dir(
+                    db, user_id, patient.id, upload.id, work_path
+                )
             elif file_type == "zip":
                 stats = await _ingest_zip(db, user_id, patient.id, upload.id, work_path)
             elif file_type == "cda_xml":
-                stats = await _ingest_cda_standalone(db, user_id, patient.id, upload.id, work_path)
+                stats = await _ingest_cda_standalone(
+                    db, user_id, patient.id, upload.id, work_path
+                )
             else:
                 raise ValueError(f"Unsupported file type: {file_type}")
 
@@ -312,9 +384,7 @@ async def ingest_file(
             upload.ingestion_status = "dedup_scanning"
             await db.commit()
 
-            asyncio.create_task(
-                _run_dedup_background(upload.id, patient.id, user_id)
-            )
+            schedule_dedup_background(upload.id, patient.id, user_id)
 
             return {
                 "upload_id": str(upload.id),
@@ -348,13 +418,23 @@ async def _run_dedup_background(
 
     try:
         async with async_session_factory() as db:
-            upload = await db.get(UploadedFile, upload_id)
+            upload = await _claim_dedup_upload(db, upload_id, user_id)
             if not upload:
-                logger.error("Background dedup: upload %s not found", upload_id)
+                logger.info(
+                    "Background dedup: upload %s was absent, terminal, or already claimed "
+                    "for owner %s",
+                    upload_id,
+                    user_id,
+                )
                 return
 
             dedup_summary = await run_upload_dedup(
-                upload_id, patient_id, user_id, db
+                upload_id,
+                patient_id,
+                user_id,
+                db,
+                processing_mode=upload.processing_mode,
+                commit=False,
             )
             upload.dedup_summary = dedup_summary.to_dict()
 
@@ -369,20 +449,197 @@ async def _run_dedup_background(
             await db.commit()
             logger.info(
                 "Background dedup completed for %s: %d candidates, %d auto-merged, %d need review",
-                upload_id, dedup_summary.total_candidates,
-                dedup_summary.auto_merged, dedup_summary.needs_review,
+                upload_id,
+                dedup_summary.total_candidates,
+                dedup_summary.auto_merged,
+                dedup_summary.needs_review,
             )
+    except asyncio.CancelledError:
+        logger.info("Background dedup cancelled for %s", upload_id)
+        await _mark_dedup_interrupted(upload_id, user_id, retryable=True)
+        raise
     except Exception:
         logger.exception("Background dedup failed for %s", upload_id)
-        try:
-            async with async_session_factory() as db:
-                upload = await db.get(UploadedFile, upload_id)
-                if upload:
-                    upload.ingestion_status = "completed"
+        await _mark_dedup_interrupted(upload_id, user_id, retryable=False)
+
+
+async def _owned_processing_upload(
+    db: AsyncSession,
+    upload_id: UUID,
+    user_id: UUID,
+) -> UploadedFile | None:
+    """Lock one active scan without weakening the tenant boundary."""
+    return (
+        await db.execute(
+            select(UploadedFile)
+            .where(
+                UploadedFile.id == upload_id,
+                UploadedFile.user_id == user_id,
+                UploadedFile.ingestion_status == "dedup_processing",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+
+
+async def _claim_dedup_upload(
+    db: AsyncSession,
+    upload_id: UUID,
+    user_id: UUID,
+) -> UploadedFile | None:
+    """Claim one tenant-owned scan while holding its row lock through completion."""
+    upload = (
+        await db.execute(
+            select(UploadedFile)
+            .where(
+                UploadedFile.id == upload_id,
+                UploadedFile.user_id == user_id,
+                UploadedFile.ingestion_status.in_(
+                    ("dedup_scanning", "dedup_processing")
+                ),
+            )
+            .with_for_update(skip_locked=True)
+        )
+    ).scalar_one_or_none()
+    if upload is not None:
+        upload.ingestion_status = "dedup_processing"
+        upload.processing_started_at = datetime.now(timezone.utc)
+        upload.processing_completed_at = None
+    return upload
+
+
+async def _mark_dedup_interrupted(
+    upload_id: UUID,
+    user_id: UUID,
+    *,
+    retryable: bool,
+) -> None:
+    """Persist truthful state after a cancelled or failed dedup pass."""
+    from app.database import async_session_factory
+
+    try:
+        async with async_session_factory() as db:
+            upload = await _owned_processing_upload(db, upload_id, user_id)
+            if upload:
+                if retryable:
+                    upload.ingestion_status = "dedup_scanning"
+                    upload.processing_started_at = None
+                    upload.processing_completed_at = None
+                else:
+                    upload.ingestion_status = "failed"
                     upload.processing_completed_at = datetime.now(timezone.utc)
-                    await db.commit()
-        except Exception:
-            logger.exception("Failed to update upload status after dedup error")
+                await db.commit()
+    except Exception:
+        logger.exception("Failed to update upload status after interrupted dedup")
+
+
+async def recover_dedup_background_specs(
+    db: AsyncSession,
+) -> list[tuple[UUID, UUID, UUID]]:
+    """Claim a bounded batch of crash-interrupted dedup tasks to resume."""
+    recovered_at = datetime.now(timezone.utc)
+    stale_before = recovered_at - timedelta(
+        minutes=settings.extraction_timeout_minutes
+    )
+    patient_id = (
+        select(HealthRecord.patient_id)
+        .where(
+            HealthRecord.source_file_id == UploadedFile.id,
+            HealthRecord.user_id == UploadedFile.user_id,
+            HealthRecord.deleted_at.is_(None),
+        )
+        .order_by(HealthRecord.created_at.asc(), HealthRecord.id.asc())
+        .limit(1)
+        .correlate(UploadedFile)
+        .scalar_subquery()
+    )
+    rows = (
+        await db.execute(
+            select(UploadedFile, patient_id.label("patient_id"))
+            .where(
+                or_(
+                    UploadedFile.ingestion_status == "dedup_scanning",
+                    (
+                        UploadedFile.ingestion_status == "dedup_processing"
+                    )
+                    & or_(
+                        UploadedFile.processing_started_at.is_(None),
+                        UploadedFile.processing_started_at <= stale_before,
+                    ),
+                ),
+                UploadedFile.deleted_at.is_(None),
+            )
+            .order_by(UploadedFile.created_at.asc(), UploadedFile.id.asc())
+            .limit(_DEDUP_RECOVERY_BATCH_SIZE + 1)
+            .with_for_update(skip_locked=True)
+        )
+    ).all()
+    if len(rows) > _DEDUP_RECOVERY_BATCH_SIZE:
+        logger.warning(
+            "Dedup recovery reached its %d-upload safety bound",
+            _DEDUP_RECOVERY_BATCH_SIZE,
+        )
+        rows = rows[:_DEDUP_RECOVERY_BATCH_SIZE]
+
+    resumable: list[tuple[UUID, UUID, UUID]] = []
+    for upload, recovered_patient_id in rows:
+        if recovered_patient_id is None:
+            # There is no record to compare. Finish truthfully instead of
+            # leaving a permanently spinning recovery row.
+            upload.ingestion_status = "completed"
+            upload.processing_completed_at = recovered_at
+            continue
+        upload.ingestion_status = "dedup_processing"
+        upload.processing_started_at = recovered_at
+        upload.processing_completed_at = None
+        resumable.append((upload.id, recovered_patient_id, upload.user_id))
+    return resumable
+
+
+def schedule_dedup_background(
+    upload_id: UUID,
+    patient_id: UUID,
+    user_id: UUID,
+) -> None:
+    """Schedule upload deduplication and retain it until it reaches a terminal state."""
+    task = asyncio.create_task(_run_dedup_background(upload_id, patient_id, user_id))
+    _dedup_tasks.add(task)
+    task.add_done_callback(_dedup_tasks.discard)
+
+
+async def stop_dedup_background_tasks(*, cancel: bool = False) -> None:
+    """Drain dedup work, cancelling only when callers require immediate teardown."""
+    tasks = [task for task in _dedup_tasks if not task.done()]
+    if not tasks:
+        _dedup_tasks.clear()
+        return
+
+    if cancel:
+        for task in tasks:
+            task.cancel()
+
+    drain = asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(drain),
+            timeout=settings.local_ai_shutdown_drain_seconds,
+        )
+    except TimeoutError:
+        if cancel:
+            logger.warning("Dedup shutdown cancellation drain timed out")
+        else:
+            logger.warning("Dedup shutdown drain timed out; cancelling remaining work")
+            for task in tasks:
+                task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(drain),
+                    timeout=settings.local_ai_shutdown_drain_seconds,
+                )
+            except TimeoutError:
+                logger.warning("Dedup shutdown cancellation drain timed out")
+    finally:
+        _dedup_tasks.difference_update(task for task in tasks if task.done())
 
 
 async def _ingest_fhir(
@@ -422,9 +679,12 @@ async def _backfill_patient_by_id(
     if patient is None:
         return
     await backfill_patient_demographics(
-        db, patient,
-        name=demo.get("name"), mrn=demo.get("mrn"),
-        dob=demo.get("dob"), gender=demo.get("gender"),
+        db,
+        patient,
+        name=demo.get("name"),
+        mrn=demo.get("mrn"),
+        dob=demo.get("dob"),
+        gender=demo.get("gender"),
     )
 
 
@@ -484,7 +744,9 @@ async def _ingest_cda_standalone(
         result = await idempotent_insert_records(db, batch)
         stats["records_inserted"] += result["inserted"]
         stats["records_updated"] = stats.get("records_updated", 0) + result["updated"]
-        stats["records_unchanged"] = stats.get("records_unchanged", 0) + result["unchanged"]
+        stats["records_unchanged"] = (
+            stats.get("records_unchanged", 0) + result["unchanged"]
+        )
         await db.commit()
 
     logger.info(
@@ -521,9 +783,14 @@ async def _ingest_xdm(
     # Backfill patient identifiers from the XDM manifest (HL7 PID-5/PID-7) so the
     # deterministic PHI scrubber can strip the patient's own name from CDA text.
     await _backfill_patient_by_id(
-        db, patient_id,
-        {"name": manifest.patient_name, "dob": manifest.patient_dob,
-         "mrn": None, "gender": None},
+        db,
+        patient_id,
+        {
+            "name": manifest.patient_name,
+            "dob": manifest.patient_dob,
+            "mrn": None,
+            "gender": None,
+        },
     )
 
     # Filter to XML documents only
@@ -532,11 +799,13 @@ async def _ingest_xdm(
 
     # Log skipped files
     for doc in skipped_docs:
-        stats["errors"].append({
-            "file": doc.uri,
-            "reason": "structured_preferred",
-            "message": "Skipped: CDA XML documents provide higher-fidelity structured data",
-        })
+        stats["errors"].append(
+            {
+                "file": doc.uri,
+                "reason": "structured_preferred",
+                "message": "Skipped: CDA XML documents provide higher-fidelity structured data",
+            }
+        )
 
     if not xml_docs:
         stats["errors"].append({"error": "No CDA XML documents found in manifest"})
@@ -578,7 +847,9 @@ async def _ingest_xdm(
         result = await idempotent_insert_records(db, batch)
         stats["records_inserted"] += result["inserted"]
         stats["records_updated"] = stats.get("records_updated", 0) + result["updated"]
-        stats["records_unchanged"] = stats.get("records_unchanged", 0) + result["unchanged"]
+        stats["records_unchanged"] = (
+            stats.get("records_unchanged", 0) + result["unchanged"]
+        )
         await db.commit()
 
     logger.info(
@@ -612,7 +883,9 @@ async def _ingest_zip(
         if metadata_path:
             logger.info("Detected IHE XDM package: %s", metadata_path)
             xdm_dir = metadata_path.parent
-            return await _ingest_xdm(db, user_id, patient_id, upload_id, xdm_dir, metadata_path)
+            return await _ingest_xdm(
+                db, user_id, patient_id, upload_id, xdm_dir, metadata_path
+            )
 
         # Collect all files, excluding schema dirs and readme
         all_files = list(temp_dir.rglob("*"))
@@ -650,7 +923,9 @@ async def _ingest_zip(
         # Process structured content
         if tsv_files:
             tsv_dir = tsv_files[0].parent
-            epic_stats = await _ingest_epic_dir(db, user_id, patient_id, upload_id, tsv_dir)
+            epic_stats = await _ingest_epic_dir(
+                db, user_id, patient_id, upload_id, tsv_dir
+            )
             stats["total_entries"] += epic_stats.get("total_files", 0)
             stats["records_inserted"] += epic_stats.get("records_inserted", 0)
             stats["records_skipped"] += epic_stats.get("records_skipped", 0)
@@ -669,44 +944,130 @@ async def _ingest_zip(
 
         # Queue unstructured files for extraction
         if unstructured_files:
-            for uf in unstructured_files:
-                try:
-                    # Copy to upload dir with UUID filename
-                    dest_name = f"{uuid4()}{uf.suffix}"
-                    dest_path = Path(settings.upload_dir) / dest_name
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(uf, dest_path)
-
-                    # Determine mime type
-                    suffix = uf.suffix.lower()
-                    mime_map = {
-                        ".pdf": "application/pdf",
-                        ".rtf": "application/rtf",
-                        ".tif": "image/tiff",
-                        ".tiff": "image/tiff",
-                    }
-
-                    unstr_upload = UploadedFile(
-                        id=uuid4(),
-                        user_id=user_id,
-                        filename=uf.name,
-                        mime_type=mime_map.get(suffix, "application/octet-stream"),
-                        file_size_bytes=uf.stat().st_size,
-                        file_hash=compute_file_hash(uf),
-                        storage_path=str(dest_path),
-                        ingestion_status="pending_extraction",
-                        file_category="unstructured",
+            parent_upload = (
+                await db.execute(
+                    select(UploadedFile).where(
+                        UploadedFile.id == upload_id,
+                        UploadedFile.user_id == user_id,
                     )
-                    db.add(unstr_upload)
-                    stats["unstructured_files"].append({
-                        "upload_id": str(unstr_upload.id),
-                        "filename": uf.name,
-                        "status": "pending_extraction",
-                    })
-                except Exception as e:
-                    stats["errors"].append({"file": uf.name, "error": str(e)})
+                )
+            ).scalar_one_or_none()
+            if parent_upload is None:
+                raise ValueError("Parent upload is unavailable")
+            child_set = ZipChildSet(
+                Path(settings.upload_dir),
+                writer_factory=EncryptedFileWriter,
+            )
+            staged_uploads: list[UploadedFile] = []
+            strict_job_uploads: list[UploadedFile] = []
+            staged_results: list[dict[str, str]] = []
+            staging_rows_committed = False
+            try:
+                for uf in unstructured_files:
+                    dest_name = f"{uuid4()}{uf.suffix}"
+                    try:
+                        # All ciphertext remains inside one owner-only pending
+                        # directory until the complete set is committed.
+                        dest_path = child_set.child_path(dest_name)
+                        child_set.encrypt(uf, dest_name)
 
-            await db.commit()
+                        suffix = uf.suffix.lower()
+                        mime_map = {
+                            ".pdf": "application/pdf",
+                            ".rtf": "application/rtf",
+                            ".tif": "image/tiff",
+                            ".tiff": "image/tiff",
+                        }
+
+                        unstr_upload = UploadedFile(
+                            id=uuid4(),
+                            user_id=user_id,
+                            filename=uf.name,
+                            mime_type=mime_map.get(suffix, "application/octet-stream"),
+                            file_size_bytes=uf.stat().st_size,
+                            file_hash=compute_file_hash(uf),
+                            storage_path=str(dest_path),
+                            ingestion_status=STAGING_EXTRACTION_STATUS,
+                            file_category="unstructured",
+                            manual_extraction_required=True,
+                            processing_mode=parent_upload.processing_mode,
+                            processing_manifest=copy.deepcopy(
+                                parent_upload.processing_manifest
+                            ),
+                            processing_schema_version=(
+                                parent_upload.processing_schema_version
+                            ),
+                        )
+                        db.add(unstr_upload)
+                        if parent_upload.processing_mode == "validated_strict_local":
+                            strict_job_uploads.append(unstr_upload)
+                        staged_uploads.append(unstr_upload)
+                        staged_results.append(
+                            {
+                                "upload_id": str(unstr_upload.id),
+                                "filename": uf.name,
+                                "status": "pending_extraction",
+                                "manual_extraction_required": True,
+                            }
+                        )
+                    except Exception as e:
+                        child_set.discard(dest_name)
+                        stats["errors"].append({"file": uf.name, "error": str(e)})
+
+                if staged_uploads:
+                    await db.flush(staged_uploads)
+                    if strict_job_uploads:
+                        manifest_snapshot, manifest_digest = (
+                            canonicalize_manifest_snapshot(
+                                parent_upload.processing_manifest
+                            )
+                        )
+                        strict_snapshot = ProcessingSnapshot(
+                            mode=ProcessingMode.VALIDATED_STRICT_LOCAL,
+                            manifest_snapshot=manifest_snapshot,
+                            manifest_sha256=manifest_digest,
+                            schema_version=parent_upload.processing_schema_version,
+                        )
+                        await revalidate_strict_snapshot_admission(
+                            db,
+                            strict_snapshot,
+                        )
+
+                        for strict_upload in strict_job_uploads:
+                            job = build_ingestion_job(
+                                upload_id=strict_upload.id,
+                                user_id=user_id,
+                                snapshot=strict_snapshot,
+                            )
+                            if job is None:
+                                raise RuntimeError(
+                                    "Strict-local child job could not be created"
+                                )
+                            db.add(job)
+                    child_set.seal()
+                    try:
+                        await db.commit()
+                        staging_rows_committed = True
+                    except BaseException:
+                        await db.rollback()
+                        raise
+
+                    try:
+                        child_set.publish()
+                    except BaseException:
+                        await db.rollback()
+                        raise
+
+                    for staged_upload in staged_uploads:
+                        staged_upload.ingestion_status = "pending_extraction"
+                    try:
+                        await db.commit()
+                    except BaseException:
+                        await db.rollback()
+                        raise
+                    stats["unstructured_files"].extend(staged_results)
+            finally:
+                child_set.close(cleanup_pending=not staging_rows_committed)
 
         if not tsv_files and not json_files and not unstructured_files:
             raise ValueError("ZIP contains no processable files")

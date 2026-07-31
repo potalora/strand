@@ -96,7 +96,9 @@ test.describe("Timeline page", () => {
     const card = page.locator("button.tl-card").first();
     await expect(card).toBeVisible({ timeout: 15_000 });
     await card.click();
-    await expect(page.getByText("Record detail")).toBeVisible({
+    await expect(
+      page.getByRole("dialog", { name: "Record detail", exact: true })
+    ).toBeVisible({
       timeout: 10_000,
     });
   });

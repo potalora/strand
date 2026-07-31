@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from app.services.ingestion.xdm_parser import parse_xdm_metadata
 

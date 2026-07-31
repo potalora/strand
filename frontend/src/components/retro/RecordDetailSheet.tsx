@@ -3,14 +3,21 @@
 import { useEffect, useState } from "react";
 import { Trash2, Sparkles, Download } from "lucide-react";
 import { toast } from "sonner";
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { api } from "@/lib/api";
+import { fmtDay, fmtShort } from "@/lib/format-date";
 import { sourceLabel } from "@/lib/source-label";
 import { recordTitle } from "@/lib/record-title";
 import type { HealthRecord, SeriesResponse, SeriesPoint, SummaryItem, TimelineEvent } from "@/types/api";
 import { usePreferencesStore } from "@/stores/usePreferencesStore";
 import { useUIStore } from "@/stores/useUIStore";
-import { RECORD_TYPE_ICONS, getObservationIcon } from "@/lib/record-icons";
+import { getRecordTypeIconElement } from "@/lib/record-icons";
 import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
 import { RetroBadge } from "./RetroBadge";
 import { TimelineMetricStrip } from "./TimelineMetricStrip";
@@ -18,7 +25,12 @@ import { RetroLoadingState } from "./RetroLoadingState";
 import { FhirResourceRenderer } from "./FhirResourceRenderer";
 import { Sparkline } from "./DataViz";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { ExtractionEvidencePanel } from "./ExtractionEvidencePanel";
 import { AIExtractionBadge, AdvancedSection } from "./renderers/shared";
+import {
+  transitionRecordDetailNavigation,
+  type RecordDetailNavigation,
+} from "./record-detail-navigation";
 
 interface RecordDetailSheetProps {
   recordId: string | null;
@@ -40,7 +52,17 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
   // Records extracted from the same visit/note (encounters only).
   const [linked, setLinked] = useState<TimelineEvent[]>([]);
   // Lets a "From this visit" row navigate the sheet without touching the parent.
-  const [viewId, setViewId] = useState<string | null>(recordId);
+  const [navigation, setNavigation] = useState<RecordDetailNavigation>({
+    previousOpen: open,
+    viewOverride: null,
+  });
+
+  // A parent can close this controlled sheet without Radix emitting
+  // onOpenChange. Reset the nested navigation during that prop transition so
+  // reopening the same root record never resumes a linked record.
+  if (open !== navigation.previousOpen) {
+    setNavigation(transitionRecordDetailNavigation(navigation, open));
+  }
 
   const { skipDeleteConfirm, setSkipDeleteConfirm } = usePreferencesStore();
   const setDetailOpen = useUIStore((s) => s.setDetailOpen);
@@ -51,25 +73,25 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
     return () => setDetailOpen(false);
   }, [open, setDetailOpen]);
 
-  // Reset the in-sheet navigation override whenever the parent opens a record.
-  useEffect(() => {
-    setViewId(recordId);
-  }, [recordId, open]);
+  const viewId =
+    open && navigation.viewOverride?.rootRecordId === recordId
+      ? navigation.viewOverride.viewId
+      : recordId;
 
   useEffect(() => {
-    if (!viewId || !open) {
-      setRecord(null);
+    void (async () => {
+      if (!viewId || !open) {
+        setRecord(null);
+        setLinked([]);
+        return;
+      }
+
+      setLoading(true);
+      setTrend([]);
       setLinked([]);
-      return;
-    }
-
-    setLoading(true);
-    setTrend([]);
-    setLinked([]);
-    setInSummary(false);
-    api
-      .get<HealthRecord>(`/records/${viewId}`)
-      .then((rec) => {
+      setInSummary(false);
+      try {
+        const rec = await api.get<HealthRecord>(`/records/${viewId}`);
         setRecord(rec);
         // For recurring observations, pull the recorded series for a neutral trend line.
         if (rec.record_type === "observation" && rec.code_value) {
@@ -85,9 +107,12 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
             .then((items) => setLinked(items ?? []))
             .catch(() => setLinked([]));
         }
-      })
-      .catch(() => setRecord(null))
-      .finally(() => setLoading(false));
+      } catch {
+        setRecord(null);
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, [viewId, open]);
 
   function handleDeleteClick() {
@@ -109,6 +134,7 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
           setSkipDeleteConfirm(true);
         }
         setConfirmOpen(false);
+        setNavigation((state) => ({ ...state, viewOverride: null }));
         onDelete?.();
         onClose();
       })
@@ -156,13 +182,19 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
 
   // Resolve icon + colors for the header chip
   const type = record?.record_type?.toLowerCase() ?? "";
-  const IconComponent =
-    type === "observation" && record ? getObservationIcon(record.fhir_resource) : RECORD_TYPE_ICONS[type];
+  const icon = record ? getRecordTypeIconElement(type, 20, record.fhir_resource) : null;
   const colors = RECORD_TYPE_COLORS[type] ?? DEFAULT_RECORD_COLOR;
+
+  function handleSheetOpenChange(isOpen: boolean) {
+    if (!isOpen) {
+      setNavigation((state) => ({ ...state, viewOverride: null }));
+      onClose();
+    }
+  }
 
   return (
     <>
-      <Sheet open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
+      <Sheet open={open} onOpenChange={handleSheetOpenChange}>
         <SheetContent
           className="w-full sm:max-w-xl overflow-auto border-l p-0"
           style={{ background: "var(--card)", borderColor: "var(--border)" }}
@@ -173,6 +205,9 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
                 Record detail
               </p>
             </SheetTitle>
+            <SheetDescription className="sr-only">
+              Clinical record details and actions.
+            </SheetDescription>
           </SheetHeader>
 
           {loading ? (
@@ -185,7 +220,7 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
             <div className="px-6 py-6 space-y-5">
               {/* 1. Header: icon chip + serif title + badge + status */}
               <div className="flex items-start gap-3">
-                {IconComponent && (
+                {icon && (
                   <div
                     className="flex items-center justify-center w-10 h-10 shrink-0 mt-1"
                     style={{
@@ -194,7 +229,7 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
                       borderRadius: "var(--radius-sm)",
                     }}
                   >
-                    <IconComponent size={20} />
+                    {icon}
                   </div>
                 )}
                 <div className="min-w-0 flex-1">
@@ -248,7 +283,14 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
                       <button
                         key={item.id}
                         className="dv-linked-row"
-                        onClick={() => setViewId(item.id)}
+                        onClick={() => {
+                          if (recordId) {
+                            setNavigation((state) => ({
+                              ...state,
+                              viewOverride: { rootRecordId: recordId, viewId: item.id },
+                            }));
+                          }
+                        }}
                       >
                         <span className="dv-linked-top">
                           <RetroBadge recordType={item.record_type} category={item.category} />
@@ -268,12 +310,15 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
 
               {/* 3. AI extraction info (conditional) */}
               {record.ai_extracted && (
-                <AIExtractionBadge aiExtracted={record.ai_extracted} confidenceScore={record.confidence_score} />
+                <>
+                  <AIExtractionBadge aiExtracted={record.ai_extracted} confidenceScore={record.confidence_score} />
+                  <ExtractionEvidencePanel recordId={record.id} enabled />
+                </>
               )}
 
               {/* 4. Metadata fields */}
               <div>
-                <Field label="Date" value={fmtDate(record.effective_date)} />
+                <Field label="Date" value={fmtDay(record.effective_date) || "Not specified"} />
                 <Field label="Source" value={sourceLabel(record.source_format)} />
                 {record.code_value && (
                   <Field
@@ -285,7 +330,7 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
                 {record.category && record.category.length > 0 && (
                   <Field label="Categories" value={record.category.join(", ")} />
                 )}
-                <Field label="Added" value={fmtDate(record.created_at)} />
+                <Field label="Added" value={fmtTimestampDate(record.created_at)} />
               </div>
 
               {/* 5. Advanced section: collapsible FHIR JSON */}
@@ -346,14 +391,9 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
   );
 }
 
-function fmtDate(value: string | null): string {
+function fmtTimestampDate(value: string | null): string {
   if (!value) return "Not specified";
   return new Date(value).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
-}
-
-function fmtShort(value: string | null | undefined): string {
-  if (!value) return "";
-  return new Date(value).toLocaleDateString("en-US", { year: "2-digit", month: "short" });
 }
 
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {

@@ -34,6 +34,7 @@ async def test_reupload_identical_file_is_marked_duplicate(
         ingestion_status="completed",
         file_category="unstructured",
         record_count=7,
+        processing_mode="cloud_assisted",
     )
     db_session.add(prior)
     await db_session.commit()
@@ -41,6 +42,7 @@ async def test_reupload_identical_file_is_marked_duplicate(
     resp = await client.post(
         "/api/v1/upload/unstructured",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files={"file": ("note.pdf", content, "application/pdf")},
     )
     assert resp.status_code == 202, resp.text

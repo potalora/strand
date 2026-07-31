@@ -11,19 +11,13 @@ import { recordTitle } from "@/lib/record-title";
 import { RetroBadge } from "@/components/retro/RetroBadge";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
+import { fmtDay } from "@/lib/format-date";
 
 const PAGE_SIZE = 20;
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 // Server-side sort keys accepted by GET /records?sort=...
 type SortKey = "type" | "display_text" | "date";
 type SortOrder = "asc" | "desc";
-
-const fmtDate = (s: string | null) => {
-  if (!s) return "--";
-  const d = new Date(s);
-  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
-};
 
 // ↑/↓ glyph shown only on the active sort column.
 const sortIndicator = (col: SortKey, active: SortKey, order: SortOrder) =>
@@ -32,7 +26,7 @@ const sortIndicator = (col: SortKey, active: SortKey, order: SortOrder) =>
 function SecureChip() {
   return (
     <span className="secure">
-      <Lock size={13} strokeWidth={1.9} /> End-to-end encrypted
+      <Lock size={13} strokeWidth={1.9} /> Application-layer encrypted at rest
     </span>
   );
 }
@@ -99,26 +93,27 @@ export default function RecordsPage() {
   }, [searchInput]);
 
   useEffect(() => {
-    setLoading(true);
-    const params = new URLSearchParams({
-      page: String(page),
-      page_size: String(PAGE_SIZE),
-      sort: sortKey,
-      order: sortOrder,
-    });
-    if (recordType) params.set("record_type", recordType);
-    if (search) params.set("search", search);
-    api
-      .get<RecordListResponse>(`/records?${params.toString()}`)
-      .then((data) => {
+    void (async () => {
+      setLoading(true);
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(PAGE_SIZE),
+        sort: sortKey,
+        order: sortOrder,
+      });
+      if (recordType) params.set("record_type", recordType);
+      if (search) params.set("search", search);
+      try {
+        const data = await api.get<RecordListResponse>(`/records?${params.toString()}`);
         setRecords(data.items || []);
         setTotal(data.total || 0);
-      })
-      .catch(() => {
+      } catch {
         setRecords([]);
         setTotal(0);
-      })
-      .finally(() => setLoading(false));
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, [page, search, recordType, sortKey, sortOrder]);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -239,7 +234,7 @@ export default function RecordsPage() {
                       <RetroBadge recordType={r.record_type} category={r.category} />
                     </td>
                     <td className="desc">{recordTitle(r)}</td>
-                    <td className="num">{fmtDate(r.effective_date)}</td>
+                    <td className="num">{fmtDay(r.effective_date) || "--"}</td>
                     <td className="muted">{r.source_format ? sourceLabel(r.source_format) : "--"}</td>
                     <td className="num">{r.code_value || "--"}</td>
                   </tr>

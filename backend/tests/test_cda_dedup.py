@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-import pytest
 
-from app.services.ingestion.cda_dedup import CdaDedupStats, deduplicate_across_documents
+from app.services.ingestion.cda_dedup import deduplicate_across_documents
 
 
 def _make_record(
@@ -63,7 +62,9 @@ class TestDeduplicateAcrossDocuments:
         assert stats.total_parsed == 2
         assert stats.unique_records == 1
         assert stats.duplicates_collapsed == 1
-        source_docs = unique[0]["fhir_resource"]["_extraction_metadata"]["source_documents"]
+        source_docs = unique[0]["fhir_resource"]["_extraction_metadata"][
+            "source_documents"
+        ]
         assert source_docs == ["doc_a.xml", "doc_b.xml"]
 
     def test_different_codes_kept(self):

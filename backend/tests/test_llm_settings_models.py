@@ -4,7 +4,10 @@ import pytest
 from sqlalchemy import select
 
 from app.middleware.encryption import decrypt_field, encrypt_field
+from app.models.ai_summary import AISummaryPrompt
 from app.models.llm_settings import LLMProviderConfig, UserLLMPreferences
+from app.models.patient import Patient
+from app.models.uploaded_file import UploadedFile
 from app.models.user import User
 
 
@@ -43,7 +46,11 @@ async def test_preferences_one_row_per_user(db_session):
     user = User(email="llm-models-b@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
-    pref = UserLLMPreferences(user_id=user.id, default_provider="anthropic")
+    pref = UserLLMPreferences(
+        user_id=user.id,
+        default_provider="anthropic",
+        processing_mode="validated_strict_local",
+    )
     db_session.add(pref)
     await db_session.commit()
 
@@ -55,3 +62,50 @@ async def test_preferences_one_row_per_user(db_session):
     assert got.default_provider == "anthropic"
     assert got.summary_provider is None
     assert got.extraction_engine is None
+    assert got.processing_mode == "validated_strict_local"
+
+
+@pytest.mark.asyncio
+async def test_new_processing_rows_default_prompt_only(db_session) -> None:
+    """Fresh policy-bearing rows cannot opt into cloud processing by omission."""
+    user = User(email="llm-models-defaults@example.com", password_hash="x")
+    db_session.add(user)
+    await db_session.flush()
+    patient = Patient(user_id=user.id)
+    db_session.add(patient)
+    await db_session.flush()
+
+    preference = UserLLMPreferences(user_id=user.id)
+    summary = AISummaryPrompt(
+        user_id=user.id,
+        patient_id=patient.id,
+        summary_type="full",
+        system_prompt="Organize the supplied records.",
+        user_prompt="Create a records summary.",
+        suggested_config={},
+        record_count=0,
+    )
+    upload = UploadedFile(
+        user_id=user.id,
+        filename="records.json",
+        mime_type="application/json",
+        file_hash="f" * 64,
+        storage_path="/encrypted/records.json",
+    )
+    db_session.add_all([preference, summary, upload])
+    await db_session.flush()
+
+    assert preference.processing_mode == "prompt_only"
+    assert summary.processing_mode == "prompt_only"
+    assert upload.processing_mode == "prompt_only"
+
+
+def test_processing_mode_model_defaults_are_prompt_only() -> None:
+    """Python and server defaults agree for every policy-bearing model."""
+    for model in (UserLLMPreferences, AISummaryPrompt, UploadedFile):
+        column = model.__table__.c.processing_mode
+
+        assert column.default is not None
+        assert column.default.arg == "prompt_only"
+        assert column.server_default is not None
+        assert str(column.server_default.arg) == "prompt_only"

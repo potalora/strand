@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime, timezone, timedelta
@@ -54,29 +55,90 @@ def private_fixture_root() -> Path | None:
     return path if path.exists() else None
 
 
-# Slow/fidelity tests drive real Gemini calls over real data and legitimately
-# take minutes (e.g. the section-parsing wall-clock test runs the full pipeline
-# and asserts <450s itself). The fast-suite ``timeout = 120`` would falsely kill
-# them, so they get a generous BUT BOUNDED override — enough headroom for real
-# API latency, while still backstopping a genuine hang (a frozen await never
-# returns; the internal perf assertions can't fire until it does).
+# Ordinary test runs must not inherit cloud credentials merely because a
+# developer's root ``.env`` contains them. In particular, private-fixture
+# fidelity tests must never turn key presence into consent to send medical data.
+_CLOUD_CREDENTIALS = {
+    "GEMINI_API_KEY": "gemini_api_key",
+    "GOOGLE_API_KEY": "gemini_api_key",
+    "OPENAI_API_KEY": "openai_api_key",
+    "ANTHROPIC_API_KEY": "anthropic_api_key",
+    "OPENROUTER_API_KEY": "openrouter_api_key",
+}
+_LIVE_CLOUD_OPTION = "--run-live-cloud-tests"
+_PRIVATE_CLOUD_OPTION = "--run-private-cloud-fidelity"
+_PRIVATE_CLOUD_SKIP = pytest.mark.skip(
+    reason=(
+        "private cloud fidelity requires both --run-live-cloud-tests and "
+        "--run-private-cloud-fidelity"
+    )
+)
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Require explicit command-line consent before any live cloud test."""
+
+    parser.addoption(
+        _LIVE_CLOUD_OPTION,
+        action="store_true",
+        default=False,
+        help="allow synthetic live-cloud provider tests to use configured credentials",
+    )
+    parser.addoption(
+        _PRIVATE_CLOUD_OPTION,
+        action="store_true",
+        default=False,
+        help=(
+            "allow tests marked private_cloud_fidelity to send private fixtures; "
+            "also requires --run-live-cloud-tests"
+        ),
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Blank inherited cloud credentials unless live-cloud tests were requested."""
+
+    config.addinivalue_line(
+        "markers",
+        "private_cloud_fidelity: may send private medical fixtures to a cloud provider",
+    )
+    if config.getoption(_LIVE_CLOUD_OPTION):
+        return
+    for env_name, setting_name in _CLOUD_CREDENTIALS.items():
+        os.environ[env_name] = ""
+        setattr(settings, setting_name, "")
+    settings.vertex_project = ""
+
+
+# Slow/fidelity tests can legitimately take minutes. The fast-suite
+# ``timeout = 120`` would falsely kill them, so they get a generous BUT BOUNDED
+# override while still backstopping a genuine hang.
 _SLOW_TEST_TIMEOUT_S = 900
 
 
 def pytest_collection_modifyitems(config, items):
-    """Give slow/fidelity tests a generous bounded timeout instead of the 120s
-    fast-suite default. Never disable the timeout entirely (timeout=0) — that
-    reintroduces the infinite-hang failure mode this whole change exists to
-    prevent."""
+    """Apply bounded timeouts and fail-closed private-cloud collection gates."""
+
+    private_cloud_allowed = config.getoption(_LIVE_CLOUD_OPTION) and config.getoption(
+        _PRIVATE_CLOUD_OPTION
+    )
     for item in items:
+        if (
+            item.get_closest_marker("private_cloud_fidelity")
+            and not private_cloud_allowed
+        ):
+            item.add_marker(_PRIVATE_CLOUD_SKIP)
         if item.get_closest_marker("slow") or item.get_closest_marker("fidelity"):
             item.add_marker(pytest.mark.timeout(_SLOW_TEST_TIMEOUT_S))
+
 
 # Use a dedicated test database to avoid destroying production data.
 # Derive from the production URL by appending "_test" to the database name.
 _prod_url = settings.database_url
 if "_test" not in _prod_url:
-    TEST_DB_URL = _prod_url.rsplit("/", 1)[0] + "/" + _prod_url.rsplit("/", 1)[1] + "_test"
+    TEST_DB_URL = (
+        _prod_url.rsplit("/", 1)[0] + "/" + _prod_url.rsplit("/", 1)[1] + "_test"
+    )
 else:
     TEST_DB_URL = _prod_url
 
@@ -92,10 +154,12 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
 
     # Clean up any leftover data from prior runs (CASCADE handles FK deps)
     async with engine.begin() as conn:
-        await conn.execute(text(
-            "TRUNCATE revoked_tokens, provenance, dedup_candidates, record_cross_references, health_records, "
-            "ai_summary_prompts, uploaded_files, patients, audit_log, users CASCADE"
-        ))
+        await conn.execute(
+            text(
+                "TRUNCATE revoked_tokens, provenance, dedup_candidates, record_cross_references, health_records, "
+                "ai_summary_prompts, uploaded_files, patients, audit_log, users CASCADE"
+            )
+        )
 
     session_factory = async_sessionmaker(
         engine, class_=AsyncSession, expire_on_commit=False
@@ -105,10 +169,12 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
 
     # Clean up all data after each test (CASCADE handles FK deps)
     async with engine.begin() as conn:
-        await conn.execute(text(
-            "TRUNCATE revoked_tokens, provenance, dedup_candidates, record_cross_references, health_records, "
-            "ai_summary_prompts, uploaded_files, patients, audit_log, users CASCADE"
-        ))
+        await conn.execute(
+            text(
+                "TRUNCATE revoked_tokens, provenance, dedup_candidates, record_cross_references, health_records, "
+                "ai_summary_prompts, uploaded_files, patients, audit_log, users CASCADE"
+            )
+        )
 
     await engine.dispose()
 
@@ -127,21 +193,32 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     # request rollback can't drop the audit row). Point that factory at the test
     # DB for the duration of the test, otherwise it writes api.access rows to the
     # real database during the suite.
+    import app.database as _database
     import app.middleware.audit as _audit
+    from app.services.ingestion.coordinator import stop_dedup_background_tasks
 
     _audit_engine = create_async_engine(TEST_DB_URL, echo=False)
+    _dedup_engine = create_async_engine(TEST_DB_URL, echo=False)
     _orig_audit_factory = _audit.async_session_factory
+    _orig_database_factory = _database.async_session_factory
     _audit.async_session_factory = async_sessionmaker(
         _audit_engine, class_=AsyncSession, expire_on_commit=False
     )
+    _database.async_session_factory = async_sessionmaker(
+        _dedup_engine, class_=AsyncSession, expire_on_commit=False
+    )
 
     transport = ASGITransport(app=fastapi_app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
-
-    fastapi_app.dependency_overrides.clear()
-    _audit.async_session_factory = _orig_audit_factory
-    await _audit_engine.dispose()
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+    finally:
+        await stop_dedup_background_tasks(cancel=True)
+        fastapi_app.dependency_overrides.clear()
+        _audit.async_session_factory = _orig_audit_factory
+        _database.async_session_factory = _orig_database_factory
+        await _audit_engine.dispose()
+        await _dedup_engine.dispose()
 
 
 @pytest.fixture
@@ -170,6 +247,7 @@ def epic_export_dir():
 def clear_rate_limiters():
     """Clear rate limiter state before each test."""
     from app.middleware.rate_limit import login_limiter, register_limiter
+
     login_limiter._requests.clear()
     register_limiter._requests.clear()
     yield
@@ -177,8 +255,8 @@ def clear_rate_limiters():
     register_limiter._requests.clear()
 
 
-@pytest.fixture(autouse=True)
-def reset_extraction_worker():
+@pytest_asyncio.fixture(autouse=True)
+async def reset_extraction_worker():
     """Stop the DB-polling extraction worker from leaking across tests.
 
     ``upload._worker_task`` is a module global. A worker started in one test is
@@ -191,21 +269,39 @@ def reset_extraction_worker():
     bound to its own loop.
     """
     import app.api.upload as upload_module
+    from app.services.ingestion.coordinator import stop_dedup_background_tasks
 
-    def _reset() -> None:
+    async def _cancel_task(task: asyncio.Task | None) -> None:
+        if task is None or task.done():
+            return
+        task.cancel()
+        if task.get_loop() is asyncio.get_running_loop():
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _reset() -> None:
         task = getattr(upload_module, "_worker_task", None)
-        if task is not None:
-            try:
-                task.cancel()
-            except Exception:
-                pass
+        await _cancel_task(task)
+        for child in list(upload_module._extraction_tasks):
+            await _cancel_task(child)
         upload_module._worker_task = None
+        upload_module._extraction_tasks.clear()
+        upload_module._extraction_draining = False
         upload_module._extraction_semaphores.clear()
         upload_module._gemini_semaphores.clear()
+        upload_module._strict_extraction_semaphores.clear()
 
-    _reset()
+        await stop_dedup_background_tasks(cancel=True)
+
+        from app.services.local_ai.summary_runner import local_summary_runner
+
+        for task in list(local_summary_runner._tasks.values()):
+            await _cancel_task(task)
+        local_summary_runner._tasks.clear()
+        local_summary_runner._draining = False
+
+    await _reset()
     yield
-    _reset()
+    await _reset()
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +309,9 @@ def reset_extraction_worker():
 # ---------------------------------------------------------------------------
 
 
-async def auth_headers(client: AsyncClient, email: str = "test@example.com") -> tuple[dict, str]:
+async def auth_headers(
+    client: AsyncClient, email: str = "test@example.com"
+) -> tuple[dict, str]:
     """Register a user, log in, return (headers_dict, user_id_str)."""
     reg = await client.post(
         "/api/v1/auth/register",
@@ -231,7 +329,9 @@ async def auth_headers(client: AsyncClient, email: str = "test@example.com") -> 
 async def create_test_patient(db_session: AsyncSession, user_id: str | UUID) -> Patient:
     """Insert a Patient row and return it."""
     uid = UUID(user_id) if isinstance(user_id, str) else user_id
-    patient = Patient(id=uuid4(), user_id=uid, fhir_id="test-patient-001", gender="male")
+    patient = Patient(
+        id=uuid4(), user_id=uid, fhir_id="test-patient-001", gender="male"
+    )
     db_session.add(patient)
     await db_session.commit()
     await db_session.refresh(patient)
@@ -245,7 +345,13 @@ SAMPLE_RECORDS = [
         "fhir_resource": {
             "resourceType": "Condition",
             "code": {
-                "coding": [{"system": "http://snomed.info/sct", "code": "44054006", "display": "Type 2 diabetes"}]
+                "coding": [
+                    {
+                        "system": "http://snomed.info/sct",
+                        "code": "44054006",
+                        "display": "Type 2 diabetes",
+                    }
+                ]
             },
             "clinicalStatus": {"coding": [{"code": "active"}]},
         },
@@ -264,7 +370,15 @@ SAMPLE_RECORDS = [
             "resourceType": "Observation",
             "status": "final",
             "category": [{"coding": [{"code": "laboratory"}]}],
-            "code": {"coding": [{"system": "http://loinc.org", "code": "4548-4", "display": "Hemoglobin A1c"}]},
+            "code": {
+                "coding": [
+                    {
+                        "system": "http://loinc.org",
+                        "code": "4548-4",
+                        "display": "Hemoglobin A1c",
+                    }
+                ]
+            },
             "valueQuantity": {"value": 6.8, "unit": "%"},
             "referenceRange": [{"low": {"value": 4.0}, "high": {"value": 5.6}}],
             "interpretation": [{"coding": [{"code": "H"}]}],

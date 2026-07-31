@@ -14,23 +14,12 @@ from app.services.extraction.clinical_examples import (
     CLINICAL_EXAMPLES,
     CLINICAL_EXTRACTION_PROMPT,
 )
+from app.services.extraction.entity_types import ExtractedEntity
 
 if TYPE_CHECKING:
     from app.services.ai.llm import LLMConfig
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ExtractedEntity:
-    """A single entity extracted from clinical text."""
-
-    entity_class: str
-    text: str
-    attributes: dict = field(default_factory=dict)
-    start_pos: int | None = None
-    end_pos: int | None = None
-    confidence: float = 0.8
 
 
 @dataclass
@@ -46,7 +35,14 @@ class ExtractionResult:
 MAX_RETRIES = 3
 BACKOFF_BASE = 2  # seconds
 
-_TRANSIENT_ERROR_KEYWORDS = ("429", "resource_exhausted", "quota", "rate", "timeout", "connection")
+_TRANSIENT_ERROR_KEYWORDS = (
+    "429",
+    "resource_exhausted",
+    "quota",
+    "rate",
+    "timeout",
+    "connection",
+)
 
 
 def extract_entities(
@@ -98,7 +94,10 @@ def extract_entities(
                     wait = BACKOFF_BASE ** (attempt + 1)
                     logger.warning(
                         "Transient error on attempt %d for %s, retrying in %ds: %s",
-                        attempt + 1, source_file, wait, e,
+                        attempt + 1,
+                        source_file,
+                        wait,
+                        e,
                     )
                     time.sleep(wait)
                     continue
@@ -131,9 +130,7 @@ def extract_entities(
                 )
             )
 
-        logger.info(
-            "Extracted %d entities from %s", len(entities), source_file
-        )
+        logger.info("Extracted %d entities from %s", len(entities), source_file)
         if progress_callback is not None:
             try:
                 progress_callback("extracting_entities", 1, len(entities))
@@ -166,7 +163,11 @@ def _langextract_params(
     """
     creds = config.providers.get(provider) if config else None
     if provider in ("gemini", "vertex"):
-        return (settings.gemini_extraction_model, api_key or settings.gemini_api_key, None)
+        return (
+            settings.gemini_extraction_model,
+            api_key or settings.gemini_api_key,
+            None,
+        )
     if provider == "openai":
         model = creds.model if creds and creds.model else settings.openai_model
         key = creds.api_key if creds and creds.api_key else settings.openai_api_key
@@ -201,8 +202,13 @@ async def extract_entities_async(
     if lx_params is not None:
         model_id, lx_key, model_url = lx_params
         return await asyncio.to_thread(
-            extract_entities, text, source_file, lx_key, progress_callback,
-            model_id=model_id, model_url=model_url,
+            extract_entities,
+            text,
+            source_file,
+            lx_key,
+            progress_callback,
+            model_id=model_id,
+            model_url=model_url,
         )
     from app.services.extraction.generic_entity_extractor import (
         generic_extract_entities_async,

@@ -1,15 +1,13 @@
 """HIPAA Compliance Tests — verifying all audit findings are remediated."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
-import pytest_asyncio
 from httpx import AsyncClient
 
-from tests.conftest import auth_headers, create_test_patient, seed_test_records
+from tests.conftest import auth_headers
 
 
 # ===========================================================================
@@ -20,8 +18,7 @@ from tests.conftest import auth_headers, create_test_patient, seed_test_records
 @pytest.mark.asyncio
 async def test_revoked_token_rejected_after_logout(client: AsyncClient):
     """After logout, the same token should be rejected (401)."""
-    headers, user_id = await auth_headers(client, "revoke@test.com")
-    token = headers["Authorization"].split(" ")[1]
+    headers, _ = await auth_headers(client, "revoke@test.com")
 
     # Logout
     resp = await client.post("/api/v1/auth/logout", headers=headers)
@@ -236,7 +233,6 @@ async def test_valid_complex_password_accepted(client: AsyncClient):
 
 def test_config_rejects_default_secret_in_production():
     """Production mode should reject default JWT secret."""
-    import os
     from app.config import Settings
 
     with pytest.raises(Exception):
@@ -263,7 +259,7 @@ def test_config_accepts_default_secret_in_development():
 @pytest.mark.asyncio
 async def test_login_audit_does_not_log_email(client: AsyncClient, db_session):
     """Login audit event should only log email domain, not full email."""
-    from sqlalchemy import select, text
+    from sqlalchemy import select
     from app.models.audit import AuditLog
 
     await client.post(

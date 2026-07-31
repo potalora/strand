@@ -6,6 +6,7 @@ Marks:
 
 Skipped automatically when either the note PDF or the API key is absent.
 """
+
 from __future__ import annotations
 
 import uuid
@@ -25,6 +26,8 @@ from tests.conftest import (
     create_test_patient,
     private_fixture_root,
 )
+
+pytestmark = pytest.mark.private_cloud_fidelity
 
 # ---------------------------------------------------------------------------
 # Locate real note PDF via REAL_MEDICAL_FIXTURES_DIR (gitignored, off-repo).
@@ -47,6 +50,7 @@ _SHOULD_SKIP = _NOTE is None or not settings.gemini_api_key
 # _process_unstructured writes to the same DB the test fixtures use.
 # ---------------------------------------------------------------------------
 
+
 @pytest_asyncio.fixture
 async def test_session_factory():
     """Return a session factory targeting medtimeline_test."""
@@ -59,6 +63,7 @@ async def test_session_factory():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 async def _count_ai_records(factory: async_sessionmaker, user_id: uuid.UUID) -> int:  # type: ignore[type-arg]
     """Count live AI-extracted health records for a user via a fresh session."""
@@ -97,6 +102,7 @@ async def _set_upload_status(
 # ---------------------------------------------------------------------------
 # The test
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.slow
 @pytest.mark.fidelity

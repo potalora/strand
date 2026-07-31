@@ -38,6 +38,28 @@ test.describe("Per-row extraction status tracks polling", () => {
       body: JSON.stringify(body),
     });
 
+    // This is a mocked upload-page test. Keep its privacy mode deterministic
+    // instead of inheriting the fresh account's fail-closed prompt-only default.
+    await page.route(
+      (url) => url.pathname === "/api/v1/settings/llm",
+      (route) =>
+        route.fulfill(
+          json({
+            providers: [],
+            routing: {
+              default: "gemini",
+              summary: "gemini",
+              section: "gemini",
+              dedup: "gemini",
+              extraction: "gemini",
+              vision: "gemini",
+              extraction_engine: "local",
+              processing_mode: "validated_strict_local",
+            },
+          })
+        )
+    );
+
     // Structured upload (.zip) returns an unstructured child that needs extraction.
     await page.route(
       (url) => url.pathname === "/api/v1/upload",
@@ -53,13 +75,14 @@ test.describe("Per-row extraction status tracks polling", () => {
                 upload_id: "mock-u1",
                 filename: "scan-note.pdf",
                 status: "pending_extraction",
+                manual_extraction_required: true,
               },
             ],
           })
         )
     );
 
-    // Triggering extraction reports the file as now processing.
+    // The trigger endpoint accepts the pending file; polling below reports processing.
     await page.route(
       (url) => url.pathname === "/api/v1/upload/trigger-extraction",
       (route) =>
@@ -67,7 +90,7 @@ test.describe("Per-row extraction status tracks polling", () => {
           json({
             triggered: 1,
             failed: 0,
-            results: [{ upload_id: "mock-u1", status: "processing" }],
+            results: [{ upload_id: "mock-u1", status: "pending_extraction" }],
           })
         )
     );

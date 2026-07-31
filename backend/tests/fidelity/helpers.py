@@ -3,6 +3,7 @@
 Provides FHIR path resolution and comparison helpers that work
 at the mapper level (no DB required).
 """
+
 from __future__ import annotations
 
 import csv
@@ -50,9 +51,26 @@ def load_tsv_rows(tsv_path: Path) -> list[dict[str, str]]:
         return list(reader)
 
 
+def enrich_companion_rows(
+    export_dir: Path,
+    table_name: str,
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Apply the production companion-table enrichment used by Epic parsing."""
+
+    from app.services.ingestion.epic_parser import (
+        _VitalsValueIndex,
+        _enrich_epic_row,
+    )
+
+    with _VitalsValueIndex(export_dir) as vitals_values:
+        return [_enrich_epic_row(table_name, row, vitals_values) for row in rows]
+
+
 def get_mapper_for_table(table_name: str):
     """Get the mapper instance for a given Epic table name."""
     from app.services.ingestion.epic_parser import EPIC_TABLE_MAPPERS
+
     return EPIC_TABLE_MAPPERS.get(table_name)
 
 
@@ -95,20 +113,22 @@ def map_with_metadata(table_name: str, rows: list[dict[str, str]]) -> list[dict]
         record_type = RECORD_TYPE_MAP.get(resource_type, resource_type.lower())
         code_system, code_value, code_display = extract_coding(fhir_resource)
 
-        results.append({
-            "fhir_resource": fhir_resource,
-            "skipped": False,
-            "row": row,
-            "resource_type": resource_type,
-            "record_type": record_type,
-            "effective_date": extract_effective_date(fhir_resource),
-            "effective_date_end": extract_effective_date_end(fhir_resource),
-            "status": extract_status(fhir_resource),
-            "category": extract_categories(fhir_resource),
-            "code_system": code_system,
-            "code_value": code_value,
-            "code_display": code_display,
-            "display_text": build_display_text(fhir_resource, resource_type),
-        })
+        results.append(
+            {
+                "fhir_resource": fhir_resource,
+                "skipped": False,
+                "row": row,
+                "resource_type": resource_type,
+                "record_type": record_type,
+                "effective_date": extract_effective_date(fhir_resource),
+                "effective_date_end": extract_effective_date_end(fhir_resource),
+                "status": extract_status(fhir_resource),
+                "category": extract_categories(fhir_resource),
+                "code_system": code_system,
+                "code_value": code_value,
+                "code_display": code_display,
+                "display_text": build_display_text(fhir_resource, resource_type),
+            }
+        )
 
     return results

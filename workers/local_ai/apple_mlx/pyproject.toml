@@ -1,0 +1,39 @@
+[project]
+name = "local-ai-mlx-worker"
+version = "0.1.0"
+description = "Isolated Apple MLX worker for MedTimeline strict-local AI"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "mlx-vlm==0.5.0",
+    "Pillow==12.3.0",
+]
+
+[project.scripts]
+local-ai-mlx-worker = "local_ai_mlx_worker.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.11,<0.12",
+]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+markers = [
+    "local_model: requires the exact locked local model artifacts",
+]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/local_ai_mlx_worker"]

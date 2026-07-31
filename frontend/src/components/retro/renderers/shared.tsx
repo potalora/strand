@@ -1,8 +1,8 @@
 "use client";
 
 import React, { useState } from "react";
-import { ChevronDown, Sparkles, type LucideIcon } from "lucide-react";
-import { RECORD_TYPE_ICONS, getObservationIcon } from "@/lib/record-icons";
+import { ChevronDown, Sparkles } from "lucide-react";
+import { getRecordTypeIconElement } from "@/lib/record-icons";
 import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR, RECORD_TYPE_LABELS } from "@/lib/constants";
 
 // ---------------------------------------------------------------------------
@@ -212,21 +212,18 @@ export interface RecordHeaderProps {
 
 export function RecordHeader({ recordType, title, fhirResource, status, statusColor }: RecordHeaderProps) {
   const type = recordType.toLowerCase();
-  let IconComponent: LucideIcon | undefined = RECORD_TYPE_ICONS[type];
-  if (type === "observation" && fhirResource) {
-    IconComponent = getObservationIcon(fhirResource);
-  }
+  const icon = getRecordTypeIconElement(type, 16, fhirResource);
   const colors = RECORD_TYPE_COLORS[type] ?? DEFAULT_RECORD_COLOR;
   const label = RECORD_TYPE_LABELS[type] ?? type;
 
   return (
     <div className="flex items-start gap-3 mb-3">
-      {IconComponent && (
+      {icon && (
         <div
           className="flex items-center justify-center w-8 h-8 rounded-md shrink-0 mt-0.5"
           style={{ backgroundColor: colors.bg, color: colors.text }}
         >
-          <IconComponent size={16} />
+          {icon}
         </div>
       )}
       <div className="min-w-0 flex-1">

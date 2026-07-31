@@ -7,6 +7,7 @@ Each TableSpec defines:
 - record_type: expected health_records.record_type value
 - example_row: a sample TSV row dict for unit testing
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field
 @dataclass
 class ColumnMapping:
     """Maps a single TSV column to its expected FHIR location."""
+
     tsv_column: str
     fhir_path: str  # dot-separated path within FHIR resource
     transform: str = "direct"  # direct, date, status_map, numeric, conditional
@@ -24,13 +26,23 @@ class ColumnMapping:
 @dataclass
 class TableSpec:
     """Full specification for an Epic EHI table mapper."""
+
     table_name: str
     mapper_class: str
     resource_type: str
     record_type: str
     gate_columns: list[str]
     columns: list[ColumnMapping]
+    gate_groups: list[list[str]] | None = None
     example_row: dict[str, str] = field(default_factory=dict)
+
+    def has_required_data(self, row: dict[str, str]) -> bool:
+        """Return whether every required group has a populated alternative."""
+
+        groups = self.gate_groups or [self.gate_columns]
+        return all(
+            any((row.get(column) or "").strip() for column in group) for group in groups
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -45,12 +57,22 @@ PROBLEM_LIST_SPEC = TableSpec(
     gate_columns=["DX_ID_DX_NAME", "DESCRIPTION"],  # both must be empty to skip
     columns=[
         ColumnMapping("DX_ID_DX_NAME", "code.text"),
-        ColumnMapping("DESCRIPTION", "code.text", description="Fallback for DX_ID_DX_NAME"),
+        ColumnMapping(
+            "DESCRIPTION", "code.text", description="Fallback for DX_ID_DX_NAME"
+        ),
         ColumnMapping("NOTED_DATE", "onsetDateTime", transform="date"),
         ColumnMapping("RESOLVED_DATE", "abatementDateTime", transform="date"),
-        ColumnMapping("PROBLEM_STATUS_C_NAME", "clinicalStatus.coding.0.code", transform="status_map"),
-        ColumnMapping("CHRONIC_YN", "category.1.text", transform="conditional",
-                      description="Only added when Y"),
+        ColumnMapping(
+            "PROBLEM_STATUS_C_NAME",
+            "clinicalStatus.coding.0.code",
+            transform="status_map",
+        ),
+        ColumnMapping(
+            "CHRONIC_YN",
+            "category.1.text",
+            transform="conditional",
+            description="Only added when Y",
+        ),
         ColumnMapping("PROBLEM_CMT", "note.0.text"),
     ],
     example_row={
@@ -87,18 +109,25 @@ ORDER_MED_SPEC = TableSpec(
     mapper_class="OrderMedMapper",
     resource_type="MedicationRequest",
     record_type="medication",
-    gate_columns=["DISPLAY_NAME", "MEDICATION_ID_MEDICATION_NAME"],  # both must be empty to skip
+    gate_columns=[
+        "DISPLAY_NAME",
+        "MEDICATION_ID_MEDICATION_NAME",
+    ],  # both must be empty to skip
     columns=[
         ColumnMapping("DISPLAY_NAME", "medicationCodeableConcept.text"),
-        ColumnMapping("MEDICATION_ID_MEDICATION_NAME", "medicationCodeableConcept.text",
-                      description="Fallback for DISPLAY_NAME"),
+        ColumnMapping(
+            "MEDICATION_ID_MEDICATION_NAME",
+            "medicationCodeableConcept.text",
+            description="Fallback for DISPLAY_NAME",
+        ),
         ColumnMapping("ORDERING_DATE", "authoredOn", transform="date"),
         ColumnMapping("START_DATE", "effectivePeriod.start", transform="date"),
         ColumnMapping("END_DATE", "effectivePeriod.end", transform="date"),
         ColumnMapping("ORDER_STATUS_C_NAME", "status", transform="status_map"),
         ColumnMapping("DOSAGE", "dosageInstruction.0.text"),
-        ColumnMapping("DESCRIPTION", "dosageInstruction.0.text",
-                      description="Fallback for DOSAGE"),
+        ColumnMapping(
+            "DESCRIPTION", "dosageInstruction.0.text", description="Fallback for DOSAGE"
+        ),
         ColumnMapping("QUANTITY", "dispenseRequest.quantity.value"),
         ColumnMapping("REFILLS", "dispenseRequest.numberOfRepeatsAllowed"),
         ColumnMapping("MED_PRESC_PROV_ID_PROV_NAME", "requester.display"),
@@ -129,13 +158,23 @@ ORDER_RESULTS_SPEC = TableSpec(
     columns=[
         ColumnMapping("COMPONENT_ID_NAME", "code.text"),
         ColumnMapping("ORD_NUM_VALUE", "valueQuantity.value", transform="numeric"),
-        ColumnMapping("ORD_VALUE", "valueString", description="Fallback when non-numeric"),
+        ColumnMapping(
+            "ORD_VALUE", "valueString", description="Fallback when non-numeric"
+        ),
         ColumnMapping("REFERENCE_UNIT", "valueQuantity.unit"),
-        ColumnMapping("REFERENCE_LOW", "referenceRange.0.low.value", transform="numeric"),
-        ColumnMapping("REFERENCE_HIGH", "referenceRange.0.high.value", transform="numeric"),
+        ColumnMapping(
+            "REFERENCE_LOW", "referenceRange.0.low.value", transform="numeric"
+        ),
+        ColumnMapping(
+            "REFERENCE_HIGH", "referenceRange.0.high.value", transform="numeric"
+        ),
         ColumnMapping("RESULT_DATE", "effectiveDateTime", transform="date"),
         ColumnMapping("RESULT_STATUS_C_NAME", "status", transform="status_map"),
-        ColumnMapping("RESULT_FLAG_C_NAME", "interpretation.0.coding.0.code", transform="status_map"),
+        ColumnMapping(
+            "RESULT_FLAG_C_NAME",
+            "interpretation.0.coding.0.code",
+            transform="status_map",
+        ),
         ColumnMapping("COMPON_LNC_ID_LNC_LONG_NAME", "code.coding.0.display"),
     ],
     example_row={
@@ -164,8 +203,11 @@ PAT_ENC_SPEC = TableSpec(
         ColumnMapping("FIN_CLASS_C_NAME", "class.code", transform="status_map"),
         ColumnMapping("DEPARTMENT_ID_EXTERNAL_NAME", "location.0.location.display"),
         ColumnMapping("VISIT_PROV_ID_PROV_NAME", "participant.0.individual.display"),
-        ColumnMapping("VISIT_PROV_TITLE_NAME", "participant.0.individual.display",
-                      description="Appended to provider name"),
+        ColumnMapping(
+            "VISIT_PROV_TITLE_NAME",
+            "participant.0.individual.display",
+            description="Appended to provider name",
+        ),
         ColumnMapping("HOSP_DISCHRG_TIME", "period.end", transform="date"),
         ColumnMapping("CONTACT_COMMENT", "reasonCode.0.text"),
     ],
@@ -193,8 +235,12 @@ DOC_INFORMATION_SPEC = TableSpec(
         ColumnMapping("DOC_STAT_C_NAME", "status", transform="status_map"),
         ColumnMapping("DOC_DESCR", "description"),
         ColumnMapping("RECV_BY_USER_ID_NAME", "author.0.display"),
-        ColumnMapping("IS_SCANNED_YN", "category.0.text", transform="conditional",
-                      description="Only added when Y"),
+        ColumnMapping(
+            "IS_SCANNED_YN",
+            "category.0.text",
+            transform="conditional",
+            description="Only added when Y",
+        ),
     ],
     example_row={
         "DOC_INFO_TYPE_C_NAME": "Progress Note",
@@ -216,7 +262,11 @@ ALLERGY_SPEC = TableSpec(
         ColumnMapping("ALLERGEN_ID_ALLERGEN_NAME", "code.text"),
         ColumnMapping("DATE_NOTED", "recordedDate", transform="date"),
         ColumnMapping("SEVERITY_C_NAME", "reaction.0.severity", transform="status_map"),
-        ColumnMapping("ALRGY_STATUS_C_NAME", "clinicalStatus.coding.0.code", transform="status_map"),
+        ColumnMapping(
+            "ALRGY_STATUS_C_NAME",
+            "clinicalStatus.coding.0.code",
+            transform="status_map",
+        ),
         ColumnMapping("REACTION", "reaction.0.manifestation.0.text"),
     ],
     example_row={
@@ -261,7 +311,12 @@ ORDER_PROC_SPEC = TableSpec(
     mapper_class="OrderProcMapper",
     resource_type="Procedure",
     record_type="procedure",
-    gate_columns=["DESCRIPTION", "PROC_NAME", "ORDER_TYPE_C_NAME", "DISPLAY_NAME"],  # all must be empty to skip
+    gate_columns=[
+        "DESCRIPTION",
+        "PROC_NAME",
+        "ORDER_TYPE_C_NAME",
+        "DISPLAY_NAME",
+    ],  # all must be empty to skip
     columns=[
         ColumnMapping("DESCRIPTION", "code.text"),
         ColumnMapping("ORDER_INST", "performedDateTime", transform="date"),
@@ -281,13 +336,26 @@ VITALS_SPEC = TableSpec(
     mapper_class="VitalsMapper",
     resource_type="Observation",
     record_type="observation",
-    gate_columns=["FLO_MEAS_NAME", "DISP_NAME", "FLO_MEAS_ID_FLO_MEAS_NAME", "MEAS_VALUE"],  # name + value both required
+    gate_columns=[
+        "FLO_MEAS_NAME",
+        "DISP_NAME",
+        "FLO_MEAS_ID_FLO_MEAS_NAME",
+        "MEAS_VALUE",
+    ],
     columns=[
         ColumnMapping("FLO_MEAS_NAME", "code.text"),
-        ColumnMapping("MEAS_VALUE", "valueQuantity.value", transform="numeric",
-                      description="Numeric values; falls back to valueString"),
+        ColumnMapping(
+            "MEAS_VALUE",
+            "valueQuantity.value",
+            transform="numeric",
+            description="Numeric values; falls back to valueString",
+        ),
         ColumnMapping("UNITS", "valueQuantity.unit"),
         ColumnMapping("RECORDED_TIME", "effectiveDateTime", transform="date"),
+    ],
+    gate_groups=[
+        ["FLO_MEAS_NAME", "DISP_NAME", "FLO_MEAS_ID_FLO_MEAS_NAME"],
+        ["MEAS_VALUE"],
     ],
     example_row={
         "FLO_MEAS_NAME": "Blood Pressure Systolic",
@@ -302,7 +370,10 @@ REFERRAL_SPEC = TableSpec(
     mapper_class="ReferralMapper",
     resource_type="ServiceRequest",
     record_type="service_request",
-    gate_columns=["RSN_FOR_RFL_C_NAME", "REFERRAL_PROV_ID_PROV_NAME"],  # both must be empty to skip
+    gate_columns=[
+        "RSN_FOR_RFL_C_NAME",
+        "REFERRAL_PROV_ID_PROV_NAME",
+    ],  # both must be empty to skip
     columns=[
         ColumnMapping("RSN_FOR_RFL_C_NAME", "code.text"),
         ColumnMapping("REFERRING_PROV_ID_REFERRING_PROV_NAM", "requester.display"),
@@ -346,8 +417,14 @@ SOCIAL_HX_SPEC = TableSpec(
     mapper_class="SocialHxMapper",
     resource_type="Observation",
     record_type="observation",
-    gate_columns=["SOCIAL_HX_TYPE_C_NAME", "HX_TYPE", "TOBACCO_USER_C_NAME",
-                   "SOCIAL_HX_COMMENT", "COMMENT", "SMOKING_TOBA_USE_C_NAME"],  # all must be empty
+    gate_columns=[
+        "SOCIAL_HX_TYPE_C_NAME",
+        "HX_TYPE",
+        "TOBACCO_USER_C_NAME",
+        "SOCIAL_HX_COMMENT",
+        "COMMENT",
+        "SMOKING_TOBA_USE_C_NAME",
+    ],  # all must be empty
     columns=[
         ColumnMapping("SOCIAL_HX_TYPE_C_NAME", "code.text"),
         ColumnMapping("SOCIAL_HX_COMMENT", "valueString"),
@@ -369,8 +446,12 @@ FAMILY_HX_SPEC = TableSpec(
     columns=[
         ColumnMapping("FAM_MEDICAL_DX_ID_DX_NAME", "condition.0.code.text"),
         ColumnMapping("RELATION_C_NAME", "relationship.text"),
-        ColumnMapping("AGE_OF_ONSET", "condition.0.onsetAge.value", transform="numeric",
-                      description="Numeric → onsetAge, non-numeric → onsetString"),
+        ColumnMapping(
+            "AGE_OF_ONSET",
+            "condition.0.onsetAge.value",
+            transform="numeric",
+            description="Numeric → onsetAge, non-numeric → onsetString",
+        ),
     ],
     example_row={
         "FAM_MEDICAL_DX_ID_DX_NAME": "Type 2 Diabetes",

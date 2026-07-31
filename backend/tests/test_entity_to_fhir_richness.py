@@ -4,6 +4,7 @@ condition onset, diagnostic-report performer, and lab-panel orders.
 These pin the recall improvements (B1-B8) for the AI-extracted (LangExtract)
 path. All pure functions — no DB.
 """
+
 from __future__ import annotations
 
 from uuid import uuid4
@@ -147,7 +148,9 @@ class TestLabObservationBuild:
         assert res["interpretation"][0]["coding"][0]["code"] == "H"
 
     def test_explicit_attrs_still_win(self):
-        rec = _record(_entity("lab_result", "Glucose", test="Glucose", value="88", unit="mg/dL"))
+        rec = _record(
+            _entity("lab_result", "Glucose", test="Glucose", value="88", unit="mg/dL")
+        )
         res = rec["fhir_resource"]
         assert res["valueQuantity"]["value"] == 88.0
         assert res["valueQuantity"]["unit"] == "mg/dL"
@@ -160,20 +163,35 @@ class TestLabObservationBuild:
 
 class TestProviderAttachment:
     def test_encounter_participant_from_attr(self):
-        rec = _record(_entity("encounter", "Office visit", visit_type="office",
-                              provider="Dr. Jane Smith", date="2024-03-01"))
+        rec = _record(
+            _entity(
+                "encounter",
+                "Office visit",
+                visit_type="office",
+                provider="Dr. Jane Smith",
+                date="2024-03-01",
+            )
+        )
         res = rec["fhir_resource"]
         assert res["participant"][0]["individual"]["display"] == "Dr. Jane Smith"
 
     def test_observation_performer_from_attr(self):
-        rec = _record(_entity("lab_result", "Glucose", value="95", unit="mg/dL",
-                              performer="Dr. Jane Smith"))
+        rec = _record(
+            _entity(
+                "lab_result",
+                "Glucose",
+                value="95",
+                unit="mg/dL",
+                performer="Dr. Jane Smith",
+            )
+        )
         res = rec["fhir_resource"]
         assert res["performer"][0]["display"] == "Dr. Jane Smith"
 
     def test_procedure_performer_from_attr(self):
-        rec = _record(_entity("procedure", "Colonoscopy", date="2024-03-01",
-                              provider="Dr. Gomez"))
+        rec = _record(
+            _entity("procedure", "Colonoscopy", date="2024-03-01", provider="Dr. Gomez")
+        )
         res = rec["fhir_resource"]
         assert res["performer"][0]["actor"]["display"] == "Dr. Gomez"
 
@@ -224,7 +242,9 @@ class TestParseDosage:
 
 class TestMedicationDosageBuild:
     def test_dosage_instruction_structured(self):
-        rec = _record(_entity("medication", "Metformin", dosage="500 mg PO twice daily"))
+        rec = _record(
+            _entity("medication", "Metformin", dosage="500 mg PO twice daily")
+        )
         di = rec["fhir_resource"]["dosageInstruction"][0]
         assert di["doseAndRate"][0]["doseQuantity"]["value"] == 500.0
         assert di["doseAndRate"][0]["doseQuantity"]["unit"] == "mg"
@@ -241,8 +261,11 @@ class TestMedicationDosageBuild:
 
 class TestConditionOnset:
     def test_onset_from_attr(self):
-        rec = _record(_entity("condition", "Crohn's Disease", status="active",
-                              onset_date="2015-06-01"))
+        rec = _record(
+            _entity(
+                "condition", "Crohn's Disease", status="active", onset_date="2015-06-01"
+            )
+        )
         assert rec["fhir_resource"]["onsetDateTime"] == "2015-06-01"
 
     def test_onset_since_attr(self):
@@ -257,8 +280,14 @@ class TestConditionOnset:
 
 class TestDiagnosticReportPerformer:
     def test_performer_from_lab_attr(self):
-        rec = _record(_entity("imaging_result", "CT Chest", findings="No acute findings",
-                              lab="Radiology Associates"))
+        rec = _record(
+            _entity(
+                "imaging_result",
+                "CT Chest",
+                findings="No acute findings",
+                lab="Radiology Associates",
+            )
+        )
         res = rec["fhir_resource"]
         assert res["performer"][0]["display"] == "Radiology Associates"
 
@@ -314,10 +343,130 @@ class TestBackwardCompat:
     def test_minimal_signature_unchanged(self):
         rec = entity_to_health_record_dict(
             _entity("condition", "Type 2 Diabetes", status="active"),
-            uuid4(), uuid4(), uuid4(),
+            uuid4(),
+            uuid4(),
+            uuid4(),
         )
         assert rec is not None
         assert rec["content_hash"]
 
     def test_non_storable_still_none(self):
         assert _record(_entity("dosage", "10mg")) is None
+
+    def test_non_local_extraction_metadata_shape_is_unchanged(self):
+        entity = _entity("condition", "Asthma", status="active")
+
+        metadata = _record(entity)["fhir_resource"]["_extraction_metadata"]
+
+        assert metadata == {
+            "entity_class": "condition",
+            "original_text": "Asthma",
+            "attributes": {"status": "active"},
+            "start_pos": 0,
+            "end_pos": len("Asthma"),
+            "confidence": 0.85,
+        }
+
+
+class TestStrictLocalEvidenceProvenance:
+    def test_caller_shaped_evidence_metadata_is_not_trusted(self):
+        entity = _entity(
+            "lab_result",
+            "Glucose",
+            value="95",
+            unit="mg/dL",
+            _evidence_ids=["ev1_" + "a" * 40],
+            _source_page=2,
+            _verbatim="Glucose 95 mg/dL",
+            _normalization_method="identity",
+            _normalization_version="1",
+        )
+
+        metadata = _record(entity)["fhir_resource"]["_extraction_metadata"]
+
+        assert (
+            not {
+                "_evidence_ids",
+                "_source_page",
+                "_verbatim",
+                "_normalization_method",
+                "_normalization_version",
+            }
+            & metadata.keys()
+        )
+
+    def test_arbitrary_underscore_keys_cannot_overwrite_protected_metadata(self):
+        entity = _entity(
+            "condition",
+            "Asthma",
+            status="active",
+            _arbitrary_secret="do not copy",
+            _extraction_metadata={"entity_class": "attacker"},
+            _evidence_ids=["ev1_" + "b" * 40],
+        )
+
+        metadata = _record(entity)["fhir_resource"]["_extraction_metadata"]
+
+        assert metadata["entity_class"] == "condition"
+        assert "_arbitrary_secret" not in metadata
+        assert "_extraction_metadata" not in metadata
+        assert "_arbitrary_secret" not in metadata["attributes"]
+        assert "_extraction_metadata" not in metadata["attributes"]
+        assert "_evidence_ids" not in metadata
+
+    def test_malformed_or_oversized_provenance_values_are_not_copied(self):
+        entity = _entity(
+            "condition",
+            "Asthma",
+            status="active",
+            _evidence_ids="not-a-list",
+            _source_page=True,
+            _verbatim="   ",
+            _normalization_method="caller-invented",
+            _normalization_version="version with spaces",
+        )
+
+        metadata = _record(entity)["fhir_resource"]["_extraction_metadata"]
+
+        assert (
+            not {
+                "_evidence_ids",
+                "_source_page",
+                "_verbatim",
+                "_normalization_method",
+                "_normalization_version",
+            }
+            & metadata.keys()
+        )
+
+    def test_untrusted_regex_shaped_provenance_is_not_promoted(self):
+        entity = _entity(
+            "condition",
+            "Asthma",
+            status="active",
+            _evidence_ids=["ev1_" + "c" * 40],
+            _source_page=1,
+            _verbatim="Asthma",
+            _normalization_method="identity",
+            _normalization_version="1",
+        )
+
+        metadata = _record(entity)["fhir_resource"]["_extraction_metadata"]
+
+        assert "_evidence_ids" not in metadata
+        assert "_source_page" not in metadata
+        assert "_verbatim" not in metadata
+
+    def test_existing_source_section_metadata_remains_backward_compatible(self):
+        entity = _entity(
+            "condition",
+            "Asthma",
+            status="active",
+            _source_section="Assessment",
+            _local_ner=True,
+        )
+
+        metadata = _record(entity)["fhir_resource"]["_extraction_metadata"]
+
+        assert metadata["attributes"]["_source_section"] == "Assessment"
+        assert metadata["attributes"]["_local_ner"] is True

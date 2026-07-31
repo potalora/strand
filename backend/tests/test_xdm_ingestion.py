@@ -1,15 +1,14 @@
 """Integration tests for XDM package detection and ingestion via coordinator."""
+
 from __future__ import annotations
 
 import io
-import json
 import zipfile
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.record import HealthRecord
@@ -51,10 +50,10 @@ async def test_coordinator_detects_xdm_in_zip(
     headers, uid = await auth_headers(client)
     zip_data = _create_xdm_zip()
 
-    with patch(PATCH_DEDUP, new_callable=AsyncMock) as mock_dedup, \
-         patch(
-             "app.services.ingestion.coordinator.parse_cda_document"
-         ) as mock_parse:
+    with (
+        patch(PATCH_DEDUP, new_callable=AsyncMock) as mock_dedup,
+        patch("app.services.ingestion.coordinator.parse_cda_document") as mock_parse,
+    ):
         mock_dedup.return_value = DedupSummary()
 
         # Return some synthetic records from the CDA parser
@@ -94,6 +93,7 @@ async def test_coordinator_detects_xdm_in_zip(
         resp = await client.post(
             "/api/v1/upload",
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
             files={"file": ("xdm_export.zip", zip_data, "application/zip")},
         )
 
@@ -107,17 +107,15 @@ async def test_coordinator_detects_xdm_in_zip(
 
 
 @pytest.mark.asyncio
-async def test_xdm_skips_pdf_in_package(
-    client: AsyncClient, db_session: AsyncSession
-):
+async def test_xdm_skips_pdf_in_package(client: AsyncClient, db_session: AsyncSession):
     """PDF entry in XDM manifest is skipped (not processed as unstructured)."""
     headers, uid = await auth_headers(client)
     zip_data = _create_xdm_zip()
 
-    with patch(PATCH_DEDUP, new_callable=AsyncMock) as mock_dedup, \
-         patch(
-             "app.services.ingestion.coordinator.parse_cda_document"
-         ) as mock_parse:
+    with (
+        patch(PATCH_DEDUP, new_callable=AsyncMock) as mock_dedup,
+        patch("app.services.ingestion.coordinator.parse_cda_document") as mock_parse,
+    ):
         mock_dedup.return_value = DedupSummary()
         mock_parse.return_value = [
             {
@@ -146,6 +144,7 @@ async def test_xdm_skips_pdf_in_package(
         resp = await client.post(
             "/api/v1/upload",
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
             files={"file": ("xdm_export.zip", zip_data, "application/zip")},
         )
 
@@ -153,8 +152,7 @@ async def test_xdm_skips_pdf_in_package(
     data = resp.json()
     # The PDF should show up in errors with structured_preferred reason
     pdf_errors = [
-        e for e in data.get("errors", [])
-        if e.get("reason") == "structured_preferred"
+        e for e in data.get("errors", []) if e.get("reason") == "structured_preferred"
     ]
     assert len(pdf_errors) == 1
     assert "SCAN0001.PDF" in pdf_errors[0]["file"]
@@ -163,17 +161,15 @@ async def test_xdm_skips_pdf_in_package(
 
 
 @pytest.mark.asyncio
-async def test_xdm_creates_cda_records(
-    client: AsyncClient, db_session: AsyncSession
-):
+async def test_xdm_creates_cda_records(client: AsyncClient, db_session: AsyncSession):
     """Records from XDM ingestion have source_format='cda_r2'."""
     headers, uid = await auth_headers(client)
     zip_data = _create_xdm_zip()
 
-    with patch(PATCH_DEDUP, new_callable=AsyncMock) as mock_dedup, \
-         patch(
-             "app.services.ingestion.coordinator.parse_cda_document"
-         ) as mock_parse:
+    with (
+        patch(PATCH_DEDUP, new_callable=AsyncMock) as mock_dedup,
+        patch("app.services.ingestion.coordinator.parse_cda_document") as mock_parse,
+    ):
         mock_dedup.return_value = DedupSummary()
         mock_parse.return_value = [
             {
@@ -204,6 +200,7 @@ async def test_xdm_creates_cda_records(
         resp = await client.post(
             "/api/v1/upload",
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
             files={"file": ("xdm_export.zip", zip_data, "application/zip")},
         )
 
@@ -211,6 +208,7 @@ async def test_xdm_creates_cda_records(
 
     # Query DB for inserted records
     from uuid import UUID as _UUID
+
     result = await db_session.execute(
         select(HealthRecord).where(HealthRecord.user_id == _UUID(uid))
     )
@@ -221,9 +219,7 @@ async def test_xdm_creates_cda_records(
 
 
 @pytest.mark.asyncio
-async def test_xdm_intra_upload_dedup(
-    client: AsyncClient, db_session: AsyncSession
-):
+async def test_xdm_intra_upload_dedup(client: AsyncClient, db_session: AsyncSession):
     """Dedup collapses duplicate records across CDA documents."""
     headers, uid = await auth_headers(client)
     zip_data = _create_xdm_zip()
@@ -267,21 +263,25 @@ async def test_xdm_intra_upload_dedup(
         call_count += 1
         # Return a copy with different source_document metadata
         import copy
+
         rec = copy.deepcopy(shared_record)
         doc_name = f"DOC000{call_count}.XML"
         rec["fhir_resource"]["_extraction_metadata"]["source_document"] = doc_name
         return [rec]
 
-    with patch(PATCH_DEDUP, new_callable=AsyncMock) as mock_dedup, \
-         patch(
-             "app.services.ingestion.coordinator.parse_cda_document",
-             side_effect=mock_parse_side_effect,
-         ):
+    with (
+        patch(PATCH_DEDUP, new_callable=AsyncMock) as mock_dedup,
+        patch(
+            "app.services.ingestion.coordinator.parse_cda_document",
+            side_effect=mock_parse_side_effect,
+        ),
+    ):
         mock_dedup.return_value = DedupSummary()
 
         resp = await client.post(
             "/api/v1/upload",
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
             files={"file": ("xdm_export.zip", zip_data, "application/zip")},
         )
 
@@ -305,6 +305,7 @@ async def test_non_xdm_zip_uses_existing_pipeline(
         resp = await client.post(
             "/api/v1/upload",
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
             files={"file": ("fhir_bundle.zip", zip_data, "application/zip")},
         )
 

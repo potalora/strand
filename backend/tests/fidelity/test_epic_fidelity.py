@@ -10,15 +10,16 @@ Two categories:
 2. Real-data fidelity tests (@pytest.mark.fidelity) — verify against
    actual Epic EHI exports, skip when absent
 """
+
 from __future__ import annotations
 
-import csv
 from pathlib import Path
 
 import pytest
 
-from tests.fidelity.column_specs import ALL_TABLE_SPECS, TableSpec
+from tests.fidelity.column_specs import ALL_TABLE_SPECS
 from tests.fidelity.helpers import (
+    enrich_companion_rows,
     get_mapper_for_table,
     load_tsv_rows,
     map_with_metadata,
@@ -45,9 +46,7 @@ class TestMapperExampleRows:
         mapper = get_mapper_for_table(table_name)
         assert mapper is not None, f"No mapper registered for {table_name}"
         result = mapper.to_fhir(spec.example_row)
-        assert result is not None, (
-            f"{spec.mapper_class} returned None for example_row"
-        )
+        assert result is not None, f"{spec.mapper_class} returned None for example_row"
         assert result["resourceType"] == spec.resource_type
 
     @pytest.mark.parametrize(
@@ -131,13 +130,18 @@ class TestMapperColumnAccuracy:
         spec = ALL_TABLE_SPECS["MEDICAL_HX"]
         mapper = get_mapper_for_table("MEDICAL_HX")
         result = mapper.to_fhir(spec.example_row)
-        assert resolve_fhir_path(result, "note.0.text") == "Laparoscopic, no complications"
+        assert (
+            resolve_fhir_path(result, "note.0.text") == "Laparoscopic, no complications"
+        )
 
     def test_order_med_medication_name(self):
         spec = ALL_TABLE_SPECS["ORDER_MED"]
         mapper = get_mapper_for_table("ORDER_MED")
         result = mapper.to_fhir(spec.example_row)
-        assert resolve_fhir_path(result, "medicationCodeableConcept.text") == "Metformin 500mg"
+        assert (
+            resolve_fhir_path(result, "medicationCodeableConcept.text")
+            == "Metformin 500mg"
+        )
 
     def test_order_med_effective_period(self):
         """Verify effectivePeriod is used (not _effectiveStart)."""
@@ -153,14 +157,18 @@ class TestMapperColumnAccuracy:
         spec = ALL_TABLE_SPECS["ORDER_MED"]
         mapper = get_mapper_for_table("ORDER_MED")
         result = mapper.to_fhir(spec.example_row)
-        assert resolve_fhir_path(result, "dosageInstruction.0.text") == "500mg twice daily"
+        assert (
+            resolve_fhir_path(result, "dosageInstruction.0.text") == "500mg twice daily"
+        )
 
     def test_order_med_dispense(self):
         spec = ALL_TABLE_SPECS["ORDER_MED"]
         mapper = get_mapper_for_table("ORDER_MED")
         result = mapper.to_fhir(spec.example_row)
         assert resolve_fhir_path(result, "dispenseRequest.quantity.value") == "60"
-        assert resolve_fhir_path(result, "dispenseRequest.numberOfRepeatsAllowed") == "3"
+        assert (
+            resolve_fhir_path(result, "dispenseRequest.numberOfRepeatsAllowed") == "3"
+        )
 
     def test_order_med_route(self):
         spec = ALL_TABLE_SPECS["ORDER_MED"]
@@ -212,7 +220,10 @@ class TestMapperColumnAccuracy:
         spec = ALL_TABLE_SPECS["PAT_ENC"]
         mapper = get_mapper_for_table("PAT_ENC")
         result = mapper.to_fhir(spec.example_row)
-        assert resolve_fhir_path(result, "location.0.location.display") == "Internal Medicine"
+        assert (
+            resolve_fhir_path(result, "location.0.location.display")
+            == "Internal Medicine"
+        )
 
     def test_pat_enc_provider(self):
         spec = ALL_TABLE_SPECS["PAT_ENC"]
@@ -300,6 +311,20 @@ class TestMapperColumnAccuracy:
         assert resolve_fhir_path(result, "valueQuantity.value") == 120.0
         assert resolve_fhir_path(result, "valueQuantity.unit") == "mmHg"
 
+    def test_vitals_gate_requires_both_name_and_value(self):
+        spec = ALL_TABLE_SPECS["IP_FLWSHT_MEAS"]
+
+        assert not spec.has_required_data(
+            {"FLO_MEAS_ID_FLO_MEAS_NAME": "Blood Pressure"}
+        )
+        assert not spec.has_required_data({"MEAS_VALUE": "120"})
+        assert spec.has_required_data(
+            {
+                "FLO_MEAS_ID_FLO_MEAS_NAME": "Blood Pressure",
+                "MEAS_VALUE": "120",
+            }
+        )
+
     def test_referral_code(self):
         spec = ALL_TABLE_SPECS["REFERRAL"]
         mapper = get_mapper_for_table("REFERRAL")
@@ -359,8 +384,11 @@ class TestDisplayTextExtraction:
         display = result["display_text"]
         # Should not be just the bare resource type name
         bare_names = {
-            spec.resource_type, spec.resource_type.lower(),
-            "Unknown", "unknown", "",
+            spec.resource_type,
+            spec.resource_type.lower(),
+            "Unknown",
+            "unknown",
+            "",
         }
         assert display not in bare_names, (
             f"{spec.mapper_class} display_text is bare '{display}'"
@@ -407,12 +435,12 @@ class TestRealEpicCompleteness:
         rows = load_tsv_rows(tsv_path)
         if not rows:
             pytest.skip(f"{table_name}.tsv is header-only")
+        rows = enrich_companion_rows(real_epic_dir, table_name, rows)
 
         mapper = get_mapper_for_table(table_name)
         dropped = []
         for i, row in enumerate(rows):
-            # Check if gate columns are populated
-            has_gate = any(row.get(col, "").strip() for col in spec.gate_columns)
+            has_gate = spec.has_required_data(row)
             result = mapper.to_fhir(row)
             if has_gate and result is None:
                 dropped.append(i)
@@ -437,6 +465,7 @@ class TestRealEpicCompleteness:
         rows = load_tsv_rows(tsv_path)
         if not rows:
             pytest.skip(f"{table_name}.tsv is header-only")
+        rows = enrich_companion_rows(real_epic_dir, table_name, rows)
 
         results = map_with_metadata(table_name, rows)
         mapped = [r for r in results if not r["skipped"]]
@@ -446,8 +475,11 @@ class TestRealEpicCompleteness:
 
         total = len(mapped)
         has_date = sum(1 for r in mapped if r["effective_date"] is not None)
-        has_status = sum(1 for r in mapped if r["status"] is not None)
-        has_display = sum(1 for r in mapped if r["display_text"] and r["display_text"] != spec.resource_type)
+        has_display = sum(
+            1
+            for r in mapped
+            if r["display_text"] and r["display_text"] != spec.resource_type
+        )
 
         # display_text should always be populated (build_display_text fallback)
         assert has_display == total, (
@@ -457,8 +489,9 @@ class TestRealEpicCompleteness:
         # Warn on low date population (not a hard failure)
         if total > 0 and has_date / total < 0.5:
             import warnings
+
             warnings.warn(
-                f"{spec.mapper_class}: only {has_date}/{total} ({has_date*100//total}%) "
+                f"{spec.mapper_class}: only {has_date}/{total} ({has_date * 100 // total}%) "
                 f"rows have effective_date"
             )
 
@@ -477,6 +510,7 @@ class TestRealEpicCompleteness:
         rows = load_tsv_rows(tsv_path)
         if not rows:
             pytest.skip(f"{table_name}.tsv is header-only")
+        rows = enrich_companion_rows(real_epic_dir, table_name, rows)
 
         mapper = get_mapper_for_table(table_name)
         mapped_resources = [mapper.to_fhir(r) for r in rows]
@@ -496,6 +530,7 @@ class TestRealEpicCompleteness:
 
         if never_populated:
             import warnings
+
             warnings.warn(
                 f"{spec.mapper_class}: columns never populated in real data: "
                 f"{never_populated}"
@@ -517,6 +552,7 @@ class TestRealEpicRowDetails:
             has_mapper = table_name in EPIC_TABLE_MAPPERS
             mapped_count = 0
             if has_mapper and rows:
+                rows = enrich_companion_rows(real_epic_dir, table_name, rows)
                 mapper = get_mapper_for_table(table_name)
                 mapped_count = sum(1 for r in rows if mapper.to_fhir(r) is not None)
             summary[table_name] = {

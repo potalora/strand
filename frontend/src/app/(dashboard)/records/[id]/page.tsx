@@ -7,7 +7,7 @@ import { ChevronLeft, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import type { HealthRecord } from "@/types/api";
 import { usePreferencesStore } from "@/stores/usePreferencesStore";
-import { RECORD_TYPE_ICONS, getObservationIcon } from "@/lib/record-icons";
+import { getRecordTypeIconElement } from "@/lib/record-icons";
 import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
 import { sourceLabel } from "@/lib/source-label";
 import { recordTitle } from "@/lib/record-title";
@@ -16,6 +16,8 @@ import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { FhirResourceRenderer } from "@/components/retro/FhirResourceRenderer";
 import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
 import { AIExtractionBadge, AdvancedSection } from "@/components/retro/renderers/shared";
+import { ExtractionEvidencePanel } from "@/components/retro/ExtractionEvidencePanel";
+import { fmtDay } from "@/lib/format-date";
 
 export default function RecordDetailPage() {
   const params = useParams();
@@ -40,12 +42,17 @@ export default function RecordDetailPage() {
 
   useEffect(() => {
     if (!id) return;
-    setLoading(true);
-    api
-      .get<HealthRecord>(`/records/${id}`)
-      .then(setRecord)
-      .catch((err) => setError(err instanceof Error ? err.message : "Failed to load record"))
-      .finally(() => setLoading(false));
+    void (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        setRecord(await api.get<HealthRecord>(`/records/${id}`));
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to load record");
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, [id]);
 
   function handleDeleteClick() {
@@ -93,8 +100,7 @@ export default function RecordDetailPage() {
 
   // Resolve icon + colors for the header chip (record-TYPE hue — neutral, not value-judgement).
   const type = record.record_type.toLowerCase();
-  const IconComponent =
-    type === "observation" ? getObservationIcon(record.fhir_resource) : RECORD_TYPE_ICONS[type];
+  const icon = getRecordTypeIconElement(type, 22, record.fhir_resource);
   const colors = RECORD_TYPE_COLORS[type] ?? DEFAULT_RECORD_COLOR;
 
   return (
@@ -110,7 +116,7 @@ export default function RecordDetailPage() {
         {/* 1. Editorial header: kicker + icon chip + serif title + badge + status */}
         <p className="kicker">Record detail</p>
         <div className="flex items-start gap-3" style={{ marginTop: 6 }}>
-          {IconComponent && (
+          {icon && (
             <div
               className="flex items-center justify-center shrink-0"
               style={{
@@ -122,7 +128,7 @@ export default function RecordDetailPage() {
                 borderRadius: "var(--radius-sm)",
               }}
             >
-              <IconComponent size={22} />
+              {icon}
             </div>
           )}
           <div className="min-w-0 flex-1">
@@ -155,12 +161,15 @@ export default function RecordDetailPage() {
             <p className="muted text-xs" style={{ marginTop: 8 }}>
               This record was extracted from an unstructured document using AI.
             </p>
+            <div style={{ marginTop: 14 }}>
+              <ExtractionEvidencePanel recordId={record.id} enabled />
+            </div>
           </div>
         )}
 
         {/* 4. Metadata fields */}
         <div style={{ marginTop: 18 }}>
-          <Field label="Date" value={fmtDate(record.effective_date)} />
+          <Field label="Date" value={fmtDay(record.effective_date) || "Not specified"} />
           <Field label="Source" value={sourceLabel(record.source_format)} />
           <Field label="FHIR type" value={record.fhir_resource_type} />
           {record.code_value && (
@@ -174,7 +183,7 @@ export default function RecordDetailPage() {
           {record.category && record.category.length > 0 && (
             <Field label="Categories" value={record.category.join(", ")} />
           )}
-          <Field label="Added" value={fmtDate(record.created_at)} />
+          <Field label="Added" value={fmtTimestampDate(record.created_at)} />
         </div>
 
         {/* 5. Advanced section: collapsible FHIR JSON */}
@@ -215,7 +224,7 @@ export default function RecordDetailPage() {
   );
 }
 
-function fmtDate(value: string | null): string {
+function fmtTimestampDate(value: string | null): string {
   if (!value) return "Not specified";
   return new Date(value).toLocaleDateString("en-US", {
     year: "numeric",

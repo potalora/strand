@@ -1,7 +1,7 @@
 import "react";
 
 declare module "react" {
-  interface InputHTMLAttributes<T> {
+  interface InputHTMLAttributes {
     webkitdirectory?: string;
     directory?: string;
   }

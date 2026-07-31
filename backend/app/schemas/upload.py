@@ -1,9 +1,42 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from app.services.local_ai.types import ProcessingMode
+
+
+class LocalModelInfo(BaseModel):
+    role: Literal["ocr", "extraction"]
+    repository: str
+    revision: str
+
+
+class LocalRunInfo(BaseModel):
+    privacy_mode: Literal["validated_strict_local"]
+    models: list[LocalModelInfo] = Field(default_factory=list, max_length=2)
+
+
+class LocalProcessingFailure(BaseModel):
+    stage: str
+    code: str
+    message: str
+    model_role: str | None = None
+    repository: str | None = None
+    revision: str | None = None
+    retryable: bool
+    checkpoint_preserved: bool
+    cloud_fallback_attempted: Literal[False] = False
+
+
+class UnstructuredUploadItem(BaseModel):
+    upload_id: str
+    filename: str
+    status: str
+    manual_extraction_required: bool
 
 
 class UploadResponse(BaseModel):
@@ -11,7 +44,7 @@ class UploadResponse(BaseModel):
     status: str
     records_inserted: int
     errors: list[Any] = []
-    unstructured_uploads: list[dict] = []
+    unstructured_uploads: list[UnstructuredUploadItem] = Field(default_factory=list)
 
 
 class UploadStatusResponse(BaseModel):
@@ -22,6 +55,7 @@ class UploadStatusResponse(BaseModel):
     total_file_count: int = 1
     ingestion_progress: dict = {}
     ingestion_errors: list[Any] = []
+    manual_extraction_required: bool = False
     processing_started_at: datetime | None = None
     processing_completed_at: datetime | None = None
     # Section-level extraction progress (unstructured pipeline).
@@ -29,6 +63,9 @@ class UploadStatusResponse(BaseModel):
     progress_detail: dict | None = None
     # Durable per-file notices (e.g. an OCR provider refusal + fallback).
     notices: list[Any] = []
+    local_run: LocalRunInfo | None = None
+    local_failure: LocalProcessingFailure | None = None
+    local_job_id: str | None = None
 
 
 class UploadHistoryItem(BaseModel):
@@ -40,6 +77,10 @@ class UploadHistoryItem(BaseModel):
     created_at: str | None = None
     ingestion_progress: dict = {}
     ingestion_errors: list[Any] = []
+    manual_extraction_required: bool = False
+    local_run: LocalRunInfo | None = None
+    local_failure: LocalProcessingFailure | None = None
+    local_job_id: str | None = None
 
 
 class UploadHistoryResponse(BaseModel):
@@ -51,6 +92,7 @@ class UnstructuredUploadResponse(BaseModel):
     upload_id: str
     status: str
     file_type: str
+    manual_extraction_required: bool = False
 
 
 class ExtractedEntitySchema(BaseModel):
@@ -75,13 +117,17 @@ class BatchUploadResponse(BaseModel):
     total: int
 
 
+class ReprocessUploadRequest(BaseModel):
+    processing_mode: ProcessingMode | None = None
+
+
 class ConfirmExtractionRequest(BaseModel):
     confirmed_entities: list[ExtractedEntitySchema]
     patient_id: str
 
 
 class TriggerExtractionRequest(BaseModel):
-    upload_ids: list[str]
+    upload_ids: list[UUID]
 
 
 class PendingExtractionFile(BaseModel):
@@ -92,11 +138,15 @@ class PendingExtractionFile(BaseModel):
     file_size_bytes: int | None = None
     created_at: str | None = None
     ingestion_status: str | None = None
+    manual_extraction_required: bool = False
     # Section-level extraction progress (unstructured pipeline).
     progress_stage: str | None = None
     progress_detail: dict | None = None
     # Durable per-file notices (e.g. an OCR provider refusal + fallback).
     notices: list[Any] = []
+    local_run: LocalRunInfo | None = None
+    local_failure: LocalProcessingFailure | None = None
+    local_job_id: str | None = None
 
 
 class CancelExtractionRequest(BaseModel):

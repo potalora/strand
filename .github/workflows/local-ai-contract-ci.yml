@@ -1,0 +1,174 @@
+name: Strict-local AI contracts
+
+on:
+  pull_request:
+    paths:
+      - "backend/app/services/local_ai/**"
+      - "backend/app/api/local_ai.py"
+      - "backend/app/api/upload.py"
+      - "backend/app/config.py"
+      - "backend/app/model_manifests/**"
+      - "backend/app/services/local_ai/pack_operations.py"
+      - "backend/scripts/local_ai_pack.py"
+      - "backend/scripts/benchmark_local_ai.py"
+      - "backend/scripts/promote_local_ai_release.py"
+      - "backend/alembic/versions/**"
+      - "backend/tests/test_local_ai_*.py"
+      - "backend/tests/test_strict_local_*.py"
+      - "workers/local_ai/**"
+      - "scripts/setup-local-ai-macos.sh"
+      - "justfile"
+      - ".github/workflows/local-ai-contract-ci.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "backend/app/services/local_ai/**"
+      - "backend/app/api/local_ai.py"
+      - "backend/app/api/upload.py"
+      - "backend/app/config.py"
+      - "backend/app/model_manifests/**"
+      - "backend/app/services/local_ai/pack_operations.py"
+      - "backend/scripts/local_ai_pack.py"
+      - "backend/scripts/benchmark_local_ai.py"
+      - "backend/scripts/promote_local_ai_release.py"
+      - "backend/alembic/versions/**"
+      - "backend/tests/test_local_ai_*.py"
+      - "backend/tests/test_strict_local_*.py"
+      - "workers/local_ai/**"
+      - "scripts/setup-local-ai-macos.sh"
+      - "justfile"
+      - ".github/workflows/local-ai-contract-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: medtimeline_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d medtimeline_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/medtimeline_test
+      REDIS_URL: redis://127.0.0.1:6379/0
+      JWT_SECRET_KEY: ci-only-jwt-secret-with-more-than-thirty-two-characters
+      DATABASE_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      PHI_NER_ENABLED: "false"
+      LOCAL_AI_ENABLED: "false"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.6.6"
+          python-version: "3.11.8"
+          enable-cache: true
+          cache-dependency-glob: |
+            backend/uv.lock
+
+      - name: Install locked backend dependencies
+        working-directory: backend
+        run: uv sync --frozen
+
+      - name: Run fake-worker privacy and lifecycle contracts
+        working-directory: backend
+        run: |
+          uv run pytest \
+            tests/test_local_ai_manifest.py \
+            tests/test_local_ai_artifacts.py \
+            tests/test_local_ai_downloader.py \
+            tests/test_local_ai_model_manager.py \
+            tests/test_local_ai_pack_verifier.py \
+            tests/test_local_ai_cleanup.py \
+            tests/test_local_ai_log_privacy.py \
+            tests/test_strict_local_egress.py \
+            tests/test_strict_local_pipeline.py \
+            -q
+
+      - name: Check local-AI backend formatting and lint
+        working-directory: backend
+        run: |
+          uv run ruff format --check \
+            app/api/local_ai.py \
+            app/services/ai/grounded_routing.py \
+            app/services/ai/prompt_grounding.py \
+            app/services/local_ai \
+            scripts/benchmark_local_ai.py \
+            scripts/local_ai_pack.py \
+            scripts/promote_local_ai_release.py \
+            scripts/run_local_ai_fidelity.py \
+            tests/test_grounded_*.py \
+            tests/test_local_ai_*.py \
+            tests/test_prompt_only_grounded_summary.py \
+            tests/test_strict_local_*.py
+          uv run ruff check \
+            app/api/local_ai.py \
+            app/services/ai/grounded_routing.py \
+            app/services/ai/prompt_grounding.py \
+            app/services/local_ai \
+            scripts/benchmark_local_ai.py \
+            scripts/local_ai_pack.py \
+            scripts/promote_local_ai_release.py \
+            scripts/run_local_ai_fidelity.py \
+            tests/test_grounded_*.py \
+            tests/test_local_ai_*.py \
+            tests/test_prompt_only_grounded_summary.py \
+            tests/test_strict_local_*.py
+
+      - name: Smoke-test Alembic upgrade in an isolated database
+        working-directory: backend
+        env:
+          PGPASSWORD: postgres
+        run: |
+          createdb -h 127.0.0.1 -U postgres medtimeline_migrations_ci
+          trap 'dropdb -h 127.0.0.1 -U postgres --if-exists medtimeline_migrations_ci' EXIT
+          DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/medtimeline_migrations_ci uv run alembic upgrade head
+
+  apple-mlx-worker:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.6.6"
+          python-version: "3.11.8"
+          enable-cache: true
+          cache-dependency-glob: workers/local_ai/apple_mlx/uv.lock
+
+      - name: Install isolated MLX worker dependencies
+        working-directory: workers/local_ai/apple_mlx
+        run: uv sync --frozen
+
+      - name: Run offline worker contracts without model downloads
+        working-directory: workers/local_ai/apple_mlx
+        run: |
+          uv run ruff format --check src tests
+          uv run ruff check src tests
+          uv run pytest -q

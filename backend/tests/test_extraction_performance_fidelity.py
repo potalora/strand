@@ -21,7 +21,9 @@ _HAS_KEY = bool(settings.gemini_api_key)
 @pytest.mark.skipif(_NOTE is None, reason="real note PDF required")
 def test_textlayer_note_uses_local_no_gemini_vision():
     text, confidence = text_extractor.extract_text_from_pdf_local(_NOTE)
-    print(f"\nnote PDF confidence: {confidence:.1f} chars/page (threshold={text_extractor.LOCAL_TEXT_MIN_CHARS_PER_PAGE})")
+    print(
+        f"\nnote PDF confidence: {confidence:.1f} chars/page (threshold={text_extractor.LOCAL_TEXT_MIN_CHARS_PER_PAGE})"
+    )
     assert confidence >= text_extractor.LOCAL_TEXT_MIN_CHARS_PER_PAGE, (
         f"note confidence {confidence} below threshold — is it really a text-layer PDF?"
     )
@@ -29,7 +31,9 @@ def test_textlayer_note_uses_local_no_gemini_vision():
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not _HAS_KEY or _NOTE is None, reason="GEMINI_API_KEY + note required")
+@pytest.mark.skipif(
+    not _HAS_KEY or _NOTE is None, reason="GEMINI_API_KEY + note required"
+)
 @pytest.mark.asyncio
 async def test_router_textlayer_note_skips_gemini_vision():
     with patch.object(text_extractor, "_extract_text_from_pdf_gemini") as gem:
@@ -39,8 +43,10 @@ async def test_router_textlayer_note_skips_gemini_vision():
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(not (_SCANNED and _SCANNED.exists()),
-                    reason="scanned ibs_smart.pdf required")
+@pytest.mark.skipif(
+    not (_SCANNED and _SCANNED.exists()), reason="scanned ibs_smart.pdf required"
+)
+@pytest.mark.private_cloud_fidelity
 @pytest.mark.asyncio
 async def test_router_scanned_pdf_ocr_via_chosen_vision_provider():
     """A scanned PDF routes to vision OCR via the CHOSEN vision provider.
@@ -54,18 +60,29 @@ async def test_router_scanned_pdf_ocr_via_chosen_vision_provider():
     from app.services.ai.llm.config import LLMConfig
 
     text, confidence = text_extractor.extract_text_from_pdf_local(_SCANNED)
-    print(f"\nibs_smart.pdf local confidence: {confidence:.1f} chars/page (threshold={text_extractor.LOCAL_TEXT_MIN_CHARS_PER_PAGE})")
+    print(
+        f"\nibs_smart.pdf local confidence: {confidence:.1f} chars/page (threshold={text_extractor.LOCAL_TEXT_MIN_CHARS_PER_PAGE})"
+    )
     if confidence >= text_extractor.LOCAL_TEXT_MIN_CHARS_PER_PAGE:
-        pytest.skip(f"ibs_smart.pdf has a text layer (conf={confidence}); not a scanned fixture")
+        pytest.skip(
+            f"ibs_smart.pdf has a text layer (conf={confidence}); not a scanned fixture"
+        )
 
     cfg = LLMConfig.from_settings()
     chosen = next(
-        (n for n in ("anthropic", "openai", "openrouter")
-         if cfg.providers.get(n) and cfg.providers[n].api_key),
+        (
+            n
+            for n in ("anthropic", "openai", "openrouter")
+            if cfg.providers.get(n) and cfg.providers[n].api_key
+        ),
         None,
     )
     if chosen is None:
-        pytest.skip("no non-Gemini cloud vision provider configured to read a Gemini-blocked scan")
+        pytest.skip(
+            "no non-Gemini cloud vision provider configured to read a Gemini-blocked scan"
+        )
     cfg.routing["vision"] = chosen
-    out = await text_extractor.extract_text_from_pdf(_SCANNED, settings.gemini_api_key, cfg)
+    out = await text_extractor.extract_text_from_pdf(
+        _SCANNED, settings.gemini_api_key, cfg
+    )
     assert len(out.strip()) > 0

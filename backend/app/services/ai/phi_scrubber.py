@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import re
 import logging
-from typing import Any
 
 from app.config import settings
 
@@ -12,9 +11,21 @@ logger = logging.getLogger(__name__)
 # Regex patterns for all 18 HIPAA identifiers
 PATTERNS = {
     "ssn": (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[SSN]"),
-    "phone": (re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"), "[PHONE]"),
-    "fax": (re.compile(r"\b(?:fax|facsimile)[:\s]*(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", re.IGNORECASE), "[FAX]"),
-    "email": (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"), "[EMAIL]"),
+    "phone": (
+        re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
+        "[PHONE]",
+    ),
+    "fax": (
+        re.compile(
+            r"\b(?:fax|facsimile)[:\s]*(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
+            re.IGNORECASE,
+        ),
+        "[FAX]",
+    ),
+    "email": (
+        re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),
+        "[EMAIL]",
+    ),
     "mrn": (re.compile(r"\b(?:MRN|mrn|Medical Record Number)[:\s]*\d+\b"), "[MRN]"),
     "mrn_numeric": (re.compile(r"\b\d{8,12}\b"), None),  # Only scrub in context
     "ip_address": (re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"), "[IP]"),
@@ -54,15 +65,24 @@ PATTERNS = {
     ),
     "vehicle_id": (re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b"), "[VIN]"),
     "device_id": (
-        re.compile(r"\b(?:serial|UDI|device\s*(?:id|identifier))[:\s#]*[A-Za-z0-9\-]+\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:serial|UDI|device\s*(?:id|identifier))[:\s#]*[A-Za-z0-9\-]+\b",
+            re.IGNORECASE,
+        ),
         "[DEVICE_ID]",
     ),
     "biometric_id": (
-        re.compile(r"\b(?:biometric|fingerprint|retina|voiceprint)[:\s#]*[A-Za-z0-9\-]+\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:biometric|fingerprint|retina|voiceprint)[:\s#]*[A-Za-z0-9\-]+\b",
+            re.IGNORECASE,
+        ),
         "[BIOMETRIC]",
     ),
     "health_plan_number": (
-        re.compile(r"\b(?:plan|policy|member|group|subscriber|beneficiary)\s*(?:number|no|#|id)[:\s#]*[A-Za-z0-9\-]+\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:plan|policy|member|group|subscriber|beneficiary)\s*(?:number|no|#|id)[:\s#]*[A-Za-z0-9\-]+\b",
+            re.IGNORECASE,
+        ),
         "[HEALTH_PLAN]",
     ),
 }
@@ -81,17 +101,11 @@ _MONTH_FIRST_DATE = re.compile(
     rf"\b{_MONTHS}\s+\d{{1,2}},?\s+(\d{{4}})\b", re.IGNORECASE
 )
 # "14 July 2023" -> year (group 1)
-_DAY_FIRST_DATE = re.compile(
-    rf"\b\d{{1,2}}\s+{_MONTHS}\s+(\d{{4}})\b", re.IGNORECASE
-)
+_DAY_FIRST_DATE = re.compile(rf"\b\d{{1,2}}\s+{_MONTHS}\s+(\d{{4}})\b", re.IGNORECASE)
 # ISO "2023-07-14" / "2023/07/14" -> year (group 1)
-_ISO_DATE = re.compile(
-    r"\b(\d{4})[-/](?:0?[1-9]|1[0-2])[-/](?:0?[1-9]|[12]\d|3[01])\b"
-)
+_ISO_DATE = re.compile(r"\b(\d{4})[-/](?:0?[1-9]|1[0-2])[-/](?:0?[1-9]|[12]\d|3[01])\b")
 # US slash "07/14/2023" / "7/4/2023" -> year (group 1, the 4-digit year)
-_SLASH_DATE = re.compile(
-    r"\b(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])/(\d{4})\b"
-)
+_SLASH_DATE = re.compile(r"\b(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])/(\d{4})\b")
 
 # --- Age generalization (HIPAA Safe Harbor: ages > 89 aggregate to "90+") ----
 # "95-year-old" / "95 year old" — the leading number is group 1.
@@ -137,7 +151,9 @@ def scrub_phi(
                     pattern = re.compile(re.escape(part), re.IGNORECASE)
                 matches = pattern.findall(scrubbed)
                 if matches:
-                    report["names_scrubbed"] = report.get("names_scrubbed", 0) + len(matches)
+                    report["names_scrubbed"] = report.get("names_scrubbed", 0) + len(
+                        matches
+                    )
                     scrubbed = pattern.sub("[PATIENT]", scrubbed)
 
     # Scrub known MRN
@@ -156,7 +172,9 @@ def scrub_phi(
                 pattern = re.compile(re.escape(part), re.IGNORECASE)
                 matches = pattern.findall(scrubbed)
                 if matches:
-                    report["addresses_removed"] = report.get("addresses_removed", 0) + len(matches)
+                    report["addresses_removed"] = report.get(
+                        "addresses_removed", 0
+                    ) + len(matches)
                     scrubbed = pattern.sub("[LOCATION]", scrubbed)
 
     # Scrub known DOB

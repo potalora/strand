@@ -3,6 +3,10 @@
 import { create } from "zustand";
 import type { ProgressDetail, RawProgress } from "@/lib/extraction-progress";
 import { isTerminalStatus } from "@/lib/extraction-progress";
+import type {
+  LocalProcessingFailure,
+  LocalRunInfo,
+} from "@/types/local-ai";
 
 /**
  * Single source of truth for the CURRENT extraction batch.
@@ -23,6 +27,8 @@ export interface TrackedFile {
   status: string;
   progress_stage?: string | null;
   progress_detail?: ProgressDetail | null;
+  local_run?: LocalRunInfo | null;
+  local_failure?: LocalProcessingFailure | null;
   /** ZIP-extracted child — the worker does NOT auto-claim it; needs Extract. */
   needsTrigger: boolean;
   /** Extraction has been triggered for this (needsTrigger) file. */
@@ -53,6 +59,8 @@ interface ExtractionState {
       ingestion_status: string;
       progress_stage?: string | null;
       progress_detail?: ProgressDetail | null;
+      local_run?: LocalRunInfo | null;
+      local_failure?: LocalProcessingFailure | null;
     }[]
   ) => void;
   markTriggered: (ids: string[]) => void;
@@ -68,6 +76,8 @@ function toTracked(f: TrackedFileInput): TrackedFile {
     status: f.status,
     progress_stage: null,
     progress_detail: null,
+    local_run: null,
+    local_failure: null,
     needsTrigger: f.needsTrigger ?? false,
     triggered: false,
   };
@@ -136,6 +146,12 @@ export const useExtractionStore = create<ExtractionState>((set) => ({
             row.progress_detail !== undefined
               ? row.progress_detail
               : existing.progress_detail,
+          local_run:
+            row.local_run !== undefined ? row.local_run : existing.local_run,
+          local_failure:
+            row.local_failure !== undefined
+              ? row.local_failure
+              : existing.local_failure,
         };
       }
       return { files };

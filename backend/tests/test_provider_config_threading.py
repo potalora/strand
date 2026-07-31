@@ -9,7 +9,8 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.ai.llm.config import LLMConfig, ProviderCreds
-from app.services.ai.llm.types import LLMResponse, LLMUsage
+from app.services.ai.llm.types import LLMRequest, LLMResponse, LLMUsage
+from app.services.local_ai.types import ProcessingMode
 from tests.conftest import auth_headers, create_test_patient, seed_test_records
 
 
@@ -27,6 +28,31 @@ def _resp(model: str = "m", text: str = "{}") -> LLMResponse:
     )
 
 
+def _grounded_resp(request: LLMRequest, model: str) -> LLMResponse:
+    content = request.messages[0].content
+    assert isinstance(content, str)
+    transport = json.loads(content.rsplit("INPUT_JSON=", 1)[1])
+    fact = transport["facts"][0]
+    evidence_by_id = {item["evidence_id"]: item for item in transport["evidence"]}
+    evidence_id = fact["evidence_ids"][0]
+    output = {
+        "sections": [
+            {
+                "heading": "Overview",
+                "claims": [
+                    {
+                        "fact_id": fact["fact_id"],
+                        "field_paths": evidence_by_id[evidence_id]["field_paths"],
+                        "evidence_ids": [evidence_id],
+                    }
+                ],
+            }
+        ],
+        "uncertainties": [],
+    }
+    return _resp(model=model, text=json.dumps(output))
+
+
 @pytest.mark.asyncio
 async def test_summary_loads_user_config(client: AsyncClient, db_session: AsyncSession):
     """``generate_summary`` loads the per-user config and routes the summary
@@ -39,8 +65,9 @@ async def test_summary_loads_user_config(client: AsyncClient, db_session: AsyncS
     await seed_test_records(db_session, user_id, patient.id, count=3)
 
     fake_provider = AsyncMock()
-    fake_provider.complete.return_value = _resp(
-        model="claude-x", text="A de-identified records overview."
+    fake_provider.complete.side_effect = lambda request: _grounded_resp(
+        request,
+        "claude-x",
     )
 
     cfg = _cfg("anthropic", {"anthropic": ProviderCreds(api_key="k", model="claude-x")})
@@ -50,12 +77,19 @@ async def test_summary_loads_user_config(client: AsyncClient, db_session: AsyncS
 
     # The summarizer's GEMINI guard fires for the no-explicit-provider path; give
     # it a key so the anthropic-routed call is exercised regardless of env.
-    with patch.object(summarizer.settings, "gemini_api_key", "test-key"), patch.object(
-        summarizer, "load_llm_config", fake_load
-    ), patch.object(
-        summarizer, "get_provider", return_value=fake_provider
-    ) as mock_get_provider:
-        out = await summarizer.generate_summary(db_session, UUID(user_id), patient.id)
+    with (
+        patch.object(summarizer.settings, "gemini_api_key", "test-key"),
+        patch.object(summarizer, "load_llm_config", fake_load),
+        patch.object(
+            summarizer, "get_provider", return_value=fake_provider
+        ) as mock_get_provider,
+    ):
+        out = await summarizer.generate_summary(
+            db_session,
+            UUID(user_id),
+            patient.id,
+            processing_mode=ProcessingMode.CLOUD_ASSISTED,
+        )
 
         assert out["model_used"] == "claude-x"
         # get_provider was called WITH the operation key and the loaded config object.
@@ -124,16 +158,23 @@ async def test_judge_threads_config():
     """``judge_candidate_pair(config=...)`` forwards that config to get_provider."""
     from app.services.dedup import llm_judge
 
-    payload = {"classification": "duplicate", "confidence": 0.9, "explanation": "same",
-               "field_diff": None}
+    payload = {
+        "classification": "duplicate",
+        "confidence": 0.9,
+        "explanation": "same",
+        "field_diff": None,
+    }
     prov = AsyncMock()
     prov.complete.return_value = _resp(text=json.dumps(payload))
     cfg = _cfg("anthropic", {"anthropic": ProviderCreds(api_key="k")})
 
     with patch.object(llm_judge, "get_provider", return_value=prov) as gp:
         out = await llm_judge.judge_candidate_pair(
-            {"resourceType": "Condition"}, {"resourceType": "Condition"},
-            "condition", api_key="unused", config=cfg,
+            {"resourceType": "Condition"},
+            {"resourceType": "Condition"},
+            "condition",
+            api_key="unused",
+            config=cfg,
         )
 
     assert out.classification == "duplicate"
@@ -146,7 +187,9 @@ async def test_judge_batch_threads_config_into_pairs():
     from app.services.dedup import llm_judge
 
     cfg = _cfg("anthropic", {"anthropic": ProviderCreds(api_key="k")})
-    pairs = [({"resourceType": "Condition"}, {"resourceType": "Condition"}, "condition")]
+    pairs = [
+        ({"resourceType": "Condition"}, {"resourceType": "Condition"}, "condition")
+    ]
 
     async def fake_pair(fhir_a, fhir_b, record_type, api_key, config=None):
         assert config is cfg

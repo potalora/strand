@@ -8,20 +8,15 @@ import type { HealthRecord, RecordListResponse } from "@/types/api";
 import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
+import { fmtDay } from "@/lib/format-date";
 
 const RECORD_TYPE = "condition";
 const PAGE_SIZE = 25;
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const fmtDate = (s: string | null) => {
-  if (!s) return "";
-  const d = new Date(s);
-  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
-};
 
 function SecureChip() {
   return (
     <span className="secure">
-      <Lock size={13} strokeWidth={1.9} /> End-to-end encrypted
+      <Lock size={13} strokeWidth={1.9} /> Application-layer encrypted at rest
     </span>
   );
 }
@@ -41,18 +36,19 @@ export default function ConditionsPage() {
   }, []);
 
   useEffect(() => {
-    setLoading(true);
-    api
-      .get<RecordListResponse>(`/records?record_type=${RECORD_TYPE}&page=${page}&page_size=${PAGE_SIZE}`)
-      .then((data) => {
+    void (async () => {
+      setLoading(true);
+      try {
+        const data = await api.get<RecordListResponse>(`/records?record_type=${RECORD_TYPE}&page=${page}&page_size=${PAGE_SIZE}`);
         setRecords(data.items || []);
         setTotal(data.total || 0);
-      })
-      .catch(() => {
+      } catch {
         setRecords([]);
         setTotal(0);
-      })
-      .finally(() => setLoading(false));
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, [page]);
 
   const dot = (RECORD_TYPE_COLORS[RECORD_TYPE] ?? DEFAULT_RECORD_COLOR).dot;
@@ -96,7 +92,7 @@ export default function ConditionsPage() {
                     <span className="lrow-title">{r.display_text}</span>
                     {r.status && <span className="lrow-sub">{r.status}</span>}
                   </span>
-                  <span className="lrow-meta tnum">{fmtDate(r.effective_date)}</span>
+                  <span className="lrow-meta tnum">{fmtDay(r.effective_date)}</span>
                   <ChevronRight size={15} style={{ color: "var(--text-muted)" }} />
                 </button>
               ))}

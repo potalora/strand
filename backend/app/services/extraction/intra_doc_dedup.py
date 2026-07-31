@@ -10,6 +10,9 @@ existing ``(entity_class, normalized_text)`` dedup in the worker does NOT catch:
 * **Brand + generic medication duplication** — the same drug extracted twice
   because both names appear (Lexapro + escitalopram; Seysara + sarecycline),
   resolving to the SAME RxNorm code.
+* **Exact clinical duplicates** — overlapping extraction fragments or repeated
+  document sections yield the same mapped FHIR content with different evidence
+  spans. These collapse to one record while retaining every evidence ID.
 
 This pass runs PER DOCUMENT, after terminology resolution (so medications carry
 their ``code_value``/``code_system``) and before insert. It NEVER merges across
@@ -113,7 +116,7 @@ _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
 def dedup_within_document(built_records):
-    """Collapse intra-document duplicate encounters and medications.
+    """Collapse safe intra-document duplicates while preserving evidence lineage.
 
     Args:
         built_records: list of ``(ExtractedEntity, record_dict | None)`` pairs
@@ -128,42 +131,151 @@ def dedup_within_document(built_records):
     if not built_records:
         return built_records
 
-    indexed = [
-        (i, ent, rec) for i, (ent, rec) in enumerate(built_records)
-    ]
+    indexed = [(i, ent, rec) for i, (ent, rec) in enumerate(built_records)]
     drop_ids: set[int] = set()
+    merge_targets: dict[int, dict] = {}
 
     encounters = [
-        item for item in indexed
+        item
+        for item in indexed
         if item[2] is not None and item[2].get("record_type") == "encounter"
     ]
-    drop_ids |= _encounter_drops(encounters)
+    encounter_drops, encounter_targets = _encounter_drops(encounters)
+    drop_ids |= encounter_drops
+    merge_targets.update(encounter_targets)
 
     medications = [
-        item for item in indexed
+        item
+        for item in indexed
         if item[2] is not None and item[2].get("record_type") == "medication"
     ]
-    drop_ids |= _medication_drops(medications)
+    medication_drops, medication_targets = _medication_drops(medications)
+    drop_ids |= medication_drops
+    merge_targets.update(medication_targets)
+
+    exact_drops, exact_targets = _exact_content_drops(
+        [
+            item
+            for item in indexed
+            if item[2] is not None and id(item[2]) not in drop_ids
+        ]
+    )
+    drop_ids |= exact_drops
+    merge_targets.update(exact_targets)
 
     if not drop_ids:
         return built_records
 
-    result = [
-        (ent, rec)
-        for (ent, rec) in built_records
-        if rec is None or id(rec) not in drop_ids
-    ]
+    evidence_by_survivor: dict[int, list[str]] = defaultdict(list)
+    for _, _, rec in indexed:
+        if id(rec) not in drop_ids:
+            continue
+        survivor = _resolve_merge_target(rec, merge_targets)
+        if survivor is not None:
+            evidence_by_survivor[id(survivor)].extend(_evidence_ids(rec))
+
+    result = []
+    for ent, rec in built_records:
+        if rec is not None and id(rec) in drop_ids:
+            continue
+        if rec is not None:
+            rec = _with_merged_evidence_ids(
+                rec,
+                evidence_by_survivor.get(id(rec), []),
+            )
+        result.append((ent, rec))
     removed = len(built_records) - len(result)
     if removed:
         logger.info("intra-doc dedup removed %d duplicate record(s)", removed)
     return result
 
 
+def _exact_content_drops(
+    records: list[tuple[int, object, dict]],
+) -> tuple[set[int], dict[int, dict]]:
+    """Collapse only byte-stable clinical content hashes across mapped records."""
+
+    drops: set[int] = set()
+    merge_targets: dict[int, dict] = {}
+    survivors: dict[tuple[str, str, str], dict] = {}
+    for _, _, record in records:
+        if not _evidence_ids(record):
+            continue
+        record_type = record.get("record_type")
+        resource_type = record.get("fhir_resource_type")
+        digest = record.get("content_hash")
+        if not all(
+            isinstance(value, str) and value
+            for value in (record_type, resource_type, digest)
+        ):
+            continue
+        key = (record_type, resource_type, digest)
+        survivor = survivors.get(key)
+        if survivor is None:
+            survivors[key] = record
+            continue
+        drops.add(id(record))
+        merge_targets[id(record)] = survivor
+    return drops, merge_targets
+
+
+def _resolve_merge_target(
+    record: dict,
+    merge_targets: dict[int, dict],
+) -> dict | None:
+    """Resolve a dropped record through any winner chain to its final survivor."""
+    survivor = merge_targets.get(id(record))
+    visited = {id(record)}
+    while survivor is not None and id(survivor) not in visited:
+        visited.add(id(survivor))
+        next_survivor = merge_targets.get(id(survivor))
+        if next_survivor is None:
+            return survivor
+        survivor = next_survivor
+    return None
+
+
+def _evidence_ids(record: dict) -> list[str]:
+    """Return valid evidence IDs without trusting extraction metadata shapes."""
+    resource = record.get("fhir_resource")
+    if not isinstance(resource, dict):
+        return []
+    metadata = resource.get("_extraction_metadata")
+    if not isinstance(metadata, dict):
+        return []
+    evidence_ids = metadata.get("_evidence_ids")
+    if not isinstance(evidence_ids, list):
+        return []
+    return [value for value in evidence_ids if isinstance(value, str)]
+
+
+def _with_merged_evidence_ids(record: dict, additional_ids: list[str]) -> dict:
+    """Copy a survivor and append unique loser evidence IDs in stable order."""
+    if not additional_ids:
+        return record
+    resource = record.get("fhir_resource")
+    if not isinstance(resource, dict):
+        return record
+    metadata = resource.get("_extraction_metadata")
+    metadata_copy = dict(metadata) if isinstance(metadata, dict) else {}
+    merged_ids = list(dict.fromkeys([*_evidence_ids(record), *additional_ids]))
+    if not merged_ids:
+        return record
+    metadata_copy["_evidence_ids"] = merged_ids
+    resource_copy = dict(resource)
+    resource_copy["_extraction_metadata"] = metadata_copy
+    record_copy = dict(record)
+    record_copy["fhir_resource"] = resource_copy
+    return record_copy
+
+
 # --- Encounters --------------------------------------------------------------
 
 
-def _encounter_drops(encounters: list[tuple[int, object, dict]]) -> set[int]:
-    """Return ``id(record_dict)`` of encounter records to drop.
+def _encounter_drops(
+    encounters: list[tuple[int, object, dict]],
+) -> tuple[set[int], dict[int, dict]]:
+    """Return encounter drop IDs and loser-to-survivor mappings.
 
     Encounters within one document that share a date — or have no date — are the
     same visit and collapse to a single, most-informative survivor. Encounters on
@@ -172,7 +284,7 @@ def _encounter_drops(encounters: list[tuple[int, object, dict]]) -> set[int]:
     clearly document chrome (boilerplate / bare facility name), which is dropped.
     """
     if len(encounters) <= 1:
-        return set()
+        return set(), {}
 
     dated: dict[object, list] = defaultdict(list)
     dateless: list = []
@@ -185,6 +297,7 @@ def _encounter_drops(encounters: list[tuple[int, object, dict]]) -> set[int]:
 
     distinct_dates = list(dated.keys())
     drops: set[int] = set()
+    merge_targets: dict[int, dict] = {}
     groups: list[list] = []
 
     if not distinct_dates:
@@ -211,7 +324,8 @@ def _encounter_drops(encounters: list[tuple[int, object, dict]]) -> set[int]:
         for item in group:
             if item[2] is not survivor[2]:
                 drops.add(id(item[2]))
-    return drops
+                merge_targets[id(item[2])] = survivor[2]
+    return drops, merge_targets
 
 
 def _date_key(rec: dict):
@@ -246,7 +360,12 @@ def _encounter_score(item: tuple[int, object, dict]) -> float:
     if rec.get("effective_date") is not None:
         score += 50.0
     score += _populated_field_count(fhir)
-    for key, pts in (("text", 10), ("reasonCode", 10), ("type", 5), ("serviceProvider", 3)):
+    for key, pts in (
+        ("text", 10),
+        ("reasonCode", 10),
+        ("type", 5),
+        ("serviceProvider", 3),
+    ):
         if fhir.get(key):
             score += pts
     return score
@@ -303,17 +422,20 @@ def _looks_like_bare_facility(signal: str) -> bool:
 # --- Medications -------------------------------------------------------------
 
 
-def _medication_drops(medications: list[tuple[int, object, dict]]) -> set[int]:
-    """Return ``id(record_dict)`` of medication records to drop.
+def _medication_drops(
+    medications: list[tuple[int, object, dict]],
+) -> tuple[set[int], dict[int, dict]]:
+    """Return medication drop IDs and loser-to-survivor mappings.
 
     Coded medications collapse only when they share the SAME RxNorm code (the
     brand + generic case). Uncoded medications collapse only on a conservative
     fuzzy-name match. Different RxNorm codes / clearly-different names are kept.
     """
     if len(medications) <= 1:
-        return set()
+        return set(), {}
 
     drops: set[int] = set()
+    merge_targets: dict[int, dict] = {}
     by_code: dict[str, tuple] = {}
     uncoded: list = []
 
@@ -330,6 +452,7 @@ def _medication_drops(medications: list[tuple[int, object, dict]]) -> set[int]:
                 winner, loser = _prefer_med(existing, item)
                 by_code[key] = winner
                 drops.add(id(loser[2]))
+                merge_targets[id(loser[2])] = winner[2]
         else:
             uncoded.append(item)
 
@@ -342,11 +465,12 @@ def _medication_drops(medications: list[tuple[int, object, dict]]) -> set[int]:
                 winner, loser = _prefer_med(survivor, item)
                 survivors[idx] = winner
                 drops.add(id(loser[2]))
+                merge_targets[id(loser[2])] = winner[2]
                 merged = True
                 break
         if not merged:
             survivors.append(item)
-    return drops
+    return drops, merge_targets
 
 
 def _med_name(ent: object, rec: dict) -> str:

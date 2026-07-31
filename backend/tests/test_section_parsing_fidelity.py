@@ -32,6 +32,7 @@ Marks
 
 Skipped automatically when either the note PDF or the API key is absent.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -53,6 +54,8 @@ from tests.conftest import (
     create_test_patient,
     private_fixture_root,
 )
+
+pytestmark = pytest.mark.private_cloud_fidelity
 
 # ---------------------------------------------------------------------------
 # Locate real note PDF via REAL_MEDICAL_FIXTURES_DIR (gitignored, off-repo).
@@ -134,9 +137,7 @@ async def test_real_note_parses_into_multiple_sections() -> None:
     doc = await parse_sections(text, settings.gemini_api_key)
 
     section_types = [s.section_type.value for s in doc.sections]
-    print(
-        f"[section-fidelity] sections={len(doc.sections)} types={section_types}"
-    )
+    print(f"[section-fidelity] sections={len(doc.sections)} types={section_types}")
 
     assert len(doc.sections) > 1, (
         f"real note should parse into multiple sections now (robust anchor-only prompt), "

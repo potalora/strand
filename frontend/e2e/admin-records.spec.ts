@@ -72,6 +72,21 @@ test.describe.serial("Admin — Records tab", () => {
     });
   });
 
+  test("search matches the displayed source label", async ({ page }) => {
+    await browserLogin(page, EMAIL, TEST_PASSWORD);
+    await page.goto("/admin");
+    await expect(page.locator("tr.clickable").first()).toBeVisible({
+      timeout: 15_000,
+    });
+
+    const search = page.getByPlaceholder("Search descriptions, codes, sources…");
+    await search.fill("FHIR R4");
+    await expect(page.locator("tr.clickable").first()).toBeVisible({
+      timeout: 5_000,
+    });
+    await expect(page.getByText(/^0 of \d+ records$/)).not.toBeVisible();
+  });
+
   test("type filter narrows the set", async ({ page }) => {
     await browserLogin(page, EMAIL, TEST_PASSWORD);
     await page.goto("/admin");
@@ -101,7 +116,9 @@ test.describe.serial("Admin — Records tab", () => {
     const row = page.locator("tr.clickable").first();
     await expect(row).toBeVisible({ timeout: 15_000 });
     await row.click();
-    await expect(page.getByText("Record detail")).toBeVisible({
+    await expect(
+      page.getByRole("dialog", { name: "Record detail", exact: true })
+    ).toBeVisible({
       timeout: 10_000,
     });
   });

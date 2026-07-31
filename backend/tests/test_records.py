@@ -35,7 +35,7 @@ async def test_records_with_data(client: AsyncClient, db_session: AsyncSession):
     """GET /records returns seeded records with correct schema."""
     headers, uid = await auth_headers(client)
     patient = await create_test_patient(db_session, uid)
-    records = await seed_test_records(db_session, uid, patient.id, count=5)
+    await seed_test_records(db_session, uid, patient.id, count=5)
 
     resp = await client.get("/api/v1/records", headers=headers)
     assert resp.status_code == 200

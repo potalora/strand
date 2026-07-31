@@ -1,8 +1,10 @@
 import { test, expect } from "@playwright/test";
 import {
+  EXTRACTION_POLL_STATUSES,
   isTerminalStatus,
   formatStage,
   deriveBatch,
+  statusDotColor,
 } from "./extraction-progress";
 
 /**
@@ -24,12 +26,24 @@ test.describe("isTerminalStatus", () => {
     expect(isTerminalStatus("processing")).toBe(false);
     expect(isTerminalStatus("pending_extraction")).toBe(false);
     expect(isTerminalStatus("pending")).toBe(false);
+    expect(isTerminalStatus("dedup_scanning")).toBe(false);
+    expect(isTerminalStatus("dedup_processing")).toBe(false);
   });
 
   test("nullish is not terminal", () => {
     expect(isTerminalStatus(null)).toBe(false);
     expect(isTerminalStatus(undefined)).toBe(false);
     expect(isTerminalStatus("")).toBe(false);
+  });
+});
+
+test.describe("dedup progress presentation", () => {
+  test("polls and colors both dedup states as active", () => {
+    for (const status of ["dedup_scanning", "dedup_processing"]) {
+      expect(EXTRACTION_POLL_STATUSES).toContain(status);
+      expect(isTerminalStatus(status)).toBe(false);
+      expect(statusDotColor(status)).toBe("var(--primary)");
+    }
   });
 });
 
@@ -59,6 +73,18 @@ test.describe("formatStage", () => {
     expect(
       formatStage("extracting_entities", { section_index: 0, section_total: 0 })
     ).toBe("Extracting entities");
+  });
+
+  test("formats a local OCR page without losing immutable model detail", () => {
+    const label = formatStage("local_ocr", {
+      page_index: 2,
+      page_total: 9,
+      model_role: "ocr",
+      repository: "sahilchachra/ovisocr2-int4-mlx",
+      revision: "0123456789abcdef0123456789abcdef01234567",
+    });
+
+    expect(label).toBe("Local OCR — page 2 of 9");
   });
 });
 

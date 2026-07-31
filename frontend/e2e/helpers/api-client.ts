@@ -1,6 +1,78 @@
 import * as fs from "fs";
+import { isTerminalStatus } from "../../src/lib/extraction-progress";
 
 const API_BASE = "http://localhost:8000/api/v1";
+
+type ApiRecord = {
+  id: string;
+  record_type: string;
+  category: string[] | null;
+  ai_extracted: boolean;
+  confidence_score: number | null;
+};
+
+type UploadStatus = {
+  ingestion_status?: string;
+  status?: string;
+  local_run?: {
+    privacy_mode?: string;
+  } | null;
+  local_failure?: {
+    cloud_fallback_attempted?: boolean;
+  } | null;
+};
+
+type UploadHistoryItem = {
+  id: string;
+  filename?: string;
+  ingestion_status?: string;
+  created_at?: string;
+  record_count?: number;
+};
+
+type UploadHistoryResponse = {
+  items: UploadHistoryItem[];
+};
+
+type RecordsResponse = {
+  items: ApiRecord[];
+  total: number;
+};
+
+type UploadReview = {
+  upload: Record<string, unknown>;
+  auto_merged: { candidate_id: string }[];
+  needs_review: Record<string, { candidate_id: string }[]>;
+};
+
+type DedupResolution = {
+  resolved: number;
+};
+
+type AuthenticatedUser = {
+  email: string;
+};
+
+type DedupCandidatesResponse = {
+  items: { candidate_id: string }[];
+};
+
+type TimelineResponse = {
+  events: { id: string }[];
+};
+
+type EmptyApiResponse = Record<string, unknown>;
+
+type SummaryPrompt = {
+  id: string;
+};
+
+type LocalAIJobStatus = {
+  id: string;
+  status: string;
+};
+
+const LOCAL_ONLY = process.env.E2E_LOCAL_ONLY === "1";
 
 export class ApiClient {
   private token: string = "";
@@ -36,6 +108,9 @@ export class ApiClient {
     }
     const data = await res.json();
     this.token = data.access_token;
+    if (LOCAL_ONLY) {
+      await this.setProcessingMode("validated_strict_local");
+    }
   }
 
   private async _withRateLimitRetry(
@@ -59,6 +134,33 @@ export class ApiClient {
     };
   }
 
+  async setProcessingMode(mode: "validated_strict_local"): Promise<void> {
+    const res = await fetch(`${API_BASE}/settings/llm/routing`, {
+      method: "PUT",
+      headers: this.headers(),
+      body: JSON.stringify({ processing_mode: mode }),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `Set processing mode failed: ${res.status} ${await res.text()}`
+      );
+    }
+  }
+
+  async getLlmSettings(): Promise<{
+    routing: { processing_mode?: string };
+  }> {
+    const res = await fetch(`${API_BASE}/settings/llm`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `Get LLM settings failed: ${res.status} ${await res.text()}`
+      );
+    }
+    return res.json();
+  }
+
   async uploadStructured(
     filePath: string,
     filename: string
@@ -70,6 +172,9 @@ export class ApiClient {
       new Blob([fileContent], { type: "application/json" }),
       filename
     );
+    if (LOCAL_ONLY) {
+      formData.append("processing_mode", "validated_strict_local");
+    }
 
     const res = await fetch(`${API_BASE}/upload`, {
       method: "POST",
@@ -90,6 +195,9 @@ export class ApiClient {
       const content = fs.readFileSync(file.path);
       formData.append("files", new Blob([content], { type: file.mime }), file.name);
     }
+    if (LOCAL_ONLY) {
+      formData.append("processing_mode", "validated_strict_local");
+    }
 
     const res = await fetch(`${API_BASE}/upload/unstructured-batch`, {
       method: "POST",
@@ -108,18 +216,8 @@ export class ApiClient {
     uploadId: string,
     timeoutMs: number = 60_000,
     excludeTerminal: string[] = [],
-  ): Promise<any> {
+  ): Promise<UploadStatus> {
     const start = Date.now();
-    const terminalStatuses = [
-      "completed",
-      "completed_with_errors",
-      "completed_with_merges",
-      "failed",
-      "awaiting_confirmation",
-      "awaiting_review",
-      "dedup_scanning",
-      "duplicate_file", // idempotent re-upload of identical content (Phase 2a)
-    ].filter((s) => !excludeTerminal.includes(s));
 
     while (Date.now() - start < timeoutMs) {
       const res = await fetch(`${API_BASE}/upload/${uploadId}/status`, {
@@ -132,7 +230,11 @@ export class ApiClient {
       }
       const data = await res.json();
       const st = data.ingestion_status ?? data.status;
-      if (terminalStatuses.includes(st)) {
+      if (
+        typeof st === "string" &&
+        isTerminalStatus(st) &&
+        !excludeTerminal.includes(st)
+      ) {
         return data;
       }
       await new Promise((r) => setTimeout(r, 2000));
@@ -142,14 +244,18 @@ export class ApiClient {
     );
   }
 
-  async getExtractionProgress(): Promise<{
+  async getExtractionProgress(uploadIds: string[] = []): Promise<{
     total: number;
     completed: number;
     processing: number;
     failed: number;
     pending: number;
   }> {
-    const res = await fetch(`${API_BASE}/upload/extraction-progress`, {
+    const query =
+      uploadIds.length > 0
+        ? `?ids=${encodeURIComponent(uploadIds.join(","))}`
+        : "";
+    const res = await fetch(`${API_BASE}/upload/extraction-progress${query}`, {
       headers: this.headers(),
     });
     if (!res.ok) {
@@ -160,7 +266,46 @@ export class ApiClient {
     return res.json();
   }
 
-  async getUploadHistory(): Promise<any> {
+  async getSummaryPrompts(): Promise<{ items: SummaryPrompt[] }> {
+    const res = await fetch(`${API_BASE}/summary/prompts`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `Summary prompts failed: ${res.status} ${await res.text()}`
+      );
+    }
+    return res.json();
+  }
+
+  async pollLocalAIJob(
+    jobId: string,
+    timeoutMs: number = 60_000
+  ): Promise<LocalAIJobStatus> {
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      const res = await fetch(`${API_BASE}/local-ai/jobs/${jobId}`, {
+        headers: this.headers(),
+      });
+      if (!res.ok) {
+        throw new Error(
+          `Local AI job status failed: ${res.status} ${await res.text()}`
+        );
+      }
+      const job = (await res.json()) as LocalAIJobStatus;
+      if (job.status === "completed") return job;
+      if (job.status === "failed" || job.status === "cancelled") {
+        throw new Error(`Local AI job ${jobId} ended as ${job.status}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new Error(
+      `Local AI job ${jobId} did not complete within ${timeoutMs}ms`
+    );
+  }
+
+  async getUploadHistory(): Promise<UploadHistoryResponse> {
     const res = await fetch(`${API_BASE}/upload/history`, {
       headers: this.headers(),
     });
@@ -176,7 +321,7 @@ export class ApiClient {
     record_type?: string;
     page?: number;
     page_size?: number;
-  }): Promise<any> {
+  }): Promise<RecordsResponse> {
     const query = new URLSearchParams();
     if (params?.record_type) query.set("record_type", params.record_type);
     if (params?.page) query.set("page", String(params.page));
@@ -192,7 +337,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getUploadReview(uploadId: string): Promise<any> {
+  async getUploadReview(uploadId: string): Promise<UploadReview> {
     const res = await fetch(`${API_BASE}/upload/${uploadId}/review`, {
       headers: this.headers(),
     });
@@ -207,7 +352,7 @@ export class ApiClient {
   async resolveDedup(
     uploadId: string,
     resolutions: { candidate_id: string; action: "merge" | "dismiss" }[]
-  ): Promise<any> {
+  ): Promise<DedupResolution> {
     const res = await fetch(`${API_BASE}/upload/${uploadId}/review/resolve`, {
       method: "POST",
       headers: this.headers(),
@@ -221,7 +366,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getMe(): Promise<any> {
+  async getMe(): Promise<AuthenticatedUser> {
     const res = await fetch(`${API_BASE}/auth/me`, {
       headers: this.headers(),
     });
@@ -231,7 +376,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async scanDedup(): Promise<any> {
+  async scanDedup(): Promise<EmptyApiResponse> {
     const res = await fetch(`${API_BASE}/dedup/scan`, {
       method: "POST",
       headers: this.headers(),
@@ -242,7 +387,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getDedupCandidates(page = 1, limit = 20): Promise<any> {
+  async getDedupCandidates(page = 1, limit = 20): Promise<DedupCandidatesResponse> {
     const res = await fetch(
       `${API_BASE}/dedup/candidates?page=${page}&limit=${limit}`,
       { headers: this.headers() }
@@ -255,7 +400,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async mergeDedup(candidateId: string): Promise<any> {
+  async mergeDedup(candidateId: string): Promise<EmptyApiResponse> {
     const res = await fetch(`${API_BASE}/dedup/merge`, {
       method: "POST",
       headers: this.headers(),
@@ -267,7 +412,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async dismissDedup(candidateId: string): Promise<any> {
+  async dismissDedup(candidateId: string): Promise<EmptyApiResponse> {
     const res = await fetch(`${API_BASE}/dedup/dismiss`, {
       method: "POST",
       headers: this.headers(),
@@ -281,7 +426,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getDashboardOverview(): Promise<any> {
+  async getDashboardOverview(): Promise<EmptyApiResponse> {
     const res = await fetch(`${API_BASE}/dashboard/overview`, {
       headers: this.headers(),
     });
@@ -293,7 +438,7 @@ export class ApiClient {
     return res.json();
   }
 
-  async getTimeline(params?: { record_type?: string; limit?: number }): Promise<any> {
+  async getTimeline(params?: { record_type?: string; limit?: number }): Promise<TimelineResponse> {
     const query = new URLSearchParams();
     if (params?.record_type) query.set("record_type", params.record_type);
     if (params?.limit) query.set("limit", String(params.limit));

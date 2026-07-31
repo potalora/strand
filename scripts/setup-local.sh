@@ -24,11 +24,11 @@ else
     echo "Redis already installed: $(redis-cli --version)"
 fi
 
-if ! command -v python3.12 &> /dev/null && ! command -v python3 &> /dev/null; then
-    echo "Installing Python 3.12..."
-    brew install python@3.12
+if ! command -v python3.11 &> /dev/null; then
+    echo "Installing Python 3.11..."
+    brew install python@3.11
 else
-    echo "Python already installed: $(python3 --version)"
+    echo "Python already installed: $(python3.11 --version)"
 fi
 
 if ! command -v node &> /dev/null; then

@@ -12,14 +12,6 @@ export interface SeededData {
 export async function seedTestData(auth: AuthContext): Promise<SeededData> {
   const headers = authHeaders(auth.accessToken);
 
-  // Ensure we have a patient (check dashboard first)
-  const dashRes = await fetch(`${API_BASE}/dashboard/patients`, { headers });
-  const patients = await dashRes.json();
-  let patientId: string | null = null;
-  if (Array.isArray(patients) && patients.length > 0) {
-    patientId = patients[0].id;
-  }
-
   // Upload the expanded fixture bundle
   const fixturePath = path.resolve(
     __dirname,

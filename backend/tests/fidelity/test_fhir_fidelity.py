@@ -17,10 +17,6 @@ import pytest
 from app.services.ingestion.fhir_parser import (
     SUPPORTED_RESOURCE_TYPES,
     build_display_text,
-    extract_categories,
-    extract_coding,
-    extract_effective_date,
-    extract_status,
     map_fhir_resource,
 )
 
@@ -245,7 +241,7 @@ class TestRealFhirBundleCompleteness:
             except Exception as e:
                 errors.append(f"Entry {i} ({rt}): {e}")
 
-        print(f"\nBundle summary:")
+        print("\nBundle summary:")
         print(f"  Total entries: {total}")
         print(f"  Mapped: {mapped}")
         print(f"  Patient (skipped): {skipped_patient}")

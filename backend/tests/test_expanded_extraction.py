@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 from uuid import uuid4
 
-import pytest
 
 from app.services.extraction.entity_extractor import ExtractedEntity
 from app.services.extraction.entity_to_fhir import (
@@ -17,7 +16,9 @@ SOURCE_FILE_ID = uuid4()
 
 
 def _make_entity(entity_class: str, text: str, **attrs) -> ExtractedEntity:
-    return ExtractedEntity(entity_class=entity_class, text=text, attributes=attrs, confidence=0.85)
+    return ExtractedEntity(
+        entity_class=entity_class, text=text, attributes=attrs, confidence=0.85
+    )
 
 
 # ---------- TestEncounterBuilder ----------
@@ -26,7 +27,9 @@ def _make_entity(entity_class: str, text: str, **attrs) -> ExtractedEntity:
 class TestEncounterBuilder:
     def test_produces_record(self):
         entity = _make_entity("encounter", "Office visit", visit_type="office")
-        result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID, SOURCE_FILE_ID)
+        result = entity_to_health_record_dict(
+            entity, USER_ID, PATIENT_ID, SOURCE_FILE_ID
+        )
         assert result is not None
         assert result["record_type"] == "encounter"
         assert result["fhir_resource_type"] == "Encounter"
@@ -34,8 +37,12 @@ class TestEncounterBuilder:
 
     def test_fhir_structure(self):
         entity = _make_entity(
-            "encounter", "Follow-up",
-            visit_type="office", cpt_code="99213", reason="Diabetes follow-up", date="2024-03-15",
+            "encounter",
+            "Follow-up",
+            visit_type="office",
+            cpt_code="99213",
+            reason="Diabetes follow-up",
+            date="2024-03-15",
         )
         result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID)
         fhir = result["fhir_resource"]
@@ -59,10 +66,14 @@ class TestEncounterBuilder:
             result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID)
             fhir = result["fhir_resource"]
             assert fhir["class"]["code"] == expected_code, f"Failed for {visit_type}"
-            assert fhir["class"]["display"] == expected_display, f"Failed for {visit_type}"
+            assert fhir["class"]["display"] == expected_display, (
+                f"Failed for {visit_type}"
+            )
 
     def test_display_text(self):
-        entity = _make_entity("encounter", "Visit", visit_type="office", date="2024-03-15")
+        entity = _make_entity(
+            "encounter", "Visit", visit_type="office", date="2024-03-15"
+        )
         assert _build_display_text(entity) == "Office encounter — 2024-03-15"
 
 
@@ -72,15 +83,20 @@ class TestEncounterBuilder:
 class TestDiagnosticReportBuilder:
     def test_produces_record(self):
         entity = _make_entity("imaging_result", "Chest X-ray")
-        result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID, SOURCE_FILE_ID)
+        result = entity_to_health_record_dict(
+            entity, USER_ID, PATIENT_ID, SOURCE_FILE_ID
+        )
         assert result is not None
         assert result["record_type"] == "diagnostic_report"
         assert result["fhir_resource_type"] == "DiagnosticReport"
 
     def test_fhir_structure(self):
         entity = _make_entity(
-            "imaging_result", "Chest X-ray",
-            procedure_name="Chest X-ray PA", findings="No acute findings", interpretation="Normal",
+            "imaging_result",
+            "Chest X-ray",
+            procedure_name="Chest X-ray PA",
+            findings="No acute findings",
+            interpretation="Normal",
         )
         result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID)
         fhir = result["fhir_resource"]
@@ -92,10 +108,14 @@ class TestDiagnosticReportBuilder:
         assert fhir["category"][0]["coding"][0]["code"] == "imaging"
 
     def test_display_text(self):
-        entity = _make_entity("imaging_result", "MRI Brain", procedure_name="MRI Brain", findings="Normal")
+        entity = _make_entity(
+            "imaging_result", "MRI Brain", procedure_name="MRI Brain", findings="Normal"
+        )
         assert _build_display_text(entity) == "MRI Brain: Normal"
 
-        entity_no_findings = _make_entity("imaging_result", "CT Abdomen", procedure_name="CT Abdomen")
+        entity_no_findings = _make_entity(
+            "imaging_result", "CT Abdomen", procedure_name="CT Abdomen"
+        )
         assert _build_display_text(entity_no_findings) == "CT Abdomen"
 
 
@@ -105,22 +125,29 @@ class TestDiagnosticReportBuilder:
 class TestFamilyHistoryBuilder:
     def test_produces_record(self):
         entity = _make_entity("family_history", "Breast cancer", relationship="mother")
-        result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID, SOURCE_FILE_ID)
+        result = entity_to_health_record_dict(
+            entity, USER_ID, PATIENT_ID, SOURCE_FILE_ID
+        )
         assert result is not None
         assert result["record_type"] == "family_history"
         assert result["fhir_resource_type"] == "FamilyMemberHistory"
 
     def test_fhir_structure(self):
         entity = _make_entity(
-            "family_history", "Diabetes",
-            relationship="father", condition="Type 2 Diabetes", notes="Diagnosed at age 50",
+            "family_history",
+            "Diabetes",
+            relationship="father",
+            condition="Type 2 Diabetes",
+            notes="Diagnosed at age 50",
         )
         result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID)
         fhir = result["fhir_resource"]
         assert fhir["resourceType"] == "FamilyMemberHistory"
         assert fhir["status"] == "completed"
         rel_coding = fhir["relationship"]["coding"][0]
-        assert rel_coding["system"] == "http://terminology.hl7.org/CodeSystem/v3-RoleCode"
+        assert (
+            rel_coding["system"] == "http://terminology.hl7.org/CodeSystem/v3-RoleCode"
+        )
         assert rel_coding["code"] == "FTH"
         assert rel_coding["display"] == "Father"
         assert fhir["condition"][0]["code"]["text"] == "Type 2 Diabetes"
@@ -144,7 +171,12 @@ class TestFamilyHistoryBuilder:
             assert coding["display"] == expected_display, f"Failed for {rel}"
 
     def test_display_text(self):
-        entity = _make_entity("family_history", "Heart disease", relationship="mother", condition="Heart disease")
+        entity = _make_entity(
+            "family_history",
+            "Heart disease",
+            relationship="mother",
+            condition="Heart disease",
+        )
         assert _build_display_text(entity) == "Mother: Heart disease"
 
 
@@ -154,14 +186,17 @@ class TestFamilyHistoryBuilder:
 class TestAssessmentPlanBuilder:
     def test_produces_record(self):
         entity = _make_entity("assessment_plan", "Continue current medications")
-        result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID, SOURCE_FILE_ID)
+        result = entity_to_health_record_dict(
+            entity, USER_ID, PATIENT_ID, SOURCE_FILE_ID
+        )
         assert result is not None
         assert result["record_type"] == "document"
         assert result["fhir_resource_type"] == "DocumentReference"
 
     def test_fhir_structure(self):
         entity = _make_entity(
-            "assessment_plan", "Patient improving",
+            "assessment_plan",
+            "Patient improving",
             plan_items=["Continue metformin", "Follow up in 3 months"],
         )
         result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID)
@@ -176,7 +211,9 @@ class TestAssessmentPlanBuilder:
         assert fhir["description"] == "Continue metformin; Follow up in 3 months"
 
     def test_display_text(self):
-        entity = _make_entity("assessment_plan", "Plan notes", plan_items=["Item 1", "Item 2", "Item 3"])
+        entity = _make_entity(
+            "assessment_plan", "Plan notes", plan_items=["Item 1", "Item 2", "Item 3"]
+        )
         assert _build_display_text(entity) == "Assessment & Plan (3 items)"
 
         entity_no_items = _make_entity("assessment_plan", "Plan notes")
@@ -189,15 +226,19 @@ class TestAssessmentPlanBuilder:
 class TestSocialHistoryBuilder:
     def test_produces_record(self):
         entity = _make_entity("social_history", "Non-smoker", category="smoking_status")
-        result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID, SOURCE_FILE_ID)
+        result = entity_to_health_record_dict(
+            entity, USER_ID, PATIENT_ID, SOURCE_FILE_ID
+        )
         assert result is not None
         assert result["record_type"] == "observation"
         assert result["fhir_resource_type"] == "Observation"
 
     def test_fhir_structure(self):
         entity = _make_entity(
-            "social_history", "Non-smoker",
-            category="smoking_status", value="Never smoker",
+            "social_history",
+            "Non-smoker",
+            category="smoking_status",
+            value="Never smoker",
         )
         result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID)
         fhir = result["fhir_resource"]
@@ -208,7 +249,12 @@ class TestSocialHistoryBuilder:
         assert fhir["valueString"] == "Never smoker"
 
     def test_display_text(self):
-        entity = _make_entity("social_history", "Non-smoker", category="smoking_status", value="Never smoker")
+        entity = _make_entity(
+            "social_history",
+            "Non-smoker",
+            category="smoking_status",
+            value="Never smoker",
+        )
         assert _build_display_text(entity) == "Smoking Status: Never smoker"
 
 
@@ -228,7 +274,9 @@ class TestExistingEntityTypesUnchanged:
         result = entity_to_health_record_dict(entity, USER_ID, PATIENT_ID)
         assert result is not None
         assert result["record_type"] == "condition"
-        assert result["fhir_resource"]["clinicalStatus"]["coding"][0]["code"] == "active"
+        assert (
+            result["fhir_resource"]["clinicalStatus"]["coding"][0]["code"] == "active"
+        )
 
     def test_non_storable_returns_none(self):
         for cls in ("provider", "dosage", "route", "frequency", "duration", "date"):

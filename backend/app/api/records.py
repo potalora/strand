@@ -12,7 +12,16 @@ from app.database import get_db
 from app.dependencies import get_authenticated_user_id
 from app.middleware.audit import log_audit_event
 from app.models.record import HealthRecord
+from app.schemas.local_ai import (
+    ExtractionEvidenceResponse,
+    ExtractionModelIdentityResponse,
+    RecordExtractionEvidenceResponse,
+)
 from app.schemas.records import HealthRecordResponse, RecordListResponse
+from app.services.local_ai.errors import LocalAIError
+from app.services.local_ai.evidence_lineage import load_strict_local_evidence_lineage
+from app.services.local_ai.manifest import parse_manifest
+from app.services.local_ai.types import ModelRole, ProcessingMode
 from app.schemas.timeline import TimelineEvent
 from app.services.timeline_preview import build_timeline_preview
 from app.services.timeline_service import extract_provider_display
@@ -208,7 +217,9 @@ async def record_series(
         items.append(
             {
                 "id": str(r.id),
-                "effective_date": r.effective_date.isoformat() if r.effective_date else None,
+                "effective_date": r.effective_date.isoformat()
+                if r.effective_date
+                else None,
                 "value": value,
                 "unit": value_qty.get("unit", ""),
             }
@@ -238,7 +249,9 @@ async def export_records(
     Declared before /{record_id} so the literal path isn't captured as a UUID.
     """
     if format != "fhir-bundle":
-        raise HTTPException(status_code=400, detail=f"Unsupported export format: {format}")
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported export format: {format}"
+        )
 
     result = await db.execute(
         select(HealthRecord)
@@ -269,7 +282,9 @@ async def export_records(
 
     return JSONResponse(
         content=bundle,
-        headers={"Content-Disposition": 'attachment; filename="medtimeline-fhir-bundle.json"'},
+        headers={
+            "Content-Disposition": 'attachment; filename="medtimeline-fhir-bundle.json"'
+        },
     )
 
 
@@ -306,7 +321,9 @@ async def recent_records(
                 "id": str(r.id),
                 "record_type": r.record_type,
                 "display_text": r.display_text,
-                "effective_date": r.effective_date.isoformat() if r.effective_date else None,
+                "effective_date": r.effective_date.isoformat()
+                if r.effective_date
+                else None,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
                 "source": source_label(r.source_format, r.source_system),
                 "value": raw_value if is_num else None,
@@ -367,6 +384,166 @@ async def record_stats(
         "last_date": last_date.isoformat() if last_date else None,
         "source_count": source_count or 0,
     }
+
+
+@router.get(
+    "/{record_id}/evidence",
+    response_model=RecordExtractionEvidenceResponse,
+)
+async def get_record_evidence(
+    record_id: UUID,
+    request: Request,
+    user_id: UUID = Depends(get_authenticated_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> RecordExtractionEvidenceResponse:
+    """Return bounded extraction evidence for one user-owned health record."""
+
+    record = (
+        await db.execute(
+            select(HealthRecord).where(
+                HealthRecord.id == record_id,
+                HealthRecord.user_id == user_id,
+                HealthRecord.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        raise HTTPException(status_code=404, detail="Record evidence not found")
+
+    lineage_result = await load_strict_local_evidence_lineage(
+        db,
+        user_id=user_id,
+        survivor_ids=[record_id],
+        limit=256,
+    )
+    if lineage_result.overflowed:
+        raise HTTPException(
+            status_code=409,
+            detail="Record extraction evidence exceeds the supported limit",
+        )
+    evidence_pairs = [
+        (lineage.evidence, lineage.upload) for lineage in lineage_result.rows
+    ]
+    if not evidence_pairs:
+        raise HTTPException(status_code=404, detail="Record evidence not found")
+
+    uploads_by_id = {upload.id: upload for _, upload in evidence_pairs}
+    unresolved: list[str] = []
+    rejected: list[str] = []
+    schema_versions: set[str] = set()
+    model_identities: dict[
+        tuple[str, str, str, str, str],
+        ExtractionModelIdentityResponse,
+    ] = {}
+    try:
+        for upload in sorted(uploads_by_id.values(), key=lambda item: str(item.id)):
+            if (
+                not isinstance(upload.processing_manifest, dict)
+                or not isinstance(upload.processing_schema_version, str)
+                or not upload.processing_schema_version
+            ):
+                raise LocalAIError("Stored strict-local provenance is invalid.")
+            manifest = parse_manifest(upload.processing_manifest)
+            schema_versions.add(upload.processing_schema_version)
+            metadata = (
+                upload.document_metadata
+                if isinstance(upload.document_metadata, dict)
+                else {}
+            )
+            upload_unresolved = metadata.get("unresolved_fields", [])
+            upload_rejected = metadata.get("rejected_fields", [])
+            if (
+                not isinstance(upload_unresolved, list)
+                or not isinstance(upload_rejected, list)
+                or any(
+                    not isinstance(item, str)
+                    for item in (*upload_unresolved, *upload_rejected)
+                )
+            ):
+                raise LocalAIError("Stored strict-local provenance is invalid.")
+            for target, values in (
+                (unresolved, upload_unresolved),
+                (rejected, upload_rejected),
+            ):
+                for value in values:
+                    if value not in target:
+                        target.append(value)
+                    if len(target) > 128:
+                        raise LocalAIError("Stored strict-local provenance is invalid.")
+            runtime = f"{manifest.runtime['name']} {manifest.runtime['version']}"
+            for artifact in manifest.artifacts:
+                if artifact.role not in {ModelRole.OCR, ModelRole.EXTRACTION}:
+                    continue
+                identity = ExtractionModelIdentityResponse(
+                    role=artifact.role,
+                    repository=artifact.repository,
+                    revision=artifact.revision,
+                    quantization=artifact.quantization,
+                    runtime=runtime,
+                )
+                key = (
+                    identity.role,
+                    identity.repository,
+                    identity.revision,
+                    identity.quantization,
+                    identity.runtime,
+                )
+                model_identities.setdefault(key, identity)
+        if len(schema_versions) != 1:
+            raise LocalAIError("Stored strict-local provenance is invalid.")
+        unresolved.sort()
+        rejected.sort()
+    except LocalAIError:
+        raise HTTPException(
+            status_code=409,
+            detail="Record extraction provenance is invalid",
+        ) from None
+
+    evidence: list[ExtractionEvidenceResponse] = []
+    for row, _upload in evidence_pairs:
+        source_metadata = (
+            row.source_metadata if isinstance(row.source_metadata, dict) else {}
+        )
+        evidence_id = source_metadata.get("evidence_id")
+        if not isinstance(evidence_id, str):
+            raise HTTPException(
+                status_code=409,
+                detail="Record extraction provenance is invalid",
+            )
+        evidence.append(
+            ExtractionEvidenceResponse(
+                id=evidence_id,
+                page_number=row.page_number,
+                section=row.section,
+                excerpt=row.excerpt,
+                start_offset=row.start_offset,
+                end_offset=row.end_offset,
+                field_paths=row.field_paths,
+            )
+        )
+
+    models = [model_identities[key] for key in sorted(model_identities)]
+    await log_audit_event(
+        db,
+        user_id=user_id,
+        action="records.evidence",
+        resource_type="health_record",
+        resource_id=record_id,
+        ip_address=request.client.host if request.client else None,
+        details={
+            "evidence_count": len(evidence),
+            "processing_mode": ProcessingMode.VALIDATED_STRICT_LOCAL.value,
+        },
+    )
+    return RecordExtractionEvidenceResponse(
+        record_id=record_id,
+        processing_mode=ProcessingMode.VALIDATED_STRICT_LOCAL,
+        schema_version=next(iter(schema_versions)),
+        evidence=evidence,
+        unresolved_fields=unresolved,
+        rejected_fields=rejected,
+        models=models,
+    )
 
 
 @router.get("/{record_id}", response_model=HealthRecordResponse)

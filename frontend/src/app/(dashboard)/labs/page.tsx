@@ -9,14 +9,9 @@ import { RECORD_TYPE_COLORS, DEFAULT_RECORD_COLOR } from "@/lib/constants";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
 import { Gauge } from "@/components/retro/DataViz";
+import { fmtDay } from "@/lib/format-date";
 
 const PAGE_SIZE = 20;
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const fmtDate = (s: string | null) => {
-  if (!s) return "";
-  const d = new Date(s);
-  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
-};
 
 // The lab's OWN interpretation flag, surfaced as neutral text. This is the
 // source's recorded annotation — never recolored as good/bad by this app.
@@ -38,7 +33,7 @@ function interpretationText(code: string): string | null {
 function SecureChip() {
   return (
     <span className="secure">
-      <Lock size={13} strokeWidth={1.9} /> End-to-end encrypted
+      <Lock size={13} strokeWidth={1.9} /> Application-layer encrypted at rest
     </span>
   );
 }
@@ -65,18 +60,19 @@ export default function LabsPage() {
   }, []);
 
   useEffect(() => {
-    setLoading(true);
-    api
-      .get<LabResponse>(`/dashboard/labs?page=${page}&page_size=${PAGE_SIZE}`)
-      .then((data) => {
+    void (async () => {
+      setLoading(true);
+      try {
+        const data = await api.get<LabResponse>(`/dashboard/labs?page=${page}&page_size=${PAGE_SIZE}`);
         setItems(data.items || []);
         setTotal(data.total || 0);
-      })
-      .catch(() => {
+      } catch {
         setItems([]);
         setTotal(0);
-      })
-      .finally(() => setLoading(false));
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, [page]);
 
   const dot = (RECORD_TYPE_COLORS.observation ?? DEFAULT_RECORD_COLOR).dot;
@@ -143,7 +139,7 @@ export default function LabsPage() {
                         <span className="lrow-title">{item.display_text}</span>
                         {subParts && <span className="lrow-sub muted">{subParts}</span>}
                       </span>
-                      <span className="lrow-meta tnum">{fmtDate(item.effective_date)}</span>
+                      <span className="lrow-meta tnum">{fmtDay(item.effective_date)}</span>
                       <ChevronRight size={15} style={{ color: "var(--text-muted)" }} />
                     </button>
                     {showGauge && (

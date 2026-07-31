@@ -5,6 +5,21 @@
  * server-free unit suite all import these, so they must not pull in React, the
  * API client, or app type barrels.
  */
+import type { LocalModelRole } from "@/types/local-ai";
+
+/** Upload states that the page must keep refreshing until they become terminal. */
+export const EXTRACTION_POLL_STATUSES: string[] = [
+  "pending_extraction",
+  "processing",
+  "completed",
+  "failed",
+  "cancelled",
+  "awaiting_confirmation",
+  "awaiting_review",
+  "completed_with_merges",
+  "dedup_scanning",
+  "dedup_processing",
+];
 
 /** Statuses at which a file is DONE — it will not advance on its own. */
 export const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
@@ -22,14 +37,51 @@ export function isTerminalStatus(status: string | null | undefined): boolean {
   return !!status && TERMINAL_STATUSES.has(status);
 }
 
-/** Section-level progress emitted per file while a long LLM extract runs. */
+/** Dot color for the upload row's neutral status pill. */
+export function statusDotColor(status: string): string {
+  switch (status) {
+    case "completed":
+    case "completed_with_merges":
+    case "awaiting_confirmation":
+    case "awaiting_review":
+    case "parsed":
+      return "var(--success)";
+    case "processing":
+    case "pending_extraction":
+    case "dedup_scanning":
+    case "dedup_processing":
+    case "pending":
+      return "var(--primary)";
+    case "failed":
+      return "var(--danger)";
+    case "cancelled":
+    case "duplicate_file":
+    case "duplicate":
+      return "var(--text-muted)";
+    default:
+      return "var(--text-muted)";
+  }
+}
+
+/** Content-free section/page/model progress emitted by an extraction worker. */
 export interface ProgressDetail {
-  section_index: number;
-  section_total: number;
+  section_index?: number;
+  section_total?: number;
+  page_index?: number;
+  page_total?: number;
+  model_role?: LocalModelRole;
+  repository?: string;
+  revision?: string;
 }
 
 // Human labels for the worker's `progress_stage` values (contract §2a iv).
 const STAGE_LABELS: Record<string, string> = {
+  ocr: "Local OCR",
+  extraction: "Local extraction",
+  summary: "Local summary",
+  local_ocr: "Local OCR",
+  local_extraction: "Local extraction",
+  local_summary: "Local summary",
   extracting_text: "Extracting text",
   scrubbing_phi: "De-identifying",
   extracting_entities: "Extracting entities",
@@ -52,7 +104,20 @@ export function formatStage(
 ): string | null {
   if (!stage) return null;
   const label = STAGE_LABELS[stage] ?? humanize(stage);
-  if (detail && detail.section_total > 0) {
+  if (
+    detail &&
+    detail.page_total !== undefined &&
+    detail.page_total > 0 &&
+    detail.page_index !== undefined
+  ) {
+    return `${label} — page ${detail.page_index} of ${detail.page_total}`;
+  }
+  if (
+    detail &&
+    detail.section_total !== undefined &&
+    detail.section_total > 0 &&
+    detail.section_index !== undefined
+  ) {
     return `${label} — section ${detail.section_index} of ${detail.section_total}`;
   }
   return label;

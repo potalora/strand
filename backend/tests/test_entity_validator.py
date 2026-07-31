@@ -4,7 +4,10 @@ The validator is a pure, defensive post-extraction layer that drops/repairs the
 false entities LangExtract invents.  See ``docs/extraction-remediation.md``
 section A and ``entity_validator.py``.
 """
+
 from __future__ import annotations
+
+import logging
 
 import pytest
 
@@ -46,8 +49,27 @@ def test_a5_drops_entities_that_are_phi_placeholders():
 
 def test_a5_keeps_text_with_parenthetical_icd_code():
     """ICD codes use parentheses, not the bracketed all-caps placeholder form."""
-    out = validate_entities([_e("condition", "Gastroparesis (K31.84)", status="active")])
+    out = validate_entities(
+        [_e("condition", "Gastroparesis (K31.84)", status="active")]
+    )
     assert len(out) == 1
+
+
+def test_no_content_logging_mode_suppresses_rejected_entity_text(
+    caplog: pytest.LogCaptureFixture,
+):
+    canary = "private business analyst canary"
+
+    with caplog.at_level(logging.DEBUG):
+        assert (
+            validate_entities(
+                [_e("lab_result", canary)],
+                log_rejections=False,
+            )
+            == []
+        )
+
+    assert canary not in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +121,7 @@ def test_a1_drops_scheduled_procedure_even_with_date():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("text", ["2mg", '5\' 9"', "120/80", "98.6", "  ", "140"])
+@pytest.mark.parametrize("text", ["2mg", "5' 9\"", "120/80", "98.6", "  ", "140"])
 def test_a2_drops_value_only_fragments(text):
     out = validate_entities([_e("observation", text)])
     assert out == []
@@ -113,7 +135,9 @@ def test_a2_keeps_named_valueless_panel_tokens(text):
     assert _texts(out) == [text]
 
 
-@pytest.mark.parametrize("text", ["Glucose 95 mg/dL", "HbA1c 6.8%", "BP 120/80 mmHg", "WBC 6.2"])
+@pytest.mark.parametrize(
+    "text", ["Glucose 95 mg/dL", "HbA1c 6.8%", "BP 120/80 mmHg", "WBC 6.2"]
+)
 def test_a2_keeps_named_value_pairs(text):
     out = validate_entities([_e("lab_result", text)])
     assert len(out) == 1
@@ -281,11 +305,24 @@ def test_a4_keeps_real_drug_names(text):
     "text",
     [
         # letter+digit vitamin forms the old garbage heuristic wrongly dropped
-        "B12", "b12", "D3", "K2", "B6", "B1",
+        "B12",
+        "b12",
+        "D3",
+        "K2",
+        "B6",
+        "B1",
         # vitamin-prefixed forms (the 'vitamin' prefix is decisive)
-        "vitamin D", "vitamin B12", "vitamin C",
+        "vitamin D",
+        "vitamin B12",
+        "vitamin C",
         # word / compound supplements (multi-character named supplements)
-        "folate", "B-complex", "omega-3", "CoQ10", "iron", "magnesium", "multivitamin",
+        "folate",
+        "B-complex",
+        "omega-3",
+        "CoQ10",
+        "iron",
+        "magnesium",
+        "multivitamin",
     ],
 )
 def test_a4_keeps_vitamins_and_supplements(text):

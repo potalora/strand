@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
+from app.services.local_ai.types import ProcessingMode
+
 
 class ProviderUpdate(BaseModel):
     """Partial update for a single provider's per-user config.
@@ -31,3 +33,4 @@ class RoutingUpdate(BaseModel):
     extraction: str | None = None
     vision: str | None = None
     extraction_engine: str | None = None
+    processing_mode: ProcessingMode | None = None

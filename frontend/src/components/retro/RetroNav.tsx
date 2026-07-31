@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
@@ -51,9 +51,11 @@ export function RetroNav() {
   const { clearTokens } = useAuthStore();
   const { user, fetchUser, clearUser } = useUserStore();
   const { theme, setTheme } = useTheme();
-  const [mounted, setMounted] = useState(false);
-
-  useEffect(() => setMounted(true), []);
+  const mounted = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  );
 
   // Shared store: fetched once, cached, retried on a transient 401 (so the
   // avatar initials never silently fall back to the email/placeholder).

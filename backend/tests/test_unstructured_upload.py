@@ -36,6 +36,7 @@ async def test_upload_rtf_creates_record(client: AsyncClient, db_session: AsyncS
             "/api/v1/upload/unstructured",
             files={"file": ("note.rtf", io.BytesIO(rtf_content), "application/rtf")},
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 202
     data = resp.json()
@@ -45,7 +46,9 @@ async def test_upload_rtf_creates_record(client: AsyncClient, db_session: AsyncS
 
 
 @pytest.mark.asyncio
-async def test_reject_unsupported_file_type(client: AsyncClient, db_session: AsyncSession):
+async def test_reject_unsupported_file_type(
+    client: AsyncClient, db_session: AsyncSession
+):
     """Verify .doc files are rejected with 400."""
     headers, user_id = await auth_headers(client)
 
@@ -72,7 +75,9 @@ async def test_reject_txt_file(client: AsyncClient, db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_extraction_results_endpoint_not_found(client: AsyncClient, db_session: AsyncSession):
+async def test_extraction_results_endpoint_not_found(
+    client: AsyncClient, db_session: AsyncSession
+):
     """Verify 404 for non-existent upload."""
     headers, user_id = await auth_headers(client)
 
@@ -84,7 +89,9 @@ async def test_extraction_results_endpoint_not_found(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
-async def test_extraction_results_for_uploaded_file(client: AsyncClient, db_session: AsyncSession):
+async def test_extraction_results_for_uploaded_file(
+    client: AsyncClient, db_session: AsyncSession
+):
     """Upload RTF, then check extraction endpoint returns valid response."""
     headers, user_id = await auth_headers(client)
 
@@ -94,6 +101,7 @@ async def test_extraction_results_for_uploaded_file(client: AsyncClient, db_sess
             "/api/v1/upload/unstructured",
             files={"file": ("note.rtf", io.BytesIO(rtf_content), "application/rtf")},
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     upload_id = upload_resp.json()["upload_id"]
 
@@ -105,11 +113,19 @@ async def test_extraction_results_for_uploaded_file(client: AsyncClient, db_sess
     assert resp.status_code == 200
     data = resp.json()
     assert data["upload_id"] == upload_id
-    assert data["status"] in ("pending_extraction", "processing", "awaiting_confirmation", "completed", "failed")
+    assert data["status"] in (
+        "pending_extraction",
+        "processing",
+        "awaiting_confirmation",
+        "completed",
+        "failed",
+    )
 
 
 @pytest.mark.asyncio
-async def test_confirm_extraction_missing_patient(client: AsyncClient, db_session: AsyncSession):
+async def test_confirm_extraction_missing_patient(
+    client: AsyncClient, db_session: AsyncSession
+):
     """Verify confirmation fails without patient_id."""
     headers, user_id = await auth_headers(client)
 
@@ -119,6 +135,7 @@ async def test_confirm_extraction_missing_patient(client: AsyncClient, db_sessio
             "/api/v1/upload/unstructured",
             files={"file": ("note.rtf", io.BytesIO(rtf_content), "application/rtf")},
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     upload_id = upload_resp.json()["upload_id"]
 
@@ -131,7 +148,9 @@ async def test_confirm_extraction_missing_patient(client: AsyncClient, db_sessio
 
 
 @pytest.mark.asyncio
-async def test_confirm_extraction_creates_records(client: AsyncClient, db_session: AsyncSession):
+async def test_confirm_extraction_creates_records(
+    client: AsyncClient, db_session: AsyncSession
+):
     """Confirm extracted entities and verify HealthRecords are created."""
     headers, user_id = await auth_headers(client)
     patient = await create_test_patient(db_session, user_id)
@@ -142,6 +161,7 @@ async def test_confirm_extraction_creates_records(client: AsyncClient, db_sessio
             "/api/v1/upload/unstructured",
             files={"file": ("note.rtf", io.BytesIO(rtf_content), "application/rtf")},
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     upload_id = upload_resp.json()["upload_id"]
 
@@ -189,8 +209,11 @@ async def test_upload_pdf_accepted(client: AsyncClient, db_session: AsyncSession
     with PATCH_BG_TASK:
         resp = await client.post(
             "/api/v1/upload/unstructured",
-            files={"file": ("report.pdf", io.BytesIO(b"%PDF-1.4 test"), "application/pdf")},
+            files={
+                "file": ("report.pdf", io.BytesIO(b"%PDF-1.4 test"), "application/pdf")
+            },
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 202
     data = resp.json()
@@ -198,7 +221,9 @@ async def test_upload_pdf_accepted(client: AsyncClient, db_session: AsyncSession
 
 
 @pytest.mark.asyncio
-async def test_concurrent_uploads_respect_semaphore(client: AsyncClient, db_session: AsyncSession):
+async def test_concurrent_uploads_respect_semaphore(
+    client: AsyncClient, db_session: AsyncSession
+):
     """Upload 3 RTF files simultaneously, verify all are accepted."""
     headers, user_id = await auth_headers(client)
 
@@ -213,8 +238,11 @@ async def test_concurrent_uploads_respect_semaphore(client: AsyncClient, db_sess
         for i, content in enumerate(rtf_files):
             resp = await client.post(
                 "/api/v1/upload/unstructured",
-                files={"file": (f"note_{i}.rtf", io.BytesIO(content), "application/rtf")},
+                files={
+                    "file": (f"note_{i}.rtf", io.BytesIO(content), "application/rtf")
+                },
                 headers=headers,
+                data={"processing_mode": "cloud_assisted"},
             )
             assert resp.status_code == 202
             data = resp.json()
@@ -244,6 +272,7 @@ async def test_batch_upload_endpoint(client: AsyncClient, db_session: AsyncSessi
                 ("files", ("batch3.pdf", io.BytesIO(pdf1), "application/pdf")),
             ],
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 202
     data = resp.json()
@@ -280,6 +309,7 @@ async def test_pending_extraction_lists_pending_files(
         storage_path="/tmp/test.pdf",
         ingestion_status="pending_extraction",
         file_category="unstructured",
+        manual_extraction_required=True,
     )
     db_session.add(upload)
     await db_session.commit()
@@ -290,6 +320,7 @@ async def test_pending_extraction_lists_pending_files(
     assert data["total"] == 1
     assert data["files"][0]["filename"] == "test_note.pdf"
     assert data["files"][0]["id"] == str(upload.id)
+    assert data["files"][0]["manual_extraction_required"] is True
 
 
 @pytest.mark.asyncio
@@ -333,7 +364,9 @@ async def test_pending_extraction_excludes_other_users(
 
 
 @pytest.mark.asyncio
-async def test_batch_upload_skips_invalid_files(client: AsyncClient, db_session: AsyncSession):
+async def test_batch_upload_skips_invalid_files(
+    client: AsyncClient, db_session: AsyncSession
+):
     """Batch endpoint skips unsupported file types and invalid magic bytes."""
     headers, user_id = await auth_headers(client)
 
@@ -348,6 +381,7 @@ async def test_batch_upload_skips_invalid_files(client: AsyncClient, db_session:
                 ("files", ("invalid.txt", io.BytesIO(txt_invalid), "text/plain")),
             ],
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 202
     data = resp.json()
@@ -360,7 +394,7 @@ async def test_batch_upload_skips_invalid_files(client: AsyncClient, db_session:
 async def test_trigger_extraction_starts_processing(
     client: AsyncClient, db_session: AsyncSession
 ):
-    """POST /upload/trigger-extraction triggers processing for pending files."""
+    """Manual ZIP children become worker-claimable only after the trigger commit."""
     headers, user_id = await auth_headers(client)
 
     from app.models.uploaded_file import UploadedFile
@@ -378,6 +412,8 @@ async def test_trigger_extraction_starts_processing(
             storage_path=f"/tmp/note_{i}.rtf",
             ingestion_status="pending_extraction",
             file_category="unstructured",
+            processing_mode="cloud_assisted",
+            manual_extraction_required=True,
         )
         db_session.add(upload)
         uploads.append(upload)
@@ -397,6 +433,113 @@ async def test_trigger_extraction_starts_processing(
     assert data["triggered"] == 3
     assert data["failed"] == 0
     assert len(data["results"]) == 3
+    for upload in uploads:
+        await db_session.refresh(upload)
+        assert upload.manual_extraction_required is False
+
+
+@pytest.mark.asyncio
+async def test_trigger_extraction_rejects_auto_claimable_pending_upload(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """Pending status alone never grants the manual extraction control."""
+    headers, user_id = await auth_headers(client)
+
+    from app.models.uploaded_file import UploadedFile
+    from uuid import uuid4
+
+    upload = UploadedFile(
+        id=uuid4(),
+        user_id=user_id,
+        filename="direct.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=1000,
+        file_hash="hash_direct_auto_claim",
+        storage_path="/tmp/direct.pdf",
+        ingestion_status="pending_extraction",
+        file_category="unstructured",
+        processing_mode="cloud_assisted",
+    )
+    db_session.add(upload)
+    await db_session.commit()
+
+    response = await client.post(
+        "/api/v1/upload/trigger-extraction",
+        json={"upload_ids": [str(upload.id)]},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"] == [
+        {
+            "upload_id": str(upload.id),
+            "status": "manual_extraction_not_required",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trigger_extraction_releases_failed_manual_zip_child(
+    client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    """An explicit retry clears the durable manual hold before worker claim."""
+    headers, user_id = await auth_headers(client)
+
+    from app.models.uploaded_file import UploadedFile
+    from uuid import uuid4
+
+    upload = UploadedFile(
+        id=uuid4(),
+        user_id=user_id,
+        filename="failed-zip-child.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=1000,
+        file_hash="hash_failed_manual_child",
+        storage_path="/tmp/medtimeline-zip-set-example/failed-zip-child.pdf",
+        ingestion_status="failed",
+        file_category="unstructured",
+        processing_mode="cloud_assisted",
+        manual_extraction_required=True,
+    )
+    db_session.add(upload)
+    await db_session.commit()
+
+    response = await client.post(
+        "/api/v1/upload/trigger-extraction",
+        json={"upload_ids": [str(upload.id)]},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["triggered"] == 1
+    await db_session.refresh(upload)
+    assert upload.ingestion_status == "pending_extraction"
+    assert upload.manual_extraction_required is False
+
+
+@pytest.mark.asyncio
+async def test_upload_openapi_publishes_typed_manual_extraction_contracts(
+    client: AsyncClient,
+) -> None:
+    """Mixed-ZIP and trigger payloads are explicit in generated OpenAPI."""
+    schema = (await client.get("/openapi.json")).json()
+    upload_response = schema["components"]["schemas"]["UploadResponse"]
+    child_schema = upload_response["properties"]["unstructured_uploads"]["items"]
+    assert child_schema == {"$ref": "#/components/schemas/UnstructuredUploadItem"}
+    child_properties = schema["components"]["schemas"]["UnstructuredUploadItem"][
+        "properties"
+    ]
+    assert child_properties["manual_extraction_required"]["type"] == "boolean"
+
+    trigger = schema["paths"]["/api/v1/upload/trigger-extraction"]["post"]
+    request_schema = trigger["requestBody"]["content"]["application/json"]["schema"]
+    assert request_schema == {"$ref": "#/components/schemas/TriggerExtractionRequest"}
+    response_schema = trigger["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]
+    assert response_schema == {"$ref": "#/components/schemas/TriggerExtractionResponse"}
 
 
 @pytest.mark.asyncio
@@ -456,6 +599,7 @@ async def test_trigger_extraction_allows_retry_of_processing(
         storage_path="/tmp/stuck.pdf",
         ingestion_status="processing",
         file_category="unstructured",
+        processing_mode="cloud_assisted",
     )
     db_session.add(upload)
     await db_session.commit()
@@ -500,6 +644,7 @@ async def test_trigger_extraction_skips_actively_processing(
         storage_path="/tmp/active.pdf",
         ingestion_status="processing",
         file_category="unstructured",
+        processing_mode="cloud_assisted",
         processing_started_at=datetime.now(timezone.utc),  # actively processing now
     )
     db_session.add(upload)
@@ -541,6 +686,7 @@ async def test_trigger_extraction_allows_retry_of_failed(
         storage_path="/tmp/failed.rtf",
         ingestion_status="failed",
         file_category="unstructured",
+        processing_mode="cloud_assisted",
     )
     db_session.add(upload)
     await db_session.commit()
@@ -578,6 +724,7 @@ async def test_trigger_extraction_allows_retry_of_awaiting_confirmation(
         storage_path="/tmp/awaiting.rtf",
         ingestion_status="awaiting_confirmation",
         file_category="unstructured",
+        processing_mode="cloud_assisted",
     )
     db_session.add(upload)
     await db_session.commit()
@@ -596,7 +743,9 @@ async def test_trigger_extraction_allows_retry_of_awaiting_confirmation(
 
 
 @pytest.mark.asyncio
-async def test_auto_confirm_creates_records(client: AsyncClient, db_session: AsyncSession):
+async def test_auto_confirm_creates_records(
+    client: AsyncClient, db_session: AsyncSession
+):
     """Auto-confirm creates health records when patient exists."""
     headers, user_id = await auth_headers(client)
     patient = await create_test_patient(db_session, user_id)
@@ -697,8 +846,10 @@ async def test_ensure_patient_creates_placeholder_when_missing(
 
     # No patient initially
     existing = (
-        await db_session.execute(select(Patient).where(Patient.user_id == user_id))
-    ).scalars().all()
+        (await db_session.execute(select(Patient).where(Patient.user_id == user_id)))
+        .scalars()
+        .all()
+    )
     assert existing == []
 
     patient = await _ensure_patient(db_session, user_id)
@@ -713,8 +864,10 @@ async def test_ensure_patient_creates_placeholder_when_missing(
     again = await _ensure_patient(db_session, user_id)
     assert again.id == patient.id
     all_patients = (
-        await db_session.execute(select(Patient).where(Patient.user_id == user_id))
-    ).scalars().all()
+        (await db_session.execute(select(Patient).where(Patient.user_id == user_id)))
+        .scalars()
+        .all()
+    )
     assert len(all_patients) == 1
 
 
@@ -729,7 +882,17 @@ async def test_extraction_progress_returns_counts(
     from uuid import uuid4
 
     # Create files in various statuses
-    for i, status in enumerate(["completed", "completed", "processing", "failed", "pending_extraction"]):
+    for i, status in enumerate(
+        [
+            "completed",
+            "completed",
+            "processing",
+            "dedup_scanning",
+            "dedup_processing",
+            "failed",
+            "pending_extraction",
+        ]
+    ):
         upload = UploadedFile(
             id=uuid4(),
             user_id=user_id,
@@ -748,9 +911,9 @@ async def test_extraction_progress_returns_counts(
     resp = await client.get("/api/v1/upload/extraction-progress", headers=headers)
     assert resp.status_code == 200
     data = resp.json()
-    assert data["total"] == 5
+    assert data["total"] == 7
     assert data["completed"] == 2
-    assert data["processing"] == 1
+    assert data["processing"] == 3
     assert data["failed"] == 1
     assert data["pending"] == 1
     assert data["records_created"] == 6

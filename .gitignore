@@ -100,6 +100,9 @@ CLAUDE.private.md
 # Backend data directory
 backend/data/
 
+# Operator-only local AI fidelity reports must never enter source control.
+backend/artifacts/*.private.json
+
 # Screenshots (dev artifacts) — may contain PHI, so ignored by default.
 *.png
 # Exception: README screenshots use synthetic Synthea data (no real records).

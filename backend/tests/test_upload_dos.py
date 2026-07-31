@@ -65,6 +65,7 @@ async def test_zip_bomb_rejected_by_upload_endpoint(
     resp = await client.post(
         "/api/v1/upload",
         headers=headers,
+        data={"processing_mode": "cloud_assisted"},
         files={"file": ("bomb.zip", bomb, "application/zip")},
     )
     assert resp.status_code in (400, 413), resp.text
@@ -311,6 +312,7 @@ async def test_unstructured_upload_streams_body_in_chunks(
             "/api/v1/upload/unstructured",
             files={"file": ("note.rtf", io.BytesIO(rtf), "application/rtf")},
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 202, resp.text
     assert any(
@@ -343,6 +345,7 @@ async def test_oversized_content_length_rejected_before_reading_body(
             "/api/v1/upload/unstructured",
             files={"file": ("big.pdf", io.BytesIO(big), "application/pdf")},
             headers=headers,
+            data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 413, resp.text
     assert read_calls == [], (

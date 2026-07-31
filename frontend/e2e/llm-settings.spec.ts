@@ -56,6 +56,7 @@ interface MockProvider {
 interface MockState {
   providers: MockProvider[];
   routing: Record<string, string>;
+  routingCommits: string[];
 }
 
 function freshState(): MockState {
@@ -142,7 +143,9 @@ function freshState(): MockState {
       extraction: "gemini",
       vision: "gemini",
       extraction_engine: "hybrid",
+      processing_mode: "cloud_assisted",
     },
+    routingCommits: [],
   };
 }
 
@@ -152,8 +155,18 @@ async function injectAuth(page: Page): Promise<void> {
   }, AUTH_STATE);
 }
 
-async function mockBackend(page: Page): Promise<MockState> {
+async function mockBackend(
+  page: Page,
+  options: {
+    routingDelaysMs?: number[];
+    routingFailures?: number;
+    settingsFailureCalls?: number[];
+  } = {}
+): Promise<MockState> {
   const state = freshState();
+  let routingRequest = 0;
+  let routingFailures = options.routingFailures ?? 0;
+  let settingsGet = 0;
 
   await page.route("**/api/v1/**", async (route) => {
     const req = route.request();
@@ -168,7 +181,20 @@ async function mockBackend(page: Page): Promise<MockState> {
 
     // --- LLM settings (most specific first) ---
     if (url.includes("/settings/llm/routing")) {
-      if (method === "PUT") Object.assign(state.routing, req.postDataJSON() ?? {});
+      if (method === "PUT") {
+        const body = (req.postDataJSON() ?? {}) as Record<string, unknown>;
+        const delayMs = options.routingDelaysMs?.[routingRequest] ?? 0;
+        routingRequest += 1;
+        if (delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+        if (routingFailures > 0) {
+          routingFailures -= 1;
+          return json({ detail: "routing unavailable" }, 503);
+        }
+        Object.assign(state.routing, body);
+        state.routingCommits.push(String(body.processing_mode));
+      }
       return json({ ok: true });
     }
     if (url.includes("/settings/llm/providers/")) {
@@ -194,6 +220,10 @@ async function mockBackend(page: Page): Promise<MockState> {
       return json({ ok: true });
     }
     if (url.includes("/settings/llm")) {
+      settingsGet += 1;
+      if (options.settingsFailureCalls?.includes(settingsGet)) {
+        return json({ detail: "settings unavailable" }, 503);
+      }
       return json({ providers: state.providers, routing: state.routing });
     }
 
@@ -238,7 +268,7 @@ test.describe("AI providers card (Admin → System)", () => {
 
     // The muted intro paragraph at the top of the card body.
     await expect(
-      page.getByText(/Strand can use different AI providers/i)
+      page.getByText(/Choose how medical content is processed first/i)
     ).toBeVisible();
 
     // Cloud providers (openai/anthropic/gemini/openrouter) expose a key link
@@ -273,47 +303,189 @@ test.describe("AI providers card (Admin → System)", () => {
     await expect(page.getByText("sk-openai-secret-9999")).toHaveCount(0);
   });
 
-  test("Extraction-engine select renders and PUTs routing with extraction_engine", async ({
+  test("processing-mode switches persist complete provider-safe routing", async ({
     page,
   }) => {
     await mockBackend(page);
     await page.goto("/admin?tab=sys");
 
     await expect(page.getByLabel("Default AI provider")).toBeVisible();
+    await expect(
+      page.getByText(
+        /Scanned PDF and TIFF pages are sent to the vision provider before text can be de-identified/
+      ).first()
+    ).toBeVisible();
+    const privacyCard = page
+      .getByRole("heading", { name: "Your data, your control" })
+      .locator("..");
+    await expect(privacyCard).toContainText(
+      "clinical records, source files, and stored AI payloads use application-layer encryption"
+    );
+    await expect(privacyCard).toContainText(
+      "PDF and TIFF OCR sends the original unredacted document or pages"
+    );
+    await expect(privacyCard).toContainText(
+      "Validated strict-local processing does not construct or call a cloud provider"
+    );
 
-    // The engine selector lives under the Advanced disclosure, beside the
-    // per-operation extraction provider select.
-    await page.getByText("Advanced — route each operation").click();
-
-    const engine = page.getByLabel("Extraction engine");
-    await expect(engine).toBeVisible();
+    const mode = page.getByLabel("Processing mode");
+    await expect(mode).toBeVisible();
     // Defaults to the mocked routing value.
-    await expect(engine).toHaveValue("hybrid");
+    await expect(mode).toHaveValue("cloud_assisted");
 
     const routingPromise = page.waitForRequest(
       (r) => r.method() === "PUT" && r.url().includes("/settings/llm/routing")
     );
 
-    await engine.selectOption("local");
+    await mode.selectOption("custom_local");
 
     const routingReq = await routingPromise;
-    expect(routingReq.postDataJSON()).toMatchObject({ extraction_engine: "local" });
+    expect(routingReq.postDataJSON()).toEqual({
+      default: "ollama",
+      summary: "ollama",
+      section: "ollama",
+      dedup: "ollama",
+      extraction: "ollama",
+      vision: "ollama",
+      extraction_engine: "hybrid",
+      processing_mode: "custom_local",
+    });
+
+    const cloudRoutingPromise = page.waitForRequest(
+      (r) => r.method() === "PUT" && r.url().includes("/settings/llm/routing")
+    );
+    await mode.selectOption("cloud_assisted");
+    expect((await cloudRoutingPromise).postDataJSON()).toEqual({
+      default: "gemini",
+      summary: "gemini",
+      section: "gemini",
+      dedup: "gemini",
+      extraction: "gemini",
+      vision: "gemini",
+      extraction_engine: "hybrid",
+      processing_mode: "cloud_assisted",
+    });
   });
 
-  test("changing the default select PUTs routing", async ({ page }) => {
-    await mockBackend(page);
+  test("serializes processing-mode saves so the newest snapshot commits last", async ({
+    page,
+  }) => {
+    const state = await mockBackend(page, { routingDelaysMs: [700, 0] });
+    await page.goto("/admin?tab=sys");
+
+    const mode = page.getByLabel("Processing mode");
+    await expect(mode).toHaveValue("cloud_assisted");
+    await mode.selectOption("custom_local");
+    await mode.selectOption("cloud_assisted");
+
+    await expect.poll(() => state.routingCommits.length).toBe(2);
+    expect(state.routingCommits).toEqual([
+      "custom_local",
+      "cloud_assisted",
+    ]);
+    expect(state.routing.processing_mode).toBe("cloud_assisted");
+    await expect(mode).toHaveValue("cloud_assisted");
+  });
+
+  test("a failed routing refresh clears optimistic settings and offers retry", async ({
+    page,
+  }) => {
+    await mockBackend(page, {
+      routingFailures: 1,
+    });
+    await page.goto("/admin?tab=sys");
+
+    await page.getByLabel("Processing mode").selectOption("custom_local");
+
+    await expect(
+      page.getByText("AI provider settings are unavailable right now.")
+    ).toBeVisible();
+    await expect(page.getByLabel("Processing mode")).toHaveCount(0);
+    const retry = page.getByRole("button", { name: "Retry AI provider settings" });
+    await expect(retry).toBeEnabled();
+
+    await retry.click();
+    await expect(page.getByLabel("Processing mode")).toHaveValue(
+      "cloud_assisted"
+    );
+  });
+
+  test("an initial settings failure stays unresolved until retry succeeds", async ({
+    page,
+  }) => {
+    await mockBackend(page, { settingsFailureCalls: [1] });
+    await page.goto("/admin?tab=sys");
+
+    await expect(
+      page.getByText("AI provider settings are unavailable right now.")
+    ).toBeVisible();
+    await expect(page.getByLabel("Processing mode")).toHaveCount(0);
+
+    await page
+      .getByRole("button", { name: "Retry AI provider settings" })
+      .click();
+    await expect(page.getByLabel("Processing mode")).toHaveValue(
+      "cloud_assisted"
+    );
+  });
+
+  test("selecting a configured cloud default persists every effective route", async ({
+    page,
+  }) => {
+    const state = await mockBackend(page);
+    const openai = state.providers.find((provider) => provider.name === "openai");
+    if (!openai) throw new Error("openai fixture missing");
+    openai.configured = true;
+    openai.has_key = true;
+    openai.model = "gpt-user-route";
+    await page.goto("/admin?tab=sys");
+
+    const routingPromise = page.waitForRequest(
+      (r) => r.method() === "PUT" && r.url().includes("/settings/llm/routing")
+    );
+    await page.getByLabel("Default AI provider").selectOption("openai");
+    expect((await routingPromise).postDataJSON()).toEqual({
+      default: "openai",
+      summary: "openai",
+      section: "openai",
+      dedup: "openai",
+      extraction: "openai",
+      vision: "openai",
+      extraction_engine: "hybrid",
+      processing_mode: "cloud_assisted",
+    });
+  });
+
+  test("changing one advanced route PUTs the complete effective routing", async ({
+    page,
+  }) => {
+    const state = await mockBackend(page);
+    const openai = state.providers.find((provider) => provider.name === "openai");
+    if (!openai) throw new Error("openai fixture missing");
+    openai.configured = true;
+    openai.has_key = true;
     await page.goto("/admin?tab=sys");
 
     await expect(page.getByLabel("Default AI provider")).toBeVisible();
+    await page.getByText("Advanced — route each operation").click();
 
     const routingPromise = page.waitForRequest(
       (r) => r.method() === "PUT" && r.url().includes("/settings/llm/routing")
     );
 
-    await page.getByLabel("Default AI provider").selectOption("ollama");
+    await page.getByLabel("summary provider").selectOption("openai");
 
     const routingReq = await routingPromise;
-    expect(routingReq.postDataJSON()).toMatchObject({ default: "ollama" });
+    expect(routingReq.postDataJSON()).toEqual({
+      default: "gemini",
+      summary: "openai",
+      section: "gemini",
+      dedup: "gemini",
+      extraction: "gemini",
+      vision: "gemini",
+      extraction_engine: "hybrid",
+      processing_mode: "cloud_assisted",
+    });
   });
 
   test("Test surfaces a connection result", async ({ page }) => {

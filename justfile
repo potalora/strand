@@ -43,6 +43,30 @@ setup-clinical:
     @echo "Now install the scispaCy NER model (not on PyPI):"
     @echo "  cd backend && uv run pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bc5cdr_md-0.5.4.tar.gz"
 
+# Install only the optional host-native Apple MLX worker. Model downloads stay explicit.
+local-ai-runtime-install:
+    ./scripts/setup-local-ai-macos.sh
+
+# Download, hash-check, fixture-validate, and atomically activate the locked pack.
+local-ai-pack-download:
+    cd backend && uv run python scripts/local_ai_pack.py install
+
+# Re-run the exact offline runtime and synthetic-fixture validation gate.
+local-ai-pack-verify:
+    cd backend && uv run python scripts/local_ai_pack.py verify
+
+# Run the content-free three-cold-run Apple resource release gate.
+local-ai-benchmark:
+    cd backend && uv run python scripts/benchmark_local_ai.py --runs 3 --output artifacts/local-ai-benchmark.json
+
+# Bind passing benchmark and fidelity artifacts to the exact shipped lock.
+local-ai-release-promote:
+    cd backend && uv run python scripts/promote_local_ai_release.py --manifest app/model_manifests/apple-m4-16gb-v1.lock.json --benchmark artifacts/local-ai-benchmark.json --fidelity artifacts/local-ai-fidelity.json --output app/model_manifests/apple-m4-16gb-v1.release.json
+
+# Remove model artifacts only. Clinical records, evidence, and checkpoints remain.
+local-ai-pack-remove:
+    cd backend && uv run python scripts/local_ai_pack.py remove
+
 # Native dev: bring up db+redis, then print how to run backend + frontend (two processes)
 dev:
     docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d db redis

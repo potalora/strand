@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 import pytest
 from sqlalchemy import select
 
 from app.middleware.encryption import decrypt_field
 from app.models.llm_settings import LLMProviderConfig
+from app.services.ai.llm.config import load_llm_config
+from app.services.local_ai.types import ProcessingMode
 from tests.conftest import auth_headers
 
 
@@ -26,6 +30,24 @@ async def test_get_settings_masks_keys(client, db_session):
     assert "…" in openai["key_masked"]
     assert "sk-supersecretvalue" not in openai["key_masked"]
     assert openai["source"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_get_settings_without_saved_preference_defaults_prompt_only(
+    client,
+    db_session,
+) -> None:
+    headers, user_id = await auth_headers(
+        client,
+        email="prompt-only-default@example.com",
+    )
+
+    config = await load_llm_config(db_session, UUID(user_id))
+    response = await client.get("/api/v1/settings/llm", headers=headers)
+
+    assert config.processing_mode is ProcessingMode.PROMPT_ONLY
+    assert response.status_code == 200
+    assert response.json()["routing"]["processing_mode"] == "prompt_only"
 
 
 @pytest.mark.asyncio
@@ -93,6 +115,27 @@ async def test_routing_upsert_and_get(client):
 
 
 @pytest.mark.asyncio
+async def test_explicit_cloud_assisted_preference_remains_cloud_assisted(
+    client,
+) -> None:
+    headers, _user_id = await auth_headers(
+        client,
+        email="explicit-cloud-assisted@example.com",
+    )
+
+    update = await client.put(
+        "/api/v1/settings/llm/routing",
+        json={"processing_mode": "cloud_assisted"},
+        headers=headers,
+    )
+    response = await client.get("/api/v1/settings/llm", headers=headers)
+
+    assert update.status_code == 200
+    assert response.status_code == 200
+    assert response.json()["routing"]["processing_mode"] == "cloud_assisted"
+
+
+@pytest.mark.asyncio
 async def test_delete_reverts_provider(client, db_session):
     headers, uid = await auth_headers(client)
     await client.put(
@@ -102,10 +145,14 @@ async def test_delete_reverts_provider(client, db_session):
     )
     await client.delete("/api/v1/settings/llm/providers/openai", headers=headers)
     rows = (
-        await db_session.execute(
-            select(LLMProviderConfig).where(LLMProviderConfig.provider == "openai")
+        (
+            await db_session.execute(
+                select(LLMProviderConfig).where(LLMProviderConfig.provider == "openai")
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert rows == []
 
 

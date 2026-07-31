@@ -29,7 +29,7 @@ async function loginTokens(): Promise<{ accessToken: string; refreshToken: strin
 
 test.describe("Type-specific Renderers", () => {
   const api = new ApiClient();
-  let recordsByType: Record<string, string[]> = {};
+  const recordsByType: Record<string, string[]> = {};
   let auth: { accessToken: string; refreshToken: string };
 
   test.beforeAll(async () => {

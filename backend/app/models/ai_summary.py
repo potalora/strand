@@ -3,12 +3,20 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, Text
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, UUIDPrimaryKeyMixin
-from app.models.encrypted_types import EncryptedText
+from app.models.encrypted_types import EncryptedJSON, EncryptedText
 
 
 class AISummaryPrompt(Base, UUIDPrimaryKeyMixin):
@@ -21,6 +29,12 @@ class AISummaryPrompt(Base, UUIDPrimaryKeyMixin):
         UUID(as_uuid=True), ForeignKey("patients.id"), nullable=False
     )
     summary_type: Mapped[str] = mapped_column(Text, nullable=False)
+    processing_mode: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="prompt_only",
+        server_default="prompt_only",
+    )
     scope_filter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     # Encrypted at rest (AES-256-GCM). Prompts + the model response can embed
     # clinical context; stored ciphertext, fetch-and-render only.
@@ -40,8 +54,19 @@ class AISummaryPrompt(Base, UUIDPrimaryKeyMixin):
     response_format: Mapped[str | None] = mapped_column(Text, nullable=True)
     api_model_used: Mapped[str | None] = mapped_column(Text, nullable=True)
     api_tokens_used: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Model identity/revision only; typed summary content remains encrypted.
+    model_provenance: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    typed_response: Mapped[dict | None] = mapped_column(EncryptedJSON, nullable=True)
     generated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default="now()",
         nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "id",
+            "user_id",
+            name="uq_ai_summary_prompts_id_user_id",
+        ),
     )

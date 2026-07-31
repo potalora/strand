@@ -26,6 +26,8 @@ from app.services.ai.llm import (
     load_llm_config,
 )
 from app.services.ai.llm import registry
+from app.services.local_ai.errors import LocalPolicyError
+from app.services.local_ai.policy import require_loopback
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,7 @@ _ROUTING_FIELDS: dict[str, str] = {
     "extraction": "extraction_provider",
     "vision": "vision_provider",
     "extraction_engine": "extraction_engine",
+    "processing_mode": "processing_mode",
 }
 
 
@@ -64,10 +67,14 @@ async def get_llm_settings(
     base = LLMConfig.from_settings()
 
     rows = (
-        await db.execute(
-            select(LLMProviderConfig).where(LLMProviderConfig.user_id == user_id)
+        (
+            await db.execute(
+                select(LLMProviderConfig).where(LLMProviderConfig.user_id == user_id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     user_rows = {row.provider: row for row in rows}
 
     providers = available_providers(config)
@@ -103,6 +110,7 @@ async def get_llm_settings(
         )
     ).scalar_one_or_none()
     routing["extraction_engine"] = pref.extraction_engine if pref else None
+    routing["processing_mode"] = config.processing_mode.value
 
     await log_audit_event(
         db,
@@ -126,6 +134,11 @@ async def update_provider(
     """Upsert the user's config for a single provider (API key encrypted at rest)."""
     if name not in KNOWN_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unknown provider")
+    if name in {"ollama", "lmstudio"} and body.base_url is not None:
+        try:
+            require_loopback(body.base_url)
+        except LocalPolicyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     row = (
         await db.execute(
@@ -149,6 +162,13 @@ async def update_provider(
         row.model = body.model
     if body.enabled is not None:
         row.enabled = body.enabled
+
+    try:
+        await db.flush()
+        await load_llm_config(db, user_id)
+    except LocalPolicyError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     await db.commit()
 
@@ -185,7 +205,13 @@ async def delete_provider(
     ).scalar_one_or_none()
     if row is not None:
         await db.delete(row)
-        await db.commit()
+    try:
+        await db.flush()
+        await load_llm_config(db, user_id)
+    except LocalPolicyError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await db.commit()
 
     await log_audit_event(
         db,
@@ -222,6 +248,13 @@ async def update_routing(
         if value is not None:
             setattr(pref, column, value)
             updated.append(field_name)
+
+    try:
+        await db.flush()
+        await load_llm_config(db, user_id)
+    except LocalPolicyError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     await db.commit()
 

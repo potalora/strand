@@ -3,16 +3,24 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import UUID
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import or_, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.router import api_router
 from app.config import settings
 from app.database import async_session_factory
 from app.middleware.audit import AuditMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.services.local_ai.lifecycle_lock import acquire_local_ai_lifecycle_lock
+from app.services.local_ai.model_manager import local_model_manager
+from app.services.local_ai.scratch import sweep_stale_scratch
+from app.services.ingestion.zip_child_sets import reconcile_zip_child_sets
 
 
 def resolve_log_level(log_level: str, is_production: bool) -> int:
@@ -37,9 +45,243 @@ logging.basicConfig(
 # Keep a reference to background fire-and-forget tasks so they aren't GC'd while
 # pending (asyncio only holds a weak reference to scheduled tasks).
 _background_tasks: set[asyncio.Task] = set()
+_STALE_LOCAL_AI_SCRATCH_SECONDS = 24 * 60 * 60
+_LOCAL_AI_RECOVERY_BATCH_SIZE = 1_000
+_MAX_ACTIVE_LOCAL_AI_SCRATCH_JOBS = 10_000
 
 
 logger = logging.getLogger(__name__)
+
+
+def _track_background_task(task: asyncio.Task | None) -> None:
+    """Retain a startup task until shutdown can cancel and await it."""
+    if task is None:
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _drain_background_tasks() -> None:
+    """Boundedly cancel and await startup tasks before their event loop closes."""
+    tasks = [task for task in _background_tasks if not task.done()]
+    if not tasks:
+        _background_tasks.clear()
+        return
+
+    for task in tasks:
+        task.cancel()
+    drain = asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(drain),
+            timeout=settings.local_ai_shutdown_drain_seconds,
+        )
+    except TimeoutError:
+        logger.warning("Startup background-task shutdown drain timed out")
+    finally:
+        _background_tasks.difference_update(task for task in tasks if task.done())
+
+
+def _reconcile_model_pack_operations_on_startup() -> int:
+    """Resolve crash-interrupted model-pack operations before job admission."""
+    model_root = Path(settings.local_ai_model_dir)
+    if not model_root.exists():
+        return 0
+    from app.services.local_ai.artifact_store import ArtifactStore
+    from app.services.local_ai.pack_operations import PackOperationStore
+
+    return PackOperationStore(ArtifactStore(model_root)).reconcile_interrupted()
+
+
+async def _recover_unstructured_jobs_on_startup(db: AsyncSession) -> int:
+    """Pair strict cancellation state, then requeue only uncancelled work."""
+    recovered_at = datetime.now(timezone.utc)
+    await db.execute(
+        text(
+            "UPDATE uploaded_files "
+            "SET ingestion_status = 'cancelled', progress_stage = NULL, "
+            "progress_detail = NULL, processing_completed_at = :now "
+            "WHERE ingestion_status IN ('pending_extraction', 'processing') "
+            "AND file_category = 'unstructured' "
+            "AND cancel_requested = true"
+        ),
+        {"now": recovered_at},
+    )
+    await db.execute(
+        text(
+            "UPDATE local_ai_jobs AS j "
+            "SET cancel_requested = true, status = 'cancelled', "
+            "stage = 'cancelled', progress = '{\"stage\":\"cancelled\"}'::jsonb, "
+            "failure = NULL, completed_at = :now "
+            "FROM uploaded_files AS u "
+            "WHERE j.upload_id = u.id "
+            "AND j.processing_mode = 'validated_strict_local' "
+            "AND j.status IN ('queued', 'processing') "
+            "AND u.ingestion_status = 'cancelled' "
+            "AND u.cancel_requested = true"
+        ),
+        {"now": recovered_at},
+    )
+    result = await db.execute(
+        text(
+            "UPDATE uploaded_files SET ingestion_status = 'pending_extraction', "
+            "processing_started_at = NULL "
+            "WHERE ingestion_status = 'processing' "
+            "AND file_category = 'unstructured' "
+            "AND cancel_requested = false"
+        )
+    )
+    await db.execute(
+        text(
+            "UPDATE local_ai_jobs AS j "
+            "SET status = 'queued', stage = 'recovery', "
+            "failure = NULL, completed_at = NULL "
+            "FROM uploaded_files AS u "
+            "WHERE j.upload_id = u.id "
+            "AND j.processing_mode = 'validated_strict_local' "
+            "AND j.status = 'processing' "
+            "AND u.ingestion_status = 'pending_extraction'"
+        )
+    )
+    return int(result.rowcount or 0)
+
+
+async def _recover_strict_local_summary_jobs_on_startup(
+    db: AsyncSession,
+) -> list[UUID]:
+    """Requeue interrupted strict-local summaries and return resumable job IDs."""
+    from app.models.local_ai import LocalAIJob
+
+    resumable: list[UUID] = []
+    cursor: tuple[datetime, UUID] | None = None
+    while True:
+        query = select(LocalAIJob).where(
+            LocalAIJob.kind == "summary",
+            LocalAIJob.processing_mode == "validated_strict_local",
+            LocalAIJob.status.in_(("queued", "processing")),
+        )
+        if cursor is not None:
+            created_at, cursor_id = cursor
+            query = query.where(
+                or_(
+                    LocalAIJob.created_at > created_at,
+                    (LocalAIJob.created_at == created_at) & (LocalAIJob.id > cursor_id),
+                )
+            )
+        jobs = list(
+            (
+                await db.execute(
+                    query.order_by(
+                        LocalAIJob.created_at.asc(),
+                        LocalAIJob.id.asc(),
+                    ).limit(_LOCAL_AI_RECOVERY_BATCH_SIZE)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not jobs:
+            break
+        cursor = (jobs[-1].created_at, jobs[-1].id)
+        recovered_at = datetime.now(timezone.utc)
+        for job in jobs:
+            if job.cancel_requested:
+                job.status = "cancelled"
+                job.stage = "cancelled"
+                job.progress = {"stage": "cancelled"}
+                job.failure = None
+                job.completed_at = recovered_at
+                continue
+            if job.status == "processing":
+                job.status = "queued"
+                job.stage = "recovery"
+                job.progress = {"stage": "recovery"}
+                job.failure = None
+                job.completed_at = None
+            resumable.append(job.id)
+        await db.flush()
+        if len(jobs) < _LOCAL_AI_RECOVERY_BATCH_SIZE:
+            break
+    return resumable
+
+
+async def _active_strict_local_job_ids(db: AsyncSession) -> list[str] | None:
+    """Load active IDs boundedly, or return ``None`` when sweep is unsafe."""
+    from app.models.local_ai import LocalAIJob
+
+    active_ids: list[str] = []
+    cursor: tuple[datetime, UUID] | None = None
+    while True:
+        query = select(LocalAIJob).where(
+            LocalAIJob.processing_mode == "validated_strict_local",
+            LocalAIJob.status.in_(("queued", "processing")),
+        )
+        if cursor is not None:
+            created_at, cursor_id = cursor
+            query = query.where(
+                or_(
+                    LocalAIJob.created_at > created_at,
+                    (LocalAIJob.created_at == created_at) & (LocalAIJob.id > cursor_id),
+                )
+            )
+        jobs = list(
+            (
+                await db.execute(
+                    query.order_by(
+                        LocalAIJob.created_at.asc(),
+                        LocalAIJob.id.asc(),
+                    ).limit(_LOCAL_AI_RECOVERY_BATCH_SIZE)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not jobs:
+            break
+        active_ids.extend(str(job.id) for job in jobs)
+        if len(active_ids) > _MAX_ACTIVE_LOCAL_AI_SCRATCH_JOBS:
+            logger.warning(
+                "Skipped strict-local scratch inventory because active jobs "
+                "exceeded its safety bound"
+            )
+            return None
+        cursor = (jobs[-1].created_at, jobs[-1].id)
+        if len(jobs) < _LOCAL_AI_RECOVERY_BATCH_SIZE:
+            break
+    return active_ids
+
+
+async def _shutdown_local_ai_workers(*, local_ai_started: bool) -> None:
+    """Drain tracked work, recover durable state, then stop model processes."""
+    from app.api.upload import stop_extraction_worker
+    from app.services.ingestion.coordinator import stop_dedup_background_tasks
+
+    try:
+        await stop_extraction_worker()
+    except Exception:
+        logger.exception("Failed to drain extraction work during shutdown")
+    try:
+        await stop_dedup_background_tasks()
+    except Exception:
+        logger.exception("Failed to drain dedup work during shutdown")
+    if not local_ai_started:
+        return
+
+    from app.services.local_ai.summary_runner import local_summary_runner
+
+    try:
+        await local_summary_runner.stop_and_requeue()
+    except Exception:
+        logger.exception("Failed to drain summary work during shutdown")
+    try:
+        async with async_session_factory() as db:
+            await acquire_local_ai_lifecycle_lock(db)
+            await _recover_unstructured_jobs_on_startup(db)
+            await db.commit()
+    except Exception:
+        logger.exception("Failed to requeue strict-local work during shutdown")
+    finally:
+        await local_model_manager.stop()
 
 
 def build_cors_config(cors_origins: str) -> tuple[list[str], bool]:
@@ -59,19 +301,68 @@ def build_cors_config(cors_origins: str) -> tuple[list[str], bool]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle handler."""
-    # A1: Recover files stuck in 'processing' from previous crash/restart
+    summary_jobs_to_resume: list[UUID] = []
+    dedup_jobs_to_resume: list[tuple[UUID, UUID, UUID]] = []
+    active_strict_local_job_ids: list[str] | None = None
+    strict_local_recovery_succeeded = False
+    reconciled_operations = 0
+    # Reconcile ZIP child sets independently so one malformed set cannot prevent
+    # the globally locked local-AI recovery pass.
     try:
         async with async_session_factory() as db:
-            result = await db.execute(text(
-                "UPDATE uploaded_files SET ingestion_status = 'pending_extraction', "
-                "processing_started_at = NULL "
-                "WHERE ingestion_status = 'processing' AND file_category = 'unstructured'"
-            ))
-            if result.rowcount:
-                logger.info("Recovered %d stuck files to pending_extraction on startup", result.rowcount)
+            set_recovery = await reconcile_zip_child_sets(
+                db,
+                Path(settings.upload_dir),
+            )
+            if set_recovery is not None and (
+                set_recovery.recovered_groups
+                or set_recovery.failed_groups
+                or set_recovery.removed_orphans
+            ):
+                logger.info(
+                    "ZIP child set recovery: recovered=%d failed=%d orphans=%d",
+                    set_recovery.recovered_groups,
+                    set_recovery.failed_groups,
+                    set_recovery.removed_orphans,
+                )
+            if set_recovery is not None and set_recovery.bounded:
+                logger.warning("ZIP child set recovery reached its safety bound")
             await db.commit()
     except Exception:
+        logger.exception("Failed to reconcile ZIP child sets on startup")
+
+    # A1: Recover files stuck in 'processing' from previous crash/restart.
+    try:
+        async with async_session_factory() as db:
+            if settings.local_ai_enabled:
+                await acquire_local_ai_lifecycle_lock(db)
+                reconciled_operations = _reconcile_model_pack_operations_on_startup()
+            recovered = await _recover_unstructured_jobs_on_startup(db)
+            if recovered:
+                logger.info(
+                    "Recovered %d stuck files to pending_extraction on startup",
+                    recovered,
+                )
+            summary_jobs_to_resume = (
+                await _recover_strict_local_summary_jobs_on_startup(db)
+            )
+            if settings.local_ai_enabled:
+                active_strict_local_job_ids = await _active_strict_local_job_ids(db)
+            await db.commit()
+            strict_local_recovery_succeeded = settings.local_ai_enabled
+    except Exception:
         logger.exception("Failed to recover stuck files on startup")
+
+    try:
+        from app.services.ingestion.coordinator import (
+            recover_dedup_background_specs,
+        )
+
+        async with async_session_factory() as db:
+            dedup_jobs_to_resume = await recover_dedup_background_specs(db)
+            await db.commit()
+    except Exception:
+        logger.exception("Failed to recover interrupted dedup scans on startup")
 
     # Warm-load the spaCy PHI-NER model at boot (memory free, no GIL contention)
     # so name redaction is a reliable cached singleton — not a first-load that
@@ -81,11 +372,14 @@ async def lifespan(app: FastAPI):
             from app.services.ai.phi_ner import warm_load_ner
 
             if warm_load_ner():
-                logger.info("PHI-NER spaCy model warm-loaded (%s)", settings.phi_ner_spacy_model)
+                logger.info(
+                    "PHI-NER spaCy model warm-loaded (%s)", settings.phi_ner_spacy_model
+                )
             else:
                 logger.warning(
                     "PHI-NER spaCy model %s NOT available at startup; name "
-                    "redaction will retry per-call", settings.phi_ner_spacy_model
+                    "redaction will retry per-call",
+                    settings.phi_ner_spacy_model,
                 )
         except Exception:
             logger.exception("PHI-NER warm-load raised at startup")
@@ -97,14 +391,18 @@ async def lifespan(app: FastAPI):
     # orchestrator falls back / escalates) and never blocks startup.
     if (settings.extraction_engine or "gemini").lower() in ("local", "hybrid"):
         try:
-            from app.services.extraction.clinical_context import warm_load_clinical_context
+            from app.services.extraction.clinical_context import (
+                warm_load_clinical_context,
+            )
             from app.services.extraction.local_ner import warm_load_local_ner
 
             ner_ok = warm_load_local_ner()
             ctx_ok = warm_load_clinical_context()
             logger.info(
                 "WS-A local extraction engine=%s warm-load: scispaCy NER=%s, medspaCy=%s",
-                settings.extraction_engine, ner_ok, ctx_ok,
+                settings.extraction_engine,
+                ner_ok,
+                ctx_ok,
             )
             if not (ner_ok and ctx_ok):
                 logger.warning(
@@ -120,7 +418,7 @@ async def lifespan(app: FastAPI):
     try:
         from app.services.extraction.terminology import schedule_medication_refresh
 
-        schedule_medication_refresh()
+        _track_background_task(schedule_medication_refresh())
     except Exception:
         logger.exception("medication index refresh scheduling failed at startup")
 
@@ -139,29 +437,80 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Failed to purge expired revoked tokens on startup")
 
-    purge_task = asyncio.create_task(_purge_revoked_tokens())
-    _background_tasks.add(purge_task)
-    purge_task.add_done_callback(_background_tasks.discard)
+    _track_background_task(asyncio.create_task(_purge_revoked_tokens()))
 
-    # Start the extraction worker
-    from app.api.upload import start_extraction_worker
-    start_extraction_worker()
+    local_ai_started = False
+    try:
+        if settings.local_ai_enabled:
+            try:
+                if reconciled_operations:
+                    logger.info(
+                        "Reconciled %d interrupted model-pack operations",
+                        reconciled_operations,
+                    )
+                if (
+                    strict_local_recovery_succeeded
+                    and active_strict_local_job_ids is not None
+                ):
+                    removed = sweep_stale_scratch(
+                        Path(settings.local_ai_scratch_dir),
+                        stale_after_seconds=_STALE_LOCAL_AI_SCRATCH_SECONDS,
+                        active_job_ids=active_strict_local_job_ids,
+                    )
+                    if removed:
+                        logger.info(
+                            "Removed %d stale strict-local scratch jobs", removed
+                        )
+                else:
+                    logger.warning(
+                        "Skipped strict-local scratch sweep because active jobs "
+                        "could not be verified"
+                    )
+                await local_model_manager.start()
+                local_ai_started = True
+                from app.services.local_ai.summary_runner import local_summary_runner
 
-    import sys
-    if any("--reload" in arg for arg in sys.argv):
-        logger.warning(
-            "Server started with --reload: extraction worker may restart on file changes. "
-            "Use without --reload for stable extraction processing."
+                local_summary_runner.start(summary_jobs_to_resume)
+            except BaseException:
+                await local_model_manager.stop()
+                raise
+
+        # Start the extraction worker
+        from app.api.upload import (
+            reset_extraction_worker_shutdown,
+            start_extraction_worker,
         )
 
+        reset_extraction_worker_shutdown()
+        start_extraction_worker()
 
-    yield
+        from app.services.ingestion.coordinator import schedule_dedup_background
+
+        for upload_id, patient_id, user_id in dedup_jobs_to_resume:
+            schedule_dedup_background(upload_id, patient_id, user_id)
+
+        import sys
+
+        if any("--reload" in arg for arg in sys.argv):
+            logger.warning(
+                "Server started with --reload: extraction worker may restart on file changes. "
+                "Use without --reload for stable extraction processing."
+            )
+
+        yield
+    finally:
+        try:
+            await _shutdown_local_ai_workers(local_ai_started=local_ai_started)
+        finally:
+            await _drain_background_tasks()
 
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     if not settings.gemini_api_key:
-        logger.warning("GEMINI_API_KEY is not set — extraction and summarization will fail")
+        logger.warning(
+            "GEMINI_API_KEY is not set — extraction and summarization will fail"
+        )
 
     app = FastAPI(
         title="AI Web Records API",
