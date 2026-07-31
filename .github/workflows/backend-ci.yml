@@ -73,6 +73,7 @@ jobs:
             app/api/summary.py \
             app/api/upload.py \
             app/models/local_ai.py \
+            app/models/local_ai_ddl.py \
             app/models/uploaded_file.py \
             app/schemas/local_ai.py \
             app/schemas/summary.py \

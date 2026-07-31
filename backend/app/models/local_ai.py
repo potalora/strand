@@ -26,6 +26,10 @@ from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 from app.models.encrypted_types import EncryptedJSON, EncryptedText
+from app.models.local_ai_ddl import (
+    EXTRACTION_EVIDENCE_DATABASE_GUARDS,
+    LOCAL_AI_JOB_DATABASE_GUARDS,
+)
 from app.services.local_ai.errors import LocalValidationError
 from app.services.local_ai.manifest import canonicalize_manifest_snapshot
 from app.services.local_ai.types import ProcessingMode
@@ -347,3 +351,7 @@ event.listen(
     "before_update",
     _reject_persisted_evidence_scope_changes,
 )
+for database_guard in LOCAL_AI_JOB_DATABASE_GUARDS:
+    event.listen(LocalAIJob.__table__, "after_create", database_guard)
+for database_guard in EXTRACTION_EVIDENCE_DATABASE_GUARDS:
+    event.listen(ExtractionEvidence.__table__, "after_create", database_guard)
