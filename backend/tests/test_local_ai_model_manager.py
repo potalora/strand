@@ -1443,6 +1443,80 @@ def test_activity_counter_extends_idle_without_changing_page_completion() -> Non
         )
 
 
+def test_progress_work_limits_are_immutable_and_counters_do_not_disappear() -> None:
+    from app.services.local_ai.protocol import ProgressPayload, ProtocolViolation
+
+    first = ProgressPayload(
+        role=ModelRole.SUMMARY,
+        stage="generating",
+        current=0,
+        total=1,
+        attempt=1,
+        attempt_limit=1,
+        input_tokens=20,
+        output_tokens=2,
+        output_token_limit=64,
+    )
+    advanced = first.model_copy(update={"output_tokens": 3})
+    assert ProductionLocalModelManager._validate_progress_sequence(first, advanced)
+    for mutation in (
+        {"output_token_limit": 65},
+        {"output_token_limit": None, "output_tokens": None},
+        {"output_tokens": 1},
+        {"input_tokens": None},
+    ):
+        with pytest.raises(ProtocolViolation, match="progress"):
+            ProductionLocalModelManager._validate_progress_sequence(
+                advanced,
+                advanced.model_copy(update=mutation),
+            )
+
+
+@pytest.mark.parametrize(
+    ("role", "stage"),
+    [
+        (ModelRole.SUMMARY, "processing"),
+        (ModelRole.EXTRACTION, "generating"),
+        (ModelRole.OCR, "validating"),
+    ],
+)
+def test_progress_rejects_stage_not_allowed_for_role(
+    role: ModelRole,
+    stage: str,
+) -> None:
+    from app.services.local_ai.protocol import ProgressPayload, ProtocolViolation
+
+    frame = ProgressPayload(role=role, stage=stage)
+
+    with pytest.raises(ProtocolViolation, match="progress"):
+        ProductionLocalModelManager._validate_progress_sequence(None, frame)
+
+
+def test_progress_rejects_fraction_reset_across_summary_stage_transition() -> None:
+    from app.services.local_ai.protocol import ProgressPayload, ProtocolViolation
+
+    previous = ProgressPayload(
+        role=ModelRole.SUMMARY,
+        stage="generating",
+        current=1,
+        total=1,
+        attempt=1,
+        attempt_limit=1,
+        output_tokens=10,
+        output_token_limit=10,
+    )
+    reset = previous.model_copy(
+        update={
+            "stage": "validating",
+            "current": 0,
+            "total": 999,
+        }
+    )
+
+    with pytest.raises(ProtocolViolation, match="progress"):
+        ProductionLocalModelManager._validate_progress_sequence(previous, reset)
+
+
 def test_final_memory_frame_may_omit_optional_activity_counter() -> None:
     from app.services.local_ai.protocol import ProgressPayload, ProtocolViolation
 

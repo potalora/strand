@@ -249,6 +249,15 @@ async def test_cancel_finishes_queued_strict_job_without_reserving_worker_cancel
         manifest_snapshot=snapshot,
         status="queued",
         stage="preflight",
+        progress={
+            "stage": "extraction",
+            "model_role": "extraction",
+            "attempt": 2,
+            "attempt_limit": 12,
+            "output_tokens": 300,
+            "output_token_limit": 16_384,
+            "private": "must-not-survive-cancel",
+        },
     )
     db_session.add(job)
     await db_session.commit()
@@ -281,6 +290,14 @@ async def test_cancel_finishes_queued_strict_job_without_reserving_worker_cancel
     assert job.status == "cancelled"
     assert job.stage == "cancelled"
     assert job.cancel_requested is True
+    assert job.progress == {
+        "stage": "cancelled",
+        "model_role": "extraction",
+        "attempt": 2,
+        "attempt_limit": 12,
+        "output_tokens": 300,
+        "output_token_limit": 16_384,
+    }
 
 
 @pytest.mark.asyncio
@@ -815,6 +832,15 @@ async def test_strict_worker_early_cancel_terminalizes_upload_and_job(
         manifest_snapshot=snapshot,
         status="queued",
         stage="preflight",
+        progress={
+            "stage": "extraction",
+            "model_role": "extraction",
+            "splits_used": 3,
+            "split_limit": 7,
+            "active_memory_bytes": 1_000,
+            "peak_memory_bytes": 2_000,
+            "private": "must-not-survive-worker-cancel",
+        },
     )
     db_session.add(job)
     await db_session.commit()
@@ -838,8 +864,90 @@ async def test_strict_worker_early_cancel_terminalizes_upload_and_job(
             assert persisted_job.stage == "cancelled"
             assert persisted_job.cancel_requested is True
             assert persisted_job.completed_at is not None
+            assert persisted_job.progress == {
+                "stage": "cancelled",
+                "model_role": "extraction",
+                "splits_used": 3,
+                "split_limit": 7,
+                "active_memory_bytes": 1_000,
+                "peak_memory_bytes": 2_000,
+            }
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_strict_cancel_fallback_terminalizes_every_active_job() -> None:
+    """A poisoned first transaction cannot leave another active worker behind."""
+    from types import SimpleNamespace
+
+    from app.api.upload import _mark_cancelled
+
+    user_id = uuid4()
+    upload_id = uuid4()
+    jobs = [
+        SimpleNamespace(
+            cancel_requested=False,
+            status=status,
+            stage="extraction",
+            progress={
+                "stage": "extraction",
+                "model_role": "extraction",
+                "attempt": index,
+                "attempt_limit": 12,
+                "private": f"private-{index}",
+            },
+            failure={"code": "old"},
+            completed_at=None,
+        )
+        for index, status in ((1, "queued"), (2, "processing"))
+    ]
+
+    class Rows:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return jobs
+
+    execute_calls = 0
+
+    async def execute(*_args, **_kwargs):
+        nonlocal execute_calls
+        execute_calls += 1
+        if execute_calls == 1:
+            raise RuntimeError("force fallback")
+        if execute_calls == 2:
+            return None
+        return Rows()
+
+    fake_db = SimpleNamespace(
+        execute=execute,
+        rollback=AsyncMock(),
+        commit=AsyncMock(),
+    )
+    upload = SimpleNamespace(
+        id=upload_id,
+        user_id=user_id,
+        processing_mode="validated_strict_local",
+    )
+
+    await _mark_cancelled(fake_db, upload)
+
+    fake_db.rollback.assert_awaited_once()
+    fake_db.commit.assert_awaited_once()
+    assert execute_calls == 3
+    for index, job in enumerate(jobs, start=1):
+        assert job.cancel_requested is True
+        assert (job.status, job.stage) == ("cancelled", "cancelled")
+        assert job.progress == {
+            "stage": "cancelled",
+            "model_role": "extraction",
+            "attempt": index,
+            "attempt_limit": 12,
+        }
+        assert job.failure is None
+        assert job.completed_at is not None
 
 
 @pytest.mark.asyncio
@@ -867,7 +975,12 @@ async def test_worker_writes_section_progress(db_session: AsyncSession):
         rb"{\rtf1\ansi Patient has hypertension. Plan: continue Lisinopril.}"
     )
 
-    upload = _mk_upload(user.id, "pending_extraction", storage_path=str(rtf_path))
+    upload = _mk_upload(
+        user.id,
+        "pending_extraction",
+        storage_path=str(rtf_path),
+        processing_mode="cloud_assisted",
+    )
     db_session.add(upload)
     await db_session.commit()
 

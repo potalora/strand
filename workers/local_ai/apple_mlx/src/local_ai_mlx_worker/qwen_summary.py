@@ -12,6 +12,7 @@ from datetime import date
 
 from .common import (
     Generate,
+    GeneratedText,
     GenerationError,
     LoadedRole,
     WorkerInputError,
@@ -1403,11 +1404,23 @@ def run_summary(
     *,
     loaded: LoadedRole | None = None,
     generate_fn: Generate = generate_content,
+    progress_fn: Callable[[dict[str, int | str]], None] | None = None,
 ) -> dict[str, object]:
     """Select typed references without allowing model-authored clinical prose."""
 
     safe_input = _validated_input(payload)
     validated_requested_output_tokens(payload, role_cap=SUMMARY_OUTPUT_CAP)
+
+    # Publish before model loading.  The request cap is already syntax- and
+    # role-bounded, and the server supplies the manifest-bounded value.
+    if progress_fn is not None:
+        progress_fn(
+            {
+                "stage": "loading",
+                "current": 0,
+                "total": 1,
+            }
+        )
     json_schema = _summary_output_schema(safe_input)
     selected = loaded or load_role_from_payload("summary", payload)
     serialized = bounded_json(safe_input, max_bytes=MAX_SUMMARY_INPUT_BYTES)
@@ -1428,6 +1441,25 @@ def run_summary(
     )
     prompt = f"{base_prompt}INPUT_JSON={serialized}"
     validate_token_budget(selected, [prompt], max_output_tokens=max_tokens)
+    input_tokens = _token_count(selected.processor, prompt)
+
+    def publish(stage: str, output_tokens: int) -> None:
+        if progress_fn is None:
+            return
+        progress_fn(
+            {
+                "stage": stage,
+                "current": 0,
+                "total": 1,
+                "attempt": 1,
+                "attempt_limit": 1,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "output_token_limit": max_tokens,
+            }
+        )
+
+    publish("generating", 0)
     raw = generate_fn(
         model=selected.model,
         processor=selected.processor,
@@ -1440,4 +1472,18 @@ def run_summary(
         enable_thinking=False,
         json_schema=json_schema,
     )
+    if (
+        isinstance(raw, GeneratedText)
+        and isinstance(raw.generation_tokens, int)
+        and not isinstance(raw.generation_tokens, bool)
+        and 0 <= raw.generation_tokens <= max_tokens
+    ):
+        generated_tokens = raw.generation_tokens
+    else:
+        try:
+            generated_tokens = min(max_tokens, _token_count(selected.processor, str(raw)))
+        except WorkerInputError:
+            generated_tokens = max_tokens
+    publish("generating", generated_tokens)
+    publish("validating", generated_tokens)
     return _validated_output(raw, safe_input)

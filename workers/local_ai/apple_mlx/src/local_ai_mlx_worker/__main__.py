@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -240,6 +241,7 @@ def _dispatch(
     extraction_progress: Callable[[int, int], None] | None = None,
     extraction_heartbeat: Callable[[], None] | None = None,
     extraction_lifecycle: Callable[[], None] | None = None,
+    summary_progress: Callable[[dict[str, int | str]], None] | None = None,
 ) -> object:
     if request.command == "ocr":
         return run_ocr(request.payload)
@@ -251,7 +253,7 @@ def _dispatch(
             lifecycle_progress_fn=extraction_lifecycle,
         )
     if request.command == "summarize":
-        return run_summary(request.payload)
+        return run_summary(request.payload, progress_fn=summary_progress)
     if request.command == "count_summary_tokens":
         return count_summary_reference_tokens(request.payload)
     raise WorkerInputError("Local worker command is invalid.")
@@ -314,6 +316,52 @@ def _quiet_dispatch(request: Request) -> object:
             stage = "processing" if processing_started else "loading"
             publish_extraction_progress(stage, page_current, page_total)
 
+        def publish_summary_progress(payload: dict[str, int | str]) -> None:
+            nonlocal activity
+            stage = payload.get("stage")
+            if stage not in {"loading", "generating", "validating"}:
+                raise WorkerInputError("Local worker progress is invalid.")
+            counter_names = {
+                "current",
+                "total",
+                "attempt",
+                "attempt_limit",
+                "input_tokens",
+                "output_tokens",
+                "output_token_limit",
+            }
+            if set(payload) - ({"stage"} | counter_names) or any(
+                type(payload[name]) is not int or int(payload[name]) < 0
+                for name in counter_names & set(payload)
+            ):
+                raise WorkerInputError("Local worker progress is invalid.")
+            for current_key, limit_key in (
+                ("current", "total"),
+                ("attempt", "attempt_limit"),
+                ("output_tokens", "output_token_limit"),
+            ):
+                if (current_key in payload) != (limit_key in payload):
+                    raise WorkerInputError("Local worker progress is invalid.")
+            if (
+                ("current" in payload and int(payload["current"]) > int(payload["total"]))
+                or (
+                    "attempt" in payload and int(payload["attempt"]) > int(payload["attempt_limit"])
+                )
+                or (
+                    "output_tokens" in payload
+                    and int(payload["output_tokens"]) > int(payload["output_token_limit"])
+                )
+                or activity >= MAX_EXTRACTION_ACTIVITY
+            ):
+                raise WorkerInputError("Local worker progress is invalid.")
+            activity += 1
+            _write_to_descriptor(
+                stdout_copy,
+                request.request_id,
+                "progress",
+                {"role": "summary", "activity": activity, **payload},
+            )
+
         dispatch_options: dict[str, object] = {}
         if request.command == "extract":
             dispatch_options = {
@@ -321,6 +369,13 @@ def _quiet_dispatch(request: Request) -> object:
                 "extraction_heartbeat": publish_activity,
                 "extraction_lifecycle": publish_activity,
             }
+        # Test doubles predating summary telemetry may deliberately expose a
+        # narrower signature; production dispatch always receives it.
+        elif (
+            request.command == "summarize"
+            and "summary_progress" in inspect.signature(_dispatch).parameters
+        ):
+            dispatch_options = {"summary_progress": publish_summary_progress}
         with (
             open(os.devnull, "w", encoding="utf-8") as sink,
             redirect_stdout(sink),

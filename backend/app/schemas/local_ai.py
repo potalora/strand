@@ -116,10 +116,18 @@ class LocalAIJobProgress(_SparseStrictResponse):
     page_total: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
     worker_current: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
     worker_total: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    current: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    total: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    activity: StrictInt | None = Field(default=None, ge=0, le=2**63 - 1)
     attempt: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    attempt_limit: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
     input_tokens: StrictInt | None = Field(default=None, ge=0, le=10_000_000)
     output_tokens: StrictInt | None = Field(default=None, ge=0, le=10_000_000)
+    output_token_limit: StrictInt | None = Field(default=None, ge=0, le=10_000_000)
     splits_used: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    split_limit: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    active_memory_bytes: StrictInt | None = Field(default=None, ge=0, le=2**63 - 1)
+    peak_memory_bytes: StrictInt | None = Field(default=None, ge=0, le=2**63 - 1)
 
 
 class LocalAIJobFailure(_SparseStrictResponse):

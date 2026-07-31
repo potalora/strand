@@ -57,6 +57,10 @@ GENERATION_FAILURE_CATEGORIES = frozenset(
         "output_limit",
         "stream_contract",
         "work_limit",
+        "work_token_limit",
+        "work_attempt_limit",
+        "work_split_limit",
+        "fragment_depth_limit",
     }
 )
 

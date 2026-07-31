@@ -2944,3 +2944,58 @@ def test_extraction_rejects_unexpected_raw_payload_field(tmp_path: Path) -> None
             loaded=_loaded("extraction"),  # type: ignore[arg-type]
             generate_fn=lambda **_kwargs: "{}",
         )
+
+
+def test_summary_progress_precedes_loader_and_reports_one_bounded_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Summary telemetry is content-free, bounded, and has no repair call."""
+    from local_ai_mlx_worker import qwen_summary
+    from local_ai_mlx_worker.common import GeneratedText
+
+    payload = _summary_payload()
+    payload["max_output_tokens"] = 301
+    fact = payload["facts"][0]  # type: ignore[index]
+    events: list[dict[str, int | str]] = []
+    calls = 0
+
+    def loader(_role: str, _payload: object) -> object:
+        assert events == [{"stage": "loading", "current": 0, "total": 1}]
+        return _loaded("summary")
+
+    def generate(**_kwargs: object) -> GeneratedText:
+        nonlocal calls
+        calls += 1
+        return GeneratedText(
+            json.dumps(
+                {
+                    "sections": [
+                        {
+                            "heading": "Medications",
+                            "claims": [
+                                {
+                                    "fact_id": fact["fact_id"],
+                                    "field_paths": ["/name"],
+                                    "evidence_ids": fact["evidence_ids"],
+                                }
+                            ],
+                        }
+                    ],
+                    "uncertainties": [],
+                }
+            ),
+            generation_tokens=7,
+        )
+
+    monkeypatch.setattr(qwen_summary, "load_role_from_payload", loader)
+    qwen_summary.run_summary(payload, generate_fn=generate, progress_fn=events.append)
+
+    assert calls == 1
+    assert [event["stage"] for event in events] == [
+        "loading",
+        "generating",
+        "generating",
+        "validating",
+    ]
+    assert events[-1]["output_tokens"] == 7
+    assert events[-1]["output_token_limit"] == 301

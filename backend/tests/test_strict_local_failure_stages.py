@@ -21,6 +21,7 @@ from app.services.local_ai.errors import (
     LocalAIError,
     LocalPolicyError,
     LocalValidationError,
+    LocalWorkerError,
 )
 from app.services.local_ai.manifest import (
     canonicalize_manifest_snapshot,
@@ -116,6 +117,82 @@ def _persisted_failure_state(upload: UploadedFile, job: LocalAIJob) -> str:
         default=str,
         sort_keys=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_worker_category_failure_retains_safe_progress_for_api(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal ingestion keeps counters/category and drops worker content."""
+
+    from app.api.local_ai import _job_response
+    from app.api.upload import _run_strict_local_ingestion_for_upload
+
+    upload, job = await _strict_job(db_session, label="worker-category-progress")
+    manifest = parse_manifest(upload.processing_manifest)
+    canary = "patient-secret-worker-error-canary"
+    monkeypatch.setattr(
+        "app.services.local_ai.artifact_store.ArtifactStore.active_manifest",
+        lambda _self: manifest,
+    )
+
+    async def fail_with_progress(self, _job, _upload, _file_path):
+        progress = self.on_progress(
+            {
+                "stage": "extraction",
+                "model_role": "extraction",
+                "worker_current": 1,
+                "worker_total": 2,
+                "attempt": 2,
+                "attempt_limit": 12,
+                "output_tokens": 300,
+                "output_token_limit": 16_384,
+                "splits_used": 1,
+                "split_limit": 7,
+            }
+        )
+        if isawaitable(progress):
+            await progress
+        raise LocalWorkerError(
+            canary,
+            category="invalid_structured_output",
+        )
+
+    monkeypatch.setattr(
+        "app.services.local_ai.pipeline.StrictLocalPipeline.run_ingestion",
+        fail_with_progress,
+    )
+
+    with pytest.raises(LocalWorkerError):
+        await _run_strict_local_ingestion_for_upload(
+            db_session,
+            upload,
+            Path(upload.storage_path),
+            upload.user_id,
+        )
+
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert job.failure["code"] == "invalid_structured_output"
+    assert job.progress == {
+        "stage": "failed",
+        "model_role": "extraction",
+        "worker_current": 1,
+        "worker_total": 2,
+        "attempt": 2,
+        "attempt_limit": 12,
+        "output_tokens": 300,
+        "output_token_limit": 16_384,
+        "splits_used": 1,
+        "split_limit": 7,
+    }
+    assert upload.ingestion_errors[0]["error_type"] == "invalid_structured_output"
+    api_payload = _job_response(job).model_dump(mode="json", exclude_none=True)
+    serialized = json.dumps(api_payload, sort_keys=True)
+    assert api_payload["progress"]["output_tokens"] == 300
+    assert api_payload["failure"]["code"] == "invalid_structured_output"
+    assert canary not in serialized
 
 
 @pytest.mark.asyncio
@@ -489,7 +566,32 @@ async def test_strict_finalization_runs_non_llm_dedup_in_terminal_transaction(
     from app.services.dedup.orchestrator import DedupSummary
 
     upload, job = await _strict_job(db_session, label="strict-final-dedup")
-    _patch_pipeline(monkeypatch, upload, result=_pipeline_result())
+    pipeline_result = _pipeline_result()
+    _patch_pipeline(monkeypatch, upload, result=pipeline_result)
+
+    async def run_with_progress(self, _job, _upload, _file_path):
+        progress = self.on_progress(
+            {
+                "stage": "extraction",
+                "model_role": "extraction",
+                "worker_current": 1,
+                "worker_total": 1,
+                "attempt": 3,
+                "attempt_limit": 12,
+                "output_tokens": 400,
+                "output_token_limit": 16_384,
+                "active_memory_bytes": 1_000,
+                "peak_memory_bytes": 2_000,
+            }
+        )
+        if isawaitable(progress):
+            await progress
+        return pipeline_result
+
+    monkeypatch.setattr(
+        "app.services.local_ai.pipeline.StrictLocalPipeline.run_ingestion",
+        run_with_progress,
+    )
     patient_id = uuid4()
     mapped_record = SimpleNamespace(
         id=uuid4(),
@@ -533,6 +635,19 @@ async def test_strict_finalization_runs_non_llm_dedup_in_terminal_transaction(
         "by_type": {},
     }
     assert job.status == "completed"
+    assert job.progress == {
+        "stage": "completed",
+        "model_role": "extraction",
+        "worker_current": 1,
+        "worker_total": 1,
+        "attempt": 3,
+        "attempt_limit": 12,
+        "output_tokens": 400,
+        "output_token_limit": 16_384,
+        "active_memory_bytes": 1_000,
+        "peak_memory_bytes": 2_000,
+        "pages_completed": 1,
+    }
 
 
 @pytest.mark.asyncio

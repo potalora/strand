@@ -77,12 +77,35 @@ _SAFE_CALLBACK_ERROR_TYPES = frozenset(
     }
 )
 _PROGRESS_STAGE_ORDER = {
-    "starting": 0,
-    "loading": 1,
-    "processing": 2,
-    "finalizing": 3,
-    "cancelling": 4,
+    ModelRole.OCR: {
+        "starting": 0,
+        "loading": 1,
+        "processing": 2,
+        "finalizing": 3,
+        "cancelling": 4,
+    },
+    ModelRole.EXTRACTION: {
+        "starting": 0,
+        "loading": 1,
+        "processing": 2,
+        "finalizing": 3,
+        "cancelling": 4,
+    },
+    ModelRole.SUMMARY: {
+        "starting": 0,
+        "loading": 1,
+        "generating": 2,
+        "validating": 3,
+        "finalizing": 4,
+        "cancelling": 5,
+    },
 }
+_PROGRESS_LIMIT_COUNTERS = frozenset(
+    {"attempt_limit", "output_token_limit", "split_limit"}
+)
+_PROGRESS_MONOTONIC_COUNTERS = frozenset(
+    {"activity", "attempt", "input_tokens", "output_tokens", "splits_used"}
+)
 logger = logging.getLogger(__name__)
 
 
@@ -1090,7 +1113,7 @@ class LocalModelManager:
             )
             if terminal.code == "input_limit_exceeded":
                 raise LocalInputLimitError(terminal.message)
-            raise LocalWorkerError(terminal.message)
+            raise LocalWorkerError(terminal.message, category=terminal.category)
         return terminal.data
 
     @staticmethod
@@ -1100,8 +1123,13 @@ class LocalModelManager:
     ) -> bool:
         """Reject regressing counters and identify deadline-extending progress."""
 
+        role_stages = _PROGRESS_STAGE_ORDER[current.role]
+        if current.stage not in role_stages:
+            raise ProtocolViolation("Worker progress response is invalid.")
         if previous is None:
             return True
+        if previous.role is not current.role:
+            raise ProtocolViolation("Worker progress response is invalid.")
         previous_activity = previous.activity or 0
         current_activity = (
             previous_activity if current.activity is None else current.activity
@@ -1109,15 +1137,55 @@ class LocalModelManager:
         if current_activity < previous_activity:
             raise ProtocolViolation("Worker progress response is invalid.")
         activity_advanced = current_activity > previous_activity
-        previous_order = _PROGRESS_STAGE_ORDER[previous.stage]
-        current_order = _PROGRESS_STAGE_ORDER[current.stage]
+        previous_order = role_stages.get(previous.stage)
+        current_order = role_stages[current.stage]
+        if previous_order is None:
+            raise ProtocolViolation("Worker progress response is invalid.")
         if current_order < previous_order:
             raise ProtocolViolation("Worker progress response is invalid.")
+        for key in _PROGRESS_LIMIT_COUNTERS:
+            old = getattr(previous, key)
+            new = getattr(current, key)
+            if old is not None and new != old:
+                raise ProtocolViolation("Worker progress response is invalid.")
+        counter_advanced = False
+        for key in _PROGRESS_MONOTONIC_COUNTERS - {"activity"}:
+            old = getattr(previous, key)
+            new = getattr(current, key)
+            if old is not None and (new is None or new < old):
+                raise ProtocolViolation("Worker progress response is invalid.")
+            counter_advanced = bool(
+                counter_advanced or (old is not None and new is not None and new > old)
+            )
+        if previous.current is not None and previous.total is not None:
+            if current.stage != "cancelling" and (
+                current.current is None or current.total is None
+            ):
+                raise ProtocolViolation("Worker progress response is invalid.")
+            if current.current is not None and current.total is not None:
+                extraction_denominator_became_known = (
+                    current.role is ModelRole.EXTRACTION
+                    and previous.stage == "loading"
+                    and current.stage == "processing"
+                    and previous.current == 0
+                    and previous.total == 0
+                )
+                if current.current < previous.current or (
+                    current.total != previous.total
+                    and not extraction_denominator_became_known
+                ):
+                    raise ProtocolViolation("Worker progress response is invalid.")
         if current.stage != previous.stage:
             return True
-        if current.total != previous.total or current.current < previous.current:
-            raise ProtocolViolation("Worker progress response is invalid.")
-        return current.current > previous.current or activity_advanced
+        return (
+            (
+                current.current is not None
+                and previous.current is not None
+                and current.current > previous.current
+            )
+            or activity_advanced
+            or counter_advanced
+        )
 
     @staticmethod
     def _remember_progress_activity(
@@ -1141,19 +1209,20 @@ class LocalModelManager:
     ) -> ProgressPayload:
         """Keep page counters stable while forwarding terminal memory metrics."""
 
-        if (
-            previous is None
-            or current.role is not ModelRole.EXTRACTION
-            or previous.stage != "processing"
-            or current.stage != "finalizing"
-        ):
+        if previous is None or current.stage != "finalizing":
             return current
-        return current.model_copy(
-            update={
-                "current": previous.current,
-                "total": previous.total,
-            }
-        )
+        retained = {
+            key: getattr(previous, key)
+            for key in _PROGRESS_LIMIT_COUNTERS
+            | (_PROGRESS_MONOTONIC_COUNTERS - {"activity"})
+            if getattr(current, key) is None and getattr(previous, key) is not None
+        }
+        # A terminal MLX memory snapshot measures the completed role, not its
+        # page cursor. Retain the extraction cursor for compatibility while
+        # preserving summary's explicit 1/1 completion signal.
+        if current.role is ModelRole.EXTRACTION and previous.stage == "processing":
+            retained.update({"current": previous.current, "total": previous.total})
+        return current.model_copy(update=retained)
 
     @staticmethod
     def _progress_is_visible_advance(
@@ -1162,10 +1231,21 @@ class LocalModelManager:
     ) -> bool:
         """Return whether a stage or completed-page change should reach callers."""
 
-        return (
-            previous is None
-            or current.stage != previous.stage
-            or current.current > previous.current
+        if previous is None or current.stage != previous.stage:
+            return True
+        visible_counters = (
+            "current",
+            "total",
+            "attempt",
+            "attempt_limit",
+            "input_tokens",
+            "output_tokens",
+            "output_token_limit",
+            "splits_used",
+            "split_limit",
+        )
+        return any(
+            getattr(current, key) != getattr(previous, key) for key in visible_counters
         )
 
     async def _forward_progress(

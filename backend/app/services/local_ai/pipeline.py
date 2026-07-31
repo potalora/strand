@@ -779,26 +779,41 @@ class StrictLocalPipeline:
                     async def extraction_progress(
                         value: dict[str, object],
                     ) -> None:
-                        current = value.get("current")
-                        total = value.get("total")
-                        if (
-                            isinstance(current, int)
-                            and not isinstance(current, bool)
-                            and isinstance(total, int)
-                            and not isinstance(total, bool)
-                        ):
-                            if self.on_progress is None:
-                                return
-                            progress_value = self.on_progress(
-                                {
-                                    "stage": ModelRole.EXTRACTION.value,
-                                    "model_role": ModelRole.EXTRACTION.value,
-                                    "worker_current": current,
-                                    "worker_total": total,
-                                }
-                            )
-                            if inspect.isawaitable(progress_value):
-                                await progress_value
+                        if self.on_progress is None:
+                            return
+                        allowed = {
+                            "current",
+                            "total",
+                            "activity",
+                            "attempt",
+                            "attempt_limit",
+                            "input_tokens",
+                            "output_tokens",
+                            "output_token_limit",
+                            "splits_used",
+                            "split_limit",
+                            "active_memory_bytes",
+                            "peak_memory_bytes",
+                        }
+                        safe = {
+                            key: item
+                            for key, item in value.items()
+                            if key in allowed and type(item) is int and item >= 0
+                        }
+                        current = safe.get("current")
+                        total = safe.get("total")
+                        if type(current) is int and type(total) is int:
+                            safe["worker_current"] = safe.pop("current")
+                            safe["worker_total"] = safe.pop("total")
+                        progress_value = self.on_progress(
+                            {
+                                "stage": ModelRole.EXTRACTION.value,
+                                "model_role": ModelRole.EXTRACTION.value,
+                                **safe,
+                            }
+                        )
+                        if inspect.isawaitable(progress_value):
+                            await progress_value
 
                     extraction_payload = self._extraction_payload(
                         job_id,

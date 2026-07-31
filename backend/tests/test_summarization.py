@@ -341,9 +341,11 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         commits += 1
         await original_commit()
 
-    async def run(role: ModelRole, payload: dict) -> dict:
+    async def run(role: ModelRole, payload: dict, on_progress=None) -> dict:
         inference_events.append("generate")
         assert commits >= 1
+        assert worker_session is not None
+        assert worker_session.in_transaction() is False
         assert role is ModelRole.SUMMARY
         assert set(payload) == {
             "job_id",
@@ -366,6 +368,23 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         assert [item["excerpt"] for item in payload["evidence"]] == [
             "Hypertension from archived strict evidence."
         ]
+        assert on_progress is not None
+        await on_progress(
+            {
+                "role": "summary",
+                "stage": "finalizing",
+                "current": 1,
+                "total": 1,
+                "activity": 4,
+                "attempt": 1,
+                "attempt_limit": 1,
+                "input_tokens": 500,
+                "output_tokens": 200,
+                "output_token_limit": 301,
+                "active_memory_bytes": 1_000,
+                "peak_memory_bytes": 2_000,
+            }
+        )
         return {
             "sections": [
                 {
@@ -553,6 +572,21 @@ async def test_strict_local_summary_commits_then_queues_background_work(
             "manifest_identity",
         }
         assert durable_job.status == "completed"
+        assert durable_job.progress == {
+            "stage": "completed",
+            "model_role": "summary",
+            "current": 1,
+            "total": 1,
+            "activity": 4,
+            "attempt": 1,
+            "attempt_limit": 1,
+            "input_tokens": 500,
+            "output_tokens": 200,
+            "output_token_limit": 301,
+            "active_memory_bytes": 1_000,
+            "peak_memory_bytes": 2_000,
+            "facts": 1,
+        }
         assert durable_prompt.response_text is not None
     elif preflight_case in {"over_limit", "count_failure"}:
         token_count.assert_awaited_once()
@@ -766,7 +800,7 @@ async def test_startup_requeues_and_resumes_strict_local_summary_job(
 
 
 @pytest.mark.asyncio
-async def test_old_summary_attempt_cannot_terminalize_a_new_claim(
+async def test_old_or_terminal_summary_attempt_cannot_overwrite_durable_state(
     client: AsyncClient,
     db_session: AsyncSession,
 ) -> None:
@@ -834,6 +868,34 @@ async def test_old_summary_attempt_cannot_terminalize_a_new_claim(
         "preflight",
         new_started_at,
     )
+
+    original_failure = {
+        "stage": "validating",
+        "code": "invalid_structured_output",
+        "message": "Strict-local summary did not complete.",
+        "retryable": False,
+        "cloud_fallback_attempted": False,
+    }
+    job.status = "failed"
+    job.stage = "failed"
+    job.progress = {
+        "stage": "failed",
+        "model_role": "summary",
+        "output_tokens": 128,
+        "output_token_limit": 256,
+    }
+    job.failure = original_failure
+    await db_session.commit()
+
+    await _finish_strict_summary_job(
+        db_session,
+        job_id=job.id,
+        error=RuntimeError("late recovery finalizer"),
+    )
+
+    await db_session.refresh(job)
+    assert job.failure == original_failure
+    assert job.progress["output_tokens"] == 128
 
 
 @pytest.mark.asyncio
@@ -1005,6 +1067,8 @@ async def test_final_summary_completion_honors_cancellation_under_its_terminal_l
     async def complete_model(*_args, **_kwargs) -> dict:
         return {}
 
+    job_id = job.id
+
     async def persist_cancellation() -> None:
         async with async_sessionmaker(
             db_session.bind,
@@ -1013,7 +1077,7 @@ async def test_final_summary_completion_honors_cancellation_under_its_terminal_l
         )() as cancellation_session:
             await cancellation_session.execute(
                 update(LocalAIJob)
-                .where(LocalAIJob.id == job.id)
+                .where(LocalAIJob.id == job_id)
                 .values(cancel_requested=True)
             )
             await cancellation_session.commit()
@@ -1063,7 +1127,7 @@ async def test_final_summary_completion_honors_cancellation_under_its_terminal_l
             db_session,
             user_id=UUID(user_id),
             patient_id=patient.id,
-            job_id=job.id,
+            job_id=job_id,
             summary_type="full",
         )
 

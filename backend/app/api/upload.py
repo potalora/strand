@@ -93,13 +93,52 @@ _STRICT_LOCAL_PROGRESS_COUNTERS = (
     "page_total",
     "worker_current",
     "worker_total",
+    "current",
+    "total",
+    "activity",
+    "attempt",
+    "attempt_limit",
+    "input_tokens",
+    "output_tokens",
+    "output_token_limit",
+    "splits_used",
+    "split_limit",
+    "active_memory_bytes",
+    "peak_memory_bytes",
 )
-_STRICT_LOCAL_MAX_PROGRESS_COUNTER = 1_000_000
+_STRICT_LOCAL_MAX_PROGRESS_COUNTER = 2**63 - 1
 
 # Worker task reference
 _worker_task: asyncio.Task | None = None
 _extraction_tasks: set[asyncio.Task[None]] = set()
 _extraction_draining = False
+
+
+def _merge_strict_local_progress(
+    prior: object,
+    update_value: dict[str, object],
+    *,
+    stage: str,
+) -> dict[str, object]:
+    """Carry only allowlisted telemetry into the next content-free stage."""
+
+    merged: dict[str, object] = {"stage": stage}
+    if isinstance(prior, dict):
+        model_role = prior.get("model_role")
+        if model_role in _STRICT_LOCAL_MODEL_ROLES:
+            merged["model_role"] = model_role
+        for key in _STRICT_LOCAL_PROGRESS_COUNTERS:
+            item = prior.get(key)
+            if type(item) is int and 0 <= item <= _STRICT_LOCAL_MAX_PROGRESS_COUNTER:
+                merged[key] = item
+    for key, item in update_value.items():
+        if key == "model_role" and item in _STRICT_LOCAL_MODEL_ROLES:
+            merged[key] = item
+        elif key in _STRICT_LOCAL_PROGRESS_COUNTERS and (
+            type(item) is int and 0 <= item <= _STRICT_LOCAL_MAX_PROGRESS_COUNTER
+        ):
+            merged[key] = item
+    return merged
 
 
 def _prune_closed_loops(
@@ -1156,7 +1195,11 @@ async def cancel_extraction(
             if job.status == "queued":
                 job.status = "cancelled"
                 job.stage = "cancelled"
-                job.progress = {"stage": "cancelled"}
+                job.progress = _merge_strict_local_progress(
+                    job.progress,
+                    {},
+                    stage="cancelled",
+                )
                 job.completed_at = cancelled_at
                 if job.upload_id not in processing_upload_ids:
                     queued_upload = owned.get(job.upload_id)
@@ -1743,7 +1786,7 @@ async def _persist_strict_local_progress(
         if active_upload_id is None:
             raise LocalPolicyError("Strict-local job was cancelled.")
 
-        active_job_query = select(LocalAIJob.id).where(
+        active_job_query = select(LocalAIJob).where(
             LocalAIJob.id == job_id,
             LocalAIJob.upload_id == upload_id,
             LocalAIJob.user_id == user_id,
@@ -1755,20 +1798,25 @@ async def _persist_strict_local_progress(
             active_job_query = active_job_query.where(
                 LocalAIJob.started_at == claim_started_at
             )
-        active_job_id = (
+        active_job = (
             await progress_db.execute(active_job_query.with_for_update())
         ).scalar_one_or_none()
-        if active_job_id is None:
+        if active_job is None:
             raise LocalPolicyError("Strict-local job was cancelled.")
 
+        merged_progress = _merge_strict_local_progress(
+            active_job.progress,
+            progress,
+            stage=stage,
+        )
         update_job_query = (
             update(LocalAIJob)
             .where(
-                LocalAIJob.id == active_job_id,
+                LocalAIJob.id == active_job.id,
                 LocalAIJob.status == "processing",
                 LocalAIJob.cancel_requested.is_(False),
             )
-            .values(stage=stage, progress=progress)
+            .values(stage=stage, progress=merged_progress)
             .returning(LocalAIJob.id)
         )
         if claim_started_at is not None:
@@ -1788,7 +1836,7 @@ async def _persist_strict_local_progress(
                 )
                 .values(
                     progress_stage=f"local_{stage}",
-                    progress_detail=progress,
+                    progress_detail=merged_progress,
                 )
                 .returning(UploadedFile.id)
             )
@@ -1887,6 +1935,7 @@ async def _mark_cancelled(db: AsyncSession, upload: UploadedFile) -> None:
     """Mark a file as cleanly cancelled (terminal). Rolls back any poisoned
     session first so the terminal write always persists."""
     upload_id = upload.id
+    user_id = upload.user_id
     strict_local = upload.processing_mode == "validated_strict_local"
     try:
         await db.execute(
@@ -1902,29 +1951,36 @@ async def _mark_cancelled(db: AsyncSession, upload: UploadedFile) -> None:
         if strict_local:
             from app.models.local_ai import LocalAIJob
 
-            job = (
-                await db.execute(
-                    select(LocalAIJob)
-                    .where(
-                        LocalAIJob.upload_id == upload.id,
-                        LocalAIJob.user_id == upload.user_id,
-                        LocalAIJob.status.in_(("queued", "processing")),
+            jobs = (
+                (
+                    await db.execute(
+                        select(LocalAIJob)
+                        .where(
+                            LocalAIJob.upload_id == upload_id,
+                            LocalAIJob.user_id == user_id,
+                            LocalAIJob.status.in_(("queued", "processing")),
+                        )
+                        .order_by(LocalAIJob.created_at.desc(), LocalAIJob.id.desc())
+                        .with_for_update()
                     )
-                    .order_by(LocalAIJob.created_at.desc(), LocalAIJob.id.desc())
-                    .limit(1)
-                    .with_for_update()
                 )
-            ).scalar_one_or_none()
-            if job is not None:
+                .scalars()
+                .all()
+            )
+            for job in jobs:
                 job.cancel_requested = True
                 job.status = "cancelled"
                 job.stage = "cancelled"
-                job.progress = {"stage": "cancelled"}
+                job.progress = _merge_strict_local_progress(
+                    job.progress,
+                    {},
+                    stage="cancelled",
+                )
                 job.failure = None
                 job.completed_at = completed_at
         await db.commit()
     except Exception:
-        logger.error("Failed to mark %s cancelled; retrying after rollback", upload.id)
+        logger.error("Failed to mark %s cancelled; retrying after rollback", upload_id)
         await db.rollback()
         completed_at = datetime.now(timezone.utc)
         await db.execute(
@@ -1936,17 +1992,35 @@ async def _mark_cancelled(db: AsyncSession, upload: UploadedFile) -> None:
             {"now": completed_at, "id": upload_id},
         )
         if strict_local:
-            await db.execute(
-                text(
-                    "UPDATE local_ai_jobs SET cancel_requested = true, "
-                    "status = 'cancelled', stage = 'cancelled', "
-                    'progress = \'{"stage":"cancelled"}\'::jsonb, '
-                    "failure = NULL, completed_at = :now "
-                    "WHERE upload_id = :upload_id "
-                    "AND status IN ('queued', 'processing')"
-                ),
-                {"now": completed_at, "upload_id": upload_id},
+            from app.models.local_ai import LocalAIJob
+
+            fallback_jobs = (
+                (
+                    await db.execute(
+                        select(LocalAIJob)
+                        .where(
+                            LocalAIJob.upload_id == upload_id,
+                            LocalAIJob.user_id == user_id,
+                            LocalAIJob.status.in_(("queued", "processing")),
+                        )
+                        .order_by(LocalAIJob.created_at.desc(), LocalAIJob.id.desc())
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
             )
+            for fallback_job in fallback_jobs:
+                fallback_job.cancel_requested = True
+                fallback_job.status = "cancelled"
+                fallback_job.stage = "cancelled"
+                fallback_job.progress = _merge_strict_local_progress(
+                    fallback_job.progress,
+                    {},
+                    stage="cancelled",
+                )
+                fallback_job.failure = None
+                fallback_job.completed_at = completed_at
         await db.commit()
 
 
@@ -2483,7 +2557,11 @@ async def _run_strict_local_ingestion_for_upload(
     from app.models.local_ai import ExtractionEvidence, LocalAIJob
     from app.services.local_ai.artifact_store import ArtifactStore
     from app.services.local_ai.checkpoint_store import CheckpointStore
-    from app.services.local_ai.errors import LocalAIError, LocalPolicyError
+    from app.services.local_ai.errors import (
+        LOCAL_WORKER_FAILURE_CATEGORIES,
+        LocalAIError,
+        LocalPolicyError,
+    )
     from app.services.local_ai.manifest import (
         canonicalize_manifest_snapshot,
         parse_manifest,
@@ -2568,7 +2646,11 @@ async def _run_strict_local_ingestion_for_upload(
             if current_job is not None:
                 current_job.status = "cancelled"
                 current_job.stage = "cancelled"
-                current_job.progress = {"stage": "cancelled"}
+                current_job.progress = _merge_strict_local_progress(
+                    current_job.progress,
+                    {},
+                    stage="cancelled",
+                )
                 current_job.failure = None
                 current_job.completed_at = completed_at
             if current_upload is not None:
@@ -2580,8 +2662,13 @@ async def _run_strict_local_ingestion_for_upload(
             await db.commit()
             return True
 
+        category = getattr(exc, "category", None)
         error_code = (
-            exc.code
+            category
+            if isinstance(exc, LocalAIError)
+            and isinstance(category, str)
+            and category in LOCAL_WORKER_FAILURE_CATEGORIES
+            else exc.code
             if isinstance(exc, LocalAIError)
             else f"local_ai_{failure_stage}_failed"
         )
@@ -2591,6 +2678,11 @@ async def _run_strict_local_ingestion_for_upload(
         if current_job is not None:
             current_job.status = "failed"
             current_job.stage = "failed"
+            current_job.progress = _merge_strict_local_progress(
+                current_job.progress,
+                {},
+                stage="failed",
+            )
             current_job.failure = {
                 "stage": failure_stage,
                 "code": error_code,
@@ -2695,6 +2787,7 @@ async def _run_strict_local_ingestion_for_upload(
             ):
                 raise LocalPolicyError("Strict-local progress counter is invalid.")
             safe[key] = item
+        safe = _merge_strict_local_progress(job.progress, safe, stage=stage)
         failure_stage = stage
         await _persist_strict_local_progress(
             runner_db=db,
@@ -2873,7 +2966,11 @@ async def _run_strict_local_ingestion_for_upload(
 
         failure_stage = "finalizing"
         job.stage = failure_stage
-        job.progress = {"stage": failure_stage}
+        job.progress = _merge_strict_local_progress(
+            job.progress,
+            {},
+            stage=failure_stage,
+        )
         if records:
             from app.services.dedup.orchestrator import run_upload_dedup
 
@@ -2914,10 +3011,12 @@ async def _run_strict_local_ingestion_for_upload(
         upload.processing_completed_at = completed_at
         job.status = "completed"
         job.stage = "completed"
-        job.progress = {
-            "stage": "completed",
-            "pages_completed": len(result.page_markdown),
-        }
+        job.progress = _merge_strict_local_progress(
+            job.progress,
+            {},
+            stage="completed",
+        )
+        job.progress["pages_completed"] = len(result.page_markdown)
         job.completed_at = completed_at
         await db.commit()
     except Exception as exc:

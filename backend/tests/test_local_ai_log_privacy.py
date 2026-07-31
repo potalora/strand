@@ -178,7 +178,15 @@ async def test_strict_local_summary_recovery_never_logs_exception_message(
         manifest_sha256=digest,
         status="queued",
         stage="queued",
-        progress={"stage": "queued"},
+        progress={
+            "stage": "queued",
+            "model_role": "summary",
+            "attempt": 1,
+            "attempt_limit": 1,
+            "output_tokens": 12,
+            "output_token_limit": 128,
+            "private": canary,
+        },
     )
     db_session.add_all([prompt, job])
     await db_session.commit()
@@ -188,7 +196,7 @@ async def test_strict_local_summary_recovery_never_logs_exception_message(
         yield db_session
 
     async def fail_summary(*_args, **_kwargs) -> None:
-        raise LocalWorkerError(canary)
+        raise LocalWorkerError(canary, category="invalid_structured_output")
 
     monkeypatch.setattr(
         "app.services.ai.summarizer.generate_grounded_local_summary",
@@ -210,9 +218,17 @@ async def test_strict_local_summary_recovery_never_logs_exception_message(
     assert canary not in persisted
     assert str(job.id) in caplog.text
     assert job.failure == {
-        "stage": "summary",
-        "code": "local_worker_error",
+        "stage": "queued",
+        "code": "invalid_structured_output",
         "message": "Strict-local summary did not complete.",
         "retryable": False,
         "cloud_fallback_attempted": False,
+    }
+    assert job.progress == {
+        "stage": "failed",
+        "model_role": "summary",
+        "attempt": 1,
+        "attempt_limit": 1,
+        "output_tokens": 12,
+        "output_token_limit": 128,
     }

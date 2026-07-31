@@ -191,6 +191,40 @@ def test_progress_activity_is_bounded_integer_only() -> None:
             WorkerResponse.model_validate(_response("progress", payload))
 
 
+def test_progress_allows_stage_only_frame_and_enforces_bounded_work_counters() -> None:
+    """Loading may precede a known denominator; work counters remain paired."""
+    stage_only = WorkerResponse.model_validate(
+        _response("progress", {"role": "summary", "stage": "loading"})
+    )
+    assert stage_only.payload.current is None
+    payload = {
+        "role": "summary",
+        "stage": "generating",
+        "current": 0,
+        "total": 1,
+        "attempt": 1,
+        "attempt_limit": 1,
+        "input_tokens": 2048,
+        "output_tokens": 512,
+        "output_token_limit": 1024,
+        "splits_used": 0,
+        "split_limit": 7,
+    }
+    assert (
+        WorkerResponse.model_validate(_response("progress", payload)).kind == "progress"
+    )
+    for key, bad_value in (
+        ("attempt", 2),
+        ("output_tokens", 1025),
+        ("splits_used", 8),
+        ("input_tokens", "2048"),
+        ("total", 10_000_001),
+    ):
+        invalid = {**payload, key: bad_value}
+        with pytest.raises(ValidationError):
+            WorkerResponse.model_validate(_response("progress", invalid))
+
+
 def test_health_ready_response_needs_no_model_role() -> None:
     response = WorkerResponse.model_validate(_response("ready", {}))
 

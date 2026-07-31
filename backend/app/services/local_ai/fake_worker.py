@@ -441,13 +441,14 @@ def _main(*, pipeline_valid: bool = False) -> int:
         and not isinstance(progress_steps, bool)
         and 0 < progress_steps <= 1_000
     ):
+        progress_stage = "generating" if role is ModelRole.SUMMARY else "processing"
         _write(
             _response(
                 response_id,
                 "progress",
                 ProgressPayload(
                     role=role,
-                    stage="processing",
+                    stage=progress_stage,
                     current=0,
                     total=progress_steps,
                 ),
@@ -461,28 +462,30 @@ def _main(*, pipeline_valid: bool = False) -> int:
                     "progress",
                     ProgressPayload(
                         role=role,
-                        stage="processing",
+                        stage=progress_stage,
                         current=current,
                         total=progress_steps,
                     ),
                 )
             )
     elif payload.get("repeat_progress") is True:
+        progress_stage = "generating" if role is ModelRole.SUMMARY else "processing"
         repeated = _response(
             response_id,
             "progress",
-            ProgressPayload(role=role, stage="processing", current=0, total=1),
+            ProgressPayload(role=role, stage=progress_stage, current=0, total=1),
         )
         _write(repeated)
         while True:
             time.sleep(min(progress_delay_ms, 60_000) / 1000)
             _write(repeated)
     else:
+        progress_stage = "generating" if role is ModelRole.SUMMARY else "processing"
         _write(
             _response(
                 response_id,
                 "progress",
-                ProgressPayload(role=role, stage="processing", current=0, total=1),
+                ProgressPayload(role=role, stage=progress_stage, current=0, total=1),
             )
         )
     guard_path_value = payload.get("concurrency_guard_path")

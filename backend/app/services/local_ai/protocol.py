@@ -22,6 +22,9 @@ from app.services.local_ai.types import ModelRole
 PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_PROGRESS_ACTIVITY = 2**63 - 1
+MAX_PROGRESS_COUNTER = 10_000_000
+MAX_PROGRESS_ATTEMPTS = 1_000_000
+MAX_PROGRESS_SPLITS = 1_000_000
 
 Identifier = Annotated[
     str,
@@ -41,7 +44,15 @@ WorkerCommand = Literal[
     "shutdown",
 ]
 ResponseKind = Literal["ready", "progress", "result", "error"]
-ProgressStage = Literal["starting", "loading", "processing", "finalizing", "cancelling"]
+ProgressStage = Literal[
+    "starting",
+    "loading",
+    "processing",
+    "generating",
+    "validating",
+    "finalizing",
+    "cancelling",
+]
 ErrorCode = Literal[
     "cancelled",
     "generation_failed",
@@ -59,6 +70,10 @@ GenerationFailureCategory = Literal[
     "output_limit",
     "stream_contract",
     "work_limit",
+    "work_token_limit",
+    "work_attempt_limit",
+    "work_split_limit",
+    "fragment_depth_limit",
 ]
 ProtocolVersion = Annotated[StrictInt, Field(ge=PROTOCOL_VERSION, le=PROTOCOL_VERSION)]
 
@@ -104,16 +119,66 @@ class ProgressPayload(_StrictMessage):
 
     role: ModelRole
     stage: ProgressStage
-    current: Annotated[StrictInt, Field(ge=0)]
-    total: Annotated[StrictInt, Field(ge=0)]
+    # A worker may report a stage/liveness transition before it knows a useful
+    # visible denominator.  Completion counters must otherwise travel as a
+    # pair so a consumer never renders a misleading partial fraction.
+    current: Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_COUNTER)] | None = None
+    total: Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_COUNTER)] | None = None
     activity: Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_ACTIVITY)] | None = None
     active_memory_bytes: Annotated[StrictInt, Field(ge=0, le=2**63 - 1)] | None = None
     peak_memory_bytes: Annotated[StrictInt, Field(ge=0, le=2**63 - 1)] | None = None
+    attempt: Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_ATTEMPTS)] | None = None
+    attempt_limit: (
+        Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_ATTEMPTS)] | None
+    ) = None
+    input_tokens: Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_COUNTER)] | None = (
+        None
+    )
+    output_tokens: Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_COUNTER)] | None = (
+        None
+    )
+    output_token_limit: (
+        Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_COUNTER)] | None
+    ) = None
+    splits_used: Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_SPLITS)] | None = None
+    split_limit: Annotated[StrictInt, Field(ge=0, le=MAX_PROGRESS_SPLITS)] | None = None
 
     @model_validator(mode="after")
-    def current_does_not_exceed_total(self) -> ProgressPayload:
-        if self.current > self.total:
+    def counters_are_consistent(self) -> ProgressPayload:
+        if (self.current is None) != (self.total is None):
+            raise ValueError("current and total must be supplied together")
+        if (
+            self.current is not None
+            and self.total is not None
+            and self.current > self.total
+        ):
             raise ValueError("current cannot exceed total")
+        if (self.attempt is None) != (self.attempt_limit is None):
+            raise ValueError("attempt and attempt_limit must be supplied together")
+        if (
+            self.attempt is not None
+            and self.attempt_limit is not None
+            and self.attempt > self.attempt_limit
+        ):
+            raise ValueError("attempt cannot exceed attempt_limit")
+        if (self.output_tokens is None) != (self.output_token_limit is None):
+            raise ValueError(
+                "output_tokens and output_token_limit must be supplied together"
+            )
+        if (
+            self.output_tokens is not None
+            and self.output_token_limit is not None
+            and self.output_tokens > self.output_token_limit
+        ):
+            raise ValueError("output_tokens cannot exceed output_token_limit")
+        if (self.splits_used is None) != (self.split_limit is None):
+            raise ValueError("splits_used and split_limit must be supplied together")
+        if (
+            self.splits_used is not None
+            and self.split_limit is not None
+            and self.splits_used > self.split_limit
+        ):
+            raise ValueError("splits_used cannot exceed split_limit")
         return self
 
 

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import func, or_, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.models.patient import Patient
@@ -46,6 +46,22 @@ logger = logging.getLogger(__name__)
 _STRICT_LOCAL_RECORD_LIMIT = 512
 _STRICT_LOCAL_EVIDENCE_LIMIT = 512
 _STRICT_LOCAL_SUMMARY_RECOVERY_LIMIT = 1_000
+_STRICT_LOCAL_SUMMARY_TERMINAL_PROGRESS_KEYS = frozenset(
+    {
+        "current",
+        "total",
+        "activity",
+        "attempt",
+        "attempt_limit",
+        "input_tokens",
+        "output_tokens",
+        "output_token_limit",
+        "splits_used",
+        "split_limit",
+        "active_memory_bytes",
+        "peak_memory_bytes",
+    }
+)
 _SAFE_ROUTED_MODEL_LEAF = re.compile(
     r"\A[A-Za-z0-9][A-Za-z0-9._+-]{0,127}"
     r"(?::[A-Za-z0-9][A-Za-z0-9._+-]{0,63})?\Z"
@@ -1258,7 +1274,10 @@ async def _finish_strict_summary_job(
 ) -> None:
     """Persist a safe terminal state after a strict-local summary attempt."""
     from app.models.local_ai import LocalAIJob
-    from app.services.local_ai.errors import LocalAIError
+    from app.services.local_ai.errors import (
+        LocalAIError,
+        LOCAL_WORKER_FAILURE_CATEGORIES,
+    )
 
     job = (
         await db.execute(
@@ -1279,17 +1298,29 @@ async def _finish_strict_summary_job(
     if expected_status is not None and job.status != expected_status:
         await db.rollback()
         return
+    if job.status in {"completed", "failed", "cancelled"}:
+        await db.rollback()
+        return
     completed_at = datetime.now().astimezone()
     cancelled = bool(cancelled or job.cancel_requested)
     failure_stage = job.stage
     job.status = "cancelled" if cancelled else "failed"
     job.stage = "cancelled" if cancelled else "failed"
-    job.progress = {"stage": job.stage}
+    job.progress = _strict_summary_terminal_progress(job.progress, stage=job.stage)
     job.completed_at = completed_at
     if cancelled:
         job.failure = None
     else:
-        code = error.code if isinstance(error, LocalAIError) else "local_ai_error"
+        category = getattr(error, "category", None)
+        code = (
+            category
+            if isinstance(error, LocalAIError)
+            and isinstance(category, str)
+            and category in LOCAL_WORKER_FAILURE_CATEGORIES
+            else error.code
+            if isinstance(error, LocalAIError)
+            else "local_ai_error"
+        )
         job.failure = {
             "stage": failure_stage,
             "code": code,
@@ -1298,6 +1329,70 @@ async def _finish_strict_summary_job(
             "cloud_fallback_attempted": False,
         }
     await db.commit()
+
+
+def _strict_summary_terminal_progress(
+    prior: object,
+    *,
+    stage: str,
+) -> dict[str, object]:
+    """Retain only content-free inference telemetry in a terminal summary."""
+
+    terminal: dict[str, object] = {"stage": stage}
+    if not isinstance(prior, dict):
+        return terminal
+    if prior.get("model_role") == "summary":
+        terminal["model_role"] = "summary"
+    for key in _STRICT_LOCAL_SUMMARY_TERMINAL_PROGRESS_KEYS:
+        value = prior.get(key)
+        if type(value) is int and 0 <= value <= 2**63 - 1:
+            terminal[key] = value
+    return terminal
+
+
+async def _persist_strict_summary_progress(
+    runner_db: AsyncSession,
+    *,
+    job_id: UUID,
+    user_id: UUID,
+    claim_started_at: datetime,
+    stage: str,
+    progress: dict[str, object],
+) -> bool:
+    """Persist a validated worker frame without holding the inference transaction."""
+    from app.models.local_ai import LocalAIJob
+    from app.services.local_ai.errors import LocalPolicyError
+
+    if runner_db.bind is None:
+        raise LocalPolicyError("Strict-local summary progress is unavailable.")
+    progress_session_factory = async_sessionmaker(
+        bind=runner_db.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with progress_session_factory() as progress_db:
+        updated_job_id = (
+            await progress_db.execute(
+                update(LocalAIJob)
+                .where(
+                    LocalAIJob.id == job_id,
+                    LocalAIJob.user_id == user_id,
+                    LocalAIJob.kind == "summary",
+                    LocalAIJob.processing_mode
+                    == ProcessingMode.VALIDATED_STRICT_LOCAL.value,
+                    LocalAIJob.status == "processing",
+                    LocalAIJob.cancel_requested.is_(False),
+                    LocalAIJob.started_at == claim_started_at,
+                )
+                .values(stage=stage, progress=progress)
+                .returning(LocalAIJob.id)
+            )
+        ).scalar_one_or_none()
+        if updated_job_id is None:
+            await progress_db.rollback()
+            return False
+        await progress_db.commit()
+        return True
 
 
 async def resume_grounded_local_summary_jobs(
@@ -1376,9 +1471,15 @@ async def resume_grounded_local_summary_jobs(
                 )
             except asyncio.CancelledError:
                 raise
-            except (LocalAIError, ValueError):
-                # The claimed generator conditionally persists its own terminal
-                # state. Recovery only needs to keep moving to the next job.
+            except (LocalAIError, ValueError) as exc:
+                # A normal generator terminalizes itself, but recovery must
+                # also close a job if startup or a future implementation
+                # fails before its terminal transaction.
+                await _finish_strict_summary_job(
+                    db,
+                    job_id=job_id,
+                    error=exc,
+                )
                 logger.error(
                     "Recovered strict-local summary job %s did not complete",
                     job_id,
@@ -1434,7 +1535,10 @@ async def requeue_interrupted_summary_jobs(*, session_factory=None) -> list[UUID
                 if job.cancel_requested:
                     job.status = "cancelled"
                     job.stage = "cancelled"
-                    job.progress = {"stage": "cancelled"}
+                    job.progress = _strict_summary_terminal_progress(
+                        job.progress,
+                        stage="cancelled",
+                    )
                     job.failure = None
                     job.completed_at = recovered_at
                     continue
@@ -1512,6 +1616,64 @@ async def generate_grounded_local_summary(
 
     job, claim_started_at = claim
     stable_job_id = job.id
+    stable_manifest_sha256 = job.manifest_sha256
+
+    async def publish_summary_progress(value: dict[str, object]) -> None:
+        """Fence one content-free worker frame to this exact summary attempt."""
+        stage = value.get("stage")
+        if stage not in {"loading", "generating", "validating", "finalizing"}:
+            raise LocalPolicyError("Strict-local summary progress stage is invalid.")
+        if value.get("role") != ModelRole.SUMMARY.value:
+            raise LocalPolicyError("Strict-local summary progress role is invalid.")
+        counter_names = (
+            "current",
+            "total",
+            "activity",
+            "attempt",
+            "attempt_limit",
+            "input_tokens",
+            "output_tokens",
+            "output_token_limit",
+            "splits_used",
+            "split_limit",
+            "active_memory_bytes",
+            "peak_memory_bytes",
+        )
+        safe: dict[str, object] = {
+            "stage": stage,
+            "model_role": ModelRole.SUMMARY.value,
+        }
+        for key in counter_names:
+            item = value.get(key)
+            if item is None:
+                continue
+            if type(item) is not int or item < 0 or item > 2**63 - 1:
+                raise LocalPolicyError(
+                    "Strict-local summary progress counter is invalid."
+                )
+            safe[key] = item
+        if ("current" in safe) != ("total" in safe):
+            raise LocalPolicyError("Strict-local summary progress is invalid.")
+        for current_key, limit_key in (
+            ("attempt", "attempt_limit"),
+            ("output_tokens", "output_token_limit"),
+            ("splits_used", "split_limit"),
+        ):
+            if (current_key in safe) != (limit_key in safe):
+                raise LocalPolicyError("Strict-local summary progress is invalid.")
+            if current_key in safe and int(safe[current_key]) > int(safe[limit_key]):
+                raise LocalPolicyError("Strict-local summary progress is invalid.")
+        persisted = await _persist_strict_summary_progress(
+            db,
+            job_id=stable_job_id,
+            user_id=user_id,
+            claim_started_at=claim_started_at,
+            stage=stage,
+            progress=safe,
+        )
+        if not persisted:
+            raise LocalPolicyError("Strict-local summary job was cancelled.")
+
     try:
         snapshot = job.revalidate_manifest_snapshot()
         manifest = parse_manifest(snapshot)
@@ -1575,7 +1737,7 @@ async def generate_grounded_local_summary(
             await db.rollback()
             return {"superseded": True}
         await db.commit()
-        if await _is_strict_summary_cancelled(db, job.id):
+        if await _is_strict_summary_cancelled(db, stable_job_id):
             raise LocalPolicyError("Strict-local summary job was cancelled.")
 
         manifest_identity = {
@@ -1591,10 +1753,10 @@ async def generate_grounded_local_summary(
             "quantization": artifact.quantization,
             "license": artifact.license,
             "attribution": artifact.attribution,
-            "manifest_sha256": job.manifest_sha256,
+            "manifest_sha256": stable_manifest_sha256,
         }
         worker_payload = {
-            "job_id": str(job.id),
+            "job_id": str(stable_job_id),
             "requested_scope": summary_input.requested_scope.model_dump(mode="json"),
             "facts": [item.model_dump(mode="json") for item in summary_input.facts],
             "evidence": [
@@ -1609,7 +1771,7 @@ async def generate_grounded_local_summary(
         }
         scratch_root = Path(settings.local_ai_scratch_dir).resolve()
         model_dir = (store.packs_dir / manifest.pack_revision).resolve()
-        with ScratchJob(scratch_root, str(job.id)) as scratch:
+        with ScratchJob(scratch_root, str(stable_job_id)) as scratch:
             locked_manifest_path = scratch.create_file(
                 "locked-manifest.json",
                 json.dumps(
@@ -1642,11 +1804,14 @@ async def generate_grounded_local_summary(
                 await db.rollback()
                 return {"superseded": True}
             await db.commit()
-            if await _is_strict_summary_cancelled(db, job.id):
+            if await _is_strict_summary_cancelled(db, stable_job_id):
                 raise LocalPolicyError("Strict-local summary job was cancelled.")
+            # The cancellation read opened a transaction. Release it before
+            # model inference so worker progress owns only isolated sessions.
+            await db.rollback()
             token_count = await local_model_manager.count_summary_tokens(
                 {
-                    "job_id": str(job.id),
+                    "job_id": str(stable_job_id),
                     "reference_document": maximal_reference.model_dump(mode="json"),
                     "manifest_path": str(locked_manifest_path),
                     "model_dir": str(model_dir),
@@ -1710,7 +1875,7 @@ async def generate_grounded_local_summary(
                 await db.rollback()
                 return {"superseded": True}
             await db.commit()
-            if await _is_strict_summary_cancelled(db, job.id):
+            if await _is_strict_summary_cancelled(db, stable_job_id):
                 raise LocalPolicyError("Strict-local summary job was cancelled.")
 
             stage_result = await db.execute(
@@ -1738,8 +1903,9 @@ async def generate_grounded_local_summary(
             raw_output = await local_model_manager.run(
                 ModelRole.SUMMARY,
                 worker_payload,
+                on_progress=publish_summary_progress,
             )
-        if await _is_strict_summary_cancelled(db, job.id):
+        if await _is_strict_summary_cancelled(db, stable_job_id):
             raise LocalPolicyError("Strict-local summary job was cancelled.")
         rendered = validate_and_render_summary(
             raw_output,
@@ -1767,7 +1933,10 @@ async def generate_grounded_local_summary(
         if current_job.cancel_requested:
             current_job.status = "cancelled"
             current_job.stage = "cancelled"
-            current_job.progress = {"stage": "cancelled"}
+            current_job.progress = _strict_summary_terminal_progress(
+                current_job.progress,
+                stage="cancelled",
+            )
             current_job.completed_at = datetime.now().astimezone()
             await db.commit()
             raise LocalPolicyError("Strict-local summary job was cancelled.")
@@ -1806,7 +1975,13 @@ async def generate_grounded_local_summary(
         prompt.record_count = len(records)
         job.status = "completed"
         job.stage = "completed"
-        job.progress = {"stage": "completed", "facts": len(summary_input.facts)}
+        job.progress = {
+            **_strict_summary_terminal_progress(
+                job.progress,
+                stage="completed",
+            ),
+            "facts": len(summary_input.facts),
+        }
         job.completed_at = completed_at
         await db.commit()
         return {
