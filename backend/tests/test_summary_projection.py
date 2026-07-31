@@ -841,7 +841,9 @@ def test_extracted_observation_omits_derived_status_without_source_support() -> 
     _ground(projection)
 
 
-def test_structured_observation_with_inherited_local_evidence_keeps_status_guard() -> None:
+def test_structured_observation_with_inherited_local_evidence_keeps_status_guard() -> (
+    None
+):
     """A structured merge survivor must not inherit the local derived-status exception."""
     record = _record(
         "observation",

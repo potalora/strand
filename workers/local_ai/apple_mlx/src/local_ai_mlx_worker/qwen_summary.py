@@ -1094,12 +1094,8 @@ def _selection_to_public_output(
         ):
             raise ValueError
         facts = {str(item["fact_id"]): item for item in facts_value}
-        evidence = {
-            str(item["evidence_id"]): item for item in evidence_value
-        }
-        uncertainties = {
-            str(item["uncertainty_id"]): item for item in uncertainties_value
-        }
+        evidence = {str(item["evidence_id"]): item for item in evidence_value}
+        uncertainties = {str(item["uncertainty_id"]): item for item in uncertainties_value}
 
         claims_by_heading: dict[str, list[dict[str, object]]] = {}
         selected_fact_ids: set[str] = set()
@@ -1136,9 +1132,7 @@ def _selection_to_public_output(
             fact = facts[fact_id]
             evidence_ids = _identifier_list(fact["evidence_ids"])
             known_paths = {
-                str(field["path"])
-                for field in fact["fields"]
-                if isinstance(field, Mapping)
+                str(field["path"]) for field in fact["fields"] if isinstance(field, Mapping)
             }
             supported_paths = sorted(
                 {

@@ -2472,8 +2472,7 @@ def test_summary_internal_schema_structurally_bounds_nineteen_facts() -> None:
     claim_properties = schema["properties"]["claims"]["properties"]  # type: ignore[index]
     assert set(claim_properties) == fact_ids
     assert all(
-        set(claim_properties[fact_id]["properties"])
-        == {"field_paths", "evidence_ids", "overview"}
+        set(claim_properties[fact_id]["properties"]) == {"field_paths", "evidence_ids", "overview"}
         for fact_id in fact_ids
     )
 
