@@ -3,8 +3,15 @@
 import { useEffect, useState } from "react";
 import { Trash2, Sparkles, Download } from "lucide-react";
 import { toast } from "sonner";
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { api } from "@/lib/api";
+import { fmtDay, fmtShort } from "@/lib/format-date";
 import { sourceLabel } from "@/lib/source-label";
 import { recordTitle } from "@/lib/record-title";
 import type { HealthRecord, SeriesResponse, SeriesPoint, SummaryItem, TimelineEvent } from "@/types/api";
@@ -198,6 +205,9 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
                 Record detail
               </p>
             </SheetTitle>
+            <SheetDescription className="sr-only">
+              Clinical record details and actions.
+            </SheetDescription>
           </SheetHeader>
 
           {loading ? (
@@ -308,7 +318,7 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
 
               {/* 4. Metadata fields */}
               <div>
-                <Field label="Date" value={fmtDate(record.effective_date)} />
+                <Field label="Date" value={fmtDay(record.effective_date) || "Not specified"} />
                 <Field label="Source" value={sourceLabel(record.source_format)} />
                 {record.code_value && (
                   <Field
@@ -320,7 +330,7 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
                 {record.category && record.category.length > 0 && (
                   <Field label="Categories" value={record.category.join(", ")} />
                 )}
-                <Field label="Added" value={fmtDate(record.created_at)} />
+                <Field label="Added" value={fmtTimestampDate(record.created_at)} />
               </div>
 
               {/* 5. Advanced section: collapsible FHIR JSON */}
@@ -381,14 +391,9 @@ export function RecordDetailSheet({ recordId, open, onClose, onDelete }: RecordD
   );
 }
 
-function fmtDate(value: string | null): string {
+function fmtTimestampDate(value: string | null): string {
   if (!value) return "Not specified";
   return new Date(value).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
-}
-
-function fmtShort(value: string | null | undefined): string {
-  if (!value) return "";
-  return new Date(value).toLocaleDateString("en-US", { year: "2-digit", month: "short" });
 }
 
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {

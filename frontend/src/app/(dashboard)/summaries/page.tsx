@@ -593,19 +593,24 @@ export default function SummariesPage() {
 
       {/* Patient selector */}
       <div className="card-surface pad">
-        <div className="field-l" style={{ marginBottom: 8 }}>
+        <label
+          className="field-l"
+          htmlFor="summary-record-subject"
+          style={{ marginBottom: 8 }}
+        >
           Record subject
-        </div>
+        </label>
         <select
+          id="summary-record-subject"
           className="selectbox"
           style={{ width: "100%" }}
           value={selectedPatient}
           onChange={(e) => setSelectedPatient(e.target.value)}
         >
           {patients.length === 0 && <option value="">No record found</option>}
-          {patients.map((p) => (
+          {patients.map((p, index) => (
             <option key={p.id} value={p.id}>
-              {p.fhir_id || p.id.slice(0, 8)} ({p.gender || "unknown"})
+              {p.name?.trim() || `Record subject ${index + 1}`}
             </option>
           ))}
         </select>

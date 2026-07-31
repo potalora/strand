@@ -28,6 +28,27 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v
 
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
+export function formatApiErrorDetail(detail: unknown): string {
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (!item || typeof item !== "object" || !("msg" in item)) return "";
+        return typeof item.msg === "string" && item.msg.trim()
+          ? item.msg
+          : "";
+      })
+      .filter((message): message is string => Boolean(message));
+    if (messages.length) return messages.join("; ");
+  }
+  if (detail && typeof detail === "object" && "msg" in detail) {
+    if (typeof detail.msg === "string" && detail.msg.trim()) {
+      return detail.msg;
+    }
+  }
+  return "Request failed";
+}
+
 function readAuthState(): { accessToken?: string; refreshToken?: string } | null {
   if (typeof window === "undefined") return null;
   try {
@@ -185,11 +206,10 @@ class ApiClient {
 
     if (!response.ok) {
       const error = await response.json().catch(() => ({ detail: "Request failed" }));
-      const detail =
-        typeof error?.detail === "string" && error.detail.trim()
-          ? error.detail
-          : "Request failed";
-      throw new ApiError(response.status, detail);
+      throw new ApiError(
+        response.status,
+        formatApiErrorDetail(error?.detail)
+      );
     }
 
     if (response.status === 204) {

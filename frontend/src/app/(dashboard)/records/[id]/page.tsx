@@ -17,6 +17,7 @@ import { FhirResourceRenderer } from "@/components/retro/FhirResourceRenderer";
 import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
 import { AIExtractionBadge, AdvancedSection } from "@/components/retro/renderers/shared";
 import { ExtractionEvidencePanel } from "@/components/retro/ExtractionEvidencePanel";
+import { fmtDay } from "@/lib/format-date";
 
 export default function RecordDetailPage() {
   const params = useParams();
@@ -168,7 +169,7 @@ export default function RecordDetailPage() {
 
         {/* 4. Metadata fields */}
         <div style={{ marginTop: 18 }}>
-          <Field label="Date" value={fmtDate(record.effective_date)} />
+          <Field label="Date" value={fmtDay(record.effective_date) || "Not specified"} />
           <Field label="Source" value={sourceLabel(record.source_format)} />
           <Field label="FHIR type" value={record.fhir_resource_type} />
           {record.code_value && (
@@ -182,7 +183,7 @@ export default function RecordDetailPage() {
           {record.category && record.category.length > 0 && (
             <Field label="Categories" value={record.category.join(", ")} />
           )}
-          <Field label="Added" value={fmtDate(record.created_at)} />
+          <Field label="Added" value={fmtTimestampDate(record.created_at)} />
         </div>
 
         {/* 5. Advanced section: collapsible FHIR JSON */}
@@ -223,7 +224,7 @@ export default function RecordDetailPage() {
   );
 }
 
-function fmtDate(value: string | null): string {
+function fmtTimestampDate(value: string | null): string {
   if (!value) return "Not specified";
   return new Date(value).toLocaleDateString("en-US", {
     year: "numeric",

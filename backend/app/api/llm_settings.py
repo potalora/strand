@@ -28,7 +28,6 @@ from app.services.ai.llm import (
 from app.services.ai.llm import registry
 from app.services.local_ai.errors import LocalPolicyError
 from app.services.local_ai.policy import require_loopback
-from app.services.local_ai.types import ProcessingMode
 
 logger = logging.getLogger(__name__)
 
@@ -111,11 +110,7 @@ async def get_llm_settings(
         )
     ).scalar_one_or_none()
     routing["extraction_engine"] = pref.extraction_engine if pref else None
-    routing["processing_mode"] = (
-        pref.processing_mode
-        if pref is not None and pref.processing_mode
-        else ProcessingMode.CLOUD_ASSISTED.value
-    )
+    routing["processing_mode"] = config.processing_mode.value
 
     await log_audit_event(
         db,

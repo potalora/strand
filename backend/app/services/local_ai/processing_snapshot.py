@@ -69,7 +69,7 @@ def build_ingestion_job(
 
 def _coerce_mode(value: ProcessingMode | str | None) -> ProcessingMode:
     if value is None:
-        return ProcessingMode.CLOUD_ASSISTED
+        return ProcessingMode.PROMPT_ONLY
     try:
         return ProcessingMode(value)
     except (TypeError, ValueError) as exc:
@@ -131,7 +131,7 @@ async def resolve_new_job_snapshot(
     user_id: UUID,
     explicit_mode: ProcessingMode | str | None = None,
 ) -> ProcessingSnapshot:
-    """Resolve explicit mode, then stored preference, then the cloud default.
+    """Resolve explicit mode, then stored preference, then the prompt-only default.
 
     Validated strict-local work is accepted only when the feature is enabled and
     the exact locked manifest is the fully verified active artifact pack.

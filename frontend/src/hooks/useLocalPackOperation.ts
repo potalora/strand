@@ -46,12 +46,17 @@ export function useLocalPackOperation() {
       window.dispatchEvent(
         new CustomEvent("medtimeline:local-pack-status", { detail: next })
       );
-      if (!operationId.current && next.operation) {
-        setOperation(next.operation);
-        if (["queued", "running"].includes(next.operation.state)) {
-          setPollingInterrupted(false);
-          operationId.current = next.operation.id;
-        }
+      const serverOperation = next.state === "ready" ? null : next.operation;
+      setOperation(serverOperation);
+      if (
+        serverOperation &&
+        ["queued", "running"].includes(serverOperation.state)
+      ) {
+        setPollingInterrupted(false);
+        operationId.current = serverOperation.id;
+      } else {
+        operationId.current = null;
+        setPollingInterrupted(false);
       }
       setError(null);
     } catch {

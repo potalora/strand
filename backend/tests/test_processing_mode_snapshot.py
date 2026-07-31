@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
 from uuid import UUID, uuid4
 
 import pytest
@@ -18,6 +21,7 @@ from app.models.llm_settings import LLMProviderConfig
 from app.models.uploaded_file import UploadedFile
 from app.models.user import User
 from app.schemas.llm_settings import RoutingUpdate
+from app.schemas.summary import GenerateSummaryRequest
 from app.services.local_ai.errors import LocalPolicyError
 from app.services.local_ai.errors import LocalValidationError
 from app.services.local_ai.manifest import (
@@ -38,6 +42,23 @@ from app.services.local_ai.types import ProcessingMode
 from app.services.ai.llm.config import load_llm_config
 from app.utils.file_utils import encrypt_stream
 from tests.conftest import auth_headers
+
+
+def _load_prompt_only_default_migration() -> ModuleType:
+    migration_path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "b0c1d2e3f4a5_default_processing_prompt_only.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_prompt_only_default_migration",
+        migration_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class _ScalarResult:
@@ -156,6 +177,58 @@ def test_routing_update_accepts_only_explicit_processing_modes() -> None:
         RoutingUpdate(processing_mode="fallback-to-cloud")
 
 
+def test_generate_summary_defaults_prompt_only() -> None:
+    request = GenerateSummaryRequest(patient_id=uuid4())
+
+    assert request.processing_mode is ProcessingMode.PROMPT_ONLY
+
+
+def test_prompt_only_default_migration_never_rewrites_existing_choices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = _load_prompt_only_default_migration()
+    altered: list[tuple[str, str, object]] = []
+    statements: list[str] = []
+    monkeypatch.setattr(
+        migration.op,
+        "alter_column",
+        lambda table, column, **kwargs: altered.append(
+            (table, column, kwargs["server_default"])
+        ),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "execute",
+        lambda statement: statements.append(str(statement)),
+    )
+
+    migration.upgrade()
+
+    assert len(statements) == 1
+    assert statements[0].lstrip().startswith("CREATE OR REPLACE FUNCTION")
+    assert "'prompt_only'" in statements[0]
+    assert re.search(r"(?im)^\s*(UPDATE|INSERT|DELETE)\s+", statements[0]) is None
+    assert altered == [
+        ("ai_summary_prompts", "processing_mode", "prompt_only"),
+        ("uploaded_files", "processing_mode", "prompt_only"),
+        ("user_llm_preferences", "processing_mode", "prompt_only"),
+    ]
+
+    altered.clear()
+    statements.clear()
+    migration.downgrade()
+
+    assert len(statements) == 1
+    assert statements[0].lstrip().startswith("CREATE OR REPLACE FUNCTION")
+    assert "'prompt_only'" not in statements[0]
+    assert re.search(r"(?im)^\s*(UPDATE|INSERT|DELETE)\s+", statements[0]) is None
+    assert altered == [
+        ("ai_summary_prompts", "processing_mode", "cloud_assisted"),
+        ("uploaded_files", "processing_mode", "cloud_assisted"),
+        ("user_llm_preferences", "processing_mode", None),
+    ]
+
+
 def test_ingestion_job_factory_is_strict_only_and_snapshot_bound() -> None:
     upload_id = uuid4()
     user_id = uuid4()
@@ -239,7 +312,7 @@ async def test_custom_local_mode_rejects_nonlocal_effective_routes(client) -> No
 
     assert update.status_code == 409
     assert response.status_code == 200
-    assert response.json()["routing"]["processing_mode"] == "cloud_assisted"
+    assert response.json()["routing"]["processing_mode"] == "prompt_only"
 
 
 @pytest.mark.asyncio
@@ -374,12 +447,21 @@ async def test_explicit_processing_mode_overrides_stored_preference() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stored_processing_mode_precedes_cloud_default() -> None:
+async def test_stored_processing_mode_precedes_prompt_only_default() -> None:
     stored = await resolve_new_job_snapshot(_FakeDB("custom_local"), uuid4())
     defaulted = await resolve_new_job_snapshot(_FakeDB(None), uuid4())
 
     assert stored.mode is ProcessingMode.CUSTOM_LOCAL
-    assert defaulted.mode is ProcessingMode.CLOUD_ASSISTED
+    assert defaulted.mode is ProcessingMode.PROMPT_ONLY
+
+
+@pytest.mark.asyncio
+async def test_no_preference_ingestion_rejects_prompt_only_default() -> None:
+    with pytest.raises(
+        LocalPolicyError,
+        match="prompt_only is not available for document ingestion",
+    ):
+        await resolve_new_ingestion_snapshot(_FakeDB(None), uuid4())
 
 
 @pytest.mark.asyncio

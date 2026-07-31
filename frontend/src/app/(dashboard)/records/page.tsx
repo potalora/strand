@@ -11,19 +11,13 @@ import { recordTitle } from "@/lib/record-title";
 import { RetroBadge } from "@/components/retro/RetroBadge";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
+import { fmtDay } from "@/lib/format-date";
 
 const PAGE_SIZE = 20;
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 // Server-side sort keys accepted by GET /records?sort=...
 type SortKey = "type" | "display_text" | "date";
 type SortOrder = "asc" | "desc";
-
-const fmtDate = (s: string | null) => {
-  if (!s) return "--";
-  const d = new Date(s);
-  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
-};
 
 // ↑/↓ glyph shown only on the active sort column.
 const sortIndicator = (col: SortKey, active: SortKey, order: SortOrder) =>
@@ -240,7 +234,7 @@ export default function RecordsPage() {
                       <RetroBadge recordType={r.record_type} category={r.category} />
                     </td>
                     <td className="desc">{recordTitle(r)}</td>
-                    <td className="num">{fmtDate(r.effective_date)}</td>
+                    <td className="num">{fmtDay(r.effective_date) || "--"}</td>
                     <td className="muted">{r.source_format ? sourceLabel(r.source_format) : "--"}</td>
                     <td className="num">{r.code_value || "--"}</td>
                   </tr>

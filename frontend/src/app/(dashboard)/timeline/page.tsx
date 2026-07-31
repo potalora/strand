@@ -9,14 +9,9 @@ import { RetroBadge } from "@/components/retro/RetroBadge";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { RecordDetailSheet } from "@/components/retro/RecordDetailSheet";
 import { TimelineMetricStrip } from "@/components/retro/TimelineMetricStrip";
+import { fmtDay } from "@/lib/format-date";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-const fmtShort = (s: string | null) => {
-  if (!s) return "";
-  const d = new Date(s);
-  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
-};
 
 const FILTERS: { v: string; label: string }[] = [
   { v: "", label: "All" },
@@ -42,11 +37,9 @@ function SecureChip() {
 function groupByMonth(events: TimelineEvent[]): { label: string; events: TimelineEvent[] }[] {
   const groups = new Map<string, TimelineEvent[]>();
   for (const event of events) {
-    const key = event.effective_date
-      ? (() => {
-          const d = new Date(event.effective_date);
-          return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-        })()
+    const calendarMonth = event.effective_date?.match(/^(\d{4})-(\d{2})/);
+    const key = calendarMonth
+      ? `${calendarMonth[1]}-${calendarMonth[2]}`
       : "undated";
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key)!.push(event);
@@ -185,7 +178,7 @@ export default function TimelinePage() {
                         )}
                       </span>
                       <span className="tl-date">
-                        {fmtShort(r.effective_date)}
+                        {fmtDay(r.effective_date)}
                         {category && (
                           <>
                             <br />

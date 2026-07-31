@@ -93,6 +93,17 @@ interface PollProbe {
   polls: number;
 }
 
+interface StatusOperation {
+  id: string;
+  action: "install";
+  state: "queued" | "running" | "completed" | "failed" | "paused";
+  current_role: string | null;
+  bytes_done: number;
+  bytes_total: number;
+  message: string;
+  retryable: boolean;
+}
+
 async function setup(
   page: Page,
   initialState: "not_installed" | "preview" | "ready" | "failed",
@@ -102,7 +113,9 @@ async function setup(
   removalProbe?: { calls: number },
   modelMemory?: Partial<Record<string, number | null>>,
   previewReason: "feature_disabled" | "release_evidence_missing" =
-    "feature_disabled"
+    "feature_disabled",
+  statusOperation?: StatusOperation,
+  terminalOutcome: "completed" | "failed" = "completed"
 ) {
   await page.addInitScript((auth) => {
     localStorage.setItem("medtimeline-auth", JSON.stringify(auth));
@@ -110,6 +123,7 @@ async function setup(
 
   let state = initialState;
   let operationPoll = 0;
+  let statusOperationSnapshot = statusOperation ?? null;
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
     const url = request.url();
@@ -142,7 +156,7 @@ async function setup(
           expected_memory_bytes:
             modelMemory?.[model.role] ?? model.expected_memory_bytes,
         })),
-        operation: null,
+        operation: statusOperationSnapshot,
       });
     }
     if (url.endsWith("/local-ai") && method === "DELETE") {
@@ -195,17 +209,22 @@ async function setup(
           retryable: false,
         });
       }
-      state = "ready";
-      return json({
+      const terminalOperation: StatusOperation = {
         id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         action: "install",
-        state: "completed",
+        state: terminalOutcome,
         current_role: null,
         bytes_done: 1000,
         bytes_total: 1000,
-        message: "Model pack is ready.",
-        retryable: false,
-      });
+        message:
+          terminalOutcome === "completed"
+            ? "Model pack is ready."
+            : "Old install failed.",
+        retryable: terminalOutcome === "failed",
+      };
+      state = "ready";
+      statusOperationSnapshot = terminalOperation;
+      return json(terminalOperation);
     }
     if (url.includes("/settings/llm/routing") && method === "PUT") {
       Object.assign(LLM_SETTINGS.routing, request.postDataJSON() ?? {});
@@ -281,6 +300,39 @@ test("ready pack enables strict local and custom servers stay explicitly unverif
     page.locator("span.tag").filter({ hasText: "Custom local (unverified)" })
   ).toHaveCount(2);
   await expect(page.getByText(/loopback only/i).first()).toBeVisible();
+});
+
+test("newest ready status clears an older failed operation", async ({ page }) => {
+  await setup(
+    page,
+    "not_installed",
+    undefined,
+    0,
+    undefined,
+    undefined,
+    undefined,
+    "feature_disabled",
+    {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      action: "install",
+      state: "running",
+      current_role: "ocr",
+      bytes_done: 100,
+      bytes_total: 1000,
+      message: "Downloading verified model files.",
+      retryable: false,
+    },
+    "failed"
+  );
+  await page.goto("/admin?tab=sys");
+
+  await expect(page.getByText("Validated and ready")).toBeVisible({
+    timeout: 10_000,
+  });
+  await expect(page.getByText("Old install failed.")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Retry operation" })
+  ).toHaveCount(0);
 });
 
 test("disabled strict-local processing gives the enable-and-restart instruction", async ({

@@ -1136,7 +1136,11 @@ export default function UploadPage() {
           EXTRACTION PROGRESS / SUMMARY (scoped to the current batch)
           ========================================== */}
       {showProgressCard && (
-        <div className="card-surface pad">
+        <div
+          className="card-surface pad"
+          role="region"
+          aria-label="Extraction status"
+        >
           <div className="card-h">
             <h3 className="sec-title">
               {batch.allTerminal

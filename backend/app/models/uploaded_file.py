@@ -69,8 +69,8 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     processing_mode: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        default="cloud_assisted",
-        server_default="cloud_assisted",
+        default="prompt_only",
+        server_default="prompt_only",
     )
     # Immutable model identities, fixed revisions, hashes, and schema metadata.
     processing_manifest: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
@@ -150,6 +150,7 @@ event.listen(
         AS $$
         BEGIN
             IF NEW.processing_mode NOT IN (
+                'prompt_only',
                 'cloud_assisted',
                 'validated_strict_local'
             ) THEN

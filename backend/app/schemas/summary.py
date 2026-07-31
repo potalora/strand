@@ -148,7 +148,7 @@ class GenerateSummaryRequest(BaseModel):
     custom_user_prompt: Annotated[str, StringConstraints(max_length=4096)] | None = None
     provider: str | None = None
     model: str | None = None
-    processing_mode: ProcessingMode = ProcessingMode.CLOUD_ASSISTED
+    processing_mode: ProcessingMode = ProcessingMode.PROMPT_ONLY
     record_ids: BoundedRecordIds | None = None
 
 

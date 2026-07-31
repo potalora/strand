@@ -45,7 +45,7 @@ class LLMConfig:
     providers: dict[str, ProviderCreds] = field(default_factory=dict)
     # On-device-vs-cloud entity extraction: "gemini" | "local" | "hybrid".
     extraction_engine: str = ""
-    processing_mode: ProcessingMode = ProcessingMode.CLOUD_ASSISTED
+    processing_mode: ProcessingMode = ProcessingMode.PROMPT_ONLY
 
     @classmethod
     def from_settings(cls) -> LLMConfig:
@@ -154,7 +154,7 @@ async def load_llm_config(db: AsyncSession, user_id: UUID) -> LLMConfig:
             cfg.extraction_engine = pref.extraction_engine
         try:
             cfg.processing_mode = ProcessingMode(
-                pref.processing_mode or ProcessingMode.CLOUD_ASSISTED.value
+                pref.processing_mode or ProcessingMode.PROMPT_ONLY.value
             )
         except (TypeError, ValueError) as exc:
             raise LocalPolicyError("Custom local processing mode is invalid.") from exc

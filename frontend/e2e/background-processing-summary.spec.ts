@@ -81,6 +81,13 @@ test("strict summary 202 registers a durable background card and clears loading"
               id: "patient-1",
               fhir_id: "patient-1",
               gender: null,
+              name: "Ada Lovelace",
+              birth_date: null,
+            },
+            {
+              id: "patient-2",
+              fhir_id: "internal-fhir-id",
+              gender: null,
               name: null,
               birth_date: null,
             },
@@ -147,6 +154,13 @@ test("strict summary 202 registers a durable background card and clears loading"
   });
 
   await page.goto("/summaries");
+  const subject = page.getByLabel("Record subject");
+  await expect(subject.locator("option")).toHaveText([
+    "Ada Lovelace",
+    "Record subject 2",
+  ]);
+  await expect(subject).not.toContainText("patient-1");
+  await expect(subject).not.toContainText("internal-fhir-id");
   const generate = page.getByRole("button", { name: "Generate summary" });
   await expect(generate).toBeEnabled();
   await generate.click();

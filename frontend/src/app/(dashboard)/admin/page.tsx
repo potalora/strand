@@ -81,13 +81,17 @@ import type {
   LocalRunInfo,
 } from "@/types/local-ai";
 import { useBackgroundProcessingStore } from "@/stores/useBackgroundProcessingStore";
+import { fmtDay, yearOf } from "@/lib/format-date";
 
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const fmtDate = (s: string | null | undefined) => {
+const fmtTimestampDate = (s: string | null | undefined) => {
   if (!s) return "—";
   const d = new Date(s);
   if (Number.isNaN(d.getTime())) return "—";
-  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+  return d.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
 };
 
 const TABS = [
@@ -498,7 +502,7 @@ function ExtractionsTab() {
                     </span>
                   </td>
                   <td className="num">{fmtSize(file.file_size_bytes)}</td>
-                  <td className="num">{fmtDate(file.created_at)}</td>
+                  <td className="num">{fmtTimestampDate(file.created_at)}</td>
                 </tr>
               );
             })}
@@ -697,7 +701,7 @@ function RecordsTab() {
                   <RetroBadge recordType={r.record_type} short />
                 </td>
                 <td className="desc">{recordTitle(r)}</td>
-                <td className="num">{fmtDate(r.effective_date)}</td>
+                <td className="num">{fmtDay(r.effective_date) || "—"}</td>
                 <td className="num">{sourceLabel(r.source_format)}</td>
                 <td className="num">
                   {[r.code_system, r.code_value].filter(Boolean).join(" ") || "—"}
@@ -1465,7 +1469,7 @@ export function RecordMini({ rec }: { rec: DedupCandidate["record_a"] }) {
         </span>
       </div>
       <div className="num" style={{ fontSize: 11.5 }}>
-        {sourceLabel(rec.source_format)} · {fmtDate(rec.effective_date)}
+        {sourceLabel(rec.source_format)} · {fmtDay(rec.effective_date) || "—"}
       </div>
     </div>
   );
@@ -2111,8 +2115,9 @@ function SystemTab() {
   const span =
     overview?.date_range_start && overview?.date_range_end
       ? (() => {
-          const s = new Date(overview.date_range_start).getFullYear();
-          const e = new Date(overview.date_range_end).getFullYear();
+          const s = yearOf(overview.date_range_start);
+          const e = yearOf(overview.date_range_end);
+          if (s === null || e === null) return "—";
           return s === e ? `${s}` : `${s}–${e}`;
         })()
       : "—";

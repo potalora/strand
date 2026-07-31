@@ -32,8 +32,8 @@ class AISummaryPrompt(Base, UUIDPrimaryKeyMixin):
     processing_mode: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        default="cloud_assisted",
-        server_default="cloud_assisted",
+        default="prompt_only",
+        server_default="prompt_only",
     )
     scope_filter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     # Encrypted at rest (AES-256-GCM). Prompts + the model response can embed
