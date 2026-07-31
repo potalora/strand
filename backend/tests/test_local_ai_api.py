@@ -262,6 +262,137 @@ async def test_ingestion_job_status_is_bounded_and_never_returns_failure_message
 
 
 @pytest.mark.asyncio
+async def test_active_jobs_hide_manual_zip_children_until_triggered(
+    client,
+    db_session,
+) -> None:
+    """A staged manual child is not active or cancellable in the monitor."""
+    headers, user_id = await auth_headers(
+        client,
+        email="manual-job-gate@example.com",
+    )
+    manifest, _contents = _manifest()
+    upload = UploadedFile(
+        user_id=UUID(user_id),
+        filename="zip-child.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=100,
+        file_hash="c" * 64,
+        storage_path="/tmp/zip-child.pdf",
+        ingestion_status="pending_extraction",
+        file_category="unstructured",
+        manual_extraction_required=True,
+        processing_mode="validated_strict_local",
+        processing_manifest=_manifest_dict(manifest),
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=_manifest_dict(manifest),
+        status="queued",
+        stage="queued",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    before = await client.get(
+        "/api/v1/local-ai/jobs?kind=ingestion&active_only=true",
+        headers=headers,
+    )
+    all_jobs = await client.get(
+        "/api/v1/local-ai/jobs?kind=ingestion&active_only=false",
+        headers=headers,
+    )
+    trigger = await client.post(
+        "/api/v1/upload/trigger-extraction",
+        json={"upload_ids": [str(upload.id)]},
+        headers=headers,
+    )
+    after = await client.get(
+        "/api/v1/local-ai/jobs?kind=ingestion&active_only=true",
+        headers=headers,
+    )
+
+    assert before.status_code == 200
+    assert before.json() == []
+    assert [item["id"] for item in all_jobs.json()] == [str(job.id)]
+    assert trigger.status_code == 200
+    assert trigger.json()["triggered"] == 1
+    assert [item["id"] for item in after.json()] == [str(job.id)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("job_status", "expected_status"),
+    [
+        (None, "strict_job_unavailable"),
+        ("failed", "strict_job_not_queued"),
+    ],
+)
+async def test_manual_strict_child_requires_queued_uncancelled_job(
+    client,
+    db_session,
+    job_status: str | None,
+    expected_status: str,
+) -> None:
+    """Manual release fails closed without a resumable strict ingestion job."""
+    headers, user_id = await auth_headers(
+        client,
+        email=f"manual-strict-{job_status or 'missing'}@example.com",
+    )
+    manifest, _contents = _manifest()
+    upload = UploadedFile(
+        user_id=UUID(user_id),
+        filename="strict-child.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=100,
+        file_hash=f"strict-manual-{job_status or 'missing'}",
+        storage_path="/tmp/medtimeline-zip-set-example/strict-child.pdf",
+        ingestion_status="pending_extraction",
+        file_category="unstructured",
+        manual_extraction_required=True,
+        processing_mode="validated_strict_local",
+        processing_manifest=_manifest_dict(manifest),
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    if job_status is not None:
+        db_session.add(
+            LocalAIJob(
+                user_id=UUID(user_id),
+                upload_id=upload.id,
+                kind="ingestion",
+                processing_mode="validated_strict_local",
+                manifest_snapshot=_manifest_dict(manifest),
+                status=job_status,
+                stage=job_status,
+                cancel_requested=False,
+            )
+        )
+    await db_session.commit()
+
+    response = await client.post(
+        "/api/v1/upload/trigger-extraction",
+        json={"upload_ids": [str(upload.id)]},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"] == [
+        {"upload_id": str(upload.id), "status": expected_status}
+    ]
+    await db_session.refresh(upload)
+    assert upload.ingestion_status == "pending_extraction"
+    assert upload.manual_extraction_required is True
+
+
+@pytest.mark.asyncio
 async def test_retry_ingestion_job_requeues_owned_pair_and_preserves_pages(
     client,
     db_session,
@@ -326,6 +457,7 @@ async def test_retry_ingestion_job_requeues_owned_pair_and_preserves_pages(
         return upload, job
 
     upload, retryable_job = await make_job(status="failed")
+    upload.manual_extraction_required = True
     page = LocalAIPage(
         job_id=retryable_job.id,
         page_number=1,
@@ -381,6 +513,7 @@ async def test_retry_ingestion_job_requeues_owned_pair_and_preserves_pages(
     assert upload.progress_detail is None
     assert upload.ingestion_errors == []
     assert upload.retry_count == 0
+    assert upload.manual_extraction_required is False
     assert retryable_job.status == "queued"
     assert retryable_job.stage == "queued"
     assert retryable_job.progress == {}

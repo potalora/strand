@@ -340,7 +340,18 @@ async def test_claim_pending_files_can_exclude_strict_jobs_waiting_for_model_slo
         file_category="unstructured",
         processing_mode="cloud_assisted",
     )
-    db_session.add_all([strict_upload, non_strict_upload])
+    manual_zip_child = UploadedFile(
+        user_id=user_id,
+        filename="manual-child.pdf",
+        mime_type="application/pdf",
+        file_hash="a" * 64,
+        storage_path="/private/manual-child.pdf",
+        ingestion_status="pending_extraction",
+        file_category="unstructured",
+        processing_mode="cloud_assisted",
+        manual_extraction_required=True,
+    )
+    db_session.add_all([strict_upload, non_strict_upload, manual_zip_child])
     await db_session.commit()
 
     monkeypatch.setattr("app.api.upload.async_session_factory", test_session_factory)
@@ -356,6 +367,8 @@ async def test_claim_pending_files_can_exclude_strict_jobs_waiting_for_model_slo
     ]
     await db_session.refresh(strict_upload)
     assert strict_upload.ingestion_status == "pending_extraction"
+    await db_session.refresh(manual_zip_child)
+    assert manual_zip_child.ingestion_status == "pending_extraction"
 
 
 @pytest.mark.asyncio

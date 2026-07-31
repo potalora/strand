@@ -80,6 +80,7 @@ import type {
   LocalProcessingFailure,
   LocalRunInfo,
 } from "@/types/local-ai";
+import { useBackgroundProcessingStore } from "@/stores/useBackgroundProcessingStore";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const fmtDate = (s: string | null | undefined) => {
@@ -231,6 +232,8 @@ interface ExtractionFile {
   notices?: OcrNotice[];
   local_run?: LocalRunInfo | null;
   local_failure?: LocalProcessingFailure | null;
+  manual_extraction_required: boolean;
+  local_job_id?: string | null;
 }
 
 const EXTRACTION_STATUS_HUE: Record<string, string> = {
@@ -252,6 +255,7 @@ function ExtractionsTab() {
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [triggering, setTriggering] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const fetchFiles = useCallback(async () => {
     setLoading(true);
@@ -274,25 +278,68 @@ function ExtractionsTab() {
 
   const handleTrigger = async () => {
     if (selected.size === 0) return;
+    const uploadIds = Array.from(selected);
+    setActionError(null);
     setTriggering(true);
     try {
-      await api.post("/upload/trigger-extraction", {
-        upload_ids: Array.from(selected),
-      });
-      setSelected(new Set());
+      const response = await api.triggerExtraction(uploadIds);
+      const accepted = new Set(
+        response.results
+          .filter(
+            (result) =>
+              uploadIds.includes(result.upload_id) &&
+              result.status === "pending_extraction"
+          )
+          .map((result) => result.upload_id)
+      );
+      if (accepted.size > 0) {
+        const serverJobs = await api.getLocalAIJobs(true);
+        const background = useBackgroundProcessingStore.getState();
+        background.applyServerJobs(serverJobs);
+        background.registerUploadLabels(
+          Object.fromEntries(
+            files
+              .filter((file) => accepted.has(file.id))
+              .map((file) => [file.id, file.filename])
+          )
+        );
+        setSelected(
+          (current) =>
+            new Set([...current].filter((id) => !accepted.has(id)))
+        );
+      }
+      if (response.failed > 0 || accepted.size !== uploadIds.length) {
+        setActionError(
+          `${uploadIds.length - accepted.size} selected file${
+            uploadIds.length - accepted.size === 1 ? "" : "s"
+          } could not be started.`
+        );
+      }
       setTimeout(fetchFiles, 1000);
-    } catch {
-      // Silently fail
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : "Extraction could not be started."
+      );
     } finally {
       setTriggering(false);
     }
   };
 
   const toggleAll = () => {
-    if (selected.size === files.length) {
+    const selectableFiles = files.filter(
+      (file) =>
+        file.ingestion_status === "pending_extraction" &&
+        file.manual_extraction_required === true
+    );
+    if (
+      selectableFiles.length > 0 &&
+      selectableFiles.every((file) => selected.has(file.id))
+    ) {
       setSelected(new Set());
     } else {
-      setSelected(new Set(files.map((f) => f.id)));
+      setSelected(new Set(selectableFiles.map((file) => file.id)));
     }
   };
 
@@ -323,14 +370,27 @@ function ExtractionsTab() {
   const processingCount = files.filter((f) => f.ingestion_status === "processing").length;
   const failedCount = files.filter((f) => f.ingestion_status === "failed").length;
 
-  const allSelected = selected.size === files.length && files.length > 0;
+  const selectableFiles = files.filter(
+    (file) =>
+      file.ingestion_status === "pending_extraction" &&
+      file.manual_extraction_required === true
+  );
+  const allSelected =
+    selectableFiles.length > 0 &&
+    selectableFiles.every((file) => selected.has(file.id));
 
   return (
     <div>
       <p className="h-sub" style={{ margin: "0 0 18px" }}>
-        Documents waiting for text + entity extraction. Select files and extract — each is read with
-        OCR + entity extraction, then confirmed into the record.
+        Documents in the extraction queue. Only mixed-ZIP children waiting for
+        manual confirmation can be selected here. Processing and failed rows are
+        status-only.
       </p>
+      {actionError && (
+        <p role="alert" style={{ color: "var(--danger)", fontSize: 13 }}>
+          {actionError}
+        </p>
+      )}
 
       <div className="toolbar" style={{ justifyContent: "space-between" }}>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
@@ -371,7 +431,7 @@ function ExtractionsTab() {
                   type="checkbox"
                   checked={allSelected}
                   onChange={toggleAll}
-                  disabled={triggering}
+                  disabled={triggering || selectableFiles.length === 0}
                   style={{ accentColor: "var(--primary)" }}
                   aria-label="Select all files"
                 />
@@ -387,6 +447,9 @@ function ExtractionsTab() {
             {files.map((file) => {
               const ext = file.filename.split(".").pop()?.toLowerCase() || "";
               const status = file.ingestion_status || "pending_extraction";
+              const canExtract =
+                status === "pending_extraction" &&
+                file.manual_extraction_required === true;
               const statusLabel =
                 status === "duplicate_file"
                   ? "Duplicate"
@@ -407,7 +470,7 @@ function ExtractionsTab() {
                           return next;
                         });
                       }}
-                      disabled={triggering}
+                      disabled={triggering || !canExtract}
                       style={{ accentColor: "var(--primary)" }}
                       aria-label={`Select ${file.filename}`}
                     />

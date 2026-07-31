@@ -10,7 +10,7 @@ from typing import Callable, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -238,6 +238,7 @@ async def _retry_local_ai_job(
     upload.progress_detail = None
     upload.ingestion_errors = []
     upload.retry_count = 0
+    upload.manual_extraction_required = False
 
 
 async def verify_installed_pack(
@@ -714,7 +715,15 @@ async def list_local_ai_jobs(
     if kind is not None:
         query = query.where(LocalAIJob.kind == kind)
     if active_only:
-        query = query.where(LocalAIJob.status.in_(_ACTIVE_JOB_STATES))
+        manual_upload_gate = exists().where(
+            UploadedFile.id == LocalAIJob.upload_id,
+            UploadedFile.user_id == user_id,
+            UploadedFile.manual_extraction_required.is_(True),
+        )
+        query = query.where(
+            LocalAIJob.status.in_(_ACTIVE_JOB_STATES),
+            ~manual_upload_gate,
+        )
     jobs = (
         (
             await db.execute(

@@ -27,6 +27,7 @@ export interface ExtractionFileStatus {
   id: string;
   filename: string;
   ingestion_status: string;
+  manual_extraction_required?: boolean;
   progress_stage?: string | null;
   progress_detail?: ProgressDetail | null;
   // Per-file OCR provider notices (fallback/unreadable). Default [] — older
@@ -34,6 +35,7 @@ export interface ExtractionFileStatus {
   notices?: OcrNotice[];
   local_run?: LocalRunInfo | null;
   local_failure?: LocalProcessingFailure | null;
+  local_job_id?: string | null;
 }
 
 /** Detailed GET /upload/{id}/status payload. */
@@ -45,6 +47,7 @@ export interface UploadStatusResponse {
   total_file_count: number;
   ingestion_progress: Record<string, unknown>;
   ingestion_errors: unknown[];
+  manual_extraction_required: boolean;
   processing_started_at: string | null;
   processing_completed_at: string | null;
   progress_stage: string | null;
@@ -52,6 +55,7 @@ export interface UploadStatusResponse {
   notices: OcrNotice[];
   local_run: LocalRunInfo | null;
   local_failure: LocalProcessingFailure | null;
+  local_job_id: string | null;
 }
 
 /** Local provenance/failure fields are intentionally content-free. */
@@ -64,8 +68,10 @@ export interface UploadHistoryItem {
   created_at: string | null;
   ingestion_progress: Record<string, unknown>;
   ingestion_errors: unknown[];
+  manual_extraction_required: boolean;
   local_run: LocalRunInfo | null;
   local_failure: LocalProcessingFailure | null;
+  local_job_id: string | null;
 }
 
 export interface UploadHistoryResponse {

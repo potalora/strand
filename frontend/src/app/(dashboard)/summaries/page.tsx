@@ -35,6 +35,7 @@ import type {
   ProcessingMode,
   SummaryModelProvenance,
 } from "@/types/local-ai";
+import { useBackgroundProcessingStore } from "@/stores/useBackgroundProcessingStore";
 
 const SUMMARY_TYPES = [
   { key: "full", label: "Full record" },
@@ -183,6 +184,7 @@ export default function SummariesPage() {
   const [result, setResult] = useState<GenerateSummaryResponse | null>(null);
   const [promptResult, setPromptResult] = useState<PromptResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [backgroundNotice, setBackgroundNotice] = useState<string | null>(null);
   const [resultTab, setResultTab] = useState("nl");
   const [copied, setCopied] = useState(false);
 
@@ -209,6 +211,7 @@ export default function SummariesPage() {
     setSettingsLoading(true);
     setSettingsError(null);
     setError(null);
+    setBackgroundNotice(null);
     setExecutionMode(null);
     setLlmSettings(null);
     setProviders([]);
@@ -432,7 +435,17 @@ export default function SummariesPage() {
             processing_mode: mode,
           };
         }
-        setResult(await api.generateSummary(body));
+        const response = await api.generateSummary(body);
+        if ("job_id" in response) {
+          useBackgroundProcessingStore
+            .getState()
+            .registerAcceptedSummary(response);
+          setBackgroundNotice(
+            "Summary is processing in the background. You can leave this page."
+          );
+        } else {
+          setResult(response);
+        }
       }
       loadHistory();
     } catch (err) {
@@ -836,6 +849,14 @@ export default function SummariesPage() {
               {error}
             </p>
           </div>
+        </div>
+      )}
+
+      {backgroundNotice && (
+        <div className="card-surface pad" role="status">
+          <p className="dim" style={{ fontSize: 13, lineHeight: 1.5, margin: 0 }}>
+            {backgroundNotice}
+          </p>
         </div>
       )}
 

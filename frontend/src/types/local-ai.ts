@@ -105,6 +105,52 @@ export interface LocalProcessingFailure {
   cloud_fallback_attempted: false;
 }
 
+export type LocalJobKind = "ingestion" | "summary";
+export type LocalJobStatus =
+  | "queued"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface LocalAIJobProgress {
+  model_role?: LocalModelRole | null;
+  page_index?: number | null;
+  page_total?: number | null;
+  worker_current?: number | null;
+  worker_total?: number | null;
+  attempt?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  splits_used?: number | null;
+}
+
+export interface LocalAIJobFailure {
+  stage: string;
+  code: string;
+  model_role?: LocalModelRole | null;
+  retryable: boolean;
+  checkpoint_preserved: boolean;
+  cloud_fallback_attempted: boolean;
+}
+
+export interface LocalAIJobResponse {
+  id: string;
+  upload_id: string | null;
+  summary_prompt_id: string | null;
+  kind: LocalJobKind;
+  processing_mode: ProcessingMode;
+  status: LocalJobStatus;
+  stage: string;
+  progress: LocalAIJobProgress | null;
+  failure: LocalAIJobFailure | null;
+  cancel_requested: boolean;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
 export interface EvidenceReference {
   id: string;
   page_number: number | null;

@@ -303,7 +303,7 @@ test("pack lifecycle helpers map to the complete operation API", async () => {
   ]);
 });
 
-test("generate summary carries its immutable mode and grounded provenance", async () => {
+test("strict summary generation returns a durable accepted job reference", async () => {
   const request = {
     patient_id: "patient-1",
     summary_type: "full",
@@ -311,38 +311,20 @@ test("generate summary carries its immutable mode and grounded provenance", asyn
     processing_mode: "validated_strict_local",
   } satisfies GenerateSummaryRequest;
   const response = {
-    id: "summary-1",
-    natural_language: "Grounded summary",
-    json_data: {},
-    record_count: 1,
-    duplicate_warning: null,
-    de_identification_report: null,
-    model_used: "Qwen/Qwen3.5-9B@0123456789abcdef",
-    generated_at: "2026-07-27T12:00:00Z",
+    id: "prompt-1",
+    job_id: "job-1",
     processing_mode: "validated_strict_local",
-    model_provenance: {
-      processing_mode: "validated_strict_local",
-      manifest_sha256: "a".repeat(64),
-      pack_revision: "apple-m4-16gb-v1",
-      model: {
-        role: "summary",
-        repository: "Qwen/Qwen3.5-9B",
-        revision: "0123456789abcdef0123456789abcdef01234567",
-        quantization: "int4",
-        runtime: { name: "mlx-vlm", version: "0.5.0" },
-      },
-    },
-    typed_response: {
-      sections: [],
-      uncertainties: [],
-    },
+    kind: "summary",
+    status: "queued",
+    stage: "queued",
+    created_at: "2026-07-27T12:00:00Z",
   } satisfies GenerateSummaryApiResponse;
   const originalFetch = globalThis.fetch;
   let posted: unknown;
   globalThis.fetch = (async (_input, init) => {
     posted = JSON.parse(String(init?.body));
     return new Response(JSON.stringify(response), {
-      status: 200,
+      status: 202,
       headers: { "Content-Type": "application/json" },
     });
   }) as typeof fetch;

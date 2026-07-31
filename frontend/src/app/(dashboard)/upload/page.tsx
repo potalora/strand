@@ -20,7 +20,6 @@ import { api, getLlmSettings, type OcrNotice } from "@/lib/api";
 import type {
   UploadResponse,
   UnstructuredUploadResponse,
-  TriggerExtractionResponse,
 } from "@/types/api";
 import { OcrNotices } from "@/components/retro/OcrNotices";
 import {
@@ -29,10 +28,12 @@ import {
   isTerminalStatus,
 } from "@/lib/extraction-progress";
 import {
+  batchIsPollable,
   statusMapFromFiles,
   useExtractionStore,
   type TrackedFileInput,
 } from "@/stores/useExtractionStore";
+import { useBackgroundProcessingStore } from "@/stores/useBackgroundProcessingStore";
 import { RetroLoadingState } from "@/components/retro/RetroLoadingState";
 import { ConfirmDialog } from "@/components/retro/ConfirmDialog";
 import { LocalProcessingDetails } from "@/components/retro/LocalProcessingDetails";
@@ -58,6 +59,17 @@ const UPLOAD_PROCESSING_MODES = new Set<ProcessingMode>([
   "validated_strict_local",
   "cloud_assisted",
 ]);
+const EXTRACTION_POLL_STATUSES = [
+  "pending_extraction",
+  "processing",
+  "completed",
+  "failed",
+  "cancelled",
+  "awaiting_confirmation",
+  "awaiting_review",
+  "completed_with_merges",
+  "dedup_scanning",
+];
 
 function uploadBlockedModeLabel(mode: ProcessingMode): string {
   if (mode === "custom_local") return "Custom local (unverified)";
@@ -123,7 +135,7 @@ interface UploadHistoryItem {
   filename: string;
   ingestion_status: string;
   records_inserted?: number;
-  created_at: string;
+  created_at: string | null;
   file_category?: string;
   record_count?: number;
   ingestion_progress?: {
@@ -140,6 +152,8 @@ interface UploadHistoryItem {
   notices?: OcrNotice[];
   local_run?: LocalRunInfo | null;
   local_failure?: LocalProcessingFailure | null;
+  local_job_id?: string | null;
+  manual_extraction_required: boolean;
 }
 
 function statusLabel(status: string): string {
@@ -262,6 +276,9 @@ export default function UploadPage() {
   const [deleteTarget, setDeleteTarget] = useState<UploadHistoryItem | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [historyActionError, setHistoryActionError] = useState<string | null>(
+    null
+  );
 
   // --- Current extraction batch (shared with the global status bar) ---
   // The store is the single source of truth: starting a batch RESETS the prior
@@ -278,6 +295,49 @@ export default function UploadPage() {
   const markTriggered = useExtractionStore((s) => s.markTriggered);
   const markCancelling = useExtractionStore((s) => s.markCancelling);
   const dismissBatch = useExtractionStore((s) => s.dismiss);
+
+  const pollableBatch = batchIsPollable(files);
+  const batchKey = batchIds.join(",");
+  useEffect(() => {
+    if (!pollableBatch || batchKey === "" || dismissed) return;
+    let mounted = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = async () => {
+      try {
+        const [nextProgress, statuses] = await Promise.all([
+          api.getExtractionProgress(batchIds),
+          api.getExtractionFileStatuses(EXTRACTION_POLL_STATUSES),
+        ]);
+        if (!mounted) return;
+        useExtractionStore.getState().setProgress(nextProgress);
+        mergeFileStatuses(
+          statuses.files.map((file) => ({
+            id: file.id,
+            ingestion_status: file.ingestion_status,
+            progress_stage: file.progress_stage,
+            progress_detail: file.progress_detail,
+            local_run: file.local_run,
+            local_failure: file.local_failure,
+          }))
+        );
+      } catch {
+        // Keep the last server state visible and retry after the interval.
+      } finally {
+        if (mounted) timer = setTimeout(() => void tick(), 2000);
+      }
+    };
+    void tick();
+    return () => {
+      mounted = false;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [
+    batchIds,
+    batchKey,
+    dismissed,
+    mergeFileStatuses,
+    pollableBatch,
+  ]);
 
   // ZIP-extracted children that still need a manual Extract click.
   const [selectedForExtraction, setSelectedForExtraction] = useState<Set<string>>(
@@ -307,10 +367,8 @@ export default function UploadPage() {
   const fetchHistory = useCallback(async () => {
     setHistoryLoading(true);
     try {
-      const data = await api.get<{ items: UploadHistoryItem[]; total: number }>(
-        "/upload/history"
-      );
-      setHistory(data.items || []);
+      const data = await api.getUploadHistory();
+      setHistory((data.items || []) as unknown as UploadHistoryItem[]);
       setHistoryLoaded(true);
     } catch {
       setHistory([]);
@@ -434,7 +492,7 @@ export default function UploadPage() {
               upload_id: u.upload_id,
               filename: u.filename,
               status: u.status || "pending_extraction",
-              needsTrigger: true,
+              needsTrigger: u.manual_extraction_required === true,
             });
           }
         }
@@ -463,7 +521,7 @@ export default function UploadPage() {
           upload_id: resp.upload_id,
           filename: file.name,
           status: resp.status || "pending_extraction",
-          needsTrigger: false,
+          needsTrigger: resp.manual_extraction_required === true,
         });
       } catch (err) {
         results.push({
@@ -490,7 +548,7 @@ export default function UploadPage() {
             upload_id: upload.upload_id,
             filename,
             status: upload.status || "pending_extraction",
-            needsTrigger: false,
+            needsTrigger: upload.manual_extraction_required === true,
           });
         }
       } catch (err) {
@@ -509,6 +567,17 @@ export default function UploadPage() {
     if (batchInputs.length > 0) {
       startBatch(batchInputs);
       setSelectedForExtraction(new Set());
+      const labels = Object.fromEntries(
+        batchInputs.map((input) => [input.upload_id, input.filename])
+      );
+      try {
+        const serverJobs = await api.getLocalAIJobs(true);
+        const background = useBackgroundProcessingStore.getState();
+        background.applyServerJobs(serverJobs);
+        background.registerUploadLabels(labels);
+      } catch {
+        // The authenticated monitor will discover durable jobs on its next load.
+      }
     }
 
     setUploadResults(results);
@@ -521,21 +590,47 @@ export default function UploadPage() {
   const handleTriggerExtraction = useCallback(async () => {
     if (selectedForExtraction.size === 0) return;
     const ids = Array.from(selectedForExtraction);
-    // Optimistically reflect the trigger; polling refines from here.
-    markTriggered(ids);
-    mergeFileStatuses(ids.map((id) => ({ id, ingestion_status: "processing" })));
+    setUploadError(null);
     try {
-      const resp = await api.post<TriggerExtractionResponse>(
-        "/upload/trigger-extraction",
-        { upload_ids: ids }
-      );
+      const resp = await api.triggerExtraction(ids);
+      const accepted = resp.results
+        .filter((result) => result.status === "pending_extraction")
+        .map((result) => result.upload_id);
+      if (accepted.length === 0) {
+        throw new Error("The selected files are not available for extraction.");
+      }
+      markTriggered(accepted);
       mergeFileStatuses(
         resp.results.map((r) => ({ id: r.upload_id, ingestion_status: r.status }))
       );
-    } catch {
-      /* the file stays tracked; the next poll reflects reality */
+      const serverJobs = await api.getLocalAIJobs(true);
+      const background = useBackgroundProcessingStore.getState();
+      background.applyServerJobs(serverJobs);
+      background.registerUploadLabels(
+        Object.fromEntries(
+          accepted
+            .map((id) => files[id])
+            .filter((file) => file !== undefined)
+            .map((file) => [file.upload_id, file.filename])
+        )
+      );
+      setSelectedForExtraction(
+        (current) =>
+          new Set([...current].filter((id) => !accepted.includes(id)))
+      );
+      if (resp.failed > 0) {
+        setUploadError(
+          `${resp.failed} selected file${resp.failed === 1 ? "" : "s"} could not be started.`
+        );
+      }
+    } catch (error) {
+      setUploadError(
+        error instanceof Error
+          ? error.message
+          : "Extraction could not be started."
+      );
     }
-  }, [selectedForExtraction, markTriggered, mergeFileStatuses]);
+  }, [selectedForExtraction, markTriggered, mergeFileStatuses, files]);
 
   // --- Cancel in-flight extractions ---
   const handleCancel = useCallback(
@@ -564,33 +659,79 @@ export default function UploadPage() {
         status: "processing",
         needsTrigger: false,
       }));
-      await api.post<TriggerExtractionResponse>("/upload/trigger-extraction", {
-        upload_ids: inputs.map((f) => f.upload_id),
-      });
-      startBatch(inputs);
-    } catch {
-      /* silently fail */
+      const triggered = await api.triggerExtraction(
+        inputs.map((input) => input.upload_id)
+      );
+      const acceptedIds = new Set(
+        triggered.results
+          .filter((result) => result.status === "pending_extraction")
+          .map((result) => result.upload_id)
+      );
+      const accepted = inputs.filter((input) =>
+        acceptedIds.has(input.upload_id)
+      );
+      if (accepted.length > 0) startBatch(accepted);
+      if (triggered.failed > 0 || accepted.length === 0) {
+        setUploadError("Some failed extractions could not be retried.");
+      }
+    } catch (error) {
+      setUploadError(
+        error instanceof Error ? error.message : "Retry could not be started."
+      );
     }
   }, [startBatch]);
 
   // --- Retry / extract a single history row ---
   const handleHistoryExtract = useCallback(
     async (upload: UploadHistoryItem) => {
+      setHistoryActionError(null);
       try {
-        await api.post<TriggerExtractionResponse>("/upload/trigger-extraction", {
-          upload_ids: [upload.id],
-        });
+        if (
+          upload.local_run?.privacy_mode === "validated_strict_local" &&
+          upload.ingestion_status === "failed"
+        ) {
+          if (
+            !upload.local_job_id ||
+            upload.local_failure?.retryable !== true
+          ) {
+            throw new Error("This background job cannot be retried.");
+          }
+          const retried = await api.retryLocalAIJob(upload.local_job_id);
+          useBackgroundProcessingStore.getState().applyServerJobs([retried]);
+        } else {
+          const response = await api.triggerExtraction([upload.id]);
+          const result = response.results.find(
+            (item) => item.upload_id === upload.id
+          );
+          if (
+            response.failed > 0 ||
+            result?.status !== "pending_extraction"
+          ) {
+            throw new Error("This file is not available for extraction.");
+          }
+          const serverJobs = await api.getLocalAIJobs(true);
+          useBackgroundProcessingStore
+            .getState()
+            .applyServerJobs(serverJobs);
+        }
+        useBackgroundProcessingStore
+          .getState()
+          .registerUploadLabels({ [upload.id]: upload.filename });
         startBatch([
           {
             upload_id: upload.id,
             filename: upload.filename,
-            status: "processing",
+            status: "pending_extraction",
             needsTrigger: false,
           },
         ]);
         setHistoryLoaded(false);
-      } catch {
-        /* silently fail */
+      } catch (error) {
+        setHistoryActionError(
+          error instanceof Error
+            ? error.message
+            : "The extraction action could not be completed."
+        );
       }
     },
     [startBatch]
@@ -1311,13 +1452,13 @@ export default function UploadPage() {
 
         {historyOpen && (
           <div style={{ padding: "0 22px 22px" }}>
-            {deleteError && (
+            {(deleteError || historyActionError) && (
               <div
                 className="tag"
                 style={{ color: "var(--danger)", marginBottom: 12 }}
               >
                 <span className="tdot" style={{ background: "var(--danger)" }} />
-                {deleteError}
+                {deleteError || historyActionError}
               </div>
             )}
             {historyLoading ? (
@@ -1343,6 +1484,21 @@ export default function UploadPage() {
                     {history.map((upload) => {
                       const ext =
                         upload.filename.split(".").pop()?.toLowerCase() || "—";
+                      const canExtract =
+                        upload.ingestion_status === "pending_extraction" &&
+                        upload.manual_extraction_required === true;
+                      const canRetryStrict =
+                        upload.ingestion_status === "failed" &&
+                        upload.local_run?.privacy_mode ===
+                          "validated_strict_local" &&
+                        typeof upload.local_job_id === "string" &&
+                        upload.local_failure?.retryable === true;
+                      const canRetryNonStrict =
+                        upload.ingestion_status === "failed" &&
+                        upload.local_run?.privacy_mode !==
+                          "validated_strict_local";
+                      const showExtractionAction =
+                        canExtract || canRetryStrict || canRetryNonStrict;
                       return (
                         <tr key={upload.id}>
                           <td className="desc">
@@ -1402,9 +1558,7 @@ export default function UploadPage() {
                                 gap: 8,
                               }}
                             >
-                              {(upload.ingestion_status === "pending_extraction" ||
-                                upload.ingestion_status === "failed" ||
-                                upload.ingestion_status === "processing") && (
+                              {showExtractionAction && (
                                 <button
                                   className="btn ghost sm"
                                   onClick={(e: React.MouseEvent) => {
@@ -1413,7 +1567,9 @@ export default function UploadPage() {
                                   }}
                                 >
                                   <RotateCcw size={13} />
-                                  {upload.ingestion_status === "failed" ? "Retry" : "Extract"}
+                                  {upload.ingestion_status === "failed"
+                                    ? "Retry"
+                                    : "Extract"}
                                 </button>
                               )}
                               <button

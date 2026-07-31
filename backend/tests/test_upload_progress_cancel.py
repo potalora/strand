@@ -693,6 +693,15 @@ async def test_status_payload_exposes_typed_strict_local_failure(
     )
     assert payload["local_failure"] == job.failure
     assert payload["local_failure"]["cloud_fallback_attempted"] is False
+    assert payload["local_job_id"] == str(job.id)
+
+    history = await client.get("/api/v1/upload/history", headers=headers)
+    assert history.status_code == 200
+    history_item = next(
+        item for item in history.json()["items"] if item["id"] == str(upload.id)
+    )
+    assert history_item["local_job_id"] == str(job.id)
+    assert history_item["local_failure"]["retryable"] is False
 
 
 @pytest.mark.asyncio

@@ -60,6 +60,12 @@ class UploadedFile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     file_category: Mapped[str] = mapped_column(
         Text, default="structured", server_default="structured"
     )
+    # Mixed-ZIP children are staged for explicit user confirmation. The
+    # extraction worker excludes them until trigger-extraction clears this
+    # durable flag in the same locked transaction.
+    manual_extraction_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
     processing_mode: Mapped[str] = mapped_column(
         String(32),
         nullable=False,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -31,12 +32,19 @@ class LocalProcessingFailure(BaseModel):
     cloud_fallback_attempted: Literal[False] = False
 
 
+class UnstructuredUploadItem(BaseModel):
+    upload_id: str
+    filename: str
+    status: str
+    manual_extraction_required: bool
+
+
 class UploadResponse(BaseModel):
     upload_id: str
     status: str
     records_inserted: int
     errors: list[Any] = []
-    unstructured_uploads: list[dict] = []
+    unstructured_uploads: list[UnstructuredUploadItem] = Field(default_factory=list)
 
 
 class UploadStatusResponse(BaseModel):
@@ -47,6 +55,7 @@ class UploadStatusResponse(BaseModel):
     total_file_count: int = 1
     ingestion_progress: dict = {}
     ingestion_errors: list[Any] = []
+    manual_extraction_required: bool = False
     processing_started_at: datetime | None = None
     processing_completed_at: datetime | None = None
     # Section-level extraction progress (unstructured pipeline).
@@ -56,6 +65,7 @@ class UploadStatusResponse(BaseModel):
     notices: list[Any] = []
     local_run: LocalRunInfo | None = None
     local_failure: LocalProcessingFailure | None = None
+    local_job_id: str | None = None
 
 
 class UploadHistoryItem(BaseModel):
@@ -67,8 +77,10 @@ class UploadHistoryItem(BaseModel):
     created_at: str | None = None
     ingestion_progress: dict = {}
     ingestion_errors: list[Any] = []
+    manual_extraction_required: bool = False
     local_run: LocalRunInfo | None = None
     local_failure: LocalProcessingFailure | None = None
+    local_job_id: str | None = None
 
 
 class UploadHistoryResponse(BaseModel):
@@ -80,6 +92,7 @@ class UnstructuredUploadResponse(BaseModel):
     upload_id: str
     status: str
     file_type: str
+    manual_extraction_required: bool = False
 
 
 class ExtractedEntitySchema(BaseModel):
@@ -114,7 +127,7 @@ class ConfirmExtractionRequest(BaseModel):
 
 
 class TriggerExtractionRequest(BaseModel):
-    upload_ids: list[str]
+    upload_ids: list[UUID]
 
 
 class PendingExtractionFile(BaseModel):
@@ -125,6 +138,7 @@ class PendingExtractionFile(BaseModel):
     file_size_bytes: int | None = None
     created_at: str | None = None
     ingestion_status: str | None = None
+    manual_extraction_required: bool = False
     # Section-level extraction progress (unstructured pipeline).
     progress_stage: str | None = None
     progress_detail: dict | None = None
@@ -132,6 +146,7 @@ class PendingExtractionFile(BaseModel):
     notices: list[Any] = []
     local_run: LocalRunInfo | None = None
     local_failure: LocalProcessingFailure | None = None
+    local_job_id: str | None = None
 
 
 class CancelExtractionRequest(BaseModel):

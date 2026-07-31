@@ -65,6 +65,7 @@ async def _add_staging_row(
         storage_path=str(storage_path),
         ingestion_status=STAGING_EXTRACTION_STATUS,
         file_category="unstructured",
+        manual_extraction_required=True,
     )
     db.add(row)
     await db.commit()
@@ -282,6 +283,7 @@ async def test_reconcile_crash_before_set_rename(
 
     assert result.recovered_groups == 1
     assert row.ingestion_status == "pending_extraction"
+    assert row.manual_extraction_required is True
     assert final.is_dir()
     assert not pending.exists()
     assert (final / "child.pdf").is_file()
@@ -310,6 +312,7 @@ async def test_reconcile_crash_after_set_rename_before_status_commit_is_idempote
     assert second.recovered_groups == 0
     assert second.failed_groups == 0
     assert row.ingestion_status == "pending_extraction"
+    assert row.manual_extraction_required is True
     assert (final / "child.pdf").is_file()
 
 
@@ -321,9 +324,7 @@ async def test_reconcile_invalid_group_fails_all_rows_without_phi_in_error(
     db_session: AsyncSession,
     tmp_path: Path,
 ) -> None:
-    _, user_text = await auth_headers(
-        client, f"zip-recover-{failure_kind}@example.com"
-    )
+    _, user_text = await auth_headers(client, f"zip-recover-{failure_kind}@example.com")
     user_id = UUID(user_text)
     upload_root = tmp_path / "uploads"
     final_name, pending_name = _set_names()
@@ -381,9 +382,7 @@ async def test_reconcile_removes_valid_orphan_set(
 ) -> None:
     upload_root = tmp_path / "uploads"
     final_name, pending_name = _set_names()
-    orphan = upload_root / (
-        pending_name if directory_kind == "pending" else final_name
-    )
+    orphan = upload_root / (pending_name if directory_kind == "pending" else final_name)
     orphan.mkdir(mode=0o700, parents=True)
     _write_encrypted(orphan / "orphan.pdf")
 
@@ -530,18 +529,22 @@ async def test_mixed_zip_rows_are_nonclaimable_until_atomic_set_publish(
     )
 
     original_commit = db_session.commit
-    snapshots: list[tuple[set[str], bool, bool]] = []
+    snapshots: list[tuple[set[str], set[bool], bool, bool]] = []
 
     async def observing_commit() -> None:
         await original_commit()
         rows = (
-            await db_session.execute(
-                select(UploadedFile).where(
-                    UploadedFile.user_id == user_id,
-                    UploadedFile.file_category == "unstructured",
+            (
+                await db_session.execute(
+                    select(UploadedFile).where(
+                        UploadedFile.user_id == user_id,
+                        UploadedFile.file_category == "unstructured",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         if not rows:
             return
         final_parent = Path(rows[0].storage_path).parent
@@ -549,6 +552,7 @@ async def test_mixed_zip_rows_are_nonclaimable_until_atomic_set_publish(
         snapshots.append(
             (
                 {row.ingestion_status for row in rows},
+                {row.manual_extraction_required for row in rows},
                 pending.is_dir(),
                 final_parent.is_dir(),
             )
@@ -565,20 +569,29 @@ async def test_mixed_zip_rows_are_nonclaimable_until_atomic_set_publish(
     )
 
     assert len(result["unstructured_files"]) == 2
+    assert all(
+        child["manual_extraction_required"] is True
+        for child in result["unstructured_files"]
+    )
     assert snapshots == [
-        ({STAGING_EXTRACTION_STATUS}, True, False),
-        ({"pending_extraction"}, False, True),
+        ({STAGING_EXTRACTION_STATUS}, {True}, True, False),
+        ({"pending_extraction"}, {True}, False, True),
     ]
     rows = (
-        await db_session.execute(
-            select(UploadedFile).where(
-                UploadedFile.user_id == user_id,
-                UploadedFile.file_category == "unstructured",
+        (
+            await db_session.execute(
+                select(UploadedFile).where(
+                    UploadedFile.user_id == user_id,
+                    UploadedFile.file_category == "unstructured",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len({Path(row.storage_path).parent for row in rows}) == 1
     assert all(Path(row.storage_path).is_file() for row in rows)
+    assert all(row.manual_extraction_required is True for row in rows)
 
 
 @pytest.mark.asyncio
@@ -630,13 +643,17 @@ async def test_publication_failure_leaves_whole_group_staging_and_parent_writabl
         )
 
     rows = (
-        await db_session.execute(
-            select(UploadedFile).where(
-                UploadedFile.user_id == user_id,
-                UploadedFile.file_category == "unstructured",
+        (
+            await db_session.execute(
+                select(UploadedFile).where(
+                    UploadedFile.user_id == user_id,
+                    UploadedFile.file_category == "unstructured",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert rows
     assert {row.ingestion_status for row in rows} == {STAGING_EXTRACTION_STATUS}
     assert not Path(rows[0].storage_path).parent.exists()
@@ -703,13 +720,17 @@ async def test_status_commit_failure_leaves_published_group_recoverable(
         )
 
     rows = (
-        await db_session.execute(
-            select(UploadedFile).where(
-                UploadedFile.user_id == user_id,
-                UploadedFile.file_category == "unstructured",
+        (
+            await db_session.execute(
+                select(UploadedFile).where(
+                    UploadedFile.user_id == user_id,
+                    UploadedFile.file_category == "unstructured",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert {row.ingestion_status for row in rows} == {STAGING_EXTRACTION_STATUS}
     assert all(Path(row.storage_path).is_file() for row in rows)
 
@@ -719,3 +740,4 @@ async def test_status_commit_failure_leaves_published_group_recoverable(
         await db_session.refresh(row)
     assert recovery.recovered_groups == 1
     assert {row.ingestion_status for row in rows} == {"pending_extraction"}
+    assert {row.manual_extraction_required for row in rows} == {True}

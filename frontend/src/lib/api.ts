@@ -7,15 +7,18 @@ import type {
 import type {
   CancelExtractionResponse,
   ExtractionFileStatus,
+  UploadHistoryResponse,
 } from "@/types/upload";
 import type {
   LocalModelRole,
+  LocalAIJobResponse,
   LocalPackOperation,
   LocalPackOperationCreated,
   LocalPackStatus,
   ProcessingMode,
   RecordExtractionProvenance,
 } from "@/types/local-ai";
+import type { TriggerExtractionResponse } from "@/types/api";
 import {
   parseLocalRunInfo,
   parseRecordExtractionProvenance,
@@ -182,7 +185,11 @@ class ApiClient {
 
     if (!response.ok) {
       const error = await response.json().catch(() => ({ detail: "Request failed" }));
-      throw new ApiError(response.status, error.detail || "Request failed");
+      const detail =
+        typeof error?.detail === "string" && error.detail.trim()
+          ? error.detail
+          : "Request failed";
+      throw new ApiError(response.status, detail);
     }
 
     if (response.status === 204) {
@@ -292,6 +299,44 @@ class ApiClient {
     uploadIds: string[]
   ): Promise<CancelExtractionResponse> {
     return this.post<CancelExtractionResponse>("/upload/cancel", {
+      upload_ids: uploadIds,
+    });
+  }
+
+  async getLocalAIJobs(
+    activeOnly = false
+  ): Promise<LocalAIJobResponse[]> {
+    return this.get<LocalAIJobResponse[]>(
+      `/local-ai/jobs?active_only=${activeOnly ? "true" : "false"}`
+    );
+  }
+
+  async getLocalAIJob(id: string): Promise<LocalAIJobResponse> {
+    return this.get<LocalAIJobResponse>(
+      `/local-ai/jobs/${encodeURIComponent(id)}`
+    );
+  }
+
+  async cancelLocalAIJob(id: string): Promise<LocalAIJobResponse> {
+    return this.post<LocalAIJobResponse>(
+      `/local-ai/jobs/${encodeURIComponent(id)}/cancel`
+    );
+  }
+
+  async retryLocalAIJob(id: string): Promise<LocalAIJobResponse> {
+    return this.post<LocalAIJobResponse>(
+      `/local-ai/jobs/${encodeURIComponent(id)}/retry`
+    );
+  }
+
+  async getUploadHistory(): Promise<UploadHistoryResponse> {
+    return this.get<UploadHistoryResponse>("/upload/history");
+  }
+
+  async triggerExtraction(
+    uploadIds: string[]
+  ): Promise<TriggerExtractionResponse> {
+    return this.post<TriggerExtractionResponse>("/upload/trigger-extraction", {
       upload_ids: uploadIds,
     });
   }

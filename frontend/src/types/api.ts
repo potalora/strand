@@ -4,7 +4,6 @@ import type {
   GroundedSummaryDocument,
   ProcessingMode,
   SummaryModelProvenance,
-  StrictLocalSummaryModelProvenance,
 } from "@/types/local-ai";
 
 export interface TokenResponse {
@@ -124,7 +123,12 @@ export interface UploadResponse {
   status: string;
   records_inserted: number;
   errors: unknown[];
-  unstructured_uploads?: { upload_id: string; filename: string; status: string }[];
+  unstructured_uploads?: {
+    upload_id: string;
+    filename: string;
+    status: string;
+    manual_extraction_required: boolean;
+  }[];
 }
 
 export interface PendingExtractionFile {
@@ -134,6 +138,7 @@ export interface PendingExtractionFile {
   file_category: string;
   file_size_bytes: number | null;
   created_at: string | null;
+  manual_extraction_required: boolean;
 }
 
 export interface TriggerExtractionResponse {
@@ -215,6 +220,7 @@ export interface UnstructuredUploadResponse {
   upload_id: string;
   status: string;
   file_type: string;
+  manual_extraction_required: boolean;
 }
 
 export interface DuplicateWarning {
@@ -285,12 +291,18 @@ export type GenerateSummaryResponse = GenerateSummaryResponseBase & {
   model_provenance?: SummaryModelProvenance | null;
 };
 
+export interface StrictLocalSummaryAccepted {
+  id: string;
+  job_id: string;
+  processing_mode: "validated_strict_local";
+  kind: "summary";
+  status: "queued";
+  stage: string;
+  created_at: string;
+}
+
 export type GenerateSummaryApiResponse =
-  | (GenerateSummaryResponseBase & {
-      processing_mode: "validated_strict_local";
-      model_provenance: StrictLocalSummaryModelProvenance | null;
-      typed_response: GroundedSummaryDocument;
-    })
+  | StrictLocalSummaryAccepted
   | (GenerateSummaryResponseBase & {
       processing_mode: "custom_local";
       model_provenance: CustomLocalSummaryModelProvenance | null;

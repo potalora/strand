@@ -39,6 +39,8 @@ from app.schemas.upload import (
     LocalRunInfo,
     PendingExtractionFile,
     ReprocessUploadRequest,
+    TriggerExtractionRequest,
+    TriggerExtractionResponse,
     UnstructuredUploadResponse,
     UploadHistoryResponse,
     UploadResponse,
@@ -217,6 +219,7 @@ async def _claim_pending_files(
                     "FROM uploaded_files "
                     "WHERE ingestion_status = 'pending_extraction' "
                     "AND file_category = 'unstructured' "
+                    "AND manual_extraction_required = false "
                     "AND (:allow_strict "
                     "OR processing_mode != 'validated_strict_local') "
                     "ORDER BY created_at ASC "
@@ -986,11 +989,15 @@ async def get_pending_extractions(
                 file_size_bytes=file.file_size_bytes,
                 created_at=file.created_at.isoformat() if file.created_at else None,
                 ingestion_status=file.ingestion_status,
+                manual_extraction_required=file.manual_extraction_required,
                 progress_stage=file.progress_stage,
                 progress_detail=file.progress_detail,
                 notices=file.notices or [],
                 local_run=local_run,
                 local_failure=local_failure,
+                local_job_id=(
+                    str(local_jobs[file.id].id) if file.id in local_jobs else None
+                ),
             ).model_dump()
         )
 
@@ -1196,18 +1203,16 @@ async def cancel_extraction(
     return CancelExtractionResponse(cancelled=cancelled, skipped=skipped)
 
 
-@router.post("/trigger-extraction")
+@router.post("/trigger-extraction", response_model=TriggerExtractionResponse)
 async def trigger_extraction(
-    body: dict,
+    body: TriggerExtractionRequest,
     user_id: UUID = Depends(get_authenticated_user_id),
     db: AsyncSession = Depends(get_db),
-) -> dict:
+) -> TriggerExtractionResponse:
     """Trigger text+entity extraction for pending unstructured files."""
     from app.models.local_ai import LocalAIJob
-    from app.schemas.upload import TriggerExtractionRequest
 
-    req = TriggerExtractionRequest(**body)
-    upload_ids = [UUID(uid) for uid in req.upload_ids]
+    upload_ids = body.upload_ids
 
     # Bulk fetch only uploads owned by this user (HIPAA: row-level security)
     result = await db.execute(
@@ -1285,6 +1290,35 @@ async def trigger_extraction(
                 continue
             triggered.append(upload)
             continue
+        if status_ == "pending_extraction":
+            if not upload.manual_extraction_required:
+                failed.append(
+                    {
+                        "upload_id": str(uid),
+                        "status": "manual_extraction_not_required",
+                    }
+                )
+                continue
+            if upload.processing_mode == ProcessingMode.VALIDATED_STRICT_LOCAL.value:
+                if strict_job is None:
+                    failed.append(
+                        {
+                            "upload_id": str(uid),
+                            "status": "strict_job_unavailable",
+                        }
+                    )
+                    continue
+                if strict_job.status != "queued" or strict_job.cancel_requested:
+                    failed.append(
+                        {
+                            "upload_id": str(uid),
+                            "status": "strict_job_not_queued",
+                        }
+                    )
+                    continue
+            upload.manual_extraction_required = False
+            triggered.append(upload)
+            continue
         if status_ == "processing":
             heartbeat = (
                 strict_job.updated_at
@@ -1316,7 +1350,7 @@ async def trigger_extraction(
                 failed.append({"upload_id": str(uid), "status": "processing"})
                 continue
             upload.ingestion_status = "pending_extraction"
-        elif status_ in ("pending_extraction", "failed", "awaiting_confirmation"):
+        elif status_ in ("failed", "awaiting_confirmation"):
             # The DB-polling worker picks up pending_extraction automatically.
             if status_ in ("failed", "awaiting_confirmation"):
                 if (
@@ -1332,6 +1366,7 @@ async def trigger_extraction(
                     )
                     continue
                 upload.ingestion_status = "pending_extraction"
+                upload.manual_extraction_required = False
         else:
             failed.append({"upload_id": str(uid), "status": status_})
             continue
@@ -1349,14 +1384,15 @@ async def trigger_extraction(
         details={"triggered": len(triggered), "failed": len(failed)},
     )
 
-    return {
-        "triggered": len(triggered),
-        "failed": len(failed),
-        "results": [
-            {"upload_id": str(u.id), "status": "pending_extraction"} for u in triggered
+    return TriggerExtractionResponse(
+        triggered=len(triggered),
+        failed=len(failed),
+        results=[
+            {"upload_id": str(upload.id), "status": "pending_extraction"}
+            for upload in triggered
         ]
         + failed,
-    }
+    )
 
 
 @router.get("/{upload_id}/status", response_model=UploadStatusResponse)
@@ -1386,6 +1422,7 @@ async def get_upload_status(
         total_file_count=upload.total_file_count or 1,
         ingestion_progress=upload.ingestion_progress or {},
         ingestion_errors=upload.ingestion_errors or [],
+        manual_extraction_required=upload.manual_extraction_required,
         processing_started_at=upload.processing_started_at,
         processing_completed_at=upload.processing_completed_at,
         progress_stage=upload.progress_stage,
@@ -1393,6 +1430,7 @@ async def get_upload_status(
         notices=upload.notices or [],
         local_run=local_run,
         local_failure=local_failure,
+        local_job_id=str(local_jobs[upload.id].id) if upload.id in local_jobs else None,
     )
 
 
@@ -1446,8 +1484,12 @@ async def get_upload_history(
                 "created_at": u.created_at.isoformat() if u.created_at else None,
                 "ingestion_progress": u.ingestion_progress or {},
                 "ingestion_errors": u.ingestion_errors or [],
+                "manual_extraction_required": u.manual_extraction_required,
                 "local_run": local_run,
                 "local_failure": local_failure,
+                "local_job_id": (
+                    str(local_jobs[u.id].id) if u.id in local_jobs else None
+                ),
             }
         )
 

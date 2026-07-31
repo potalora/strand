@@ -801,6 +801,7 @@ async def _ingest_zip(
                             storage_path=str(dest_path),
                             ingestion_status=STAGING_EXTRACTION_STATUS,
                             file_category="unstructured",
+                            manual_extraction_required=True,
                             processing_mode=parent_upload.processing_mode,
                             processing_manifest=copy.deepcopy(
                                 parent_upload.processing_manifest
@@ -818,6 +819,7 @@ async def _ingest_zip(
                                 "upload_id": str(unstr_upload.id),
                                 "filename": uf.name,
                                 "status": "pending_extraction",
+                                "manual_extraction_required": True,
                             }
                         )
                     except Exception as e:
