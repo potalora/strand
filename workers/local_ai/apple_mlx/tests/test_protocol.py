@@ -8,6 +8,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from PIL import Image
@@ -153,6 +154,76 @@ def _summary_payload() -> dict[str, object]:
         ],
         "safety_rules": SAFETY_RULES,
     }
+
+
+def _maximal_summary_reference() -> dict[str, object]:
+    payload = _summary_payload()
+    fact = payload["facts"][0]  # type: ignore[index]
+    evidence = payload["evidence"][0]  # type: ignore[index]
+    uncertainty = payload["uncertainty_labels"][0]  # type: ignore[index]
+    return {
+        "sections": [
+            {
+                "heading": "Medications",
+                "claims": [
+                    {
+                        "fact_id": fact["fact_id"],
+                        "field_paths": ["/name"],
+                        "evidence_ids": [evidence["evidence_id"]],
+                    }
+                ],
+            }
+        ],
+        "uncertainties": [
+            {
+                "uncertainty_id": uncertainty["uncertainty_id"],
+                "fact_ids": uncertainty["fact_ids"],
+                "evidence_ids": uncertainty["evidence_ids"],
+            }
+        ],
+    }
+
+
+def test_summary_reference_token_count_uses_processor_without_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_mlx_worker import qwen_summary
+
+    model_loader = Mock(side_effect=AssertionError("model weights loaded"))
+    processor_loader = Mock(return_value=_Processor())
+    monkeypatch.setattr(qwen_summary, "load_role_from_payload", model_loader)
+    reference = _maximal_summary_reference()
+
+    result = qwen_summary.count_summary_reference_tokens(
+        {"reference_document": reference},
+        processor_loader=processor_loader,
+    )
+
+    compact = json.dumps(
+        reference,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert result == {"token_count": len(compact)}
+    processor_loader.assert_called_once()
+    model_loader.assert_not_called()
+
+
+def test_malformed_summary_reference_never_loads_tokenizer() -> None:
+    from local_ai_mlx_worker.qwen_summary import count_summary_reference_tokens
+
+    processor_loader = Mock(side_effect=AssertionError("tokenizer loaded"))
+    reference = _maximal_summary_reference()
+    del reference["sections"][0]["claims"][0]["field_paths"]  # type: ignore[index]
+
+    with pytest.raises(Exception, match="invalid"):
+        count_summary_reference_tokens(
+            {"reference_document": reference},
+            processor_loader=processor_loader,
+        )
+
+    processor_loader.assert_not_called()
 
 
 def _replace_summary_fact_content(

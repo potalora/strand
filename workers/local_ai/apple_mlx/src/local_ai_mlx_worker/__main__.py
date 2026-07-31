@@ -23,14 +23,24 @@ from .common import (
 )
 from .nuextract3 import run_extraction
 from .ovisocr2 import run_ocr
-from .qwen_summary import run_summary
+from .qwen_summary import count_summary_reference_tokens, run_summary
 
 PROTOCOL_VERSION = 1
 RUNTIME = "mlx-vlm-0.5.0"
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_EXTRACTION_ACTIVITY = 2**63 - 1
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-COMMANDS = frozenset({"health", "ocr", "extract", "summarize", "cancel", "shutdown"})
+COMMANDS = frozenset(
+    {
+        "health",
+        "ocr",
+        "extract",
+        "summarize",
+        "count_summary_tokens",
+        "cancel",
+        "shutdown",
+    }
+)
 SAFE_MESSAGES = {
     "cancelled": "Local worker cancelled.",
     "generation_failed": "Local worker generation failed.",
@@ -242,6 +252,8 @@ def _dispatch(
         )
     if request.command == "summarize":
         return run_summary(request.payload)
+    if request.command == "count_summary_tokens":
+        return count_summary_reference_tokens(request.payload)
     raise WorkerInputError("Local worker command is invalid.")
 
 

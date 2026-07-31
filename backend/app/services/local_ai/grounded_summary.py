@@ -2474,6 +2474,70 @@ def _expected_fact_heading(fact: GroundedSummaryFact) -> SummaryHeading:
     return _RECORD_TYPE_HEADINGS.get(record_type, "Other records")
 
 
+def build_maximal_reference_document(
+    summary_input: GroundedSummaryInput,
+) -> GroundedSummaryDocument:
+    """Build the deterministic largest output allowed by the grounding registry."""
+
+    evidence = {item.evidence_id: item for item in summary_input.evidence}
+    claims_by_heading: dict[SummaryHeading, list[GroundedClaim]] = {}
+    for fact in sorted(summary_input.facts, key=lambda item: item.fact_id):
+        linked = [evidence[item] for item in fact.evidence_ids]
+        supported_paths = sorted(
+            {
+                path
+                for item in linked
+                for path in item.field_paths
+                if any(field.path == path for field in fact.fields)
+            }
+        )
+        if not supported_paths:
+            raise LocalValidationError("Summary fact has no grounded output fields.")
+        evidence_ids = tuple(
+            sorted(
+                item.evidence_id
+                for item in linked
+                if set(item.field_paths).intersection(supported_paths)
+            )
+        )
+        heading = _expected_fact_heading(fact)
+        claims_by_heading.setdefault(heading, []).append(
+            GroundedClaim(
+                fact_id=fact.fact_id,
+                field_paths=tuple(supported_paths),
+                evidence_ids=evidence_ids,
+            )
+        )
+
+    sections = tuple(
+        GroundedSection(
+            heading=heading,
+            claims=tuple(claims_by_heading[heading]),
+        )
+        for heading in sorted(claims_by_heading)
+    )
+    uncertainties = tuple(
+        GroundedUncertaintyReference(
+            uncertainty_id=item.uncertainty_id,
+            fact_ids=item.fact_ids,
+            evidence_ids=item.evidence_ids,
+        )
+        for item in sorted(
+            summary_input.uncertainty_labels,
+            key=lambda item: item.uncertainty_id,
+        )
+    )
+    try:
+        return GroundedSummaryDocument(
+            sections=sections,
+            uncertainties=uncertainties,
+        )
+    except (TypeError, ValueError, ValidationError):
+        raise LocalValidationError(
+            "Summary reference output exceeds structural limits."
+        ) from None
+
+
 def _render_field_value(value_json: str) -> str:
     value = json.loads(value_json)
     if type(value) is str:

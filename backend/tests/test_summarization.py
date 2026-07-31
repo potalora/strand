@@ -21,7 +21,7 @@ from app.services.local_ai.manifest import (
     canonicalize_manifest_snapshot,
     parse_manifest,
 )
-from app.services.local_ai.errors import LocalAIError
+from app.services.local_ai.errors import LocalAIError, LocalWorkerError
 from app.services.local_ai.processing_snapshot import ProcessingSnapshot
 from app.services.local_ai.types import ModelRole, ProcessingMode
 from tests.conftest import auth_headers, create_test_patient, seed_test_records
@@ -233,11 +233,23 @@ async def test_generate_custom_local_uses_stored_loopback_route_without_gemini_k
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "preflight_case",
+    [
+        "success",
+        "over_limit",
+        "unsupported_qualifier",
+        "count_failure",
+        "cancel_before_count",
+        "cancel_during_count",
+    ],
+)
 async def test_strict_local_summary_commits_then_queues_background_work(
     client: AsyncClient,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    preflight_case: str,
 ) -> None:
     """The strict route commits its recoverable job, then uses only its lock."""
     headers, user_id = await auth_headers(client)
@@ -267,6 +279,7 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         source_format="fhir",
         source_file_id=None,
         display_text="Hypertension",
+        status="active" if preflight_case == "unsupported_qualifier" else None,
         ai_extracted=False,
     )
     db_session.add(survivor)
@@ -319,6 +332,8 @@ async def test_strict_local_summary_commits_then_queues_background_work(
             return manifest
 
     commits = 0
+    inference_events: list[str] = []
+    worker_session: AsyncSession | None = None
     original_commit = db_session.commit
 
     async def counted_commit() -> None:
@@ -327,6 +342,7 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         await original_commit()
 
     async def run(role: ModelRole, payload: dict) -> dict:
+        inference_events.append("generate")
         assert commits >= 1
         assert role is ModelRole.SUMMARY
         assert set(payload) == {
@@ -344,7 +360,7 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         assert Path(payload["manifest_path"]).is_absolute()
         assert Path(payload["model_dir"]).is_absolute()
         assert payload["manifest_identity"]["revision"] == "0" * 40
-        assert payload["max_output_tokens"] == 1024
+        assert payload["max_output_tokens"] == 301
         fact = payload["facts"][0]
         assert fact["record_id"] == str(survivor_id)
         assert [item["excerpt"] for item in payload["evidence"]] == [
@@ -366,6 +382,34 @@ async def test_strict_local_summary_commits_then_queues_background_work(
             "uncertainties": [],
         }
 
+    async def count_reference_tokens(payload: dict) -> int:
+        inference_events.append("count")
+        assert set(payload["reference_document"]) == {"sections", "uncertainties"}
+        assert worker_session is not None
+        stage_row = (
+            await worker_session.execute(
+                select(LocalAIJob.stage, LocalAIJob.progress).where(
+                    LocalAIJob.id == job_id
+                )
+            )
+        ).one()
+        assert stage_row.stage == "preflight_output_fit"
+        assert stage_row.progress == {
+            "stage": "preflight_output_fit",
+            "model_role": "summary",
+        }
+        if preflight_case == "count_failure":
+            raise LocalWorkerError("Local worker failed.")
+        if preflight_case == "cancel_during_count":
+            await worker_session.execute(
+                update(LocalAIJob)
+                .where(LocalAIJob.id == job_id)
+                .values(cancel_requested=True)
+            )
+            await worker_session.commit()
+            raise LocalWorkerError("Local worker cancelled.")
+        return 897 if preflight_case == "over_limit" else 173
+
     enqueue = Mock()
     monkeypatch.setattr("app.api.summary.resolve_new_job_snapshot", resolve_snapshot)
     monkeypatch.setattr(
@@ -373,9 +417,53 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         revalidate_snapshot,
     )
     model_run = AsyncMock(side_effect=run)
+    token_count = AsyncMock(side_effect=count_reference_tokens)
+    if preflight_case == "cancel_before_count":
+        from app.services.ai import summarizer as summarizer_module
+
+        original_cancel_check = summarizer_module._is_strict_summary_cancelled
+        cancellation_checks = 0
+
+        async def cancel_before_tokenizer(
+            session: AsyncSession,
+            candidate_job_id: UUID,
+        ) -> bool:
+            nonlocal cancellation_checks
+            cancellation_checks += 1
+            if cancellation_checks == 2:
+                stage_row = (
+                    await session.execute(
+                        select(LocalAIJob.stage, LocalAIJob.progress).where(
+                            LocalAIJob.id == candidate_job_id
+                        )
+                    )
+                ).one()
+                assert stage_row.stage == "preflight_output_fit"
+                assert stage_row.progress == {
+                    "stage": "preflight_output_fit",
+                    "model_role": "summary",
+                }
+                await session.execute(
+                    update(LocalAIJob)
+                    .where(LocalAIJob.id == candidate_job_id)
+                    .values(cancel_requested=True)
+                )
+                await session.commit()
+                return True
+            return await original_cancel_check(session, candidate_job_id)
+
+        monkeypatch.setattr(
+            summarizer_module,
+            "_is_strict_summary_cancelled",
+            cancel_before_tokenizer,
+        )
     monkeypatch.setattr("app.services.local_ai.artifact_store.ArtifactStore", Store)
     monkeypatch.setattr(
         "app.services.local_ai.model_manager.local_model_manager.run", model_run
+    )
+    monkeypatch.setattr(
+        "app.services.local_ai.model_manager.local_model_manager.count_summary_tokens",
+        token_count,
     )
     monkeypatch.setattr(
         "app.services.ai.summarizer.settings.local_ai_scratch_dir",
@@ -414,6 +502,7 @@ async def test_strict_local_summary_commits_then_queues_background_work(
     enqueue.assert_called_once_with(job.id)
     model_run.assert_not_awaited()
     job_id = job.id
+    prompt_id = prompt.id
     patient_id = patient.id
     survivor_id = survivor.id
     await db_session.rollback()
@@ -426,16 +515,79 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         expire_on_commit=False,
     )
     async with session_factory() as session:
+        worker_session = session
         assert (await session.get(LocalAIJob, job_id)).status == "queued"
-        await generate_grounded_local_summary(
-            session,
-            user_id=UUID(user_id),
-            patient_id=patient_id,
-            job_id=job_id,
-            summary_type="full",
-        )
+        if preflight_case == "success":
+            await generate_grounded_local_summary(
+                session,
+                user_id=UUID(user_id),
+                patient_id=patient_id,
+                job_id=job_id,
+                summary_type="full",
+            )
+        else:
+            with pytest.raises(LocalAIError):
+                await generate_grounded_local_summary(
+                    session,
+                    user_id=UUID(user_id),
+                    patient_id=patient_id,
+                    job_id=job_id,
+                    summary_type="full",
+                )
 
-    model_run.assert_awaited_once()
+        durable_job = await session.get(LocalAIJob, job_id)
+        durable_prompt = await session.get(AISummaryPrompt, prompt_id)
+
+    assert durable_job is not None
+    assert durable_prompt is not None
+    if preflight_case == "success":
+        model_run.assert_awaited_once()
+        token_count.assert_awaited_once()
+        assert inference_events == ["count", "generate"]
+        token_payload = token_count.await_args.args[0]
+        assert set(token_payload) == {
+            "job_id",
+            "reference_document",
+            "manifest_path",
+            "model_dir",
+            "manifest_identity",
+        }
+        assert durable_job.status == "completed"
+        assert durable_prompt.response_text is not None
+    elif preflight_case in {"over_limit", "count_failure"}:
+        token_count.assert_awaited_once()
+        model_run.assert_not_awaited()
+        assert inference_events == ["count"]
+        assert durable_job.status == "failed"
+        assert durable_job.failure["stage"] == "preflight_output_fit"
+        assert durable_job.failure["cloud_fallback_attempted"] is False
+        assert durable_prompt.response_text is None
+        assert durable_prompt.typed_response is None
+    elif preflight_case == "unsupported_qualifier":
+        token_count.assert_not_awaited()
+        model_run.assert_not_awaited()
+        assert inference_events == []
+        assert durable_job.status == "failed"
+        assert durable_job.failure["stage"] == "preflight"
+        assert durable_job.failure["cloud_fallback_attempted"] is False
+        assert durable_prompt.response_text is None
+        assert durable_prompt.typed_response is None
+    elif preflight_case == "cancel_before_count":
+        token_count.assert_not_awaited()
+        model_run.assert_not_awaited()
+        assert inference_events == []
+        assert durable_job.status == "cancelled"
+        assert durable_job.failure is None
+        assert durable_prompt.response_text is None
+        assert durable_prompt.typed_response is None
+    else:
+        token_count.assert_awaited_once()
+        model_run.assert_not_awaited()
+        assert inference_events == ["count"]
+        assert durable_job.status == "cancelled"
+        assert durable_job.failure is None
+        assert durable_prompt.response_text is None
+        assert durable_prompt.typed_response is None
 
 
 @pytest.mark.asyncio
@@ -755,6 +907,10 @@ async def test_strict_local_summary_cancellation_finalizes_job_before_reraising(
         "app.services.local_ai.model_manager.local_model_manager.run", cancel
     )
     monkeypatch.setattr(
+        "app.services.local_ai.model_manager.local_model_manager.count_summary_tokens",
+        AsyncMock(return_value=100),
+    )
+    monkeypatch.setattr(
         "app.services.ai.summarizer.settings.local_ai_scratch_dir",
         str(tmp_path / "scratch"),
     )
@@ -889,6 +1045,10 @@ async def test_final_summary_completion_honors_cancellation_under_its_terminal_l
         complete_model,
     )
     monkeypatch.setattr(
+        "app.services.local_ai.model_manager.local_model_manager.count_summary_tokens",
+        AsyncMock(return_value=100),
+    )
+    monkeypatch.setattr(
         "app.services.local_ai.grounded_summary.validate_and_render_summary",
         cancel_after_model_output,
     )
@@ -1008,6 +1168,26 @@ def _strict_manifest() -> dict:
 
 
 @pytest.mark.parametrize(
+    ("reference_tokens", "manifest_limit", "expected"),
+    [(1, 1024, 256), (173, 1024, 301), (3968, 8192, 4096)],
+)
+def test_strict_local_summary_output_cap_is_exact_and_bounded(
+    reference_tokens: int,
+    manifest_limit: int,
+    expected: int,
+) -> None:
+    from app.services.ai.summarizer import _bounded_summary_output_tokens
+
+    assert (
+        _bounded_summary_output_tokens(
+            reference_tokens=reference_tokens,
+            manifest_max_output_tokens=manifest_limit,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
     ("category", "expected"),
     [("family_history", "condition"), ("imaging", "imaging_study")],
 )
@@ -1108,6 +1288,7 @@ async def test_generate_endpoint_no_api_key(
                 "patient_id": str(patient.id),
                 "summary_type": "full",
                 "output_format": "natural_language",
+                "processing_mode": "cloud_assisted",
             },
             headers=headers,
         )
@@ -1136,6 +1317,7 @@ async def test_generate_endpoint_no_records(
                 "patient_id": str(patient.id),
                 "summary_type": "full",
                 "output_format": "natural_language",
+                "processing_mode": "cloud_assisted",
             },
             headers=headers,
         )
@@ -1158,6 +1340,7 @@ async def test_generate_patient_not_found(
             "patient_id": "00000000-0000-0000-0000-000000000000",
             "summary_type": "full",
             "output_format": "natural_language",
+            "processing_mode": "cloud_assisted",
         },
         headers=headers,
     )
@@ -1199,6 +1382,7 @@ async def test_generate_natural_language(client: AsyncClient, db_session: AsyncS
                     "patient_id": str(patient.id),
                     "summary_type": "full",
                     "output_format": "natural_language",
+                    "processing_mode": "cloud_assisted",
                 },
                 headers=headers,
             )
@@ -1440,6 +1624,7 @@ async def test_generate_json_format(client: AsyncClient, db_session: AsyncSessio
                     "patient_id": str(patient.id),
                     "summary_type": "full",
                     "output_format": "json",
+                    "processing_mode": "cloud_assisted",
                 },
                 headers=headers,
             )
@@ -1479,6 +1664,7 @@ async def test_generate_both_formats(client: AsyncClient, db_session: AsyncSessi
                     "patient_id": str(patient.id),
                     "summary_type": "full",
                     "output_format": "both",
+                    "processing_mode": "cloud_assisted",
                 },
                 headers=headers,
             )

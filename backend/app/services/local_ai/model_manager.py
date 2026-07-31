@@ -413,6 +413,42 @@ class LocalModelManager:
         on_liveness: LivenessCallback | None = None,
     ) -> Any:
         """Run one role in a fresh process and return only after group cleanup."""
+        return await self._run_command(
+            role,
+            payload,
+            self._command_for(ModelRole(role)),
+            on_progress,
+            on_liveness=on_liveness,
+        )
+
+    async def count_summary_tokens(self, payload: dict[str, Any]) -> int:
+        """Count one validated reference document with the locked summary tokenizer."""
+
+        result = await self._run_command(
+            ModelRole.SUMMARY,
+            payload,
+            "count_summary_tokens",
+            None,
+            on_liveness=None,
+        )
+        if (
+            type(result) is not dict
+            or set(result) != {"token_count"}
+            or type(result["token_count"]) is not int
+            or result["token_count"] <= 0
+        ):
+            raise LocalWorkerError("Local worker returned an invalid token count.")
+        return result["token_count"]
+
+    async def _run_command(
+        self,
+        role: ModelRole,
+        payload: dict[str, Any],
+        command: str,
+        on_progress: ProgressCallback | None,
+        *,
+        on_liveness: LivenessCallback | None,
+    ) -> Any:
         role = ModelRole(role)
         job_id = self._job_id(payload)
         state = self._register_job(job_id)
@@ -428,6 +464,7 @@ class LocalModelManager:
                 state,
                 role,
                 payload,
+                command,
                 on_progress,
                 on_liveness,
             )
@@ -469,6 +506,7 @@ class LocalModelManager:
         state: _RunState,
         role: ModelRole,
         payload: dict[str, Any],
+        command: str,
         on_progress: ProgressCallback | None,
         on_liveness: LivenessCallback | None,
     ) -> Any:
@@ -480,7 +518,7 @@ class LocalModelManager:
             if len(self._detached_callbacks) >= _MAX_DETACHED_CALLBACKS:
                 raise LocalWorkerError("Local worker is unavailable.")
             self._raise_if_cancelled(state)
-            request = self._build_request(role, payload, state.job_id)
+            request = self._build_request(role, payload, state.job_id, command)
             self._active_job_id = state.job_id
             self._active_role = role
             process = await self._spawn_worker_cancellation_safe()
@@ -827,13 +865,14 @@ class LocalModelManager:
         role: ModelRole,
         payload: dict[str, Any],
         job_id: str,
+        command: str | None = None,
     ) -> WorkerRequest:
         try:
             return WorkerRequest(
                 version=1,
                 request_id=uuid.uuid4().hex,
                 job_id=job_id,
-                command=self._command_for(role),  # type: ignore[arg-type]
+                command=command or self._command_for(role),  # type: ignore[arg-type]
                 payload=payload,
             )
         except ValidationError:

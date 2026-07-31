@@ -16,6 +16,7 @@ from app.services.local_ai.grounded_summary import (
     _flatten_content,
     _stable_fact_id,
     _stable_uncertainty_id,
+    build_maximal_reference_document,
     build_grounded_summary_input,
     validate_and_render_summary,
 )
@@ -81,6 +82,39 @@ def _valid_output(summary_input: GroundedSummaryInput) -> dict[str, object]:
                     {
                         "fact_id": fact.fact_id,
                         "field_paths": ["/name", "/dose", "/status"],
+                        "evidence_ids": [evidence.evidence_id],
+                    }
+                ],
+            }
+        ],
+        "uncertainties": [
+            {
+                "uncertainty_id": uncertainty.uncertainty_id,
+                "fact_ids": [fact.fact_id],
+                "evidence_ids": [evidence.evidence_id],
+            }
+        ],
+    }
+
+
+def test_maximal_reference_document_is_complete_and_deterministic(
+    summary_input: GroundedSummaryInput,
+) -> None:
+    first = build_maximal_reference_document(summary_input)
+    second = build_maximal_reference_document(summary_input)
+    fact = summary_input.facts[0]
+    evidence = summary_input.evidence[0]
+    uncertainty = summary_input.uncertainty_labels[0]
+
+    assert first == second
+    assert first.model_dump(mode="json") == {
+        "sections": [
+            {
+                "heading": "Medications",
+                "claims": [
+                    {
+                        "fact_id": fact.fact_id,
+                        "field_paths": ["/dose", "/name", "/status"],
                         "evidence_ids": [evidence.evidence_id],
                     }
                 ],

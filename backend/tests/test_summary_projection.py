@@ -101,6 +101,13 @@ def test_projects_rich_medication_and_exact_extraction_paths() -> None:
         ],
     )
 
+    with pytest.raises(
+        LocalValidationError,
+        match="safety qualifier lacks evidence support",
+    ):
+        project_summary_records([record], {record.id: [source]})
+
+    source.field_paths.append("medications[0].status")
     projection = project_summary_records([record], {record.id: [source]})
 
     assert projection.facts[0]["content"] == {
@@ -121,6 +128,7 @@ def test_projects_rich_medication_and_exact_extraction_paths() -> None:
         "/route",
         "/frequency",
         "/end_date",
+        "/status",
     ]
     _ground(projection)
 
@@ -538,8 +546,9 @@ def test_projects_rich_clinical_types(
             [
                 "family_history[0].condition",
                 "family_history[0].relationship",
+                "family_history[0].assertion",
             ],
-            ["/diagnosis", "/relationship"],
+            ["/diagnosis", "/relationship", "/assertion"],
         ),
         (
             "procedure",
@@ -562,6 +571,7 @@ def test_extraction_paths_map_to_exact_projected_json_pointers(
     record = _record(
         record_type,
         fhir=fhir,
+        status=None,
         source_format="local_ai",
         ai_extracted=True,
     )
@@ -571,6 +581,33 @@ def test_extraction_paths_map_to_exact_projected_json_pointers(
 
     assert projection.evidence[0]["field_paths"] == expected_paths
     _ground(projection)
+
+
+def test_family_history_requires_explicit_assertion_evidence() -> None:
+    record = _record(
+        "family_history",
+        fhir={
+            "resourceType": "FamilyMemberHistory",
+            "relationship": {"text": "father"},
+            "condition": [{"code": {"text": "Diabetes"}}],
+        },
+        status=None,
+        source_format="local_ai",
+        ai_extracted=True,
+    )
+    source = _evidence(
+        record.id,
+        [
+            "family_history[0].condition",
+            "family_history[0].relationship",
+        ],
+    )
+
+    with pytest.raises(
+        LocalValidationError,
+        match="safety qualifier lacks evidence support",
+    ):
+        project_summary_records([record], {record.id: [source]})
 
 
 def test_structured_full_health_projection_never_silently_drops_supported_records() -> (
@@ -736,6 +773,7 @@ def test_extracted_observation_projects_ratio_as_typed_evidence_linked_value() -
             "vital_signs[0].name",
             "vital_signs[0].value",
             "vital_signs[0].unit",
+            "vital_signs[0].status",
         ],
     )
 
@@ -757,6 +795,7 @@ def test_extracted_observation_projects_ratio_as_typed_evidence_linked_value() -
         "/value/denominator",
         "/value/numerator_unit",
         "/value/denominator_unit",
+        "/status",
     } == mapped_paths
     _ground(projection)
 

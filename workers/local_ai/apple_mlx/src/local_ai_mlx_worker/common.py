@@ -666,6 +666,33 @@ def _default_loader(path: str, **kwargs: object) -> tuple[object, object]:
     return model, processor
 
 
+def _processor_only_loader(path: str, **kwargs: object) -> tuple[object, object]:
+    """Load the verified tokenizer/processor without constructing model weights."""
+
+    from mlx_vlm import utils
+
+    model_path = _assert_real_directory(Path(path))
+    options = dict(kwargs)
+    options.pop("lazy", None)
+    eos_token_id: object = None
+    try:
+        config = _strict_json_loads((model_path / "config.json").read_text(encoding="utf-8"))
+        if isinstance(config, Mapping):
+            eos_token_id = config.get("eos_token_id")
+            text_config = config.get("text_config")
+            if eos_token_id is None and isinstance(text_config, Mapping):
+                eos_token_id = text_config.get("eos_token_id")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
+        raise ArtifactUnavailableError("Model JSON artifact is invalid.") from None
+    processor = utils.load_processor(
+        model_path,
+        True,
+        eos_token_ids=eos_token_id,
+        **options,
+    )
+    return object(), processor
+
+
 def load_role(
     role: Role | str,
     locked_manifest: Mapping[str, object] | str | Path,
@@ -762,6 +789,101 @@ def load_role_from_payload(role: Role, payload: Mapping[str, object]) -> LoadedR
         expected_identity=identity,
         trust_remote_code=False,
     )
+
+
+def load_summary_processor_from_payload(payload: Mapping[str, object]) -> object:
+    """Load only the manifest-verified summary processor for token preflight."""
+
+    manifest_path = payload.get("manifest_path")
+    model_dir = payload.get("model_dir")
+    identity = payload.get("manifest_identity")
+    if (
+        not isinstance(manifest_path, str)
+        or not Path(manifest_path).is_absolute()
+        or not isinstance(model_dir, str)
+        or not Path(model_dir).is_absolute()
+        or type(identity) is not dict
+    ):
+        raise WorkerInputError("Local worker model paths or identity are invalid.")
+    return load_summary_processor(
+        manifest_path,
+        model_dir,
+        expected_identity=identity,
+    )
+
+
+def _processor_artifact_file(relative: str) -> bool:
+    path = PurePosixPath(relative)
+    name = path.name.casefold()
+    if name.endswith(".index.json") and ("model" in name or "weight" in name):
+        return False
+    return path.suffix.casefold() in {
+        ".json",
+        ".jinja",
+        ".model",
+        ".tiktoken",
+        ".txt",
+    }
+
+
+def load_summary_processor(
+    locked_manifest: Mapping[str, object] | str | Path,
+    model_dir: str | Path,
+    *,
+    expected_identity: Mapping[str, object] | None = None,
+    loader: Loader | None = None,
+) -> object:
+    """Verify and load only summary tokenizer assets, never weight shards."""
+
+    require_offline_environment()
+    manifest = _read_manifest(locked_manifest)
+    artifacts, _header = _validated_manifest(manifest)
+    if expected_identity is not None:
+        _assert_expected_identity(manifest, "summary", expected_identity)
+    artifact = artifacts["summary"]
+    pack_root = _assert_real_directory(Path(model_dir))
+    role_root = _assert_real_directory(pack_root / "summary")
+    if not role_root.is_relative_to(pack_root):
+        raise ArtifactUnavailableError("Model role path escapes the pack root.")
+
+    raw_files = artifact["files"]
+    if not isinstance(raw_files, list):
+        raise ArtifactUnavailableError("Model artifact file list is invalid.")
+    declared: set[str] = set()
+    processor_files: set[str] = set()
+    for raw_file_value in raw_files:
+        if not isinstance(raw_file_value, dict):
+            raise ArtifactUnavailableError("Model artifact file entry is invalid.")
+        relative = _safe_relative_path(raw_file_value["path"])
+        relative_text = str(relative)
+        declared.add(relative_text)
+        if not _processor_artifact_file(relative_text):
+            continue
+        processor_files.add(relative_text)
+        size, digest = _hash_regular_file(role_root, relative)
+        if size != raw_file_value["size"]:
+            raise ArtifactUnavailableError("Model processor artifact size does not match manifest.")
+        if digest != raw_file_value["sha256"]:
+            raise ArtifactUnavailableError("Model processor artifact hash does not match manifest.")
+
+    files = frozenset(declared)
+    _assert_exact_artifact_tree(role_root, files)
+    if "config.json" not in processor_files:
+        raise ArtifactUnavailableError("Model processor configuration is unavailable.")
+    _reject_auto_map(role_root, frozenset(processor_files))
+    selected_loader = loader or _processor_only_loader
+    try:
+        _model_sentinel, processor = selected_loader(
+            str(role_root),
+            lazy=False,
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+    except ArtifactUnavailableError:
+        raise
+    except Exception:
+        raise ArtifactUnavailableError("Model processor artifact could not be loaded.") from None
+    return processor
 
 
 def requested_output_tokens(

@@ -1126,6 +1126,28 @@ def _grounded_requested_scope(
     return scope
 
 
+def _bounded_summary_output_tokens(
+    *,
+    reference_tokens: int,
+    manifest_max_output_tokens: int,
+) -> int:
+    """Return the exact summary cap or fail before model generation."""
+
+    from app.services.local_ai.errors import LocalInputLimitError
+
+    if type(reference_tokens) is not int or reference_tokens <= 0:
+        raise LocalInputLimitError(
+            "Strict-local summary tokenizer returned an invalid count."
+        )
+    output_limit = min(manifest_max_output_tokens, 4096)
+    output_tokens = max(256, reference_tokens + 128)
+    if output_tokens > output_limit:
+        raise LocalInputLimitError(
+            "Strict-local summary reference output exceeds the validated limit."
+        )
+    return output_tokens
+
+
 async def _strict_local_summary_records(
     db: AsyncSession,
     *,
@@ -1259,6 +1281,7 @@ async def _finish_strict_summary_job(
         return
     completed_at = datetime.now().astimezone()
     cancelled = bool(cancelled or job.cancel_requested)
+    failure_stage = job.stage
     job.status = "cancelled" if cancelled else "failed"
     job.stage = "cancelled" if cancelled else "failed"
     job.progress = {"stage": job.stage}
@@ -1268,7 +1291,7 @@ async def _finish_strict_summary_job(
     else:
         code = error.code if isinstance(error, LocalAIError) else "local_ai_error"
         job.failure = {
-            "stage": "summary",
+            "stage": failure_stage,
             "code": code,
             "message": "Strict-local summary did not complete.",
             "retryable": bool(getattr(error, "retryable", False)),
@@ -1446,6 +1469,7 @@ async def generate_grounded_local_summary(
     from app.services.local_ai.errors import LocalAIError, LocalPolicyError
     from app.services.local_ai.grounded_summary import (
         SERVER_SAFETY_RULES,
+        build_maximal_reference_document,
         build_grounded_summary_input,
         validate_and_render_summary,
     )
@@ -1528,6 +1552,7 @@ async def generate_grounded_local_summary(
             requested_scope=scope,
             uncertainty_labels=projection.uncertainty_labels,
         )
+        maximal_reference = build_maximal_reference_document(summary_input)
 
         stage_result = await db.execute(
             update(LocalAIJob)
@@ -1537,11 +1562,12 @@ async def generate_grounded_local_summary(
                 LocalAIJob.started_at == claim_started_at,
             )
             .values(
-                stage="summary",
+                stage="preflight_projection",
                 failure=None,
                 progress={
-                    "stage": "summary",
-                    "model_role": ModelRole.SUMMARY.value,
+                    "stage": "preflight_projection",
+                    "facts": len(summary_input.facts),
+                    "evidence": len(summary_input.evidence),
                 },
             )
         )
@@ -1580,7 +1606,6 @@ async def generate_grounded_local_summary(
             ],
             "safety_rules": list(SERVER_SAFETY_RULES),
             "manifest_identity": manifest_identity,
-            "max_output_tokens": artifact.decode_limits["max_output_tokens"],
         }
         scratch_root = Path(settings.local_ai_scratch_dir).resolve()
         model_dir = (store.packs_dir / manifest.pack_revision).resolve()
@@ -1597,6 +1622,119 @@ async def generate_grounded_local_summary(
             )
             worker_payload["manifest_path"] = str(locked_manifest_path)
             worker_payload["model_dir"] = str(model_dir)
+            stage_result = await db.execute(
+                update(LocalAIJob)
+                .where(
+                    LocalAIJob.id == stable_job_id,
+                    LocalAIJob.status == "processing",
+                    LocalAIJob.started_at == claim_started_at,
+                )
+                .values(
+                    stage="preflight_output_fit",
+                    failure=None,
+                    progress={
+                        "stage": "preflight_output_fit",
+                        "model_role": ModelRole.SUMMARY.value,
+                    },
+                )
+            )
+            if stage_result.rowcount != 1:
+                await db.rollback()
+                return {"superseded": True}
+            await db.commit()
+            if await _is_strict_summary_cancelled(db, job.id):
+                raise LocalPolicyError("Strict-local summary job was cancelled.")
+            token_count = await local_model_manager.count_summary_tokens(
+                {
+                    "job_id": str(job.id),
+                    "reference_document": maximal_reference.model_dump(mode="json"),
+                    "manifest_path": str(locked_manifest_path),
+                    "model_dir": str(model_dir),
+                    "manifest_identity": manifest_identity,
+                }
+            )
+            summary_limit = min(
+                artifact.decode_limits["max_output_tokens"],
+                4096,
+            )
+            try:
+                max_output_tokens = _bounded_summary_output_tokens(
+                    reference_tokens=token_count,
+                    manifest_max_output_tokens=artifact.decode_limits[
+                        "max_output_tokens"
+                    ],
+                )
+            except LocalAIError:
+                stage_result = await db.execute(
+                    update(LocalAIJob)
+                    .where(
+                        LocalAIJob.id == stable_job_id,
+                        LocalAIJob.status == "processing",
+                        LocalAIJob.started_at == claim_started_at,
+                    )
+                    .values(
+                        stage="preflight_output_fit",
+                        failure=None,
+                        progress={
+                            "stage": "preflight_output_fit",
+                            "reference_tokens": token_count,
+                            "output_limit": summary_limit,
+                            "fits": False,
+                        },
+                    )
+                )
+                if stage_result.rowcount != 1:
+                    await db.rollback()
+                    return {"superseded": True}
+                await db.commit()
+                raise
+            stage_result = await db.execute(
+                update(LocalAIJob)
+                .where(
+                    LocalAIJob.id == stable_job_id,
+                    LocalAIJob.status == "processing",
+                    LocalAIJob.started_at == claim_started_at,
+                )
+                .values(
+                    stage="preflight_output_fit",
+                    failure=None,
+                    progress={
+                        "stage": "preflight_output_fit",
+                        "reference_tokens": token_count,
+                        "max_output_tokens": max_output_tokens,
+                        "output_limit": summary_limit,
+                    },
+                )
+            )
+            if stage_result.rowcount != 1:
+                await db.rollback()
+                return {"superseded": True}
+            await db.commit()
+            if await _is_strict_summary_cancelled(db, job.id):
+                raise LocalPolicyError("Strict-local summary job was cancelled.")
+
+            stage_result = await db.execute(
+                update(LocalAIJob)
+                .where(
+                    LocalAIJob.id == stable_job_id,
+                    LocalAIJob.status == "processing",
+                    LocalAIJob.started_at == claim_started_at,
+                )
+                .values(
+                    stage="summary",
+                    failure=None,
+                    progress={
+                        "stage": "summary",
+                        "model_role": ModelRole.SUMMARY.value,
+                        "max_output_tokens": max_output_tokens,
+                    },
+                )
+            )
+            if stage_result.rowcount != 1:
+                await db.rollback()
+                return {"superseded": True}
+            await db.commit()
+            worker_payload["max_output_tokens"] = max_output_tokens
             raw_output = await local_model_manager.run(
                 ModelRole.SUMMARY,
                 worker_payload,

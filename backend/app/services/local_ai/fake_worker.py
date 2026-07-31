@@ -180,6 +180,8 @@ def _fixed_result(
     *,
     pipeline_valid: bool = False,
 ) -> dict[str, object]:
+    if payload.get("fake_token_count") is not None:
+        return {"token_count": payload["fake_token_count"]}
     if payload.get("inspect_lock_fd") is True:
         raw_descriptor = os.environ.get("LOCAL_AI_PROCESS_LOCK_FD", "")
         try:

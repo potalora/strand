@@ -184,6 +184,48 @@ def test_default_loader_bypasses_hub_resolving_entrypoint(
     assert processor.image_processor is not None
 
 
+def test_processor_only_loader_never_constructs_model_weights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mlx_vlm import utils
+
+    from local_ai_mlx_worker.common import _processor_only_loader
+
+    (tmp_path / "config.json").write_text(
+        '{"text_config":{"eos_token_id":248044}}',
+        encoding="utf-8",
+    )
+    processor = object()
+    calls: list[tuple[Path, object]] = []
+
+    def reject_model_load(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("token preflight loaded model weights")
+
+    def load_processor(
+        path: Path,
+        _add_detokenizer: bool,
+        eos_token_ids: object,
+        **_kwargs: object,
+    ) -> object:
+        calls.append((path, eos_token_ids))
+        return processor
+
+    monkeypatch.setattr(utils, "load_model", reject_model_load)
+    monkeypatch.setattr(utils, "load_image_processor", reject_model_load)
+    monkeypatch.setattr(utils, "load_processor", load_processor)
+
+    _model_sentinel, loaded_processor = _processor_only_loader(
+        str(tmp_path),
+        lazy=False,
+        local_files_only=True,
+        trust_remote_code=False,
+    )
+
+    assert loaded_processor is processor
+    assert calls == [(tmp_path.resolve(), 248044)]
+
+
 @pytest.mark.parametrize(
     "relative",
     [
@@ -256,6 +298,89 @@ def test_load_role_requires_exact_manifest_schema_and_expected_identity(
             extra_artifact,
             model_dir,
             loader=lambda *_args, **_kwargs: (object(), object()),
+        )
+
+
+def test_summary_processor_preflight_skips_weights_but_hashes_tokenizer_assets(
+    synthetic_pack: tuple[dict[str, object], Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_mlx_worker import common
+
+    manifest, model_dir = synthetic_pack
+    for name, value in {
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    summary_root = model_dir / "summary"
+    tokenizer = summary_root / "tokenizer.json"
+    tokenizer.write_text('{"version":"locked"}', encoding="utf-8")
+    model_index = summary_root / "model.safetensors.index.json"
+    model_index.write_text('{"weight_map":{}}', encoding="utf-8")
+    summary_artifact = next(
+        item
+        for item in manifest["artifacts"]  # type: ignore[index]
+        if item["role"] == "summary"
+    )
+    summary_artifact["files"].extend(  # type: ignore[index]
+        [
+            _manifest_file(summary_root, "tokenizer.json"),
+            _manifest_file(summary_root, "model.safetensors.index.json"),
+        ]
+    )
+    identity = common.build_manifest_identity(manifest, "summary")
+    original_hash = common._hash_regular_file
+    hashed: list[str] = []
+
+    def processor_hash(role_root: Path, relative) -> tuple[int, str]:
+        relative_text = str(relative)
+        if relative_text.endswith(".safetensors") or relative_text.endswith(".index.json"):
+            raise AssertionError("token preflight read model weights")
+        hashed.append(relative_text)
+        return original_hash(role_root, relative)
+
+    monkeypatch.setattr(common, "_hash_regular_file", processor_hash)
+
+    def loader(*_args: object, **_kwargs: object) -> tuple[object, object]:
+        return object(), object()
+
+    common.load_summary_processor(
+        manifest,
+        model_dir,
+        expected_identity=identity,
+        loader=loader,
+    )
+
+    assert set(hashed) == {"config.json", "tokenizer.json"}
+    weights = summary_root / "model.safetensors"
+    weights.write_bytes(b"x" * weights.stat().st_size)
+    common.load_summary_processor(
+        manifest,
+        model_dir,
+        expected_identity=identity,
+        loader=loader,
+    )
+
+    tokenizer.write_bytes(b"x" * tokenizer.stat().st_size)
+    with pytest.raises(ValueError, match="processor artifact hash"):
+        common.load_summary_processor(
+            manifest,
+            model_dir,
+            expected_identity=identity,
+            loader=loader,
+        )
+
+    tokenizer.write_text('{"version":"locked"}', encoding="utf-8")
+    config = summary_root / "config.json"
+    config.write_bytes(b"x" * config.stat().st_size)
+    with pytest.raises(ValueError, match="processor artifact hash"):
+        common.load_summary_processor(
+            manifest,
+            model_dir,
+            expected_identity=identity,
+            loader=loader,
         )
 
 

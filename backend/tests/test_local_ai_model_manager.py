@@ -54,6 +54,38 @@ def worker_home(tmp_path: Path) -> Path:
 
 
 @pytest.mark.asyncio
+async def test_summary_token_count_uses_separate_worker_command(
+    fake_worker_command: list[str], worker_home: Path
+) -> None:
+    manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
+    await manager.start()
+
+    count = await manager.count_summary_tokens(
+        {"job_id": "token-job", "fake_token_count": 173}
+    )
+
+    assert count == 173
+    assert type(count) is int
+    assert manager.metrics.roles_started == [ModelRole.SUMMARY]
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_summary_token_count_rejects_non_integer_result(
+    fake_worker_command: list[str], worker_home: Path
+) -> None:
+    manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
+    await manager.start()
+
+    with pytest.raises(LocalWorkerError, match="token count"):
+        await manager.count_summary_tokens(
+            {"job_id": "token-job", "fake_token_count": True}
+        )
+
+    await manager.stop()
+
+
+@pytest.mark.asyncio
 async def test_manager_never_overlaps_role_processes(
     fake_worker_command: list[str], worker_home: Path
 ) -> None:

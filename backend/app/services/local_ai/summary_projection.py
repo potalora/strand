@@ -906,6 +906,23 @@ def project_summary_records(
         else:
             record_evidence.append(_structured_evidence(record, content))
 
+        supported_paths = {
+            str(path)
+            for item in record_evidence
+            for path in item["field_paths"]
+            if isinstance(path, str)
+        }
+        qualifier_paths = {
+            path
+            for path in _leaf_paths(content)
+            if path in {"/assertion", "/relationship", "/status"}
+            or path.startswith("/statuses/")
+        }
+        if qualifier_paths - supported_paths:
+            raise LocalValidationError(
+                "Summary fact safety qualifier lacks evidence support."
+            )
+
         evidence_ids = [str(item["id"]) for item in record_evidence]
         facts.append(
             {

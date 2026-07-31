@@ -31,7 +31,15 @@ Identifier = Annotated[
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     ),
 ]
-WorkerCommand = Literal["health", "ocr", "extract", "summarize", "cancel", "shutdown"]
+WorkerCommand = Literal[
+    "health",
+    "ocr",
+    "extract",
+    "summarize",
+    "count_summary_tokens",
+    "cancel",
+    "shutdown",
+]
 ResponseKind = Literal["ready", "progress", "result", "error"]
 ProgressStage = Literal["starting", "loading", "processing", "finalizing", "cancelling"]
 ErrorCode = Literal[

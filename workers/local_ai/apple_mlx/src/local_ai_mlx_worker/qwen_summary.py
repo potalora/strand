@@ -7,7 +7,7 @@ import json
 import math
 import re
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 
 from .common import (
@@ -15,9 +15,11 @@ from .common import (
     GenerationError,
     LoadedRole,
     WorkerInputError,
+    _token_count,
     bounded_json,
     generate_content,
     load_role_from_payload,
+    load_summary_processor_from_payload,
     parse_json_object,
     requested_output_tokens,
     validate_token_budget,
@@ -1053,6 +1055,92 @@ def _validated_output(
     ):
         raise GenerationError("Local summary returned invalid JSON.") from None
     return value
+
+
+def _validated_reference_document(value: object) -> dict[str, object]:
+    """Validate a maximal reference-only document before loading its tokenizer."""
+
+    try:
+        _validate_plain_json(value)
+        if type(value) is not dict or set(value) != {"sections", "uncertainties"}:
+            raise ValueError
+        sections = value["sections"]
+        uncertainty_refs = value["uncertainties"]
+        if (
+            not isinstance(sections, list)
+            or len(sections) > MAX_SECTIONS
+            or not isinstance(uncertainty_refs, list)
+            or len(uncertainty_refs) > MAX_UNCERTAINTIES
+        ):
+            raise ValueError
+        headings: set[str] = set()
+        facts: set[str] = set()
+        for section in sections:
+            if type(section) is not dict or set(section) != {"heading", "claims"}:
+                raise ValueError
+            heading = section["heading"]
+            claims = section["claims"]
+            if (
+                heading not in SUMMARY_HEADINGS
+                or heading in headings
+                or not isinstance(claims, list)
+                or len(claims) > MAX_CLAIMS_PER_SECTION
+            ):
+                raise ValueError
+            headings.add(str(heading))
+            for claim in claims:
+                if type(claim) is not dict or set(claim) != {
+                    "fact_id",
+                    "field_paths",
+                    "evidence_ids",
+                }:
+                    raise ValueError
+                fact_id = _identifier(claim["fact_id"])
+                if fact_id in facts:
+                    raise ValueError
+                facts.add(fact_id)
+                _field_path_list(claim["field_paths"])
+                _identifier_list(claim["evidence_ids"])
+        uncertainties: set[str] = set()
+        for reference in uncertainty_refs:
+            if type(reference) is not dict or set(reference) != {
+                "uncertainty_id",
+                "fact_ids",
+                "evidence_ids",
+            }:
+                raise ValueError
+            uncertainty_id = _identifier(reference["uncertainty_id"])
+            if uncertainty_id in uncertainties:
+                raise ValueError
+            uncertainties.add(uncertainty_id)
+            _identifier_list(reference["fact_ids"])
+            _identifier_list(reference["evidence_ids"])
+    except (KeyError, TypeError, ValueError, WorkerInputError):
+        raise WorkerInputError("Summary reference document is invalid.") from None
+    return value
+
+
+def count_summary_reference_tokens(
+    payload: Mapping[str, object],
+    *,
+    processor_loader: Callable[[Mapping[str, object]], object] = (
+        load_summary_processor_from_payload
+    ),
+) -> dict[str, int]:
+    """Count compact maximal-reference JSON without loading summary model weights."""
+
+    if set(payload) - {
+        "job_id",
+        "reference_document",
+        "manifest_path",
+        "model_dir",
+        "manifest_identity",
+    }:
+        raise WorkerInputError("Summary token-count request is invalid.")
+    reference = _validated_reference_document(payload.get("reference_document"))
+    compact = bounded_json(reference, max_bytes=MAX_SUMMARY_INPUT_BYTES)
+    processor = processor_loader(payload)
+    return {"token_count": _token_count(processor, compact)}
 
 
 def run_summary(

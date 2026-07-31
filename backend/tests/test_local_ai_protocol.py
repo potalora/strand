@@ -84,6 +84,20 @@ def test_protocol_rejects_unknown_command_and_extra_request_fields() -> None:
         WorkerRequest.model_validate({**base, "command": "ocr", "secret": "no"})
 
 
+def test_protocol_accepts_content_free_summary_token_count_command() -> None:
+    request = WorkerRequest.model_validate(
+        {
+            "version": 1,
+            "request_id": "request-1",
+            "job_id": "job-1",
+            "command": "count_summary_tokens",
+            "payload": {"reference_document": {"sections": [], "uncertainties": []}},
+        }
+    )
+
+    assert request.command == "count_summary_tokens"
+
+
 def test_progress_response_accepts_only_non_content_fields() -> None:
     response = WorkerResponse.model_validate(
         _response(
