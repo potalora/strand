@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,7 +30,7 @@ from app.schemas.summary import (
     PromptDetailResponse,
     PromptListResponse,
     PromptResponse,
-    StrictLocalGenerateSummaryResponse,
+    StrictLocalSummaryAccepted,
     SummaryItemCreate,
     SummaryItemResponse,
 )
@@ -48,6 +48,7 @@ from app.services.local_ai.processing_snapshot import (
     revalidate_strict_snapshot_admission,
     resolve_new_job_snapshot,
 )
+from app.services.local_ai.summary_runner import local_summary_runner
 from app.services.local_ai.types import ProcessingMode
 
 router = APIRouter(prefix="/summary", tags=["summary"])
@@ -504,13 +505,17 @@ async def list_providers(
     return {"providers": available_providers(), "default": provider_name_for("summary")}
 
 
-@router.post("/generate", response_model=GenerateSummaryResponse)
+@router.post(
+    "/generate",
+    response_model=GenerateSummaryResponse,
+    responses={status.HTTP_202_ACCEPTED: {"model": StrictLocalSummaryAccepted}},
+)
 async def generate_summary_endpoint(
     body: GenerateSummaryRequest,
     request: Request,
     user_id: UUID = Depends(get_authenticated_user_id),
     db: AsyncSession = Depends(get_db),
-) -> GenerateSummaryResponse:
+) -> GenerateSummaryResponse | StrictLocalSummaryAccepted:
     """Generate a summary using the selected explicit processing mode."""
     if body.processing_mode is ProcessingMode.PROMPT_ONLY:
         raise HTTPException(
@@ -598,22 +603,10 @@ async def generate_summary_endpoint(
             await db.refresh(prompt_record)
             await db.refresh(job)
 
-            from app.services.ai.summarizer import generate_grounded_local_summary
-
-            summary_data = await generate_grounded_local_summary(
-                db,
-                user_id=user_id,
-                patient_id=body.patient_id,
-                job_id=job.id,
-                summary_type=body.summary_type,
-                category=body.category,
-                date_from=body.date_from,
-                date_to=body.date_to,
-                record_ids=body.record_ids,
-            )
-            await db.refresh(prompt_record)
         except (ValueError, LocalAIError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        local_summary_runner.enqueue(job.id)
 
         await log_audit_event(
             db,
@@ -624,30 +617,19 @@ async def generate_summary_endpoint(
             ip_address=request.client.host if request.client else None,
             details={
                 "summary_type": body.summary_type,
-                "record_count": summary_data["record_count"],
+                "record_count": 0,
                 "processing_mode": ProcessingMode.VALIDATED_STRICT_LOCAL.value,
             },
         )
-        return StrictLocalGenerateSummaryResponse(
-            id=prompt_record.id,
-            processing_mode=ProcessingMode(prompt_record.processing_mode),
-            model_provenance=prompt_record.model_provenance,
-            typed_response=prompt_record.typed_response,
-            natural_language=(
-                None
-                if body.output_format == "json"
-                else summary_data["natural_language"]
-            ),
-            json_data=(
-                summary_data["json_data"]
-                if body.output_format in {"json", "both"}
-                else None
-            ),
-            record_count=summary_data["record_count"],
-            duplicate_warning=None,
-            de_identification_report=None,
-            model_used=summary_data["model_used"],
-            generated_at=prompt_record.generated_at,
+        return Response(
+            content=StrictLocalSummaryAccepted(
+                id=prompt_record.id,
+                job_id=job.id,
+                processing_mode=ProcessingMode.VALIDATED_STRICT_LOCAL.value,
+                created_at=job.created_at,
+            ).model_dump_json(),
+            media_type="application/json",
+            status_code=status.HTTP_202_ACCEPTED,
         )
 
     from app.services.ai.summarizer import generate_summary

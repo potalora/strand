@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 _STRICT_LOCAL_RECORD_LIMIT = 512
 _STRICT_LOCAL_EVIDENCE_LIMIT = 512
+_STRICT_LOCAL_SUMMARY_RECOVERY_LIMIT = 1_000
 _SAFE_ROUTED_MODEL_LEAF = re.compile(
     r"\A[A-Za-z0-9][A-Za-z0-9._+-]{0,127}"
     r"(?::[A-Za-z0-9][A-Za-z0-9._+-]{0,63})?\Z"
@@ -1288,6 +1289,58 @@ async def resume_grounded_local_summary_jobs(
                 )
 
 
+async def requeue_interrupted_summary_jobs(*, session_factory=None) -> list[UUID]:
+    """Requeue planned-shutdown work while preserving explicit cancellation."""
+    from app.models.local_ai import LocalAIJob
+
+    if session_factory is None:
+        from app.database import async_session_factory
+
+        session_factory = async_session_factory
+    async with session_factory() as db:
+        jobs = list(
+            (
+                await db.execute(
+                    select(LocalAIJob)
+                    .where(
+                        LocalAIJob.kind == "summary",
+                        LocalAIJob.processing_mode
+                        == ProcessingMode.VALIDATED_STRICT_LOCAL.value,
+                        LocalAIJob.status.in_(("queued", "processing")),
+                    )
+                    .order_by(LocalAIJob.created_at.asc(), LocalAIJob.id.asc())
+                    .limit(_STRICT_LOCAL_SUMMARY_RECOVERY_LIMIT + 1)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if len(jobs) > _STRICT_LOCAL_SUMMARY_RECOVERY_LIMIT:
+            logger.warning(
+                "Strict-local summary shutdown recovery reached its safety bound"
+            )
+            jobs = jobs[:_STRICT_LOCAL_SUMMARY_RECOVERY_LIMIT]
+        recovered_at = datetime.now().astimezone()
+        resumable: list[UUID] = []
+        for job in jobs:
+            if job.cancel_requested:
+                job.status = "cancelled"
+                job.stage = "cancelled"
+                job.progress = {"stage": "cancelled"}
+                job.failure = None
+                job.completed_at = recovered_at
+                continue
+            job.status = "queued"
+            job.stage = "recovery"
+            job.progress = {"stage": "recovery"}
+            job.failure = None
+            job.completed_at = None
+            resumable.append(job.id)
+        await db.commit()
+    return resumable
+
+
 async def generate_grounded_local_summary(
     db: AsyncSession,
     *,
@@ -1330,9 +1383,15 @@ async def generate_grounded_local_summary(
     ).scalar_one_or_none()
     if job is None:
         raise LocalPolicyError("Strict-local summary job is unavailable.")
-    if job.status not in {"queued", "processing"} or job.cancel_requested:
+    if job.cancel_requested:
         await _finish_strict_summary_job(db, job_id=job.id, error=None)
         raise LocalPolicyError("Strict-local summary job was cancelled.")
+    if job.status == "processing":
+        # Another process owns the database claim. This wake is deliberately a
+        # no-op rather than a second model invocation.
+        return {"already_processing": True}
+    if job.status != "queued":
+        raise LocalPolicyError("Strict-local summary job is unavailable.")
 
     stable_job_id = job.id
     try:
@@ -1502,14 +1561,15 @@ async def generate_grounded_local_summary(
                 stable_job_id,
             )
         await asyncio.shield(db.rollback())
-        await asyncio.shield(
-            _finish_strict_summary_job(
-                db,
-                job_id=stable_job_id,
-                error=exc,
-                cancelled=is_task_cancel,
+        if not is_task_cancel or await _is_strict_summary_cancelled(db, stable_job_id):
+            await asyncio.shield(
+                _finish_strict_summary_job(
+                    db,
+                    job_id=stable_job_id,
+                    error=exc,
+                    cancelled=is_task_cancel,
+                )
             )
-        )
         if is_task_cancel or not isinstance(exc, Exception):
             raise
         if isinstance(exc, LocalAIError):

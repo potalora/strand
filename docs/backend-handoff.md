@@ -695,7 +695,7 @@ strict-local job admission share a database advisory lock. Mutations return
 | --- | --- | --- |
 | `GET` | `/local-ai/jobs` | List owner-scoped, content-free job status |
 | `GET` | `/local-ai/jobs/{job_id}` | Read one owner-scoped job |
-| `POST` | `/local-ai/jobs/{job_id}/retry` | Requeue one failed, retryable ingestion job |
+| `POST` | `/local-ai/jobs/{job_id}/retry` | Requeue one failed, retryable ingestion or summary job |
 | `POST` | `/local-ai/jobs/{job_id}/cancel` | Persist cancellation and terminate the active worker |
 
 Jobs report target UUIDs, processing mode, kind, status, stage, cancellation
@@ -703,9 +703,11 @@ state, timestamps, and bounded progress/failure taxonomy. Progress exposes only
 stable model-role and numeric counters; failure exposes only stage, code,
 model-role, retryability, checkpoint, and fallback flags. Stored failure
 messages, clinical payloads, prompts, excerpts, evidence, manifests, and model
-output are excluded. Retry is owner-scoped, accepts only failed retryable
-ingestion jobs, resets the paired upload/job together, retains strict-local
-checkpoints, and returns `409` for all other job states.
+output are excluded. Retry is owner-scoped and accepts only failed, retryable
+ingestion or summary jobs. Ingestion retry resets the paired upload and job
+together while keeping strict-local checkpoints. Summary retry preserves its
+stored prompt scope and immutable model snapshot. All other job states return
+`409`.
 
 ### GET `/records/{record_id}/evidence`
 
@@ -997,25 +999,34 @@ while settings are unresolved.
 | `provider` | string? | Optional only for cloud-assisted explicit routing; forbidden for strict and custom local |
 | `model` | string? | Optional only for cloud-assisted explicit routing; forbidden for strict and custom local |
 
-**Response (200):**
+Validated strict-local summaries are accepted after the prompt and job commit,
+then run in the server-owned background runner. They return `202` without
+waiting for model inference:
+
+**Response (202, validated strict-local):**
+```json
+{
+  "id": "summary-prompt-uuid",
+  "job_id": "local-job-uuid",
+  "processing_mode": "validated_strict_local",
+  "kind": "summary",
+  "status": "queued",
+  "stage": "queued",
+  "created_at": "2024-02-01T10:30:00Z"
+}
+```
+
+Custom-local and cloud-assisted summaries remain synchronous and return `200`:
+
+**Response (200, custom-local or cloud-assisted):**
 ```json
 {
   "id": "uuid",
-  "processing_mode": "validated_strict_local",
+  "processing_mode": "cloud_assisted",
   "model_provenance": {
-    "processing_mode": "validated_strict_local",
-    "manifest_sha256": "64-character SHA-256",
-    "pack_revision": "apple-m4-16gb-v1",
-    "model": {
-      "role": "summary",
-      "repository": "mlx-community/Qwen3.5-9B-MLX-4bit",
-      "revision": "938d8919941c6e7efd3c7150eff7fe9d12afa631",
-      "quantization": "4bit",
-      "runtime": {
-        "name": "mlx-vlm",
-        "version": "0.5.0"
-      }
-    }
+    "processing_mode": "cloud_assisted",
+    "provider": "gemini",
+    "model": "gemini-3.5-flash"
   },
   "typed_response": {
     "sections": [],
@@ -1026,20 +1037,20 @@ while settings are unresolved.
   "record_count": 47,
   "duplicate_warning": null,
   "de_identification_report": null,
-  "model_used": "mlx-community/Qwen3.5-9B-MLX-4bit@938d8919941c6e7efd3c7150eff7fe9d12afa631",
+  "model_used": "gemini-3.5-flash",
   "generated_at": "2024-02-01T10:30:00Z"
 }
 ```
 
 **Notes:**
-- `typed_response` is always present for generated strict-local, custom-local,
-  and cloud-assisted summaries. It has exactly `sections` and `uncertainties`.
-  Legacy and prompt-only history detail may return it as null.
+- `typed_response` is present for completed custom-local and cloud-assisted
+  summaries. It has exactly `sections` and `uncertainties`. It appears on the
+  strict-local prompt after its background job completes. Legacy and prompt-only
+  history detail may return it as null.
 - `natural_language` contains the text summary (null when `output_format` is `json`)
 - `json_data` contains structured output (null when `output_format` is `natural_language`)
-- `duplicate_warning` is `null` for strict-local summaries. Custom-local and
-  cloud-assisted responses include it only when duplicates were detected and
-  excluded.
+- `duplicate_warning` is included only when a synchronous response excluded
+  duplicates. Strict-local job status remains content-free while it runs.
 - Strict-local summaries accept only validated fact and evidence IDs, reject
   unsupported claims, and append the server-owned no-medical-advice disclaimer.
 - Custom-local and cloud-assisted providers receive a de-identified reference

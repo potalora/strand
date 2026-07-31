@@ -319,24 +319,21 @@ async def lifespan(app: FastAPI):
                 logger.info("Removed %d stale strict-local scratch jobs", removed)
             await local_model_manager.start()
             local_ai_started = True
-            if summary_jobs_to_resume:
-                from app.services.ai.summarizer import (
-                    resume_grounded_local_summary_jobs,
-                )
+            from app.services.local_ai.summary_runner import local_summary_runner
 
-                summary_resume_task = asyncio.create_task(
-                    resume_grounded_local_summary_jobs(summary_jobs_to_resume)
-                )
-                _background_tasks.add(summary_resume_task)
-                summary_resume_task.add_done_callback(_background_tasks.discard)
+            local_summary_runner.start(summary_jobs_to_resume)
         except BaseException:
             await local_model_manager.stop()
             raise
 
     try:
         # Start the extraction worker
-        from app.api.upload import start_extraction_worker
+        from app.api.upload import (
+            reset_extraction_worker_shutdown,
+            start_extraction_worker,
+        )
 
+        reset_extraction_worker_shutdown()
         start_extraction_worker()
 
         import sys
@@ -349,8 +346,28 @@ async def lifespan(app: FastAPI):
 
         yield
     finally:
+        from app.api.upload import stop_extraction_worker
+
+        try:
+            await stop_extraction_worker()
+        except Exception:
+            logger.exception("Failed to drain extraction work during shutdown")
         if local_ai_started:
-            await local_model_manager.stop()
+            from app.services.local_ai.summary_runner import local_summary_runner
+
+            try:
+                await local_summary_runner.stop_and_requeue()
+            except Exception:
+                logger.exception("Failed to drain summary work during shutdown")
+            try:
+                async with async_session_factory() as db:
+                    await acquire_local_ai_lifecycle_lock(db)
+                    await _recover_unstructured_jobs_on_startup(db)
+                    await db.commit()
+            except Exception:
+                logger.exception("Failed to requeue strict-local work during shutdown")
+            finally:
+                await local_model_manager.stop()
 
 
 def create_app() -> FastAPI:

@@ -96,6 +96,8 @@ _STRICT_LOCAL_MAX_PROGRESS_COUNTER = 1_000_000
 
 # Worker task reference
 _worker_task: asyncio.Task | None = None
+_extraction_tasks: set[asyncio.Task[None]] = set()
+_extraction_draining = False
 
 
 def _prune_closed_loops(
@@ -184,7 +186,7 @@ async def _extraction_worker() -> None:
                 await strict_sem.acquire()
                 strict_slot = strict_sem
             logger.info("Claimed file %s for extraction", upload_id)
-            asyncio.create_task(
+            child = asyncio.create_task(
                 _process_and_release(
                     sem,
                     upload_id,
@@ -193,6 +195,8 @@ async def _extraction_worker() -> None:
                     strict_sem=strict_slot,
                 )
             )
+            _extraction_tasks.add(child)
+            child.add_done_callback(_extraction_tasks.discard)
 
         except Exception:
             logger.error("Extraction worker encountered an error; recovering")
@@ -473,8 +477,33 @@ async def _process_and_release(
 def start_extraction_worker() -> None:
     """Start the DB-polling extraction worker. Called from main.py lifespan."""
     global _worker_task
+    if _extraction_draining:
+        return
     if _worker_task is None or _worker_task.done():
         _worker_task = asyncio.create_task(_extraction_worker())
+
+
+def reset_extraction_worker_shutdown() -> None:
+    """Permit polling at the start of a new application lifespan."""
+    global _extraction_draining
+    _extraction_draining = False
+
+
+async def stop_extraction_worker() -> None:
+    """Stop admissions and drain claimed extraction children for shutdown."""
+    global _worker_task, _extraction_draining
+    _extraction_draining = True
+    worker = _worker_task
+    if worker is not None and not worker.done():
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+    _worker_task = None
+    children = list(_extraction_tasks)
+    for child in children:
+        child.cancel()
+    if children:
+        await asyncio.gather(*children, return_exceptions=True)
+    _extraction_tasks.clear()
 
 
 # Statuses that count as "done" for batch progress. ``cancelled`` is terminal

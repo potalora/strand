@@ -10,7 +10,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.models.ai_summary import AISummaryPrompt
 from app.models.local_ai import ExtractionEvidence, LocalAIJob
@@ -232,7 +232,7 @@ async def test_generate_custom_local_uses_stored_loopback_route_without_gemini_k
 
 
 @pytest.mark.asyncio
-async def test_strict_local_summary_persists_job_before_worker_and_renders_typed_output(
+async def test_strict_local_summary_commits_then_queues_background_work(
     client: AsyncClient,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -365,18 +365,25 @@ async def test_strict_local_summary_persists_job_before_worker_and_renders_typed
             "uncertainties": [],
         }
 
+    enqueue = Mock()
     monkeypatch.setattr("app.api.summary.resolve_new_job_snapshot", resolve_snapshot)
     monkeypatch.setattr(
         "app.api.summary.revalidate_strict_snapshot_admission",
         revalidate_snapshot,
     )
+    model_run = AsyncMock(side_effect=run)
     monkeypatch.setattr("app.services.local_ai.artifact_store.ArtifactStore", Store)
     monkeypatch.setattr(
-        "app.services.local_ai.model_manager.local_model_manager.run", run
+        "app.services.local_ai.model_manager.local_model_manager.run", model_run
     )
     monkeypatch.setattr(
         "app.services.ai.summarizer.settings.local_ai_scratch_dir",
         str(tmp_path / "scratch"),
+    )
+    monkeypatch.setattr(
+        "app.api.summary.local_summary_runner.enqueue",
+        enqueue,
+        raising=False,
     )
     monkeypatch.setattr(db_session, "commit", counted_commit)
 
@@ -391,30 +398,20 @@ async def test_strict_local_summary_persists_job_before_worker_and_renders_typed
         },
     )
 
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
     data = response.json()
-    assert data["natural_language"].endswith("qualified healthcare professional.")
-    assert data["json_data"]["sections"][0]["heading"] == "Conditions"
     assert data["processing_mode"] == "validated_strict_local"
-    assert data["typed_response"] == data["json_data"]
+    assert data["kind"] == "summary"
+    assert data["status"] == "queued"
+    assert data["stage"] == "queued"
     prompt = (await db_session.execute(select(AISummaryPrompt))).scalar_one()
     job = (await db_session.execute(select(LocalAIJob))).scalar_one()
-    assert data["model_provenance"] == {
-        "processing_mode": "validated_strict_local",
-        "manifest_sha256": digest,
-        "pack_revision": "apple-m4-16gb-v1",
-        "model": {
-            "role": "summary",
-            "repository": "owner/summary",
-            "revision": "0" * 40,
-            "quantization": "4bit",
-            "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
-        },
-    }
-    assert prompt.model_provenance["manifest_sha256"] == digest
-    assert prompt.typed_response == data["json_data"]
-    assert job.status == "completed"
+    assert data["id"] == str(prompt.id)
+    assert data["job_id"] == str(job.id)
+    assert job.status == "queued"
     assert job.kind == "summary"
+    enqueue.assert_called_once_with(job.id)
+    model_run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -555,6 +552,8 @@ async def test_strict_local_summary_cancellation_finalizes_job_before_reraising(
             return manifest
 
     async def cancel(*_args, **_kwargs):
+        job.cancel_requested = True
+        await db_session.commit()
         raise asyncio.CancelledError
 
     monkeypatch.setattr("app.services.local_ai.artifact_store.ArtifactStore", Store)

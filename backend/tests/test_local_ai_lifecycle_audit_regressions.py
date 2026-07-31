@@ -814,3 +814,105 @@ async def test_startup_reconciles_pack_and_strict_jobs_under_database_lock(
     assert events.index("commit", events.index("recover-summary")) > events.index(
         "recover-summary"
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_work_and_requeues_before_stopping_model_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The model manager is last, after runner and extraction drain/recovery."""
+    import app.main as main_module
+    import app.services.auth_service as auth_service
+    import app.services.extraction.terminology as terminology
+    from app.api import upload
+    from app.services.local_ai.summary_runner import local_summary_runner
+
+    events: list[str] = []
+
+    class FakeResult:
+        rowcount = 0
+
+    class FakeSession:
+        async def execute(self, _query: object, *_args, **_kwargs) -> FakeResult:
+            return FakeResult()
+
+        async def commit(self) -> None:
+            events.append("commit")
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> FakeSession:
+            return FakeSession()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class FakeManager:
+        async def start(self) -> None:
+            events.append("manager-start")
+
+        async def stop(self) -> None:
+            events.append("manager-stop")
+
+    async def acquire(_db: object) -> None:
+        events.append("db-lock")
+
+    async def recover_uploads(_db: object) -> int:
+        events.append("recover-ingestion")
+        return 0
+
+    async def recover_summaries(_db: object) -> list[UUID]:
+        events.append("recover-summary")
+        return []
+
+    async def stop_extraction() -> None:
+        events.append("extraction-drained")
+
+    async def stop_summaries() -> None:
+        events.append("summaries-requeued")
+
+    async def reconcile_zip(_db: object, _root: Path) -> None:
+        return None
+
+    async def no_purge(_db: object) -> int:
+        return 0
+
+    monkeypatch.setattr(main_module.settings, "local_ai_enabled", True)
+    monkeypatch.setattr(main_module.settings, "local_ai_model_dir", str(tmp_path))
+    monkeypatch.setattr(main_module.settings, "local_ai_scratch_dir", str(tmp_path))
+    monkeypatch.setattr(main_module.settings, "phi_ner_enabled", False)
+    monkeypatch.setattr(main_module.settings, "extraction_engine", "gemini")
+    monkeypatch.setattr(main_module, "async_session_factory", FakeSessionContext)
+    monkeypatch.setattr(main_module, "local_model_manager", FakeManager())
+    monkeypatch.setattr(main_module, "reconcile_zip_child_sets", reconcile_zip)
+    monkeypatch.setattr(
+        main_module, "_recover_unstructured_jobs_on_startup", recover_uploads
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_recover_strict_local_summary_jobs_on_startup",
+        recover_summaries,
+    )
+    monkeypatch.setattr(main_module, "acquire_local_ai_lifecycle_lock", acquire)
+    monkeypatch.setattr(
+        main_module,
+        "sweep_stale_scratch",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(terminology, "schedule_medication_refresh", lambda: None)
+    monkeypatch.setattr(auth_service, "purge_expired_revoked_tokens", no_purge)
+    monkeypatch.setattr(upload, "reset_extraction_worker_shutdown", lambda: None)
+    monkeypatch.setattr(upload, "start_extraction_worker", lambda: None)
+    monkeypatch.setattr(upload, "stop_extraction_worker", stop_extraction)
+    monkeypatch.setattr(local_summary_runner, "start", lambda _ids: None)
+    monkeypatch.setattr(local_summary_runner, "stop_and_requeue", stop_summaries)
+
+    async with main_module.lifespan(FastAPI()):
+        pass
+
+    shutdown_recovery = [
+        index for index, event in enumerate(events) if event == "recover-ingestion"
+    ][-1]
+    assert events.index("extraction-drained") < events.index("summaries-requeued")
+    assert events.index("summaries-requeued") < shutdown_recovery
+    assert shutdown_recovery < events.index("manager-stop")

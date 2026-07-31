@@ -184,16 +184,24 @@ async def _retry_local_ai_job(
     job: LocalAIJob,
     upload: UploadedFile | None = None,
 ) -> None:
-    """Atomically requeue one failed, retryable strict-local ingestion job."""
+    """Atomically requeue one failed, retryable strict-local job."""
     failure = job.failure if isinstance(job.failure, dict) else {}
     if job.status != "failed" or failure.get("retryable") is not True:
         raise HTTPException(status_code=409, detail="This job cannot be retried.")
-    if (
-        job.cancel_requested
-        or job.kind != "ingestion"
-        or job.upload_id is None
-        or job.processing_mode != "validated_strict_local"
-    ):
+    if job.cancel_requested or job.processing_mode != "validated_strict_local":
+        raise HTTPException(status_code=409, detail="This job cannot be retried.")
+
+    if job.kind == "summary":
+        if job.summary_prompt_id is None or job.upload_id is not None:
+            raise HTTPException(status_code=409, detail="This job cannot be retried.")
+        job.status = "queued"
+        job.stage = "queued"
+        job.progress = {}
+        job.failure = None
+        job.started_at = None
+        job.completed_at = None
+        return
+    if job.kind != "ingestion" or job.upload_id is None:
         raise HTTPException(status_code=409, detail="This job cannot be retried.")
 
     if upload is None:
@@ -748,7 +756,7 @@ async def retry_local_ai_job(
     user_id: UUID = Depends(get_authenticated_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> LocalAIJobResponse:
-    """Requeue one failed, retryable ingestion job without exposing diagnostics."""
+    """Requeue one failed, retryable strict-local job without diagnostics."""
     target = (
         await db.execute(
             select(
@@ -763,11 +771,43 @@ async def retry_local_ai_job(
     ).one_or_none()
     if target is None:
         raise HTTPException(status_code=404, detail="Local AI job not found.")
-    if (
-        target.kind != "ingestion"
-        or target.upload_id is None
-        or target.processing_mode != "validated_strict_local"
-    ):
+    if target.processing_mode != "validated_strict_local":
+        raise HTTPException(status_code=409, detail="This job cannot be retried.")
+
+    if target.kind == "summary":
+        job = (
+            await db.execute(
+                select(LocalAIJob)
+                .where(
+                    LocalAIJob.id == job_id,
+                    LocalAIJob.user_id == user_id,
+                    LocalAIJob.kind == "summary",
+                    LocalAIJob.processing_mode == "validated_strict_local",
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if job is None:
+            raise HTTPException(status_code=404, detail="Local AI job not found.")
+        await _retry_local_ai_job(db, job=job)
+        await db.commit()
+        await db.refresh(job)
+
+        await log_audit_event(
+            db,
+            user_id=user_id,
+            action="local_ai.job_retry",
+            resource_type="local_ai_job",
+            resource_id=job.id,
+            ip_address=request.client.host if request.client else None,
+            details={"kind": job.kind, "status": job.status},
+        )
+        from app.services.local_ai.summary_runner import local_summary_runner
+
+        local_summary_runner.enqueue(job.id)
+        return _job_response(job)
+
+    if target.kind != "ingestion" or target.upload_id is None:
         raise HTTPException(status_code=409, detail="This job cannot be retried.")
 
     upload = (

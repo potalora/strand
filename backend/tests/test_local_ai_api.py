@@ -712,6 +712,115 @@ async def test_summary_job_status_and_cancel_are_owner_scoped_and_content_free(
     assert job.cancel_requested is True
 
 
+@pytest.mark.asyncio
+async def test_retry_failed_summary_commits_before_waking_summary_runner(
+    client,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Summary retries use their own durable claim and do not wake before commit."""
+    headers, user_id = await auth_headers(client, email="summary-retry@example.com")
+    patient = await create_test_patient(db_session, user_id)
+    manifest, _contents = _manifest()
+    prompt = AISummaryPrompt(
+        id=uuid4(),
+        user_id=UUID(user_id),
+        patient_id=patient.id,
+        summary_type="full",
+        processing_mode="validated_strict_local",
+        scope_filter={},
+        system_prompt="Locked policy",
+        user_prompt="Grounded facts",
+        target_model="locked-local-summary",
+        suggested_config={},
+        record_count=0,
+        generated_at=datetime.now(timezone.utc),
+    )
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        summary_prompt_id=prompt.id,
+        kind="summary",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=_manifest_dict(manifest),
+        status="failed",
+        stage="failed",
+        progress={"stage": "failed"},
+        failure={"code": "local_worker_error", "retryable": True},
+        started_at=datetime.now(timezone.utc),
+        completed_at=datetime.now(timezone.utc),
+    )
+    db_session.add_all([prompt, job])
+    await db_session.commit()
+
+    enqueue = Mock()
+    monkeypatch.setattr(
+        "app.services.local_ai.summary_runner.local_summary_runner.enqueue",
+        enqueue,
+    )
+    response = await client.post(
+        f"/api/v1/local-ai/jobs/{job.id}/retry",
+        headers=headers,
+    )
+    repeat = await client.post(
+        f"/api/v1/local-ai/jobs/{job.id}/retry",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert repeat.status_code == 409
+    assert response.json()["status"] == "queued"
+    await db_session.refresh(job)
+    assert (job.status, job.stage, job.failure) == ("queued", "queued", None)
+    enqueue.assert_called_once_with(job.id)
+
+    job.status = "failed"
+    job.failure = {"code": "local_worker_error", "retryable": False}
+    await db_session.commit()
+    nonretryable = await client.post(
+        f"/api/v1/local-ai/jobs/{job.id}/retry",
+        headers=headers,
+    )
+
+    job.failure = {"code": "local_worker_error", "retryable": True}
+    job.cancel_requested = True
+    await db_session.commit()
+    cancelled = await client.post(
+        f"/api/v1/local-ai/jobs/{job.id}/retry",
+        headers=headers,
+    )
+
+    job.cancel_requested = False
+    job.status = "processing"
+    await db_session.commit()
+    active = await client.post(
+        f"/api/v1/local-ai/jobs/{job.id}/retry",
+        headers=headers,
+    )
+
+    assert nonretryable.status_code == 409
+    assert cancelled.status_code == 409
+    assert active.status_code == 409
+    enqueue.assert_called_once_with(job.id)
+
+    async def fail_audit(*_args, **_kwargs) -> None:
+        raise RuntimeError("audit unavailable")
+
+    job.status = "failed"
+    job.failure = {"code": "local_worker_error", "retryable": True}
+    await db_session.commit()
+    monkeypatch.setattr("app.api.local_ai.log_audit_event", fail_audit)
+
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        await client.post(
+            f"/api/v1/local-ai/jobs/{job.id}/retry",
+            headers=headers,
+        )
+
+    await db_session.refresh(job)
+    assert (job.status, job.stage, job.failure) == ("queued", "queued", None)
+    enqueue.assert_called_once_with(job.id)
+
+
 def test_lifecycle_operations_take_owner_only_cross_process_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

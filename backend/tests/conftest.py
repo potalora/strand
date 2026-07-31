@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime, timezone, timedelta
@@ -243,8 +244,8 @@ def clear_rate_limiters():
     register_limiter._requests.clear()
 
 
-@pytest.fixture(autouse=True)
-def reset_extraction_worker():
+@pytest_asyncio.fixture(autouse=True)
+async def reset_extraction_worker():
     """Stop the DB-polling extraction worker from leaking across tests.
 
     ``upload._worker_task`` is a module global. A worker started in one test is
@@ -258,20 +259,35 @@ def reset_extraction_worker():
     """
     import app.api.upload as upload_module
 
-    def _reset() -> None:
+    async def _cancel_task(task: asyncio.Task | None) -> None:
+        if task is None or task.done():
+            return
+        task.cancel()
+        if task.get_loop() is asyncio.get_running_loop():
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _reset() -> None:
         task = getattr(upload_module, "_worker_task", None)
-        if task is not None:
-            try:
-                task.cancel()
-            except Exception:
-                pass
+        await _cancel_task(task)
+        for child in list(upload_module._extraction_tasks):
+            await _cancel_task(child)
         upload_module._worker_task = None
+        upload_module._extraction_tasks.clear()
+        upload_module._extraction_draining = False
         upload_module._extraction_semaphores.clear()
         upload_module._gemini_semaphores.clear()
+        upload_module._strict_extraction_semaphores.clear()
 
-    _reset()
+        from app.services.local_ai.summary_runner import local_summary_runner
+
+        for task in list(local_summary_runner._tasks.values()):
+            await _cancel_task(task)
+        local_summary_runner._tasks.clear()
+        local_summary_runner._draining = False
+
+    await _reset()
     yield
-    _reset()
+    await _reset()
 
 
 # ---------------------------------------------------------------------------

@@ -178,6 +178,18 @@ class StrictLocalGenerateSummaryResponse(GenerateSummaryResponseBase):
     typed_response: GroundedSummaryDocument
 
 
+class StrictLocalSummaryAccepted(BaseModel):
+    """Content-free acknowledgement for a durable strict-local summary job."""
+
+    id: UUID
+    job_id: UUID
+    processing_mode: Literal["validated_strict_local"]
+    kind: Literal["summary"] = "summary"
+    status: Literal["queued"] = "queued"
+    stage: Literal["queued"] = "queued"
+    created_at: datetime
+
+
 class CustomLocalGenerateSummaryResponse(GenerateSummaryResponseBase):
     processing_mode: Literal["custom_local"]
     model_provenance: CustomLocalSummaryProvenance | None = None
