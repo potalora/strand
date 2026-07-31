@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -226,6 +226,7 @@ class Settings(BaseSettings):
     local_ai_max_pack_bytes: int = 20 * 1024 * 1024 * 1024
     local_ai_worker_timeout_seconds: int = 1800
     local_ai_worker_hard_timeout_seconds: int = 7200
+    local_ai_shutdown_drain_seconds: float = Field(default=5.0, gt=0, le=60)
     local_ai_max_page_pixels: int = 40_000_000
 
     # Redis

@@ -79,6 +79,48 @@ async def test_stop_cancels_tasks_then_runs_durable_requeue(
 
 
 @pytest.mark.asyncio
+async def test_stop_requeues_after_a_cancellation_resistant_summary_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck in-process wake cannot block durable shutdown recovery forever."""
+    from app.services.local_ai.summary_runner import LocalSummaryRunner
+
+    release = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+
+    async def resist_cancellation(_job_id: UUID) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await release.wait()
+
+    requeue = AsyncMock()
+    runner = LocalSummaryRunner()
+    monkeypatch.setattr(runner, "_run_one", resist_cancellation)
+    monkeypatch.setattr(
+        "app.services.local_ai.summary_runner.requeue_interrupted_summary_jobs",
+        requeue,
+    )
+    monkeypatch.setattr(
+        "app.services.local_ai.summary_runner.settings.local_ai_shutdown_drain_seconds",
+        0.01,
+    )
+    job_id = uuid4()
+    runner.enqueue(job_id)
+    await asyncio.sleep(0)
+    child = runner._tasks[job_id]
+
+    try:
+        await asyncio.wait_for(runner.stop_and_requeue(), timeout=0.2)
+        assert cancellation_seen.is_set()
+        requeue.assert_awaited_once_with()
+    finally:
+        release.set()
+        await asyncio.gather(child, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_failed_shutdown_requeue_clears_registry_before_a_new_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

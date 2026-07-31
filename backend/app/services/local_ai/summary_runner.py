@@ -6,6 +6,7 @@ import asyncio
 import logging
 from uuid import UUID
 
+from app.config import settings
 from app.services.ai.summarizer import (
     requeue_interrupted_summary_jobs,
     resume_grounded_local_summary_jobs,
@@ -54,7 +55,16 @@ class LocalSummaryRunner:
             task.cancel()
         try:
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                drain = asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(drain),
+                        timeout=settings.local_ai_shutdown_drain_seconds,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "Strict-local summary runner shutdown drain timed out"
+                    )
             await requeue_interrupted_summary_jobs()
         finally:
             self._tasks.clear()

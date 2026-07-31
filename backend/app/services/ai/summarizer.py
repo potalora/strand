@@ -1626,6 +1626,13 @@ async def generate_grounded_local_summary(
         ):
             await db.rollback()
             return {"superseded": True}
+        if current_job.cancel_requested:
+            current_job.status = "cancelled"
+            current_job.stage = "cancelled"
+            current_job.progress = {"stage": "cancelled"}
+            current_job.completed_at = datetime.now().astimezone()
+            await db.commit()
+            raise LocalPolicyError("Strict-local summary job was cancelled.")
         job = current_job
         prompt = await db.get(AISummaryPrompt, job.summary_prompt_id)
         if prompt is None or prompt.user_id != user_id:

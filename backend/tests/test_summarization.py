@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -21,6 +21,7 @@ from app.services.local_ai.manifest import (
     canonicalize_manifest_snapshot,
     parse_manifest,
 )
+from app.services.local_ai.errors import LocalAIError
 from app.services.local_ai.processing_snapshot import ProcessingSnapshot
 from app.services.local_ai.types import ModelRole, ProcessingMode
 from tests.conftest import auth_headers, create_test_patient, seed_test_records
@@ -772,6 +773,146 @@ async def test_strict_local_summary_cancellation_finalizes_job_before_reraising(
     assert job.status == "cancelled"
     assert job.stage == "cancelled"
     assert job.completed_at is not None
+    assert job.failure is None
+
+
+@pytest.mark.asyncio
+async def test_final_summary_completion_honors_cancellation_under_its_terminal_lock(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A cancellation after model output must win over the final completion write."""
+    from types import SimpleNamespace
+
+    from app.services.ai.summarizer import generate_grounded_local_summary
+
+    _headers, user_id = await auth_headers(
+        client,
+        email="strict-summary-final-window-cancel@example.com",
+    )
+    patient = await create_test_patient(db_session, user_id)
+    manifest_snapshot, digest = canonicalize_manifest_snapshot(_strict_manifest())
+    manifest = parse_manifest(manifest_snapshot)
+    prompt = AISummaryPrompt(
+        id=uuid4(),
+        user_id=UUID(user_id),
+        patient_id=patient.id,
+        summary_type="full",
+        processing_mode="validated_strict_local",
+        scope_filter={},
+        system_prompt="Locked policy",
+        user_prompt="Grounded facts",
+        target_model="locked-local-summary",
+        suggested_config={},
+        record_count=0,
+        generated_at=datetime.now(timezone.utc),
+    )
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        summary_prompt_id=prompt.id,
+        kind="summary",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=manifest_snapshot,
+        manifest_sha256=digest,
+        status="queued",
+        stage="queued",
+        progress={"stage": "queued"},
+    )
+    db_session.add_all(
+        [
+            prompt,
+            job,
+            HealthRecord(
+                user_id=UUID(user_id),
+                patient_id=patient.id,
+                record_type="condition",
+                fhir_resource_type="Condition",
+                fhir_resource={"resourceType": "Condition"},
+                source_format="fhir",
+                display_text="Hypertension",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    class Store:
+        packs_dir = tmp_path / "packs"
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def active_manifest(self):
+            return manifest
+
+    async def complete_model(*_args, **_kwargs) -> dict:
+        return {}
+
+    async def persist_cancellation() -> None:
+        async with async_sessionmaker(
+            db_session.bind,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )() as cancellation_session:
+            await cancellation_session.execute(
+                update(LocalAIJob)
+                .where(LocalAIJob.id == job.id)
+                .values(cancel_requested=True)
+            )
+            await cancellation_session.commit()
+
+    cancellation_task: asyncio.Task[None] | None = None
+
+    def cancel_after_model_output(*_args, **_kwargs):
+        nonlocal cancellation_task
+        cancellation_task = asyncio.create_task(persist_cancellation())
+        return SimpleNamespace(
+            document=SimpleNamespace(
+                model_dump=lambda **_kwargs: {"sections": [], "uncertainties": []}
+            ),
+            markdown="Cancelled summary must not be persisted.",
+        )
+
+    original_execute = db_session.execute
+
+    async def execute_after_cancellation(*args, **kwargs):
+        nonlocal cancellation_task
+        if cancellation_task is not None:
+            task, cancellation_task = cancellation_task, None
+            await task
+        return await original_execute(*args, **kwargs)
+
+    monkeypatch.setattr("app.services.local_ai.artifact_store.ArtifactStore", Store)
+    monkeypatch.setattr(
+        "app.services.local_ai.model_manager.local_model_manager.run",
+        complete_model,
+    )
+    monkeypatch.setattr(
+        "app.services.local_ai.grounded_summary.validate_and_render_summary",
+        cancel_after_model_output,
+    )
+    monkeypatch.setattr(
+        "app.services.ai.summarizer.settings.local_ai_scratch_dir",
+        str(tmp_path / "scratch"),
+    )
+    monkeypatch.setattr(db_session, "execute", execute_after_cancellation)
+
+    with pytest.raises(LocalAIError, match="cancelled"):
+        await generate_grounded_local_summary(
+            db_session,
+            user_id=UUID(user_id),
+            patient_id=patient.id,
+            job_id=job.id,
+            summary_type="full",
+        )
+
+    await db_session.refresh(job)
+    assert (job.status, job.stage, job.cancel_requested) == (
+        "cancelled",
+        "cancelled",
+        True,
+    )
     assert job.failure is None
 
 

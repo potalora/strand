@@ -929,12 +929,12 @@ async def test_shutdown_drains_work_and_requeues_before_stopping_model_manager(
 
 
 @pytest.mark.asyncio
-async def test_shutdown_awaits_tracked_extraction_child_then_requeues_before_model_stop(
+async def test_shutdown_requeues_before_model_stop_when_extraction_child_resists_cancellation(
     client,
     db_session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A claimed extraction child is drained before its durable recovery and model stop."""
+    """Durable recovery still runs when a claimed child ignores cancellation."""
     import app.main as main_module
     from app.api import upload as upload_module
     from app.models.local_ai import LocalAIJob
@@ -977,10 +977,13 @@ async def test_shutdown_awaits_tracked_extraction_child_then_requeues_before_mod
     await db_session.commit()
 
     child_awaited = asyncio.Event()
+    release_child = asyncio.Event()
 
     async def live_child() -> None:
         try:
             await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release_child.wait()
         finally:
             child_awaited.set()
 
@@ -997,7 +1000,7 @@ async def test_shutdown_awaits_tracked_extraction_child_then_requeues_before_mod
 
     class FakeManager:
         async def stop(self) -> None:
-            assert child_awaited.is_set()
+            assert child_awaited.is_set() is False
             async with session_factory() as verify:
                 current_upload = await verify.get(UploadedFile, upload.id)
                 current_job = await verify.get(LocalAIJob, job.id)
@@ -1014,7 +1017,20 @@ async def test_shutdown_awaits_tracked_extraction_child_then_requeues_before_mod
     monkeypatch.setattr(main_module, "local_model_manager", FakeManager())
     monkeypatch.setattr(main_module, "acquire_local_ai_lifecycle_lock", acquire)
     monkeypatch.setattr(local_summary_runner, "stop_and_requeue", AsyncMock())
+    monkeypatch.setattr(
+        upload_module.settings,
+        "local_ai_shutdown_drain_seconds",
+        0.01,
+    )
 
-    await main_module._shutdown_local_ai_workers(local_ai_started=True)
+    try:
+        await asyncio.wait_for(
+            main_module._shutdown_local_ai_workers(local_ai_started=True),
+            timeout=0.2,
+        )
+        assert child_awaited.is_set() is False
+    finally:
+        release_child.set()
+        await asyncio.gather(child, return_exceptions=True)
 
     assert child.done()

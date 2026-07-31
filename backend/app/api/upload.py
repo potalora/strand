@@ -496,14 +496,26 @@ async def stop_extraction_worker() -> None:
     worker = _worker_task
     if worker is not None and not worker.done():
         worker.cancel()
-        await asyncio.gather(worker, return_exceptions=True)
+        await _drain_extraction_shutdown_tasks([worker])
     _worker_task = None
     children = list(_extraction_tasks)
     for child in children:
         child.cancel()
     if children:
-        await asyncio.gather(*children, return_exceptions=True)
+        await _drain_extraction_shutdown_tasks(children)
     _extraction_tasks.clear()
+
+
+async def _drain_extraction_shutdown_tasks(tasks: list[asyncio.Task[object]]) -> None:
+    """Bound shutdown waits so durable recovery cannot be held by a stuck task."""
+    drain = asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(drain),
+            timeout=settings.local_ai_shutdown_drain_seconds,
+        )
+    except TimeoutError:
+        logger.warning("Strict-local extraction shutdown drain timed out")
 
 
 # Statuses that count as "done" for batch progress. ``cancelled`` is terminal
