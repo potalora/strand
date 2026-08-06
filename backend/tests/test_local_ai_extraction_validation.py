@@ -8,6 +8,7 @@ import pytest
 from app.services.local_ai.errors import LocalValidationError
 from app.services.local_ai.extraction_schema import (
     CLINICAL_EXTRACTION_SCHEMA_VERSION,
+    AssertionState,
     ClinicalDocumentExtraction,
 )
 from app.services.local_ai.extraction_validator import validate_clinical_extraction
@@ -561,6 +562,78 @@ def test_performed_procedure_requires_source_performance_evidence() -> None:
 
     with pytest.raises(LocalValidationError, match=r"procedures\[0\].*assertion"):
         _validate(raw, page="Colonoscopy")
+
+
+def test_billed_procedure_line_item_supports_mentioned_not_performed() -> None:
+    raw = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "mentioned_not_performed",
+                "verbatim": "Colonoscopy",
+                "page_number": 1,
+                "evidence_excerpt": "Authorization for Colonoscopy",
+            }
+        ]
+    }
+
+    result = _validate(raw, page="Authorization for Colonoscopy")
+
+    assert result.procedures[0].assertion == AssertionState.MENTIONED_NOT_PERFORMED
+
+
+def test_billed_context_does_not_forbid_dated_present_procedure() -> None:
+    raw = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "date": "2024-03-01",
+                "verbatim": "Colonoscopy on 2024-03-01",
+                "page_number": 1,
+                "evidence_excerpt": "Billed Colonoscopy on 2024-03-01",
+            }
+        ]
+    }
+
+    result = _validate(raw, page="Billed Colonoscopy on 2024-03-01")
+
+    assert result.procedures[0].assertion == AssertionState.PRESENT
+
+
+def test_billing_form_page_supports_mentioned_not_performed_without_excerpt_wording() -> None:
+    raw = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "mentioned_not_performed",
+                "verbatim": "Colonoscopy",
+                "page_number": 1,
+                "evidence_excerpt": "Colonoscopy",
+            }
+        ]
+    }
+
+    result = _validate(raw, page="Place of Service: 11. Payer: Aetna. Colonoscopy")
+
+    assert result.procedures[0].assertion == AssertionState.MENTIONED_NOT_PERFORMED
+
+
+def test_billed_present_procedure_without_support_still_fails_closed() -> None:
+    raw = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "verbatim": "Colonoscopy",
+                "page_number": 1,
+                "evidence_excerpt": "Authorization for Colonoscopy",
+            }
+        ]
+    }
+
+    with pytest.raises(LocalValidationError, match=r"procedures\[0\].*assertion"):
+        _validate(raw, page="Authorization for Colonoscopy")
 
 
 def test_evidence_ids_are_stable_and_change_with_relevant_inputs() -> None:

@@ -2065,6 +2065,116 @@ def test_extraction_deterministically_grounds_explicit_assertion_phrases(
     assert len(calls) == 1
 
 
+def test_grounding_downgrades_billed_procedure_line_items_to_mentioned_not_performed() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "verbatim": "Colonoscopy",
+                "evidence_excerpt": "Authorization for Colonoscopy",
+            }
+        ]
+    }
+
+    grounded = _ground_explicit_assertions(value)
+
+    assert grounded["procedures"][0]["assertion"] == "mentioned_not_performed"  # type: ignore[index]
+
+
+def test_grounding_keeps_billed_procedure_present_when_performance_is_documented() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "verbatim": "Colonoscopy performed",
+                "evidence_excerpt": "Authorization for Colonoscopy performed today",
+            },
+            {
+                "name": "Upper endoscopy",
+                "assertion": "present",
+                "date": "2024-03-01",
+                "verbatim": "Upper endoscopy",
+                "evidence_excerpt": "Billed: Upper endoscopy",
+            },
+        ]
+    }
+
+    grounded = _ground_explicit_assertions(value)
+
+    assert grounded["procedures"][0]["assertion"] == "present"  # type: ignore[index]
+    assert grounded["procedures"][1]["assertion"] == "present"  # type: ignore[index]
+
+
+def test_grounding_downgrades_undated_procedure_on_billing_form_page() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "page_number": 1,
+                "verbatim": "Colonoscopy",
+                "evidence_excerpt": "Colonoscopy",
+            }
+        ]
+    }
+    pages = [{"page_number": 1, "markdown": "Place of Service: 11. Payer: Aetna."}]
+
+    grounded = _ground_explicit_assertions(value, pages)
+
+    assert grounded["procedures"][0]["assertion"] == "mentioned_not_performed"  # type: ignore[index]
+
+
+def test_grounding_ignores_billing_signature_on_other_pages() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "page_number": 2,
+                "verbatim": "Colonoscopy",
+                "evidence_excerpt": "Colonoscopy",
+            }
+        ]
+    }
+    pages = [
+        {"page_number": 1, "markdown": "Place of Service: 11. Payer: Aetna."},
+        {"page_number": 2, "markdown": "Procedure note."},
+    ]
+
+    grounded = _ground_explicit_assertions(value, pages)
+
+    assert grounded["procedures"][0]["assertion"] == "present"  # type: ignore[index]
+
+
+def test_grounding_billing_context_applies_only_to_procedures() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "conditions": [
+            {
+                "name": "hypertension",
+                "assertion": "present",
+                "verbatim": "hypertension",
+                "evidence_excerpt": "Authorization for treatment of hypertension",
+            }
+        ]
+    }
+
+    grounded = _ground_explicit_assertions(value)
+
+    assert grounded["conditions"][0]["assertion"] == "present"  # type: ignore[index]
+
+
 def test_extraction_binds_missing_table_evidence_to_exact_source_row(
     tmp_path: Path,
 ) -> None:

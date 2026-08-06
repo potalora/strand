@@ -128,6 +128,28 @@ _PERFORMED_RE = re.compile(
     r"\b\w+(?:ectomy|otomy|ostomy|oplasty|plasty)\b)",
     re.IGNORECASE,
 )
+# Billing, claims, and authorization line-item wording. On those forms a listed
+# procedure is billed or requested, not clinically documented as performed, so
+# the wording supports a mentioned-not-performed assertion without forbidding
+# a present assertion that carries its own date or performance evidence.
+_BILLED_RE = re.compile(
+    r"(?:\bbill(?:ed|ing)?\b|\bcharge[ds]?\b|\bclaims?\b|\binvoice[ds]?\b|"
+    r"\bline[\s-]*items?\b|\bcpt\b|\bhcpcs\b|"
+    r"\bauthoriz(?:e[ds]?|ation|ations)\b|\bpre-?auth(?:orization)?\b|"
+    r"\brevenue\s+code\b|\bplace\s+of\s+service\b|\ballowed\s+amount\b|"
+    r"\bamount\s+(?:billed|due|paid)\b)",
+    re.IGNORECASE,
+)
+# Administrative billing-form signature, checked against the fact's own page.
+# Mirrors the worker's deterministic grounding; the effect is only to support
+# a conservative mentioned-not-performed assertion.
+_BILLING_FORM_SIGNATURE_RE = re.compile(
+    r"(?:place\s+of\s+service|revenue\s+code|allowed\s+amount|line[\s-]*items?|"
+    r"\bpayer\b|\bbilled\b|\bbilling\b|\binvoice[ds]?\b|"
+    r"claim\s+(?:number|no\.?|#|id)|authorization\s+(?:for|number|no\.?|#)|"
+    r"pre-?auth(?:orization)?\s+(?:number|no\.?|#)|benefit\s+(?:code|plan))",
+    re.IGNORECASE,
+)
 _STRICT_LOCAL_NON_PROMOTABLE_ASSERTIONS = frozenset(
     {
         AssertionState.NEGATED,
@@ -1029,7 +1051,9 @@ def _is_supported_date(value: str) -> bool:
     return False
 
 
-def _validate_assertion_guards(fact: EvidenceFact, category: str, path: str) -> None:
+def _validate_assertion_guards(
+    fact: EvidenceFact, category: str, path: str, page_text: str | None = None
+) -> None:
     assertion = getattr(fact, "assertion", None)
     context = _fact_context(fact, category, path)
     subject_negated = _subject_is_negated(context, _subject_text(fact, category))
@@ -1100,9 +1124,16 @@ def _validate_assertion_guards(fact: EvidenceFact, category: str, path: str) -> 
         )
     if category == "procedures":
         mentioned = _NOT_PERFORMED_RE.search(context) is not None
+        billed = _BILLED_RE.search(context) is not None or (
+            _BILLING_FORM_SIGNATURE_RE.search(page_text or "") is not None
+        )
         if mentioned and assertion != AssertionState.MENTIONED_NOT_PERFORMED:
             _fail(f"{path}.assertion", "mentioned procedure cannot be marked performed")
-        if not mentioned and assertion == AssertionState.MENTIONED_NOT_PERFORMED:
+        if (
+            not mentioned
+            and not billed
+            and assertion == AssertionState.MENTIONED_NOT_PERFORMED
+        ):
             _fail(
                 f"{path}.assertion",
                 "mentioned-not-performed assertion lacks source support",
@@ -1418,7 +1449,7 @@ def _validate_clinical_extraction(
                         "token not grounded on referenced page",
                         page=fact.page_number,
                     )
-            _validate_assertion_guards(fact, category, path)
+            _validate_assertion_guards(fact, category, path, page_text)
             _validate_local_precision_guards(fact, category, path)
             if strict_local:
                 _validate_strict_local_promotion(fact, category, path)
