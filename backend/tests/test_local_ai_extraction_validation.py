@@ -1105,6 +1105,78 @@ def test_lifecycle_claims_cannot_contradict_source(
         _validate({category: [fact]}, page=page)
 
 
+def test_medication_lifecycle_signal_after_comma_in_own_verbatim_is_supported() -> None:
+    """Real-world medication lines put instructions after a comma.
+
+    The lifecycle signal ("daily") sits in the fact's own evidence span but
+    outside the subject's clause. Regression: such facts were rejected with
+    "lifecycle state lacks source support" because the status check only saw
+    the subject clause, so comma-separated Epic-style med lines never
+    produced medication records (2026-08-07 typical-documents run).
+    """
+    line = (
+        "escitalopram oxalate (LEXAPRO) 20 mg tablet, "
+        "Take 2.5 tablets (50 mg total) by mouth daily"
+    )
+    fact = _medication(
+        fact_id="med-comma",
+        name="escitalopram oxalate (LEXAPRO)",
+        dose_value="50",
+        dose_unit="mg",
+        route="by mouth",
+        frequency="daily",
+        status="active",
+        verbatim=line,
+        evidence_excerpt=line,
+    )
+    extraction = _validate({"medications": [fact]}, page=line)
+    assert [med.name for med in extraction.medications] == [
+        "escitalopram oxalate (LEXAPRO)"
+    ]
+
+
+def test_medication_lifecycle_blocker_inside_verbatim_still_rejects() -> None:
+    """A blocker word inside the fact's own evidence still defeats promotion."""
+    line = "escitalopram 20 mg tablet, consider taking daily"
+    fact = _medication(
+        fact_id="med-blocker",
+        name="escitalopram",
+        dose_value=None,
+        dose_unit=None,
+        route=None,
+        frequency=None,
+        status="active",
+        verbatim=line,
+        evidence_excerpt=line,
+    )
+    with pytest.raises(
+        LocalValidationError,
+        match=r"medications\[0\].status.*contradicts source evidence",
+    ):
+        _validate({"medications": [fact]}, page=line)
+
+
+def test_medication_lifecycle_signal_outside_fact_verbatim_still_rejected() -> None:
+    """A lifecycle signal in a sibling clause is not the fact's evidence."""
+    excerpt = "Medication review notes daily dosing. escitalopram 20 mg tablet"
+    fact = _medication(
+        fact_id="med-sibling",
+        name="escitalopram",
+        dose_value=None,
+        dose_unit=None,
+        route=None,
+        frequency=None,
+        status="active",
+        verbatim="escitalopram 20 mg tablet",
+        evidence_excerpt=excerpt,
+    )
+    with pytest.raises(
+        LocalValidationError,
+        match=r"medications\[0\].status.*lacks source support",
+    ):
+        _validate({"medications": [fact]}, page=excerpt)
+
+
 @pytest.mark.parametrize(
     ("category", "fact", "page"),
     [

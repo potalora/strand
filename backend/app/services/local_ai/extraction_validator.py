@@ -804,6 +804,68 @@ def _is_qualifier_only_continuation(line: str) -> bool:
     return bool(words) and all(word in _QUALIFIER_CONTINUATION_WORDS for word in words)
 
 
+# Dosing-instruction vocabulary that may legally continue a clinical subject
+# within its own evidence span ("Drug 20 mg tablet, Take 1 by mouth daily").
+# Superset of the qualifier set: administration verbs and dosage-form nouns.
+# Any word outside this set stops the continuation walk, so a clause that can
+# carry its own clinical subject never leaks its qualifier into another fact.
+_LIFECYCLE_CONTINUATION_WORDS = _QUALIFIER_CONTINUATION_WORDS | frozenset(
+    {
+        "apply",
+        "applies",
+        "applying",
+        "by",
+        "capsule",
+        "capsules",
+        "directed",
+        "doses",
+        "drop",
+        "drops",
+        "each",
+        "ear",
+        "ears",
+        "eye",
+        "eyes",
+        "give",
+        "injected",
+        "instill",
+        "instilled",
+        "instills",
+        "instructed",
+        "mouth",
+        "nose",
+        "of",
+        "pill",
+        "pills",
+        "puff",
+        "puffs",
+        "take",
+        "takes",
+        "taking",
+        "tablet",
+        "tablets",
+        "the",
+        "then",
+        "total",
+        "under",
+        "use",
+        "uses",
+        "using",
+        "with",
+    }
+)
+
+
+def _is_lifecycle_continuation(clause: str) -> bool:
+    """Return whether a clause after the subject reads as its dosing tail."""
+    without_numbers = _NUMERIC_VALUE_RE.sub(" ", clause)
+    words = [
+        word.casefold()
+        for word in re.findall(r"[^\W\d_]+", without_numbers, re.UNICODE)
+    ]
+    return bool(words) and all(word in _LIFECYCLE_CONTINUATION_WORDS for word in words)
+
+
 def _semantic_boundaries(source: str) -> list[tuple[int, int]]:
     boundaries = [
         (match.start(), match.end())
@@ -1233,6 +1295,56 @@ def _unit_is_truncated(source: str, unit: str) -> bool:
     return found
 
 
+def _lifecycle_support_source(fact: EvidenceFact, category: str, path: str) -> str:
+    """Return the subject clause plus any trailing dosing-instruction clauses.
+
+    Lifecycle support must come from the fact's own evidence. Dosing cues
+    routinely follow the subject after a boundary on real-world lines
+    ("Drug 20 mg tablet, Take 1 by mouth daily"), so walk the clauses after
+    the subject's clause and include each one that reads purely as a dosing
+    continuation (qualifier words, numbers, units). Stop at the first clause
+    that can carry its own clinical subject, so a qualifier belonging to
+    another subject never leaks into this fact (2026-08-07 medication blind
+    spot).
+    """
+    excerpt = fact.evidence_excerpt
+    subject = _subject_text(fact, category)
+    pattern = _subject_pattern(subject)
+    if pattern is None:
+        return _fact_context(fact, category, path)
+    matches = list(re.finditer(pattern, excerpt, re.IGNORECASE))
+    if len(matches) != 1:
+        # Let the ordinary grounding path own this failure.
+        return _fact_context(fact, category, path)
+    match = matches[0]
+    boundaries = _semantic_boundaries(excerpt)
+    segments: list[tuple[int, int]] = []
+    previous = 0
+    for boundary_start, boundary_end in boundaries:
+        segments.append((previous, boundary_start))
+        previous = boundary_end
+    segments.append((previous, len(excerpt)))
+    subject_index = next(
+        (
+            index
+            for index, (seg_start, seg_end) in enumerate(segments)
+            if seg_start <= match.start() and match.end() <= seg_end
+        ),
+        None,
+    )
+    if subject_index is None:
+        return _fact_context(fact, category, path)
+    parts = [excerpt[segments[subject_index][0] : segments[subject_index][1]]]
+    for seg_start, seg_end in segments[subject_index + 1 :]:
+        clause = excerpt[seg_start:seg_end]
+        if not clause.strip():
+            continue
+        if not _is_lifecycle_continuation(clause):
+            break
+        parts.append(clause)
+    return "".join(parts)
+
+
 def _validate_lifecycle_status(
     fact: EvidenceFact,
     category: str,
@@ -1247,7 +1359,14 @@ def _validate_lifecycle_status(
         and getattr(fact, "assertion", None) != AssertionState.PRESENT
     ):
         return
-    source = _fact_context(fact, category, path)
+    # Blocking/uncertain cues scan the full clause around the evidence
+    # occurrence: it is conservative to let anything inside the fact's own
+    # span defeat a promoted claim.
+    blocker_source = _verbatim_context(fact, path)
+    # Supporting cues scan only the subject clause plus dosing continuations:
+    # a signal may promote the claim only when it cannot belong to another
+    # subject inside the same span.
+    source = _lifecycle_support_source(fact, category, path)
     detected = next(
         (status for status, pattern in signals if pattern.search(source)),
         None,
@@ -1257,8 +1376,8 @@ def _validate_lifecycle_status(
     promoted = _PROMOTED_LIFECYCLE_STATES[category]
     blocker = _LIFECYCLE_BLOCKERS.get(category)
     if claimed == promoted and (
-        _UNCERTAIN_RE.search(source) is not None
-        or (blocker is not None and blocker.search(source) is not None)
+        _UNCERTAIN_RE.search(blocker_source) is not None
+        or (blocker is not None and blocker.search(blocker_source) is not None)
     ):
         _fail(f"{path}.status", "lifecycle state contradicts source evidence")
     if detected is not None and claimed not in {detected, "unknown"}:
