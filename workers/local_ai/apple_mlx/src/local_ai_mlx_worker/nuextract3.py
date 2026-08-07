@@ -27,10 +27,19 @@ from .common import (
 )
 
 EXTRACTION_OUTPUT_CAP = 4096
-MAX_EXTRACTION_GENERATED_TOKENS = 16_384
+# Total generated-output work budget per extraction job. Raised 16_384 ->
+# 32_768 on 2026-08-07 after a dense 8-page clinical PDF legitimately consumed
+# the full 16K budget mid-document (work_token_limit at page 8/8) during the
+# strict-local typical-documents run. Still bounded; worst case roughly doubles
+# single-document extraction wall time.
+MAX_EXTRACTION_GENERATED_TOKENS = 32_768
 MAX_EXTRACTION_GENERATION_ATTEMPTS = 12
-MAX_EXTRACTION_RUNTIME_SPLITS = 7
-MAX_EXTRACTION_FRAGMENT_DEPTH = 3
+# Split/fragment budgets form one binary tree: a depth-N tree needs at most
+# 2**N - 1 splits. Raised together (7/3 -> 31/5) so a genuinely long single
+# page can subdivide until each fragment fits the batch input cap instead of
+# dying at fragment_depth_limit.
+MAX_EXTRACTION_RUNTIME_SPLITS = 31
+MAX_EXTRACTION_FRAGMENT_DEPTH = 5
 MAX_EXTRACTION_INPUT_BYTES = 4 * 1024 * 1024
 MAX_SELECTED_IMAGES = 8
 MAX_SELECTED_IMAGE_BYTES = 64 * 1024 * 1024
