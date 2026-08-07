@@ -8,6 +8,7 @@ import pytest
 from app.services.local_ai.errors import LocalValidationError
 from app.services.local_ai.extraction_schema import (
     CLINICAL_EXTRACTION_SCHEMA_VERSION,
+    AssertionState,
     ClinicalDocumentExtraction,
 )
 from app.services.local_ai.extraction_validator import validate_clinical_extraction
@@ -563,6 +564,80 @@ def test_performed_procedure_requires_source_performance_evidence() -> None:
         _validate(raw, page="Colonoscopy")
 
 
+def test_billed_procedure_line_item_supports_mentioned_not_performed() -> None:
+    raw = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "mentioned_not_performed",
+                "verbatim": "Colonoscopy",
+                "page_number": 1,
+                "evidence_excerpt": "Authorization for Colonoscopy",
+            }
+        ]
+    }
+
+    result = _validate(raw, page="Authorization for Colonoscopy")
+
+    assert result.procedures[0].assertion == AssertionState.MENTIONED_NOT_PERFORMED
+
+
+def test_billed_context_does_not_forbid_dated_present_procedure() -> None:
+    raw = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "date": "2024-03-01",
+                "verbatim": "Colonoscopy on 2024-03-01",
+                "page_number": 1,
+                "evidence_excerpt": "Billed Colonoscopy on 2024-03-01",
+            }
+        ]
+    }
+
+    result = _validate(raw, page="Billed Colonoscopy on 2024-03-01")
+
+    assert result.procedures[0].assertion == AssertionState.PRESENT
+
+
+def test_billing_form_page_supports_mentioned_not_performed_without_excerpt_wording() -> (
+    None
+):
+    raw = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "mentioned_not_performed",
+                "verbatim": "Colonoscopy",
+                "page_number": 1,
+                "evidence_excerpt": "Colonoscopy",
+            }
+        ]
+    }
+
+    result = _validate(raw, page="Place of Service: 11. Payer: Aetna. Colonoscopy")
+
+    assert result.procedures[0].assertion == AssertionState.MENTIONED_NOT_PERFORMED
+
+
+def test_billed_present_procedure_without_support_still_fails_closed() -> None:
+    raw = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "verbatim": "Colonoscopy",
+                "page_number": 1,
+                "evidence_excerpt": "Authorization for Colonoscopy",
+            }
+        ]
+    }
+
+    with pytest.raises(LocalValidationError, match=r"procedures\[0\].*assertion"):
+        _validate(raw, page="Authorization for Colonoscopy")
+
+
 def test_evidence_ids_are_stable_and_change_with_relevant_inputs() -> None:
     raw = {"medications": [_medication()]}
 
@@ -1030,6 +1105,78 @@ def test_lifecycle_claims_cannot_contradict_source(
 ) -> None:
     with pytest.raises(LocalValidationError, match=rf"{category}\[0\].*status"):
         _validate({category: [fact]}, page=page)
+
+
+def test_medication_lifecycle_signal_after_comma_in_own_verbatim_is_supported() -> None:
+    """Real-world medication lines put instructions after a comma.
+
+    The lifecycle signal ("daily") sits in the fact's own evidence span but
+    outside the subject's clause. Regression: such facts were rejected with
+    "lifecycle state lacks source support" because the status check only saw
+    the subject clause, so comma-separated Epic-style med lines never
+    produced medication records (2026-08-07 typical-documents run).
+    """
+    line = (
+        "escitalopram oxalate (LEXAPRO) 20 mg tablet, "
+        "Take 2.5 tablets (50 mg total) by mouth daily"
+    )
+    fact = _medication(
+        fact_id="med-comma",
+        name="escitalopram oxalate (LEXAPRO)",
+        dose_value="50",
+        dose_unit="mg",
+        route="by mouth",
+        frequency="daily",
+        status="active",
+        verbatim=line,
+        evidence_excerpt=line,
+    )
+    extraction = _validate({"medications": [fact]}, page=line)
+    assert [med.name for med in extraction.medications] == [
+        "escitalopram oxalate (LEXAPRO)"
+    ]
+
+
+def test_medication_lifecycle_blocker_inside_verbatim_still_rejects() -> None:
+    """A blocker word inside the fact's own evidence still defeats promotion."""
+    line = "escitalopram 20 mg tablet, consider taking daily"
+    fact = _medication(
+        fact_id="med-blocker",
+        name="escitalopram",
+        dose_value=None,
+        dose_unit=None,
+        route=None,
+        frequency=None,
+        status="active",
+        verbatim=line,
+        evidence_excerpt=line,
+    )
+    with pytest.raises(
+        LocalValidationError,
+        match=r"medications\[0\].status.*contradicts source evidence",
+    ):
+        _validate({"medications": [fact]}, page=line)
+
+
+def test_medication_lifecycle_signal_outside_fact_verbatim_still_rejected() -> None:
+    """A lifecycle signal in a sibling clause is not the fact's evidence."""
+    excerpt = "Medication review notes daily dosing. escitalopram 20 mg tablet"
+    fact = _medication(
+        fact_id="med-sibling",
+        name="escitalopram",
+        dose_value=None,
+        dose_unit=None,
+        route=None,
+        frequency=None,
+        status="active",
+        verbatim="escitalopram 20 mg tablet",
+        evidence_excerpt=excerpt,
+    )
+    with pytest.raises(
+        LocalValidationError,
+        match=r"medications\[0\].status.*lacks source support",
+    ):
+        _validate({"medications": [fact]}, page=excerpt)
 
 
 @pytest.mark.parametrize(

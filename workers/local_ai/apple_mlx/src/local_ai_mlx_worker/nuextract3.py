@@ -27,10 +27,19 @@ from .common import (
 )
 
 EXTRACTION_OUTPUT_CAP = 4096
-MAX_EXTRACTION_GENERATED_TOKENS = 16_384
+# Total generated-output work budget per extraction job. Raised 16_384 ->
+# 32_768 on 2026-08-07 after a dense 8-page clinical PDF legitimately consumed
+# the full 16K budget mid-document (work_token_limit at page 8/8) during the
+# strict-local typical-documents run. Still bounded; worst case roughly doubles
+# single-document extraction wall time.
+MAX_EXTRACTION_GENERATED_TOKENS = 32_768
 MAX_EXTRACTION_GENERATION_ATTEMPTS = 12
-MAX_EXTRACTION_RUNTIME_SPLITS = 7
-MAX_EXTRACTION_FRAGMENT_DEPTH = 3
+# Split/fragment budgets form one binary tree: a depth-N tree needs at most
+# 2**N - 1 splits. Raised together (7/3 -> 31/5) so a genuinely long single
+# page can subdivide until each fragment fits the batch input cap instead of
+# dying at fragment_depth_limit.
+MAX_EXTRACTION_RUNTIME_SPLITS = 31
+MAX_EXTRACTION_FRAGMENT_DEPTH = 5
 MAX_EXTRACTION_INPUT_BYTES = 4 * 1024 * 1024
 MAX_SELECTED_IMAGES = 8
 MAX_SELECTED_IMAGE_BYTES = 64 * 1024 * 1024
@@ -61,6 +70,32 @@ _FAMILY_MARKER = (
     r"maternal|paternal)"
 )
 _NOT_PERFORMED_MARKER = r"(?:planned|cancelled|canceled|deferred|not\s+performed|not\s+done)"
+# Billing, claims, and authorization line-item wording: on those forms a listed
+# procedure is billed or requested, not clinically documented as performed.
+_BILLED_MARKER = (
+    r"(?:bill(?:ed|ing)?|charge[ds]?|claims?|invoice[ds]?|line[\s-]*items?|"
+    r"cpt|hcpcs|authoriz(?:e[ds]?|ation|ations)|pre-?auth(?:orization)?|"
+    r"revenue\s+code|place\s+of\s+service|allowed\s+amount|"
+    r"amount\s+(?:billed|due|paid))"
+)
+# Mirrors the backend extraction validator's performed-wording guard so the
+# worker only downgrades billed line items that lack performance evidence.
+_PERFORMED_MARKER_RE = re.compile(
+    r"(?:\b(?:s/p|status post|underwent|performed|post-?op|history of|removed|"
+    r"resection|excision|completed|done on|biopsy)\b|"
+    r"\b\w+(?:ectomy|otomy|ostomy|oplasty|plasty)\b)",
+    re.IGNORECASE,
+)
+# Administrative billing-form signature, checked against the fact's own page.
+# Mirrors the backend extraction validator; the effect is only the conservative
+# downgrade of undated procedures without performance wording.
+_BILLING_FORM_SIGNATURE_RE = re.compile(
+    r"(?:place\s+of\s+service|revenue\s+code|allowed\s+amount|line[\s-]*items?|"
+    r"\bpayer\b|\bbilled\b|\bbilling\b|\binvoice[ds]?\b|"
+    r"claim\s+(?:number|no\.?|#|id)|authorization\s+(?:for|number|no\.?|#)|"
+    r"pre-?auth(?:orization)?\s+(?:number|no\.?|#)|benefit\s+(?:code|plan))",
+    re.IGNORECASE,
+)
 _UNCERTAIN_MARKER = (
     r"(?:possible|possibly|probable|probably|suspected?|question\s+of|"
     r"concern\s+for|cannot\s+rule\s+out|can(?:not|'t)\s+exclude|"
@@ -704,7 +739,7 @@ def _run_extraction_batch(
         value = _bind_missing_evidence(value, pages)
         value = _filter_fragment_grounded_content(value, pages)
         value = _bind_missing_adjacent_units(value)
-        value = _ground_explicit_assertions(value)
+        value = _ground_explicit_assertions(value, pages)
         value = _ground_lifecycle_statuses(value)
         return _filter_promotable_facts(value)
     raise GenerationError("Local extraction returned invalid JSON.")
@@ -820,8 +855,34 @@ def _run_extraction_batch_with_runtime_splits(
     ]
 
 
-def _ground_explicit_assertions(value: dict[str, object]) -> dict[str, object]:
+def _page_has_billing_form_signature(
+    fact: dict[str, object], page_markdown_by_number: dict[int, str]
+) -> bool:
+    """Return whether the fact's referenced page reads as a billing form."""
+
+    try:
+        page_number = int(fact.get("page_number"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    markdown = page_markdown_by_number.get(page_number, "")
+    return bool(markdown) and _BILLING_FORM_SIGNATURE_RE.search(markdown) is not None
+
+
+def _ground_explicit_assertions(
+    value: dict[str, object], pages: list[dict[str, object]] | None = None
+) -> dict[str, object]:
     """Apply narrow deterministic assertions for explicit source phrases."""
+
+    page_markdown_by_number: dict[int, str] = {}
+    for page in pages or []:
+        if not isinstance(page, dict):
+            continue
+        try:
+            page_markdown_by_number[int(page.get("page_number"))] = str(  # type: ignore[arg-type]
+                page.get("markdown", "")
+            )
+        except (TypeError, ValueError):
+            continue
 
     for category in _ASSERTION_CATEGORIES:
         facts = value.get(category)
@@ -889,6 +950,16 @@ def _ground_explicit_assertions(value: dict[str, object]) -> dict[str, object]:
                 re.IGNORECASE,
             ):
                 expected = "family_history"
+            elif (
+                category == "procedures"
+                and _PERFORMED_MARKER_RE.search(context) is None
+                and not (isinstance(fact.get("date"), str) and str(fact["date"]).strip())
+                and (
+                    re.search(rf"\b{_BILLED_MARKER}\b", context, re.IGNORECASE) is not None
+                    or _page_has_billing_form_signature(fact, page_markdown_by_number)
+                )
+            ):
+                expected = "mentioned_not_performed"
             else:
                 expected = "present"
             fact["assertion"] = expected
@@ -1361,7 +1432,9 @@ def run_extraction(
         "Set assertion to negated for explicit no, denies, absent, or negative evidence. "
         "Set assertion to family_history only for explicit family-history context. Set "
         "procedure assertion to mentioned_not_performed for planned, cancelled, deferred, "
-        "or not-done procedures. Use uncertain for explicit possible, suspected, or unclear "
+        "or not-done procedures, and for procedures listed only as billing, claim, or "
+        "authorization line items without a statement or date that the procedure occurred. "
+        "Use uncertain for explicit possible, suspected, or unclear "
         "evidence; otherwise use present only when the source affirms the fact. "
         "Preserve verbatim clinical values."
     )

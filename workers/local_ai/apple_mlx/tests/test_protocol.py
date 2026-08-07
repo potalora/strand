@@ -606,9 +606,9 @@ def test_quiet_extraction_dispatch_preserves_page_and_budget_counters_only(
                 "attempt": 1,
                 "attempt_limit": 12,
                 "output_tokens": 17,
-                "output_token_limit": 16_384,
+                "output_token_limit": 32_768,
                 "splits_used": 0,
-                "split_limit": 7,
+                "split_limit": 31,
             }
         )
         extraction_heartbeat()
@@ -663,9 +663,9 @@ def test_quiet_extraction_dispatch_preserves_page_and_budget_counters_only(
                 "attempt": 1,
                 "attempt_limit": 12,
                 "output_tokens": 17,
-                "output_token_limit": 16_384,
+                "output_token_limit": 32_768,
                 "splits_used": 0,
-                "split_limit": 7,
+                "split_limit": 31,
             },
         },
         {
@@ -679,9 +679,9 @@ def test_quiet_extraction_dispatch_preserves_page_and_budget_counters_only(
                 "attempt": 1,
                 "attempt_limit": 12,
                 "output_tokens": 17,
-                "output_token_limit": 16_384,
+                "output_token_limit": 32_768,
                 "splits_used": 0,
-                "split_limit": 7,
+                "split_limit": 31,
             },
         },
         {
@@ -695,9 +695,9 @@ def test_quiet_extraction_dispatch_preserves_page_and_budget_counters_only(
                 "attempt": 1,
                 "attempt_limit": 12,
                 "output_tokens": 17,
-                "output_token_limit": 16_384,
+                "output_token_limit": 32_768,
                 "splits_used": 0,
-                "split_limit": 7,
+                "split_limit": 31,
             },
         },
     ]
@@ -1505,7 +1505,9 @@ def test_extraction_stops_at_fragment_depth_after_repeated_invalid_output(
     with pytest.raises(GenerationError) as error:
         run_extraction(
             {
-                "page_markdown": [{"page_number": 1, "markdown": "bounded OCR"}],
+                # Long enough that repeated splits reach the fragment depth
+                # limit before any fragment becomes too short to split.
+                "page_markdown": [{"page_number": 1, "markdown": "bounded clinical text " * 128}],
                 "scratch_dir": str(tmp_path),
                 "image_paths": {},
                 "schema": {"schema_version": "clinical-document-extraction.v1"},
@@ -1708,16 +1710,19 @@ def test_generation_preserves_exact_cap_metadata_without_rejecting_valid_json(
 def test_extraction_work_budget_enforces_exact_independent_limits() -> None:
     from local_ai_mlx_worker.common import GenerationError
     from local_ai_mlx_worker.nuextract3 import (
+        EXTRACTION_OUTPUT_CAP,
+        MAX_EXTRACTION_GENERATED_TOKENS,
         MAX_EXTRACTION_GENERATION_ATTEMPTS,
         MAX_EXTRACTION_RUNTIME_SPLITS,
         _ExtractionWorkBudget,
     )
 
     token_budget = _ExtractionWorkBudget()
-    for _ in range(4):
-        assert token_budget.next_output_cap(8_192) == 4_096
+    full_calls = MAX_EXTRACTION_GENERATED_TOKENS // EXTRACTION_OUTPUT_CAP
+    for _ in range(full_calls):
+        assert token_budget.next_output_cap(8_192) == EXTRACTION_OUTPUT_CAP
         token_budget.reserve_attempt()
-        token_budget.charge_generation(4_096)
+        token_budget.charge_generation(EXTRACTION_OUTPUT_CAP)
     with pytest.raises(GenerationError) as token_error:
         token_budget.next_output_cap(8_192)
     assert token_error.value.category == "work_token_limit"
@@ -1739,12 +1744,16 @@ def test_extraction_work_budget_enforces_exact_independent_limits() -> None:
     assert split_budget.runtime_splits == MAX_EXTRACTION_RUNTIME_SPLITS
 
 
-def test_extraction_fragment_depth_three_is_private_and_depth_four_fails() -> None:
+def test_extraction_fragment_depth_limit_is_private_and_next_depth_fails() -> None:
     from local_ai_mlx_worker.common import GenerationError
-    from local_ai_mlx_worker.nuextract3 import _prompt_pages, _split_page
+    from local_ai_mlx_worker.nuextract3 import (
+        MAX_EXTRACTION_FRAGMENT_DEPTH,
+        _prompt_pages,
+        _split_page,
+    )
 
     fragment = {"page_number": 1, "markdown": "bounded clinical text " * 128}
-    for _ in range(3):
+    for _ in range(MAX_EXTRACTION_FRAGMENT_DEPTH):
         fragment, _right = _split_page(fragment)
 
     assert set(_prompt_pages([fragment])[0]) == {"page_number", "markdown"}
@@ -1757,7 +1766,10 @@ def test_extraction_shrinks_call_cap_and_stops_at_exact_token_budget(
     tmp_path: Path,
 ) -> None:
     from local_ai_mlx_worker.common import GeneratedText, GenerationError
-    from local_ai_mlx_worker.nuextract3 import run_extraction
+    from local_ai_mlx_worker.nuextract3 import (
+        EXTRACTION_OUTPUT_CAP,
+        run_extraction,
+    )
 
     call_caps: list[int] = []
 
@@ -1788,7 +1800,10 @@ def test_extraction_shrinks_call_cap_and_stops_at_exact_token_budget(
         )
 
     assert error.value.category == "work_token_limit"
-    assert call_caps == [4_096, 4_096, 4_096, 4_096, 4]
+    # Every call runs at the per-call cap until the remaining work budget
+    # drops below it; the final call gets exactly the leftover budget.
+    assert call_caps[:-1] and all(cap == EXTRACTION_OUTPUT_CAP for cap in call_caps[:-1])
+    assert 0 < call_caps[-1] < EXTRACTION_OUTPUT_CAP
 
 
 def test_extraction_budget_progress_is_monotonic_and_content_free(
@@ -2063,6 +2078,116 @@ def test_extraction_deterministically_grounds_explicit_assertion_phrases(
         "procedures[0]",
     ]
     assert len(calls) == 1
+
+
+def test_grounding_downgrades_billed_procedure_line_items_to_mentioned_not_performed() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "verbatim": "Colonoscopy",
+                "evidence_excerpt": "Authorization for Colonoscopy",
+            }
+        ]
+    }
+
+    grounded = _ground_explicit_assertions(value)
+
+    assert grounded["procedures"][0]["assertion"] == "mentioned_not_performed"  # type: ignore[index]
+
+
+def test_grounding_keeps_billed_procedure_present_when_performance_is_documented() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "verbatim": "Colonoscopy performed",
+                "evidence_excerpt": "Authorization for Colonoscopy performed today",
+            },
+            {
+                "name": "Upper endoscopy",
+                "assertion": "present",
+                "date": "2024-03-01",
+                "verbatim": "Upper endoscopy",
+                "evidence_excerpt": "Billed: Upper endoscopy",
+            },
+        ]
+    }
+
+    grounded = _ground_explicit_assertions(value)
+
+    assert grounded["procedures"][0]["assertion"] == "present"  # type: ignore[index]
+    assert grounded["procedures"][1]["assertion"] == "present"  # type: ignore[index]
+
+
+def test_grounding_downgrades_undated_procedure_on_billing_form_page() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "page_number": 1,
+                "verbatim": "Colonoscopy",
+                "evidence_excerpt": "Colonoscopy",
+            }
+        ]
+    }
+    pages = [{"page_number": 1, "markdown": "Place of Service: 11. Payer: Aetna."}]
+
+    grounded = _ground_explicit_assertions(value, pages)
+
+    assert grounded["procedures"][0]["assertion"] == "mentioned_not_performed"  # type: ignore[index]
+
+
+def test_grounding_ignores_billing_signature_on_other_pages() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "page_number": 2,
+                "verbatim": "Colonoscopy",
+                "evidence_excerpt": "Colonoscopy",
+            }
+        ]
+    }
+    pages = [
+        {"page_number": 1, "markdown": "Place of Service: 11. Payer: Aetna."},
+        {"page_number": 2, "markdown": "Procedure note."},
+    ]
+
+    grounded = _ground_explicit_assertions(value, pages)
+
+    assert grounded["procedures"][0]["assertion"] == "present"  # type: ignore[index]
+
+
+def test_grounding_billing_context_applies_only_to_procedures() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "conditions": [
+            {
+                "name": "hypertension",
+                "assertion": "present",
+                "verbatim": "hypertension",
+                "evidence_excerpt": "Authorization for treatment of hypertension",
+            }
+        ]
+    }
+
+    grounded = _ground_explicit_assertions(value)
+
+    assert grounded["conditions"][0]["assertion"] == "present"  # type: ignore[index]
 
 
 def test_extraction_binds_missing_table_evidence_to_exact_source_row(
