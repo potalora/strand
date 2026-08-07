@@ -953,12 +953,9 @@ def _ground_explicit_assertions(
             elif (
                 category == "procedures"
                 and _PERFORMED_MARKER_RE.search(context) is None
-                and not (
-                    isinstance(fact.get("date"), str) and str(fact["date"]).strip()
-                )
+                and not (isinstance(fact.get("date"), str) and str(fact["date"]).strip())
                 and (
-                    re.search(rf"\b{_BILLED_MARKER}\b", context, re.IGNORECASE)
-                    is not None
+                    re.search(rf"\b{_BILLED_MARKER}\b", context, re.IGNORECASE) is not None
                     or _page_has_billing_form_signature(fact, page_markdown_by_number)
                 )
             ):

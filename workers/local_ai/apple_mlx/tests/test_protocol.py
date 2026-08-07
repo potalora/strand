@@ -1507,9 +1507,7 @@ def test_extraction_stops_at_fragment_depth_after_repeated_invalid_output(
             {
                 # Long enough that repeated splits reach the fragment depth
                 # limit before any fragment becomes too short to split.
-                "page_markdown": [
-                    {"page_number": 1, "markdown": "bounded clinical text " * 128}
-                ],
+                "page_markdown": [{"page_number": 1, "markdown": "bounded clinical text " * 128}],
                 "scratch_dir": str(tmp_path),
                 "image_paths": {},
                 "schema": {"schema_version": "clinical-document-extraction.v1"},
@@ -1804,9 +1802,7 @@ def test_extraction_shrinks_call_cap_and_stops_at_exact_token_budget(
     assert error.value.category == "work_token_limit"
     # Every call runs at the per-call cap until the remaining work budget
     # drops below it; the final call gets exactly the leftover budget.
-    assert call_caps[:-1] and all(
-        cap == EXTRACTION_OUTPUT_CAP for cap in call_caps[:-1]
-    )
+    assert call_caps[:-1] and all(cap == EXTRACTION_OUTPUT_CAP for cap in call_caps[:-1])
     assert 0 < call_caps[-1] < EXTRACTION_OUTPUT_CAP
 
 

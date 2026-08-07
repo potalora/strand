@@ -601,7 +601,9 @@ def test_billed_context_does_not_forbid_dated_present_procedure() -> None:
     assert result.procedures[0].assertion == AssertionState.PRESENT
 
 
-def test_billing_form_page_supports_mentioned_not_performed_without_excerpt_wording() -> None:
+def test_billing_form_page_supports_mentioned_not_performed_without_excerpt_wording() -> (
+    None
+):
     raw = {
         "procedures": [
             {
