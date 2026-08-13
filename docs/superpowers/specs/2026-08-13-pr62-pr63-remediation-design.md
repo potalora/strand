@@ -1,6 +1,6 @@
 # PR #62 and PR #63 remediation design
 
-**Status:** Approved direction, pending written-spec review
+**Status:** Approved
 
 **Date:** 2026-08-13
 
@@ -74,7 +74,8 @@ invariants.
 
 ## Parallel execution model
 
-Wave 1 starts from the same reviewed `main` commit in three isolated worktrees:
+Wave 1 starts in three native Codex worktrees from the same planning commit. That commit adds only
+the approved design and execution plans, so its product tree matches the reviewed `main` commit:
 
 - **Track A: Global pack authorization**
 - **Track B: Clinical extraction and bounded work**
@@ -89,7 +90,8 @@ worker source and dependency lock:
 Track A and Track C both touch `backend/app/api/local_ai.py`, but they modify
 separate endpoint groups. Each stays independently reviewable; the root
 integrator resolves import or nearby-line conflicts when combining branches.
-No subagent commits. The root agent reviews, verifies, and commits each track.
+No subagent commits. The root agent reviews and verifies each track; commits require Pedro's
+explicit authorization.
 
 ## Track A: Global pack authorization
 
