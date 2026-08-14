@@ -218,10 +218,7 @@ async def verify_pack_candidate(
     ):
         raise LocalValidationError("Local model validation platform is incompatible")
     if (
-        {
-            key: manifest.runtime.get(key)
-            for key in _SUPPORTED_RUNTIME
-        }
+        {key: manifest.runtime.get(key) for key in _SUPPORTED_RUNTIME}
         != _SUPPORTED_RUNTIME
         or manifest.validation_suite_version != _SUPPORTED_FIXTURE_SUITE
     ):

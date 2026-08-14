@@ -912,6 +912,7 @@ async def test_strict_cancel_fallback_terminalizes_every_active_job() -> None:
             cancel_requested=False,
             status=status,
             stage="extraction",
+            legacy_manifest_diagnostic=lambda: None,
             progress={
                 "stage": "extraction",
                 "model_role": "extraction",

@@ -224,7 +224,9 @@ def test_worker_bundle_identity_rejects_changed_uv_macos_polyglot_launcher(
         resolve_worker_runtime_identity(project.command, project.project_dir)
 
 
-@pytest.mark.parametrize("relative_path", ["nuextract3.py", "pyproject.toml", "uv.lock"])
+@pytest.mark.parametrize(
+    "relative_path", ["nuextract3.py", "pyproject.toml", "uv.lock"]
+)
 def test_worker_bundle_identity_changes_with_runtime_input(
     tmp_path: Path,
     relative_path: str,
@@ -431,10 +433,12 @@ def test_worker_bundle_identity_ignores_python_patch_and_uv_builder_drift(
     before = resolve_worker_runtime_identity(project.command, project.project_dir)
     config = project.project_dir / ".venv/pyvenv.cfg"
     config.write_text(
-        config.read_text(encoding="utf-8").replace(
+        config.read_text(encoding="utf-8")
+        .replace(
             "version_info = 3.11.9",
             "version_info = 3.11.10",
-        ).replace("uv = 0.10.2", "uv = 0.11.0"),
+        )
+        .replace("uv = 0.10.2", "uv = 0.11.0"),
         encoding="utf-8",
     )
 
@@ -691,7 +695,9 @@ def test_worker_console_script_imports_attested_package_under_sanitized_environm
     project = build_worker_project(tmp_path / "worker", editable=editable)
     host_executable = Path(sys.executable).resolve(strict=True)
     host_home = host_executable.parent
-    version_info = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    version_info = (
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    )
     fixture_interpreter = project.project_dir / ".venv/bin/python"
     fixture_interpreter.unlink()
     fixture_interpreter.symlink_to(host_executable)
@@ -706,9 +712,7 @@ prompt = local-ai-mlx-worker
         encoding="utf-8",
     )
     (project.effective_package / "__main__.py").write_text(
-        "def main() -> int:\n"
-        "    print(__file__)\n"
-        "    return 0\n",
+        "def main() -> int:\n    print(__file__)\n    return 0\n",
         encoding="utf-8",
     )
     expected_identity = resolve_worker_runtime_identity(
@@ -742,9 +746,10 @@ prompt = local-ai-mlx-worker
 
     assert expected_identity.scheme == WORKER_IDENTITY_SCHEME
     assert result.returncode == 0, result.stderr
-    assert Path(result.stdout.strip()).resolve() == (
-        project.effective_package / "__main__.py"
-    ).resolve()
+    assert (
+        Path(result.stdout.strip()).resolve()
+        == (project.effective_package / "__main__.py").resolve()
+    )
     assert "PYTHONPATH" not in environment
     assert "PYTHONHOME" not in environment
     assert not (project.effective_package / "__pycache__").exists()
@@ -891,7 +896,9 @@ def test_worker_bundle_identity_rejects_nonregular_python_file(tmp_path: Path) -
         resolve_worker_runtime_identity(project.command, project.project_dir)
 
 
-def test_worker_bundle_identity_rejects_symlink_package_directory(tmp_path: Path) -> None:
+def test_worker_bundle_identity_rejects_symlink_package_directory(
+    tmp_path: Path,
+) -> None:
     project = build_worker_project(tmp_path / "worker", editable=False)
     package = project.effective_package
     real_package = package.with_name("real_package")

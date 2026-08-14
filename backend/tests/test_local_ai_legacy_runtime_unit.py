@@ -32,7 +32,10 @@ from app.services.local_ai.errors import (
     LocalPolicyError,
     RuntimeIdentityRequiredError,
 )
-from app.services.local_ai.manifest import canonicalize_manifest_snapshot, parse_manifest
+from app.services.local_ai.manifest import (
+    canonicalize_manifest_snapshot,
+    parse_manifest,
+)
 from app.services.local_ai.processing_snapshot import (
     fail_active_legacy_ingestion_jobs,
     fail_legacy_runtime_identity_required,
@@ -134,7 +137,10 @@ def test_legacy_job_terminalization_preserves_snapshot_and_digest() -> None:
 
     assert fail_legacy_runtime_identity_required(job, completed_at=completed_at)
 
-    assert json.dumps(job.manifest_snapshot, sort_keys=True).encode() == original_snapshot_bytes
+    assert (
+        json.dumps(job.manifest_snapshot, sort_keys=True).encode()
+        == original_snapshot_bytes
+    )
     assert job.manifest_sha256 == original_digest
     assert job.status == "failed"
     assert job.stage == "failed"
@@ -213,7 +219,11 @@ async def test_failed_legacy_summary_job_cannot_be_retried_or_mutated() -> None:
     job = _persisted_legacy_job(kind="summary")
     fail_legacy_runtime_identity_required(job)
     original = deepcopy(
-        {key: value for key, value in job.__dict__.items() if key != "_sa_instance_state"}
+        {
+            key: value
+            for key, value in job.__dict__.items()
+            if key != "_sa_instance_state"
+        }
     )
 
     with pytest.raises(HTTPException) as captured:
@@ -226,13 +236,19 @@ async def test_failed_legacy_summary_job_cannot_be_retried_or_mutated() -> None:
 
 
 @pytest.mark.asyncio
-async def test_retry_rejects_preexisting_retryable_legacy_summary_without_mutation() -> None:
+async def test_retry_rejects_preexisting_retryable_legacy_summary_without_mutation() -> (
+    None
+):
     job = _persisted_legacy_job(kind="summary")
     job.status = "failed"
     job.stage = "failed"
     job.failure = {"code": "local_worker_error", "retryable": True}
     original = deepcopy(
-        {key: value for key, value in job.__dict__.items() if key != "_sa_instance_state"}
+        {
+            key: value
+            for key, value in job.__dict__.items()
+            if key != "_sa_instance_state"
+        }
     )
 
     with pytest.raises(HTTPException) as captured:
@@ -259,6 +275,9 @@ class _RowsResult:
         return self.rows[0] if self.rows else None
 
     def scalar_one_or_none(self) -> object | None:
+        return self.rows[0] if self.rows else None
+
+    def one_or_none(self) -> object | None:
         return self.rows[0] if self.rows else None
 
 
@@ -317,7 +336,9 @@ class _SessionContext:
 
 
 @pytest.mark.asyncio
-async def test_interrupted_summary_recovery_fails_legacy_instead_of_requeueing() -> None:
+async def test_interrupted_summary_recovery_fails_legacy_instead_of_requeueing() -> (
+    None
+):
     job = _persisted_legacy_job(kind="summary")
     session = _FakeSession([[job], []])
 
@@ -435,9 +456,7 @@ async def test_direct_ingestion_cancel_pairs_legacy_upload_failure_atomically(
     assert upload.ingestion_status == "failed"
     assert upload.progress_stage is None
     assert upload.progress_detail is None
-    assert upload.ingestion_errors == [
-        {"error_type": "runtime_identity_required"}
-    ]
+    assert upload.ingestion_errors == [{"error_type": "runtime_identity_required"}]
     assert upload.processing_completed_at == job.completed_at
     assert cancellation_calls == []
 
@@ -539,7 +558,7 @@ async def test_bulk_cancel_fails_legacy_instead_of_cancelling(
 ) -> None:
     job = _persisted_legacy_job()
     upload = _legacy_upload(job)
-    session = _FakeSession([[upload], [job]])
+    session = _FakeSession([[upload], [upload], [job]])
     cancellation_calls: list[str] = []
 
     async def _cancel_registered(job_id: str) -> bool:
@@ -649,7 +668,9 @@ async def test_stuck_file_recovery_terminalizes_legacy_before_raw_updates(
 
 
 @pytest.mark.asyncio
-async def test_startup_ingestion_recovery_terminalizes_legacy_before_raw_updates() -> None:
+async def test_startup_ingestion_recovery_terminalizes_legacy_before_raw_updates() -> (
+    None
+):
     job = _persisted_legacy_job()
     upload = _legacy_upload(job)
     session = _FakeSession([[job], [upload], [job]])
@@ -718,9 +739,7 @@ async def test_cancel_requested_legacy_recovery_preserves_paired_failure(
     assert job.status == "failed"
     assert job.failure["code"] == "runtime_identity_required"
     assert upload.ingestion_status == "failed"
-    assert upload.ingestion_errors == [
-        {"error_type": "runtime_identity_required"}
-    ]
+    assert upload.ingestion_errors == [{"error_type": "runtime_identity_required"}]
     assert job.manifest_snapshot == original_snapshot
     assert job.manifest_sha256 == original_digest
     assert "FOR UPDATE" not in session.executed[0]
@@ -763,7 +782,9 @@ async def test_legacy_ingestion_recovery_locks_pairs_in_stable_upload_order() ->
             parameters = statement.compile().params
             if not self.discovery_done:
                 self.discovery_done = True
-                discovered = ordered_jobs if "ORDER BY" in rendered else ordered_jobs[::-1]
+                discovered = (
+                    ordered_jobs if "ORDER BY" in rendered else ordered_jobs[::-1]
+                )
                 return _RowsResult(discovered)
             upload_id = next(
                 (

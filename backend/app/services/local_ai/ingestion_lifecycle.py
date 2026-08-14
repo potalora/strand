@@ -105,10 +105,15 @@ async def claim_next_strict_ingestion_pair(
         _require_matching_strict_ingestion_identity(upload, job)
     except Exception:
         return None
-    if (job.status, upload.ingestion_status) != (
-        "queued",
-        "pending_extraction",
-    ) or job.cancel_requested or upload.cancel_requested:
+    if (
+        (job.status, upload.ingestion_status)
+        != (
+            "queued",
+            "pending_extraction",
+        )
+        or job.cancel_requested
+        or upload.cancel_requested
+    ):
         return None
 
     claimed_at = datetime.now(timezone.utc)

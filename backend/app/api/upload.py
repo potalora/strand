@@ -2164,9 +2164,7 @@ async def _mark_cancelled(db: AsyncSession, upload: UploadedFile) -> None:
                 job.completed_at = completed_at
             if legacy_failed:
                 upload.ingestion_status = "failed"
-                upload.ingestion_errors = [
-                    {"error_type": "runtime_identity_required"}
-                ]
+                upload.ingestion_errors = [{"error_type": "runtime_identity_required"}]
         await db.commit()
     except Exception:
         logger.error("Failed to mark %s cancelled; retrying after rollback", upload_id)
@@ -2223,7 +2221,7 @@ async def _mark_cancelled(db: AsyncSession, upload: UploadedFile) -> None:
                         "UPDATE uploaded_files SET ingestion_status = 'failed', "
                         "progress_stage = NULL, progress_detail = NULL, "
                         "ingestion_errors = "
-                        "'[{\"error_type\": \"runtime_identity_required\"}]'::jsonb, "
+                        '\'[{"error_type": "runtime_identity_required"}]\'::jsonb, '
                         "processing_completed_at = :now WHERE id = :id"
                     ),
                     {"now": completed_at, "id": upload_id},
@@ -2993,9 +2991,7 @@ async def _run_strict_local_ingestion_for_upload(
                 upload.ingestion_status = "failed"
                 upload.progress_stage = None
                 upload.progress_detail = None
-                upload.ingestion_errors = [
-                    {"error_type": "runtime_identity_required"}
-                ]
+                upload.ingestion_errors = [{"error_type": "runtime_identity_required"}]
                 upload.processing_completed_at = legacy_candidate.completed_at
                 await db.commit()
                 raise RuntimeIdentityRequiredError(

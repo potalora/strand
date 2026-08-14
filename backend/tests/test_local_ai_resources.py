@@ -280,8 +280,7 @@ def test_unexpected_worker_exit_is_a_memory_pressure_gate_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_benchmark_role_fails_closed_without_final_mlx_progress(
-) -> None:
+async def test_benchmark_role_fails_closed_without_final_mlx_progress() -> None:
     import scripts.benchmark_local_ai as benchmark
 
     class MissingTelemetryManager:

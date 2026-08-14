@@ -884,9 +884,7 @@ class LocalModelManager:
                 if cleanup_error is None:
                     self._clear_active_process_state(cleanup_process)
                     if not self._finalize_lease_or_retain(lease):
-                        cleanup_error = LocalWorkerError(
-                            "Local worker is unavailable."
-                        )
+                        cleanup_error = LocalWorkerError("Local worker is unavailable.")
                 else:
                     self._retain_failed_cleanup(cleanup_process, lease)
             if cleanup_error is not None:

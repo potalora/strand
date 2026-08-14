@@ -164,9 +164,7 @@ def _require_launcher_binding(executable: Path, expected_bin: Path) -> None:
         f"#!{expected_interpreter}\n".encode("utf-8") + _EXPECTED_LAUNCHER_BODY
     )
     uv_macos_launcher = (
-        "#!/bin/sh\n"
-        f"'''exec' '{expected_interpreter}' \"$0\" \"$@\"\n"
-        "' '''\n"
+        f"#!/bin/sh\n'''exec' '{expected_interpreter}' \"$0\" \"$@\"\n' '''\n"
     ).encode("utf-8") + _EXPECTED_LAUNCHER_BODY
     if launcher_bytes not in {direct_launcher, uv_macos_launcher}:
         raise _unavailable()
@@ -198,8 +196,7 @@ def _require_no_import_candidates(
             if candidate in allowed_names:
                 continue
             if any(
-                candidate == stem or candidate.startswith(f"{stem}.")
-                for stem in stems
+                candidate == stem or candidate.startswith(f"{stem}.") for stem in stems
             ):
                 raise _unavailable()
     finally:
@@ -311,9 +308,9 @@ def _validated_python_runtime(
     expected_bin: Path,
 ) -> str:
     try:
-        lines = _secure_file_bytes(environment / "pyvenv.cfg").decode(
-            "utf-8"
-        ).splitlines()
+        lines = (
+            _secure_file_bytes(environment / "pyvenv.cfg").decode("utf-8").splitlines()
+        )
     except UnicodeError as exc:
         raise _unavailable() from exc
     config: dict[str, str] = {}
@@ -429,7 +426,10 @@ def _editable_source_from_metadata(
     direct_url: dict[str, Any],
 ) -> Path | None:
     directory_info = direct_url.get("dir_info")
-    if not isinstance(directory_info, dict) or directory_info.get("editable") is not True:
+    if (
+        not isinstance(directory_info, dict)
+        or directory_info.get("editable") is not True
+    ):
         return None
     direct_url_value = direct_url.get("url")
     parsed = urlparse(direct_url_value if isinstance(direct_url_value, str) else "")
@@ -520,9 +520,7 @@ def _regular_python_tree(package_root: Path) -> list[Path]:
                 selected.append(member_path)
             elif member_name_casefolded.endswith(
                 ".pyc"
-            ) or member_name_casefolded.endswith(
-                _EXTENSION_SUFFIXES_CASEFOLDED
-            ):
+            ) or member_name_casefolded.endswith(_EXTENSION_SUFFIXES_CASEFOLDED):
                 raise _unavailable()
     if not selected:
         raise _unavailable()

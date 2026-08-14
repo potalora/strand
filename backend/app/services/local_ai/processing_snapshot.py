@@ -70,11 +70,13 @@ async def fail_active_legacy_ingestion_jobs(
     candidates = (
         (
             await db.execute(
-                select(LocalAIJob).where(
+                select(LocalAIJob)
+                .where(
                     LocalAIJob.kind == "ingestion",
                     LocalAIJob.processing_mode == "validated_strict_local",
                     LocalAIJob.status.in_(("queued", "processing")),
-                ).order_by(LocalAIJob.upload_id.asc(), LocalAIJob.id.asc())
+                )
+                .order_by(LocalAIJob.upload_id.asc(), LocalAIJob.id.asc())
             )
         )
         .scalars()
@@ -82,7 +84,10 @@ async def fail_active_legacy_ingestion_jobs(
     )
     failed = 0
     for candidate in candidates:
-        if candidate.upload_id is None or candidate.legacy_manifest_diagnostic() is None:
+        if (
+            candidate.upload_id is None
+            or candidate.legacy_manifest_diagnostic() is None
+        ):
             continue
         locked_upload = (
             await db.execute(

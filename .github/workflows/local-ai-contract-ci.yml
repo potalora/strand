@@ -113,8 +113,10 @@ jobs:
             tests/test_local_ai_cleanup.py \
             tests/test_local_ai_log_privacy.py \
             tests/test_local_ai_setup_script.py \
+            tests/test_local_ai_benchmark.py \
             tests/test_local_ai_candidate_pack_cli.py \
             tests/test_local_ai_ci_workflows.py \
+            tests/test_local_ai_pack_cli.py \
             tests/test_local_ai_runtime_identity.py \
             tests/test_local_ai_release_evidence.py \
             tests/test_strict_local_egress.py \

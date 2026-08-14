@@ -625,9 +625,7 @@ async def run_benchmark(
             model_root=Path(settings.local_ai_model_dir),
         )
     except LocalAIError:
-        raise BenchmarkGateError(
-            "Validated local model pack is unavailable."
-        ) from None
+        raise BenchmarkGateError("Validated local model pack is unavailable.") from None
     manifest = candidate.manifest
     pack_path = candidate.pack_path
 
@@ -678,9 +676,7 @@ async def run_benchmark(
     try:
         candidate.revalidate()
     except LocalAIError:
-        raise BenchmarkGateError(
-            "Validated local model pack is unavailable."
-        ) from None
+        raise BenchmarkGateError("Validated local model pack is unavailable.") from None
 
     swap_before = swap_samples[0]
     swap_after = swap_samples[-1]

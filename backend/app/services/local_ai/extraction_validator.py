@@ -1125,14 +1125,15 @@ def _has_subject_bound_performance(context: str, subject: str) -> bool:
         rf"\b(?:underwent|performed|status\s+post|s\s*[/.-]\s*p)\s+"
         rf"(?:(?:a|an|the)\s+)?{bounded_subject}"
     )
-    after_subject = (
-        rf"{bounded_subject}\s+(?:was\s+)?(?:performed|completed|done)\b"
+    after_subject = rf"{bounded_subject}\s+(?:was\s+)?(?:performed|completed|done)\b"
+    return (
+        re.search(
+            rf"(?:{before_subject}|{after_subject})",
+            context,
+            re.IGNORECASE,
+        )
+        is not None
     )
-    return re.search(
-        rf"(?:{before_subject}|{after_subject})",
-        context,
-        re.IGNORECASE,
-    ) is not None
 
 
 def _procedure_requires_explicit_performance(
@@ -1232,18 +1233,15 @@ def _validate_assertion_guards(
                 f"{path}.assertion",
                 "mentioned-not-performed assertion lacks source support",
             )
-        if (
-            assertion == AssertionState.PRESENT
-            and (
-                _procedure_requires_explicit_performance(
-                    context,
-                    page_text,
-                    _subject_text(fact, category),
-                )
-                or (
-                    getattr(fact, "date", None) is None
-                    and _PERFORMED_RE.search(context) is None
-                )
+        if assertion == AssertionState.PRESENT and (
+            _procedure_requires_explicit_performance(
+                context,
+                page_text,
+                _subject_text(fact, category),
+            )
+            or (
+                getattr(fact, "date", None) is None
+                and _PERFORMED_RE.search(context) is None
             )
         ):
             _fail(

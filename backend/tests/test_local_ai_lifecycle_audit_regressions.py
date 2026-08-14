@@ -130,6 +130,8 @@ def _write_release_evidence(
             "sha256": manifest_sha256(manifest),
             "runtime_name": manifest.runtime["name"],
             "runtime_version": manifest.runtime["version"],
+            "worker_identity_scheme": manifest.runtime["worker_identity_scheme"],
+            "worker_bundle_sha256": manifest.runtime["worker_bundle_sha256"],
         },
         "processes": {"max_live_models": 1, "roles_started": 9},
         "roles": {

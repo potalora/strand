@@ -903,15 +903,16 @@ class ArtifactStore:
                 chunks.append(chunk)
             encoded = b"".join(chunks)
             after = os.fstat(descriptor)
-            if (
-                opened.st_size != len(encoded)
-                or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-                != (
-                    opened.st_dev,
-                    opened.st_ino,
-                    opened.st_size,
-                    opened.st_mtime_ns,
-                )
+            if opened.st_size != len(encoded) or (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
             ):
                 raise LocalValidationError("Model activation state is invalid")
             value = json.loads(encoded)
@@ -1105,8 +1106,7 @@ class ArtifactStore:
                 not isinstance(parsed, LocalAIManifest)
                 or parsed != manifest
                 or _canonical_json(_manifest_payload(parsed)) != metadata
-                or hashlib.sha256(metadata).hexdigest()
-                != pointer["manifest_sha256"]
+                or hashlib.sha256(metadata).hexdigest() != pointer["manifest_sha256"]
             ):
                 raise LocalValidationError(
                     "Previously installed model pack is not verified"
@@ -1120,7 +1120,7 @@ class ArtifactStore:
             validations_fd = self._open_directory_fd(self.validations_dir)
             receipt = self._read_regular_file_at(
                 validations_fd,
-                f'{pointer["manifest_sha256"]}.json',
+                f"{pointer['manifest_sha256']}.json",
                 max_bytes=1024 * 1024,
             )
             if (

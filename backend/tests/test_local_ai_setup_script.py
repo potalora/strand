@@ -33,7 +33,7 @@ def _fake_setup_repository(
     _write_executable(
         fake_bin / "uname",
         "#!/bin/sh\n"
-        "case \"$1\" in\n"
+        'case "$1" in\n'
         "  -s) printf 'Darwin\\n' ;;\n"
         "  -m) printf 'arm64\\n' ;;\n"
         "  *) exit 2 ;;\n"
@@ -53,66 +53,66 @@ def _fake_setup_repository(
         fake_bin / "fixture-python",
         "#!/bin/sh\n"
         "set -eu\n"
-        "test -d \"$PYTHONPYCACHEPREFIX\"\n"
+        'test -d "$PYTHONPYCACHEPREFIX"\n'
         "mode=$(stat -f '%Lp' \"$PYTHONPYCACHEPREFIX\")\n"
-        "printf 'python %s\\n' \"$*\" >> \"$FAKE_COMMAND_LOG\"\n"
+        'printf \'python %s\\n\' "$*" >> "$FAKE_COMMAND_LOG"\n'
         "printf 'python-env %s|%s|%s|%s|%s|%s\\n' "
-        "\"${PYTHONPATH-unset}\" \"${PYTHONHOME-unset}\" "
-        "\"${PYTHONNOUSERSITE-unset}\" \"${PYTHONSAFEPATH-unset}\" "
-        "\"$PYTHONPYCACHEPREFIX\" \"$mode\" >> \"$FAKE_COMMAND_LOG\"\n"
-        "touch \"$PYTHONPYCACHEPREFIX/imported.pyc\"\n",
+        '"${PYTHONPATH-unset}" "${PYTHONHOME-unset}" '
+        '"${PYTHONNOUSERSITE-unset}" "${PYTHONSAFEPATH-unset}" '
+        '"$PYTHONPYCACHEPREFIX" "$mode" >> "$FAKE_COMMAND_LOG"\n'
+        'touch "$PYTHONPYCACHEPREFIX/imported.pyc"\n',
     )
     _write_executable(
         fake_bin / "uv",
         "#!/bin/sh\n"
         "set -eu\n"
-        "printf 'uv %s\\n' \"$*\" >> \"$FAKE_COMMAND_LOG\"\n"
-        "test \"$1\" = sync\n"
-        "test \"$2\" = --frozen\n"
-        "test \"$3\" = --project\n"
+        'printf \'uv %s\\n\' "$*" >> "$FAKE_COMMAND_LOG"\n'
+        'test "$1" = sync\n'
+        'test "$2" = --frozen\n'
+        'test "$3" = --project\n'
         "worker=$4\n"
         "site=$worker/.venv/lib/python3.11/site-packages\n"
-        "case \"${FAKE_SYMLINK_COMPONENT:-}\" in\n"
+        'case "${FAKE_SYMLINK_COMPONENT:-}" in\n'
         "  .venv)\n"
         "    external=$worker/outside-venv\n"
-        "    mkdir -p \"$external\"\n"
-        "    ln -s \"$external\" \"$worker/.venv\"\n"
+        '    mkdir -p "$external"\n'
+        '    ln -s "$external" "$worker/.venv"\n'
         "    ;;\n"
         "  lib)\n"
         "    external=$worker/outside-lib\n"
-        "    mkdir -p \"$worker/.venv\" \"$external\"\n"
-        "    ln -s \"$external\" \"$worker/.venv/lib\"\n"
+        '    mkdir -p "$worker/.venv" "$external"\n'
+        '    ln -s "$external" "$worker/.venv/lib"\n'
         "    ;;\n"
         "  python3.11)\n"
         "    external=$worker/outside-python\n"
-        "    mkdir -p \"$worker/.venv/lib\" \"$external\"\n"
-        "    ln -s \"$external\" \"$worker/.venv/lib/python3.11\"\n"
+        '    mkdir -p "$worker/.venv/lib" "$external"\n'
+        '    ln -s "$external" "$worker/.venv/lib/python3.11"\n'
         "    ;;\n"
         "  site-packages)\n"
         "    external=$worker/outside-site-packages\n"
-        "    mkdir -p \"$worker/.venv/lib/python3.11\" \"$external\"\n"
-        "    ln -s \"$external\" \"$site\"\n"
+        '    mkdir -p "$worker/.venv/lib/python3.11" "$external"\n'
+        '    ln -s "$external" "$site"\n'
         "    ;;\n"
         "esac\n"
-        "mkdir -p \"$worker/.venv/lib/python3.11\" \"$worker/.venv/bin\" \"$site\"\n"
-        "if test \"${FAKE_AMBIGUOUS:-0}\" = 1; then\n"
-        "  mkdir -p \"$worker/.venv/lib/python3.12/site-packages\"\n"
+        'mkdir -p "$worker/.venv/lib/python3.11" "$worker/.venv/bin" "$site"\n'
+        'if test "${FAKE_AMBIGUOUS:-0}" = 1; then\n'
+        '  mkdir -p "$worker/.venv/lib/python3.12/site-packages"\n'
         "fi\n"
-        "ln -s \"$FAKE_FIXTURE_PYTHON\" \"$worker/.venv/bin/python\"\n"
+        'ln -s "$FAKE_FIXTURE_PYTHON" "$worker/.venv/bin/python"\n'
         "launcher=$worker/.venv/bin/local-ai-mlx-worker\n"
         "embedded=$worker/.venv/bin/python\n"
         "entry=main\n"
-        "if test \"${FAKE_LAUNCHER_MUTATION:-}\" = interpreter; then\n"
+        'if test "${FAKE_LAUNCHER_MUTATION:-}" = interpreter; then\n'
         "  embedded=$FAKE_FIXTURE_PYTHON\n"
-        "elif test \"${FAKE_LAUNCHER_MUTATION:-}\" = body; then\n"
+        'elif test "${FAKE_LAUNCHER_MUTATION:-}" = body; then\n'
         "  entry=other\n"
         "fi\n"
         "{\n"
-        "  if test \"${FAKE_LAUNCHER_STYLE:-polyglot}\" = direct; then\n"
+        '  if test "${FAKE_LAUNCHER_STYLE:-polyglot}" = direct; then\n'
         "    printf '#!%s\\n' \"$embedded\"\n"
         "  else\n"
         "    printf '#!/bin/sh\\n'\n"
-        "    printf \"'''exec' '%s' \\\"\\$0\\\" \\\"\\$@\\\"\\n\" \"$embedded\"\n"
+        '    printf "\'\'\'exec\' \'%s\' \\"\\$0\\" \\"\\$@\\"\\n" "$embedded"\n'
         "    printf \"' '''\\n\"\n"
         "  fi\n"
         "  printf '# -*- coding: utf-8 -*-\\n'\n"
@@ -124,31 +124,31 @@ def _fake_setup_repository(
         "  printf '    elif sys.argv[0].endswith(\".exe\"):\\n'\n"
         "  printf '        sys.argv[0] = sys.argv[0][:-4]\\n'\n"
         "  printf '    sys.exit(main())\\n'\n"
-        "} > \"$launcher\"\n"
-        "if test \"${FAKE_LAUNCHER_MUTATION:-}\" = extra; then\n"
+        '} > "$launcher"\n'
+        'if test "${FAKE_LAUNCHER_MUTATION:-}" = extra; then\n'
         "  printf '# unexpected\\n' >> \"$launcher\"\n"
         "fi\n"
-        "chmod 700 \"$launcher\"\n"
-        "case \"${FAKE_BOOTSTRAP_STATE:-pair}\" in\n"
+        'chmod 700 "$launcher"\n'
+        'case "${FAKE_BOOTSTRAP_STATE:-pair}" in\n'
         "  absent) ;;\n"
         "  missing-pth) printf 'BOOTSTRAP = True\\n' > \"$site/_virtualenv.py\" ;;\n"
         "  missing-py) printf 'import _virtualenv\\n' > \"$site/_virtualenv.pth\" ;;\n"
         "  symlink-pth)\n"
         "    printf 'outside\\n' > \"$worker/outside-bootstrap.pth\"\n"
-        "    ln -s \"$worker/outside-bootstrap.pth\" \"$site/_virtualenv.pth\"\n"
+        '    ln -s "$worker/outside-bootstrap.pth" "$site/_virtualenv.pth"\n'
         "    printf 'BOOTSTRAP = True\\n' > \"$site/_virtualenv.py\"\n"
         "    ;;\n"
         "  symlink-py)\n"
         "    printf 'outside\\n' > \"$worker/outside-bootstrap.py\"\n"
-        "    ln -s \"$worker/outside-bootstrap.py\" \"$site/_virtualenv.py\"\n"
+        '    ln -s "$worker/outside-bootstrap.py" "$site/_virtualenv.py"\n'
         "    printf 'import _virtualenv\\n' > \"$site/_virtualenv.pth\"\n"
         "    ;;\n"
         "  directory-pth)\n"
-        "    mkdir \"$site/_virtualenv.pth\"\n"
+        '    mkdir "$site/_virtualenv.pth"\n'
         "    printf 'BOOTSTRAP = True\\n' > \"$site/_virtualenv.py\"\n"
         "    ;;\n"
         "  directory-py)\n"
-        "    mkdir \"$site/_virtualenv.py\"\n"
+        '    mkdir "$site/_virtualenv.py"\n'
         "    printf 'import _virtualenv\\n' > \"$site/_virtualenv.pth\"\n"
         "    ;;\n"
         "  pair)\n"
@@ -185,8 +185,7 @@ def test_setup_removes_only_generated_bootstrap_then_validates_exact_runtime(
     )
 
     site_packages = (
-        repository
-        / "workers/local_ai/apple_mlx/.venv/lib/python3.11/site-packages"
+        repository / "workers/local_ai/apple_mlx/.venv/lib/python3.11/site-packages"
     )
     assert result.returncode == 0, result.stderr
     assert not (site_packages / "_virtualenv.pth").exists()
@@ -222,8 +221,7 @@ def test_setup_fails_before_removal_when_site_packages_is_ambiguous(
     )
 
     site_packages = (
-        repository
-        / "workers/local_ai/apple_mlx/.venv/lib/python3.11/site-packages"
+        repository / "workers/local_ai/apple_mlx/.venv/lib/python3.11/site-packages"
     )
     assert result.returncode == 1
     assert "exactly one worker site-packages directory" in result.stderr
@@ -254,8 +252,7 @@ def test_setup_rejects_symlinked_site_packages_topology_before_removal(
     )
 
     site_packages = (
-        repository
-        / "workers/local_ai/apple_mlx/.venv/lib/python3.11/site-packages"
+        repository / "workers/local_ai/apple_mlx/.venv/lib/python3.11/site-packages"
     )
     assert result.returncode == 1
     assert "site-packages must be a regular in-venv directory" in result.stderr
@@ -347,8 +344,7 @@ def test_setup_rejects_nonregular_or_partial_bootstrap_without_removal(
     )
 
     site_packages = (
-        repository
-        / "workers/local_ai/apple_mlx/.venv/lib/python3.11/site-packages"
+        repository / "workers/local_ai/apple_mlx/.venv/lib/python3.11/site-packages"
     )
     other = "py" if member == "pth" else "pth"
     assert result.returncode == 1

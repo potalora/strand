@@ -194,7 +194,9 @@ async def test_candidate_verify_rejects_retained_tree_change_after_model_gate(
     async def mutate_after_bind(_manifest: object, _path: Path) -> None:
         if mutation == "state":
             state_path.write_text(
-                json.dumps(json.loads(state_path.read_text(encoding="utf-8")), indent=2),
+                json.dumps(
+                    json.loads(state_path.read_text(encoding="utf-8")), indent=2
+                ),
                 encoding="utf-8",
             )
         elif mutation == "metadata":

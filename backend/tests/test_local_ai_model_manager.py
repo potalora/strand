@@ -2554,7 +2554,9 @@ async def test_attested_wrapper_binds_manifest_before_private_run(
         observed.append(candidate)
 
     run_command = AsyncMock(return_value={"markdown": "ok", "page_number": 1})
-    monkeypatch.setattr(manager, "_require_current_runtime", require_runtime, raising=False)
+    monkeypatch.setattr(
+        manager, "_require_current_runtime", require_runtime, raising=False
+    )
     monkeypatch.setattr(manager, "_run_command", run_command)
 
     result = await manager.run_attested(manifest, ModelRole.OCR, {"job_id": "job"})
@@ -2669,7 +2671,9 @@ async def test_runtime_attestation_uses_cached_command_and_project_after_start(
         return original_resolver(command, project_dir)
 
     run_command = AsyncMock(return_value={"markdown": "ok", "page_number": 1})
-    monkeypatch.setattr(manager_module, "resolve_worker_runtime_identity", record_resolver)
+    monkeypatch.setattr(
+        manager_module, "resolve_worker_runtime_identity", record_resolver
+    )
     monkeypatch.setattr(manager, "_run_command", run_command)
 
     await manager.run_attested(manifest, ModelRole.OCR, {"job_id": "cached"})
@@ -2721,7 +2725,9 @@ async def test_real_spawn_path_attests_and_spawns_one_cached_runtime_binding(
         return original_resolver(command, project_dir)
 
     spawn = AsyncMock(side_effect=OSError("synthetic spawn failure"))
-    monkeypatch.setattr(manager_module, "resolve_worker_runtime_identity", record_resolver)
+    monkeypatch.setattr(
+        manager_module, "resolve_worker_runtime_identity", record_resolver
+    )
     monkeypatch.setattr(manager_module.asyncio, "create_subprocess_exec", spawn)
 
     with pytest.raises(LocalWorkerError, match="unavailable"):

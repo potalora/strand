@@ -94,9 +94,7 @@ def _benchmark(manifest: object) -> dict[str, object]:
             "sha256": manifest_sha256(manifest),
             "runtime_name": "mlx-vlm",
             "runtime_version": "0.5.0",
-            "worker_identity_scheme": manifest.runtime[
-                "worker_identity_scheme"
-            ],
+            "worker_identity_scheme": manifest.runtime["worker_identity_scheme"],
             "worker_bundle_sha256": manifest.runtime["worker_bundle_sha256"],
         },
         "processes": {"max_live_models": 1, "roles_started": 9},
@@ -578,8 +576,12 @@ def test_promotion_rejects_benchmark_worker_digest_drift(
         ),
         raising=False,
     )
-    monkeypatch.setattr(promotion, "validate_acceptance", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(promotion, "load_release_evidence", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        promotion, "validate_acceptance", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        promotion, "load_release_evidence", lambda *_args, **_kwargs: None
+    )
 
     with pytest.raises(LocalValidationError, match="promotion failed"):
         promotion.promote(
@@ -603,16 +605,18 @@ def test_promotion_rejects_benchmark_worker_identity_scheme_drift(
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(asdict(manifest)), encoding="utf-8")
     benchmark_value = _benchmark(manifest)
-    benchmark_value["manifest"]["worker_identity_scheme"] = (
-        "local-ai-worker-bundle.v2"
-    )
+    benchmark_value["manifest"]["worker_identity_scheme"] = "local-ai-worker-bundle.v2"
     benchmark_path = tmp_path / "benchmark.json"
     benchmark_path.write_text(json.dumps(benchmark_value), encoding="utf-8")
     fidelity_path = tmp_path / "fidelity.json"
     _write_fidelity(fidelity_path, manifest)
     output = tmp_path / "release.json"
-    monkeypatch.setattr(promotion, "validate_acceptance", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(promotion, "load_release_evidence", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        promotion, "validate_acceptance", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        promotion, "load_release_evidence", lambda *_args, **_kwargs: None
+    )
 
     with pytest.raises(LocalValidationError, match="promotion failed"):
         promotion.promote(
@@ -638,9 +642,7 @@ def test_release_loader_rejects_benchmark_worker_identity_scheme_drift(
 
     manifest = _manifest()
     benchmark_value = _benchmark(manifest)
-    benchmark_value["manifest"]["worker_identity_scheme"] = (
-        "local-ai-worker-bundle.v2"
-    )
+    benchmark_value["manifest"]["worker_identity_scheme"] = "local-ai-worker-bundle.v2"
     benchmark = tmp_path / "benchmark.json"
     benchmark.write_text(json.dumps(benchmark_value), encoding="utf-8")
     fidelity_value = _fidelity(manifest)

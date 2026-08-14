@@ -104,25 +104,20 @@ def test_backend_ci_keeps_full_lint_but_scopes_the_formatter_gate() -> None:
 
 def test_v2_pack_paths_are_the_only_active_defaults_and_release_recipes() -> None:
     configured = Settings(_env_file=None)
-    assert configured.local_ai_manifest_path.endswith(
-        "/apple-m4-16gb-v2.lock.json"
-    )
+    assert configured.local_ai_manifest_path.endswith("/apple-m4-16gb-v2.lock.json")
     assert configured.local_ai_release_evidence_path.endswith(
         "/apple-m4-16gb-v2.release.json"
     )
 
     justfile = (REPOSITORY_ROOT / "justfile").read_text(encoding="utf-8")
-    promotion = justfile.split("local-ai-release-promote:", 1)[1].split(
-        "\n\n", 1
-    )[0]
+    promotion = justfile.split("local-ai-release-promote:", 1)[1].split("\n\n", 1)[0]
     assert "apple-m4-16gb-v2.lock.json" in promotion
     assert "apple-m4-16gb-v2.release.json" in promotion
     assert "apple-m4-16gb-v1" not in promotion
 
     environment = (REPOSITORY_ROOT / ".env.example").read_text(encoding="utf-8")
     assert (
-        "LOCAL_AI_MANIFEST_PATH="
-        "./app/model_manifests/apple-m4-16gb-v2.lock.json"
+        "LOCAL_AI_MANIFEST_PATH=./app/model_manifests/apple-m4-16gb-v2.lock.json"
     ) in environment.splitlines()
     assert (
         "LOCAL_AI_RELEASE_EVIDENCE_PATH="
@@ -170,8 +165,10 @@ def test_strict_local_contract_ci_covers_setup_only_change_contracts() -> None:
 
     for test_file in (
         "tests/test_local_ai_setup_script.py",
+        "tests/test_local_ai_benchmark.py",
         "tests/test_local_ai_candidate_pack_cli.py",
         "tests/test_local_ai_ci_workflows.py",
+        "tests/test_local_ai_pack_cli.py",
         "tests/test_local_ai_runtime_identity.py",
         "tests/test_local_ai_release_evidence.py",
     ):

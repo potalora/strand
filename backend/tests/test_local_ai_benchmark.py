@@ -62,8 +62,7 @@ class _AttestedBenchmarkWorker:
 
 
 @pytest.mark.asyncio
-async def test_benchmark_wrapper_forwards_exact_manifest_to_attested_worker(
-) -> None:
+async def test_benchmark_wrapper_forwards_exact_manifest_to_attested_worker() -> None:
     import scripts.benchmark_local_ai as benchmark
 
     worker = _AttestedBenchmarkWorker()
@@ -77,14 +76,13 @@ async def test_benchmark_wrapper_forwards_exact_manifest_to_attested_worker(
     )
 
     assert manager.runtime_identity == worker.runtime_identity
-    assert worker.calls == [
-        (manifest, ModelRole.SUMMARY, {"job_id": "bench-summary"})
-    ]
+    assert worker.calls == [(manifest, ModelRole.SUMMARY, {"job_id": "bench-summary"})]
 
 
 @pytest.mark.asyncio
-async def test_benchmark_wrapper_translates_attested_worker_failure_without_leak(
-) -> None:
+async def test_benchmark_wrapper_translates_attested_worker_failure_without_leak() -> (
+    None
+):
     import scripts.benchmark_local_ai as benchmark
 
     worker = _AttestedBenchmarkWorker(fail=True)

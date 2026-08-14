@@ -19,8 +19,7 @@ def _grounding_cases() -> dict[str, object]:
     root = Path(__file__).resolve().parents[2]
     return json.loads(
         (
-            root
-            / "workers/local_ai/apple_mlx/tests/fixtures/"
+            root / "workers/local_ai/apple_mlx/tests/fixtures/"
             "strict_local_extraction_grounding_cases.json"
         ).read_text(encoding="utf-8")
     )
@@ -621,7 +620,9 @@ def test_billed_procedure_line_item_supports_mentioned_not_performed() -> None:
     assert result.procedures[0].assertion == AssertionState.MENTIONED_NOT_PERFORMED
 
 
-def test_billed_context_allows_dated_present_procedure_with_performance_evidence() -> None:
+def test_billed_context_allows_dated_present_procedure_with_performance_evidence() -> (
+    None
+):
     raw = {
         "procedures": [
             {
@@ -1283,10 +1284,9 @@ def test_medication_lifecycle_scope_matches_shared_matrix(
             verbatim="Metformin active daily",
         )
     if case["backend_valid"]:
-        assert (
-            _validate({"medications": [fact]}, page=context).medications[0].status.value
-            == str(case["candidate_status"])
-        )
+        assert _validate({"medications": [fact]}, page=context).medications[
+            0
+        ].status.value == str(case["candidate_status"])
     else:
         with pytest.raises(
             LocalValidationError,

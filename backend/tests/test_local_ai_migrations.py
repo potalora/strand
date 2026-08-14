@@ -167,8 +167,7 @@ async def _database_legacy_manifest_is_valid(db_session, manifest: dict) -> bool
         (
             await db_session.execute(
                 text(
-                    "SELECT local_ai_legacy_manifest_is_valid("
-                    "CAST(:payload AS jsonb))"
+                    "SELECT local_ai_legacy_manifest_is_valid(CAST(:payload AS jsonb))"
                 ),
                 {"payload": json.dumps(manifest)},
             )
@@ -373,8 +372,7 @@ def test_attested_manifest_guard_is_an_exact_migration_create_all_clone() -> Non
         "'worker_identity_scheme','worker_bundle_sha256' ]"
     ) in normalized
     assert (
-        "payload->'runtime'->>'worker_identity_scheme' "
-        "<> 'local-ai-worker-bundle.v1'"
+        "payload->'runtime'->>'worker_identity_scheme' <> 'local-ai-worker-bundle.v1'"
     ) in normalized
     assert "worker_bundle_sha256' !~ '^[0-9a-f]{64}$'" in normalized
     assert "file_path LIKE '%//%'" in normalized
@@ -399,11 +397,11 @@ def test_attested_job_trigger_is_an_exact_migration_create_all_clone() -> None:
         "OLD.status IN ('queued', 'processing')",
         "NEW.status = 'failed'",
         "NEW.stage = 'failed'",
-        "NEW.progress = '{\"stage\": \"failed\"}'::jsonb",
-        "NEW.failure = '{\"stage\": \"failed\", \"code\": "
-        "\"runtime_identity_required\", \"retryable\": false, "
-        "\"checkpoint_preserved\": false, "
-        "\"cloud_fallback_attempted\": false}'::jsonb",
+        'NEW.progress = \'{"stage": "failed"}\'::jsonb',
+        'NEW.failure = \'{"stage": "failed", "code": '
+        '"runtime_identity_required", "retryable": false, '
+        '"checkpoint_preserved": false, '
+        '"cloud_fallback_attempted": false}\'::jsonb',
         "NEW.completed_at IS NOT NULL",
         "NEW.manifest_snapshot IS NOT DISTINCT FROM OLD.manifest_snapshot",
         "NEW.manifest_sha256 IS NOT DISTINCT FROM OLD.manifest_sha256",
@@ -491,8 +489,7 @@ async def test_migrated_guard_accepts_only_exact_attested_v2_runtime(
             else:
                 malformed["artifacts"][0]["extra"] = True
             assert (
-                await _database_legacy_manifest_is_valid(connection, malformed)
-                is False
+                await _database_legacy_manifest_is_valid(connection, malformed) is False
             )
 
 
@@ -557,20 +554,20 @@ _REJECTED_LEGACY_UPDATES = (
     (
         "altered_progress",
         "status = 'failed', stage = 'failed', "
-        "progress = '{\"stage\": \"failed\", \"extra\": 1}'::jsonb, "
-        "failure = '{\"stage\": \"failed\", "
-        "\"code\": \"runtime_identity_required\", \"retryable\": false, "
-        "\"checkpoint_preserved\": false, "
-        "\"cloud_fallback_attempted\": false}'::jsonb, completed_at = now()",
+        'progress = \'{"stage": "failed", "extra": 1}\'::jsonb, '
+        'failure = \'{"stage": "failed", '
+        '"code": "runtime_identity_required", "retryable": false, '
+        '"checkpoint_preserved": false, '
+        '"cloud_fallback_attempted": false}\'::jsonb, completed_at = now()',
     ),
     (
         "altered_failure",
         "status = 'failed', stage = 'failed', "
-        "progress = '{\"stage\": \"failed\"}'::jsonb, "
-        "failure = '{\"stage\": \"failed\", "
-        "\"code\": \"runtime_identity_required\", \"retryable\": true, "
-        "\"checkpoint_preserved\": false, "
-        "\"cloud_fallback_attempted\": false}'::jsonb, completed_at = now()",
+        'progress = \'{"stage": "failed"}\'::jsonb, '
+        'failure = \'{"stage": "failed", '
+        '"code": "runtime_identity_required", "retryable": true, '
+        '"checkpoint_preserved": false, '
+        '"cloud_fallback_attempted": false}\'::jsonb, completed_at = now()',
     ),
 )
 
