@@ -575,19 +575,31 @@ missing or revoked credential receives `401`. An authenticated account absent
 from the allowlist receives `403` with `Local model pack management requires a
 machine operator.`
 
-The shipped platform profile is native Apple Silicon with at least 16 GB
-unified memory; 16 GB is both the minimum and recommended baseline. Its locked
-9.02 GiB pack uses OvisOCR2 for OCR, NuExtract3 for clinical extraction, and
-Qwen3.5-9B for final summarization. The M4 16 GB release passed the committed
-fidelity suite with every rate metric at `1.0`. Three cold benchmark runs
-measured peak MLX allocations of about 0.86 GB for OCR, 4.73 GB for extraction,
-and 7.10 GB for summarization. The release evidence binds the exact manifest,
-benchmark report, fidelity report, corpus identity, and hard thresholds.
+The v2 candidate profile is native Apple Silicon with at least 16 GB unified
+memory; 16 GB is both the minimum and recommended baseline. Its locked 9.02
+GiB pack uses OvisOCR2 for OCR, NuExtract3 for clinical extraction, and
+Qwen3.5-9B for final summarization. The static candidate references are
+`catalog-v2.json` and `apple-m4-16gb-v2.lock.json`.
+
+This Track D state has no verified v2 release evidence. The file
+`apple-m4-16gb-v2.release.json` is written only after the separately authorized
+benchmark, synthetic fidelity, promotion, and post-promotion verification
+gates pass. Historical v1 metrics and evidence remain diagnostic history; they
+do not validate the v2 candidate.
 
 Strict local remains opt-in through `LOCAL_AI_ENABLED=false`. Once enabled, a
 pack is `ready` only when the active files match the exact immutable manifest,
 a sealed runtime-validation receipt exists for that manifest, and the bound
 benchmark and fidelity evidence passes revalidation.
+
+Schema-v2 manifests also carry `worker_identity_scheme` and
+`worker_bundle_sha256`. The `local-ai-worker-bundle.v1` digest covers the fixed
+`local-ai-mlx-worker=local_ai_mlx_worker.__main__:main` entry point,
+`pyproject.toml`, `uv.lock`, and the effective worker `.py` tree. Launcher,
+virtual-environment, CPython, and import-surface checks are fail-closed
+preconditions but are not hashed. This identity does not attest the operating
+system owner or root of trust.
+
 The native macOS worker is launched under a fixed OS network-deny profile. An
 owner-only cross-process lock remains held through worker-group cleanup, so
 separate backend processes cannot load two model roles at once. A parent-death
@@ -614,7 +626,7 @@ whether the account may use the lifecycle controls. A non-operator receives
   "state": "not_installed",
   "status_reason": null,
   "active_revision": null,
-  "available_revision": "apple-m4-16gb-v1",
+  "available_revision": "apple-m4-16gb-v2",
   "models": [
     {
       "role": "ocr",
@@ -624,7 +636,7 @@ whether the account may use the lifecycle controls. A non-operator receives
       "runtime": "mlx-vlm 0.5.0",
       "license": "apache-2.0",
       "download_bytes": 652031947,
-      "expected_memory_bytes": 1409286144,
+      "expected_memory_bytes": null,
       "installed": false,
       "validated": false
     },
@@ -636,7 +648,7 @@ whether the account may use the lifecycle controls. A non-operator receives
       "runtime": "mlx-vlm 0.5.0",
       "license": "apache-2.0",
       "download_bytes": 3054403529,
-      "expected_memory_bytes": 5234491392,
+      "expected_memory_bytes": null,
       "installed": false,
       "validated": false
     },
@@ -648,7 +660,7 @@ whether the account may use the lifecycle controls. A non-operator receives
       "runtime": "mlx-vlm 0.5.0",
       "license": "apache-2.0",
       "download_bytes": 5977073021,
-      "expected_memory_bytes": 7851737088,
+      "expected_memory_bytes": null,
       "installed": false,
       "validated": false
     }
@@ -659,7 +671,8 @@ whether the account may use the lifecycle controls. A non-operator receives
 
 `not_installed` still reports the available locked pack and its three model
 artifacts. `installed` and `validated` remain `false` until that exact pack is
-present and passes validation.
+present and passes validation. `expected_memory_bytes` remains `null` until
+matching release evidence provides measured values.
 
 `state` is one of `not_installed`, `downloading`, `verifying`, `preview`,
 `ready`, `update_available`, or `failed`. When `state` is `preview`,
@@ -729,6 +742,21 @@ together while keeping strict-local checkpoints. Summary retry preserves its
 stored prompt scope and immutable model snapshot. All other job states return
 `409`.
 
+The schema-v2 runtime identity is checked before strict-local admission and
+again immediately before each worker spawn. Admission-time drift is rejected
+before provider construction, release-evidence loading, or creation of a new
+job or upload snapshot. The public failure boundary is content-free and does
+not expose local paths, source filenames, manifest bytes, or digests.
+
+Queued or processing schema-v1 ingestion snapshots can make only the legacy
+terminal transition to `failed` with code `runtime_identity_required`; the
+paired upload is failed in the same transaction. Schema-v1 summary jobs use
+the same code but remain job-only. These failures are non-retryable and leave
+the stored manifest unchanged. After repairing and revalidating the worker,
+the client must submit new schema-v2 work rather than retry or rewrite the
+legacy snapshot. Deployment must follow the no-active-job preflight documented
+in [Strict-local AI operations](operations-strict-local-ai.md).
+
 ### GET `/records/{record_id}/evidence`
 
 This literal route is declared before `/records/{record_id}`. It returns
@@ -743,7 +771,7 @@ model pack. The list is bounded by the evidence-source limit. Summary-model
 provenance is not mixed into ingestion evidence.
 
 See [Strict-local AI operations](operations-strict-local-ai.md) for the
-download/processing network boundary and shipped release evidence.
+download/processing network boundary and the v2 release-gate status.
 
 ---
 
@@ -883,7 +911,7 @@ List previously built prompts.
       "model_provenance": {
         "processing_mode": "validated_strict_local",
         "manifest_sha256": "64-character SHA-256",
-        "pack_revision": "apple-m4-16gb-v1",
+        "pack_revision": "apple-m4-16gb-v2",
         "model": {
           "role": "summary",
           "repository": "mlx-community/Qwen3.5-9B-MLX-4bit",
@@ -932,7 +960,7 @@ Get a single prompt detail, including any stored response.
   "model_provenance": {
     "processing_mode": "validated_strict_local",
     "manifest_sha256": "64-character SHA-256",
-    "pack_revision": "apple-m4-16gb-v1",
+    "pack_revision": "apple-m4-16gb-v2",
     "model": {
       "role": "summary",
       "repository": "mlx-community/Qwen3.5-9B-MLX-4bit",

@@ -36,6 +36,7 @@ from app.services.local_ai.manifest import (
 )
 from app.services.local_ai.pack_operations import PackOperationStore
 from app.services.local_ai.release_evidence import build_release_evidence
+from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
 from app.services.local_ai.types import ModelRole
 from app.services.local_ai.validation_receipt import (
     _issue_runtime_validation_receipt,
@@ -71,14 +72,29 @@ def _manifest(
     )
     return (
         LocalAIManifest(
-            schema_version=1,
+            schema_version=2,
             pack_revision=revision,
             platform="apple_silicon",
-            runtime={"name": "mlx-vlm", "version": "0.5.0"},
+            runtime={
+                "name": "mlx-vlm",
+                "version": "0.5.0",
+                "worker_identity_scheme": "local-ai-worker-bundle.v1",
+                "worker_bundle_sha256": "a" * 64,
+            },
             validation_suite_version="fixtures-v1",
             artifacts=artifacts,
         ),
         contents,
+    )
+
+
+def _receipt(manifest: LocalAIManifest):
+    return _issue_runtime_validation_receipt(
+        manifest,
+        WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256=manifest.runtime["worker_bundle_sha256"],
+        ),
     )
 
 
@@ -192,7 +208,7 @@ def _install(
     store.activate_validated(
         staging,
         manifest,
-        _issue_runtime_validation_receipt(manifest),
+        _receipt(manifest),
     )
     return store
 

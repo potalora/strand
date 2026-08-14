@@ -84,10 +84,15 @@ def _manifest(
         )
     return (
         LocalAIManifest(
-            schema_version=1,
+            schema_version=2,
             pack_revision=pack_revision,
             platform="apple_silicon",
-            runtime={"name": "mlx-vlm", "version": "0.5.0"},
+            runtime={
+                "name": "mlx-vlm",
+                "version": "0.5.0",
+                "worker_identity_scheme": "local-ai-worker-bundle.v1",
+                "worker_bundle_sha256": "c" * 64,
+            },
             validation_suite_version="fixtures-v1",
             artifacts=tuple(artifacts),
         ),

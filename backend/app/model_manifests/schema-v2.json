@@ -1,0 +1,217 @@
+{
+  "$id": "https://medtimeline.local/schemas/local-ai-manifest-v2.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "properties": {
+        "artifacts": {
+          "contains": {
+            "properties": {
+              "role": {
+                "const": "ocr"
+              }
+            },
+            "required": [
+              "role"
+            ]
+          },
+          "maxContains": 1,
+          "minContains": 1
+        }
+      }
+    },
+    {
+      "properties": {
+        "artifacts": {
+          "contains": {
+            "properties": {
+              "role": {
+                "const": "extraction"
+              }
+            },
+            "required": [
+              "role"
+            ]
+          },
+          "maxContains": 1,
+          "minContains": 1
+        }
+      }
+    },
+    {
+      "properties": {
+        "artifacts": {
+          "contains": {
+            "properties": {
+              "role": {
+                "const": "summary"
+              }
+            },
+            "required": [
+              "role"
+            ]
+          },
+          "maxContains": 1,
+          "minContains": 1
+        }
+      }
+    }
+  ],
+  "properties": {
+    "artifacts": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "attribution": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "decode_limits": {
+            "additionalProperties": false,
+            "properties": {
+              "max_input_tokens": {
+                "maximum": 1000000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "max_output_tokens": {
+                "maximum": 1000000,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "max_input_tokens",
+              "max_output_tokens"
+            ],
+            "type": "object"
+          },
+          "files": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "minLength": 1,
+                  "pattern": "^(?!/)(?!\\.\\.?$)(?!\\.\\.?/)(?!.*(?:/\\.\\.?/|/\\.\\.?$|//|\\\\))[^/]+(?:/[^/]+)*\\.(?:safetensors|json|txt|model|tiktoken|jinja|md|license)$",
+                  "type": "string"
+                },
+                "sha256": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "size": {
+                  "maximum": 8589934592,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path",
+                "sha256",
+                "size"
+              ],
+              "type": "object"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "license": {
+            "enum": [
+              "apache-2.0",
+              "bsd-2-clause",
+              "bsd-3-clause",
+              "mit"
+            ]
+          },
+          "quantization": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "repository": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$",
+            "type": "string"
+          },
+          "revision": {
+            "pattern": "^[0-9a-f]{40}$",
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "ocr",
+              "extraction",
+              "summary"
+            ]
+          }
+        },
+        "required": [
+          "role",
+          "repository",
+          "revision",
+          "quantization",
+          "license",
+          "attribution",
+          "decode_limits",
+          "files"
+        ],
+        "type": "object"
+      },
+      "maxItems": 3,
+      "minItems": 3,
+      "type": "array"
+    },
+    "pack_revision": {
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$",
+      "type": "string"
+    },
+    "platform": {
+      "const": "apple_silicon"
+    },
+    "runtime": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "worker_identity_scheme": {
+          "const": "local-ai-worker-bundle.v1"
+        },
+        "worker_bundle_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "worker_identity_scheme",
+        "worker_bundle_sha256"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "validation_suite_version": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "pack_revision",
+    "platform",
+    "runtime",
+    "validation_suite_version",
+    "artifacts"
+  ],
+  "title": "MedTimeline local AI manifest v2",
+  "type": "object"
+}

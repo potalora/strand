@@ -1,0 +1,57 @@
+{
+  "candidates": [
+    {
+      "attribution": "https://huggingface.co/sahilchachra/ovisocr2-int4-mlx",
+      "decode_limits": {
+        "max_input_tokens": 32768,
+        "max_output_tokens": 4096
+      },
+      "license": "apache-2.0",
+      "quantization": "int4",
+      "repository": "sahilchachra/ovisocr2-int4-mlx",
+      "revision": "1e9cea98871c19b2349a5d2df36fb6c4c38a1237",
+      "role": "ocr"
+    },
+    {
+      "attribution": "https://huggingface.co/numind/NuExtract3-mlx-4bits",
+      "decode_limits": {
+        "max_input_tokens": 32768,
+        "max_output_tokens": 8192
+      },
+      "license": "apache-2.0",
+      "license_source": {
+        "path": "LICENSE",
+        "repository": "numind/NuExtract3",
+        "revision": "2e9fca82ee641e6bb6e1f5d905241e994be27a07",
+        "sha256": "50cbab8a892c5f2993b8c7351a99182507472def3b1374558308605d99b86b32",
+        "size": 11343
+      },
+      "quantization": "4bit",
+      "repository": "numind/NuExtract3-mlx-4bits",
+      "revision": "29c38269f94054282bf9ea97a20dfc6bb8bbefea",
+      "role": "extraction"
+    },
+    {
+      "attribution": "https://huggingface.co/mlx-community/Qwen3.5-9B-MLX-4bit",
+      "decode_limits": {
+        "max_input_tokens": 32768,
+        "max_output_tokens": 4096
+      },
+      "license": "apache-2.0",
+      "quantization": "4bit",
+      "repository": "mlx-community/Qwen3.5-9B-MLX-4bit",
+      "revision": "938d8919941c6e7efd3c7150eff7fe9d12afa631",
+      "role": "summary"
+    }
+  ],
+  "pack_revision": "apple-m4-16gb-v2",
+  "platform": "apple_silicon",
+  "runtime": {
+    "name": "mlx-vlm",
+    "version": "0.5.0",
+    "worker_identity_scheme": "local-ai-worker-bundle.v1",
+    "worker_bundle_sha256": "f847c4b69848029c0e6de7edfedbbfa2ea775910d424adc1e8b714974cd4db65"
+  },
+  "schema_version": 2,
+  "validation_suite_version": "local-ai-fixtures-v1"
+}

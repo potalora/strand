@@ -10,6 +10,28 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _stable_release_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scripts.promote_local_ai_release as promotion
+    from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
+
+    monkeypatch.setattr(
+        promotion,
+        "normalize_worker_runtime_binding",
+        lambda command, project: ((str(command),), Path(project)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        promotion,
+        "resolve_worker_runtime_identity",
+        lambda _command, _project: WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256="c" * 64,
+        ),
+        raising=False,
+    )
+
+
 def _manifest() -> object:
     from app.services.local_ai.manifest import (
         LocalAIManifest,
@@ -19,10 +41,15 @@ def _manifest() -> object:
     from app.services.local_ai.types import ModelRole
 
     return LocalAIManifest(
-        schema_version=1,
-        pack_revision="apple-m4-16gb-v1",
+        schema_version=2,
+        pack_revision="apple-m4-16gb-v2",
         platform="apple_silicon",
-        runtime={"name": "mlx-vlm", "version": "0.5.0"},
+        runtime={
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "c" * 64,
+        },
         validation_suite_version="v1",
         artifacts=tuple(
             ManifestArtifact(
@@ -67,6 +94,10 @@ def _benchmark(manifest: object) -> dict[str, object]:
             "sha256": manifest_sha256(manifest),
             "runtime_name": "mlx-vlm",
             "runtime_version": "0.5.0",
+            "worker_identity_scheme": manifest.runtime[
+                "worker_identity_scheme"
+            ],
+            "worker_bundle_sha256": manifest.runtime["worker_bundle_sha256"],
         },
         "processes": {"max_live_models": 1, "roles_started": 9},
         "roles": {
@@ -514,3 +545,244 @@ def test_release_promotion_normalizes_bounded_json_decode_failures(
             fidelity_path=fidelity,
             output=tmp_path / "release.json",
         )
+
+
+def test_promotion_rejects_benchmark_worker_digest_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.promote_local_ai_release as promotion
+    from app.services.local_ai.errors import LocalValidationError
+    from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
+
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(asdict(manifest)), encoding="utf-8")
+    benchmark_value = _benchmark(manifest)
+    benchmark_path = tmp_path / "benchmark.json"
+    benchmark_path.write_text(json.dumps(benchmark_value), encoding="utf-8")
+    fidelity_path = tmp_path / "fidelity.json"
+    _write_fidelity(fidelity_path, manifest)
+    monkeypatch.setattr(
+        promotion,
+        "normalize_worker_runtime_binding",
+        lambda command, project: ((str(command),), Path(project)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        promotion,
+        "resolve_worker_runtime_identity",
+        lambda _command, _project: WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256="b" * 64,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(promotion, "validate_acceptance", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(promotion, "load_release_evidence", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(LocalValidationError, match="promotion failed"):
+        promotion.promote(
+            manifest_path=manifest_path,
+            benchmark_path=benchmark_path,
+            fidelity_path=fidelity_path,
+            output=tmp_path / "release.json",
+        )
+
+    assert not (tmp_path / "release.json").exists()
+
+
+def test_promotion_rejects_benchmark_worker_identity_scheme_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.promote_local_ai_release as promotion
+    from app.services.local_ai.errors import LocalValidationError
+
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(asdict(manifest)), encoding="utf-8")
+    benchmark_value = _benchmark(manifest)
+    benchmark_value["manifest"]["worker_identity_scheme"] = (
+        "local-ai-worker-bundle.v2"
+    )
+    benchmark_path = tmp_path / "benchmark.json"
+    benchmark_path.write_text(json.dumps(benchmark_value), encoding="utf-8")
+    fidelity_path = tmp_path / "fidelity.json"
+    _write_fidelity(fidelity_path, manifest)
+    output = tmp_path / "release.json"
+    monkeypatch.setattr(promotion, "validate_acceptance", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(promotion, "load_release_evidence", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(LocalValidationError, match="promotion failed"):
+        promotion.promote(
+            manifest_path=manifest_path,
+            benchmark_path=benchmark_path,
+            fidelity_path=fidelity_path,
+            output=output,
+        )
+
+    assert not output.exists()
+
+
+def test_release_loader_rejects_benchmark_worker_identity_scheme_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.benchmark_local_ai as benchmark_cli
+    from app.services.local_ai.errors import LocalValidationError
+    from app.services.local_ai.release_evidence import (
+        build_release_evidence,
+        load_release_evidence,
+    )
+
+    manifest = _manifest()
+    benchmark_value = _benchmark(manifest)
+    benchmark_value["manifest"]["worker_identity_scheme"] = (
+        "local-ai-worker-bundle.v2"
+    )
+    benchmark = tmp_path / "benchmark.json"
+    benchmark.write_text(json.dumps(benchmark_value), encoding="utf-8")
+    fidelity_value = _fidelity(manifest)
+    fidelity = tmp_path / "fidelity.json"
+    fidelity.write_text(json.dumps(fidelity_value), encoding="utf-8")
+    payload = build_release_evidence(manifest, benchmark_value, fidelity_value)
+    payload["benchmark_sha256"] = hashlib.sha256(benchmark.read_bytes()).hexdigest()
+    payload["fidelity_sha256"] = hashlib.sha256(fidelity.read_bytes()).hexdigest()
+    evidence = tmp_path / "release.json"
+    evidence.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        benchmark_cli,
+        "validate_acceptance",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(LocalValidationError, match="release evidence"):
+        load_release_evidence(
+            evidence,
+            manifest=manifest,
+            benchmark_path=benchmark,
+            fidelity_path=fidelity,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fidelity_wrapper_rejects_worker_identity_drift_before_suite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_local_ai_fidelity as fidelity_cli
+    from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
+
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(asdict(manifest)), encoding="utf-8")
+    called = False
+
+    async def forbidden_suite(**_kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("fidelity suite must not run")
+
+    monkeypatch.setattr(fidelity_cli, "run_installed_fidelity_suite", forbidden_suite)
+    monkeypatch.setattr(
+        fidelity_cli,
+        "normalize_worker_runtime_binding",
+        lambda command, project: ((str(command),), Path(project)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fidelity_cli,
+        "resolve_worker_runtime_identity",
+        lambda _command, _project: WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256="b" * 64,
+        ),
+        raising=False,
+    )
+    args = fidelity_cli._parser().parse_args(
+        [
+            "--manifest",
+            str(manifest_path),
+            "--model-root",
+            str(tmp_path / "models"),
+            "--scratch-root",
+            str(tmp_path / "scratch"),
+            "--output",
+            str(tmp_path / "fidelity.json"),
+        ]
+    )
+
+    assert await fidelity_cli._execute(args) == 1
+    assert called is False
+
+
+def test_fidelity_wrapper_ignores_inherited_private_fixture_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_local_ai_fidelity as fidelity_cli
+
+    monkeypatch.setenv("REAL_MEDICAL_FIXTURES_DIR", "/private/medical/fixtures")
+
+    args = fidelity_cli._parser().parse_args([])
+
+    assert args.private_fixtures_dir is None
+
+
+@pytest.mark.asyncio
+async def test_fidelity_wrapper_serializes_no_private_run_from_hostile_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_local_ai_fidelity as fidelity_cli
+    from app.services.local_ai.fidelity_runner import (
+        load_fidelity_report,
+        parse_fidelity_report,
+    )
+    from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
+
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(asdict(manifest)), encoding="utf-8")
+    output = tmp_path / "fidelity.json"
+    monkeypatch.setenv("REAL_MEDICAL_FIXTURES_DIR", "/private/medical/fixtures")
+    monkeypatch.setattr(
+        fidelity_cli,
+        "normalize_worker_runtime_binding",
+        lambda command, project: ((str(command),), Path(project)),
+    )
+    monkeypatch.setattr(
+        fidelity_cli,
+        "resolve_worker_runtime_identity",
+        lambda _command, _project: WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256=manifest.runtime["worker_bundle_sha256"],
+        ),
+    )
+
+    async def synthetic_only_suite(**kwargs: object) -> object:
+        assert kwargs["private_fixtures_dir"] is None
+        return parse_fidelity_report(_fidelity(manifest))
+
+    monkeypatch.setattr(
+        fidelity_cli,
+        "run_installed_fidelity_suite",
+        synthetic_only_suite,
+    )
+    args = fidelity_cli._parser().parse_args(
+        [
+            "--manifest",
+            str(manifest_path),
+            "--model-root",
+            str(tmp_path / "models"),
+            "--scratch-root",
+            str(tmp_path / "scratch"),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert await fidelity_cli._execute(args) == 0
+    report = load_fidelity_report(output)
+    assert report.private_documents == 0
+    assert report.private_metrics is None

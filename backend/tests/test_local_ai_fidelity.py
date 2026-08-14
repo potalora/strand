@@ -165,6 +165,7 @@ class _PerfectFidelityManager:
         self._extractions = _model_extractions()
         self._partial_typed_kind = partial_typed_kind
         self.calls: list[str] = []
+        self.manifests: list[object] = []
         self.started = False
         self.stopped = False
 
@@ -174,7 +175,13 @@ class _PerfectFidelityManager:
     async def stop(self) -> None:
         self.stopped = True
 
-    async def run(self, role: object, payload: dict[str, Any]) -> object:
+    async def run_attested(
+        self,
+        manifest: object,
+        role: object,
+        payload: dict[str, Any],
+    ) -> object:
+        self.manifests.append(manifest)
         role_name = getattr(role, "value", str(role))
         self.calls.append(role_name)
         if role_name == "summary":
@@ -256,13 +263,105 @@ def _fake_manifest() -> object:
         for role in ModelRole
     )
     return LocalAIManifest(
-        schema_version=1,
-        pack_revision="fidelity-test-v1",
+        schema_version=2,
+        pack_revision="fidelity-test-v2",
         platform="apple_silicon",
-        runtime={"name": "mlx-vlm", "version": "0.5.0"},
+        runtime={
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "c" * 64,
+        },
         validation_suite_version="local-ai-fixtures-v1",
         artifacts=artifacts,
     )
+
+
+@pytest.mark.asyncio
+async def test_installed_fidelity_binds_v2_manifest_over_retained_v1_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.local_ai.fidelity_runner as runner
+
+    manifest = _fake_manifest()
+    report = object()
+    calls: list[dict[str, object]] = []
+
+    class Candidate:
+        def __init__(self) -> None:
+            self.manifest_path = tmp_path / "apple-m4-16gb-v2.lock.json"
+            self.pack_path = tmp_path / "packs" / "apple-m4-16gb-v1"
+            self.revalidated = False
+            self.manifest = manifest
+
+        def revalidate(self) -> None:
+            self.revalidated = True
+
+    candidate = Candidate()
+
+    async def run(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return report
+
+    monkeypatch.setattr(
+        runner,
+        "resolve_retained_candidate_pack",
+        lambda **_kwargs: candidate,
+    )
+    monkeypatch.setattr(runner, "load_fidelity_corpus", lambda _path: object())
+    monkeypatch.setattr(runner, "run_fidelity_suite", run)
+
+    observed = await runner.run_installed_fidelity_suite(
+        corpus_path=tmp_path / "corpus.json",
+        manifest_path=candidate.manifest_path,
+        model_root=tmp_path / "models",
+        scratch_root=tmp_path / "scratch",
+    )
+
+    assert observed is report
+    assert calls[0]["manifest"] == manifest
+    assert calls[0]["model_dir"] == candidate.pack_path
+    assert candidate.revalidated is True
+
+
+@pytest.mark.asyncio
+async def test_installed_fidelity_rejects_retained_tree_change_after_suite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.local_ai.fidelity_runner as runner
+    from app.services.local_ai.errors import LocalValidationError
+
+    class Candidate:
+        manifest = _fake_manifest()
+        manifest_path = tmp_path / "apple-m4-16gb-v2.lock.json"
+        pack_path = tmp_path / "packs" / "apple-m4-16gb-v1"
+
+        def revalidate(self) -> None:
+            raise LocalValidationError("private retained path changed")
+
+    async def run(**_kwargs: object) -> object:
+        return object()
+
+    monkeypatch.setattr(
+        runner,
+        "resolve_retained_candidate_pack",
+        lambda **_kwargs: Candidate(),
+    )
+    monkeypatch.setattr(runner, "load_fidelity_corpus", lambda _path: object())
+    monkeypatch.setattr(runner, "run_fidelity_suite", run)
+
+    with pytest.raises(LocalValidationError) as captured:
+        await runner.run_installed_fidelity_suite(
+            corpus_path=tmp_path / "corpus.json",
+            manifest_path=tmp_path / "candidate.json",
+            model_root=tmp_path / "models",
+            scratch_root=tmp_path / "scratch",
+        )
+
+    assert "/private/" not in str(captured.value)
+    assert captured.value.__cause__ is None
 
 
 def _expected_from_corpus() -> tuple[list[str], list[dict[str, object]]]:
@@ -1038,6 +1137,7 @@ async def test_real_fidelity_runner_drives_exact_role_chain_for_every_fixture(
         "extraction",
         "summary",
     ]
+    assert manager.manifests == [manifest] * len(manager.calls)
     assert report.metrics.summary_fact_recall == 1.0
     assert report.metrics.summary_typed_field_recall == 1.0
     report.assert_release_thresholds()
@@ -1088,10 +1188,13 @@ async def test_fidelity_cli_writes_report_and_enforces_thresholds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from app.services.local_ai.artifact_store import manifest_sha256
     from app.services.local_ai.fidelity_metrics import FidelityMetrics
     from app.services.local_ai.fidelity_runner import build_fidelity_report
+    from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
     from scripts import run_local_ai_fidelity as cli
 
+    manifest = _fake_manifest()
     report = build_fidelity_report(
         metrics=FidelityMetrics(
             critical_numeric_exact=1.0,
@@ -1104,7 +1207,86 @@ async def test_fidelity_cli_writes_report_and_enforces_thresholds(
         ),
         fixture_suite_version="local-ai-fidelity-v1",
         fixture_suite_sha256=FIXTURE_SHA256,
-        manifest_sha256="a" * 64,
+        manifest_sha256=manifest_sha256(manifest),
+        synthetic_documents=3,
+        private_documents=0,
+    )
+
+    manifest_path = tmp_path / "apple-m4-16gb-v2.lock.json"
+    manifest_path.write_text(
+        json.dumps(asdict(manifest), sort_keys=True),
+        encoding="utf-8",
+    )
+    model_root = tmp_path / "models"
+
+    async def fake_run(**kwargs: object) -> object:
+        assert kwargs["manifest_path"] == manifest_path
+        assert kwargs["model_root"] == model_root
+        return report
+
+    monkeypatch.setattr(cli, "run_installed_fidelity_suite", fake_run)
+    monkeypatch.setattr(
+        cli,
+        "normalize_worker_runtime_binding",
+        lambda command, project: ((str(command),), Path(project)),
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_worker_runtime_identity",
+        lambda _command, _project: WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256=manifest.runtime["worker_bundle_sha256"],
+        ),
+    )
+    output = tmp_path / "fidelity.json"
+    exit_code = await cli._execute(
+        cli._parser().parse_args(
+            [
+                "--manifest",
+                str(manifest_path),
+                "--model-root",
+                str(model_root),
+                "--scratch-root",
+                str(tmp_path / "scratch"),
+                "--output",
+                str(output),
+            ]
+        )
+    )
+
+    assert exit_code == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["content_free"] is True
+
+
+@pytest.mark.asyncio
+async def test_fidelity_cli_rejects_report_for_another_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from app.services.local_ai.fidelity_metrics import FidelityMetrics
+    from app.services.local_ai.fidelity_runner import build_fidelity_report
+    from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
+    from scripts import run_local_ai_fidelity as cli
+
+    manifest = _fake_manifest()
+    manifest_path = tmp_path / "apple-m4-16gb-v2.lock.json"
+    manifest_path.write_text(
+        json.dumps(asdict(manifest), sort_keys=True),
+        encoding="utf-8",
+    )
+    report = build_fidelity_report(
+        metrics=FidelityMetrics(
+            critical_numeric_exact=1.0,
+            critical_precision=1.0,
+            critical_recall=1.0,
+            accepted_output_schema_validity=1.0,
+            forbidden_extraction_facts=0,
+            unsupported_summary_facts=0,
+            accepted_facts_without_evidence=0,
+        ),
+        fixture_suite_version="local-ai-fidelity-v1",
+        fixture_suite_sha256=FIXTURE_SHA256,
+        manifest_sha256="d" * 64,
         synthetic_documents=3,
         private_documents=0,
     )
@@ -1113,11 +1295,36 @@ async def test_fidelity_cli_writes_report_and_enforces_thresholds(
         return report
 
     monkeypatch.setattr(cli, "run_installed_fidelity_suite", fake_run)
+    monkeypatch.setattr(
+        cli,
+        "normalize_worker_runtime_binding",
+        lambda command, project: ((str(command),), Path(project)),
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_worker_runtime_identity",
+        lambda _command, _project: WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256=manifest.runtime["worker_bundle_sha256"],
+        ),
+    )
     output = tmp_path / "fidelity.json"
-    exit_code = await cli._execute(cli._parser().parse_args(["--output", str(output)]))
 
-    assert exit_code == 0
-    assert json.loads(output.read_text(encoding="utf-8"))["content_free"] is True
+    exit_code = await cli._execute(
+        cli._parser().parse_args(
+            [
+                "--manifest",
+                str(manifest_path),
+                "--model-root",
+                str(tmp_path / "models"),
+                "--output",
+                str(output),
+            ]
+        )
+    )
+
+    assert exit_code == 1
+    assert not output.exists()
 
 
 @pytest.mark.local_model

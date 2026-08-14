@@ -31,6 +31,12 @@ class LocalPolicyError(LocalAIError):
     code = "local_policy_error"
 
 
+class RuntimeIdentityRequiredError(LocalPolicyError):
+    """A legacy strict-local snapshot cannot be admitted after v2 rollout."""
+
+    code = "runtime_identity_required"
+
+
 class LocalWorkerError(LocalAIError):
     """Raised for a worker process failure."""
 

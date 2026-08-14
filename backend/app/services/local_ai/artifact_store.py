@@ -12,7 +12,7 @@ import stat
 import threading
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,12 +31,16 @@ from app.services.local_ai.manifest import (
     REPOSITORY_RE,
     SHA256_RE,
     LocalAIManifest,
+    LegacyManifestDiagnostic,
     ManifestArtifact,
     ManifestFile,
     is_secret_shaped_manifest_text,
+    load_manifest,
     manifest_path_suffix,
     safe_relative_manifest_path,
+    parse_manifest,
 )
+from app.services.local_ai.runtime_identity import WORKER_IDENTITY_SCHEME
 from app.services.local_ai.types import ModelRole
 from app.services.local_ai.validation_receipt import (
     RuntimeValidationReceipt,
@@ -66,6 +70,34 @@ _FILE_OPEN_FLAGS = (
 )
 _STORE_LOCKS_GUARD = threading.Lock()
 _STORE_LOCKS: dict[Path, threading.RLock] = {}
+
+
+@dataclass(frozen=True)
+class RetainedCandidateBinding:
+    """One read-only active artifact tree bound before candidate validation."""
+
+    path: Path
+    pack_revision: str
+    manifest_sha256: str
+    validation_receipt_sha256: str
+    metadata_sha256: str
+    state_sha256: str
+
+
+@dataclass(frozen=True)
+class ResolvedRetainedCandidate:
+    """A v2 manifest bound read-only to one retained physical artifact tree."""
+
+    manifest: LocalAIManifest
+    manifest_path: Path
+    pack_path: Path
+    _store: ArtifactStore
+    _binding: RetainedCandidateBinding
+
+    def revalidate(self) -> None:
+        """Require the active pointer, metadata, and artifact bytes to stay fixed."""
+
+        self._store.revalidate_retained_candidate(self.manifest, self._binding)
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -130,7 +162,7 @@ def _validate_manifest(manifest: LocalAIManifest) -> None:
     """Revalidate dataclass manifests at the filesystem trust boundary."""
 
     try:
-        if manifest.schema_version != 1 or manifest.platform != "apple_silicon":
+        if manifest.schema_version != 2 or manifest.platform != "apple_silicon":
             raise LocalValidationError("Model manifest is invalid")
         if (
             not isinstance(manifest.pack_revision, str)
@@ -141,6 +173,8 @@ def _validate_manifest(manifest: LocalAIManifest) -> None:
         if not isinstance(manifest.runtime, dict) or set(manifest.runtime) != {
             "name",
             "version",
+            "worker_identity_scheme",
+            "worker_bundle_sha256",
         }:
             raise LocalValidationError("Model manifest is invalid")
         if not all(
@@ -150,6 +184,11 @@ def _validate_manifest(manifest: LocalAIManifest) -> None:
             and not any(ord(character) < 32 for character in value)
             and not is_secret_shaped_manifest_text(value)
             for value in manifest.runtime.values()
+        ):
+            raise LocalValidationError("Model manifest is invalid")
+        if (
+            manifest.runtime["worker_identity_scheme"] != WORKER_IDENTITY_SCHEME
+            or SHA256_RE.fullmatch(manifest.runtime["worker_bundle_sha256"]) is None
         ):
             raise LocalValidationError("Model manifest is invalid")
         if (
@@ -828,25 +867,65 @@ class ArtifactStore:
             ),
         }
 
-    def _read_state(self) -> dict[str, dict[str, str] | None]:
+    def _read_state_with_bytes(
+        self,
+    ) -> tuple[dict[str, dict[str, str] | None], bytes]:
         path = self.root / _ACTIVATION_STATE
+        descriptor = -1
         try:
-            status = path.lstat()
+            before = path.lstat()
         except FileNotFoundError:
-            return {"active": None, "previous": None}
+            return {"active": None, "previous": None}, b""
         except OSError as exc:
             raise LocalValidationError(
                 "Model activation state could not be read"
             ) from exc
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
             raise LocalValidationError("Model activation state is invalid")
-        if status.st_nlink != 1 or status.st_size > 4096:
+        if before.st_nlink != 1 or before.st_size > 4096:
             raise LocalValidationError("Model activation state is invalid")
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            descriptor = os.open(path, _FILE_OPEN_FLAGS)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_size > 4096
+                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                raise LocalValidationError("Model activation state is invalid")
+            chunks: list[bytes] = []
+            observed = 0
+            while chunk := os.read(descriptor, 4097):
+                observed += len(chunk)
+                if observed > 4096:
+                    raise LocalValidationError("Model activation state is invalid")
+                chunks.append(chunk)
+            encoded = b"".join(chunks)
+            after = os.fstat(descriptor)
+            if (
+                opened.st_size != len(encoded)
+                or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                != (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                )
+            ):
+                raise LocalValidationError("Model activation state is invalid")
+            value = json.loads(encoded)
+        except LocalValidationError:
+            raise
         except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
             raise LocalValidationError("Model activation state is invalid") from exc
-        return self._validate_state(value)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return self._validate_state(value), encoded
+
+    def _read_state(self) -> dict[str, dict[str, str] | None]:
+        return self._read_state_with_bytes()[0]
 
     def _write_state(
         self,
@@ -941,7 +1020,8 @@ class ArtifactStore:
     def active_revision(self) -> str | None:
         """Return the active pack revision, if one is selected."""
 
-        pointer = self._read_state()["active"]
+        state = self._read_state()
+        pointer = state["active"]
         return pointer["pack_revision"] if pointer is not None else None
 
     def active_manifest(self) -> LocalAIManifest | None:
@@ -966,6 +1046,119 @@ class ArtifactStore:
             self.packs_dir / pointer["pack_revision"],
             pointer,
         )
+
+    def bind_retained_candidate(
+        self,
+        manifest: LocalAIManifest,
+    ) -> RetainedCandidateBinding:
+        """Verify an active artifact tree against a v2 candidate without writes."""
+
+        _validate_manifest(manifest)
+        state, state_bytes = self._read_state_with_bytes()
+        pointer = state["active"]
+        if pointer is None:
+            raise LocalValidationError("The local model pack is unavailable")
+        pack = self.packs_dir / pointer["pack_revision"]
+        root_fd = -1
+        validations_fd = -1
+        try:
+            _assert_real_directory(pack)
+            root_fd = self._open_directory_fd(pack)
+            metadata = self._read_regular_file_at(
+                root_fd,
+                _MANIFEST_METADATA,
+                max_bytes=1024 * 1024,
+            )
+            try:
+                raw = json.loads(metadata)
+                parsed = parse_manifest(raw, allow_legacy_diagnostic=True)
+            except (
+                LocalValidationError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                RecursionError,
+            ):
+                raise LocalValidationError(
+                    "Previously installed model pack is not verified"
+                ) from None
+            if isinstance(parsed, LegacyManifestDiagnostic):
+                snapshot = parsed.canonical_snapshot
+                candidate = json.loads(_canonical_json(_manifest_payload(manifest)))
+                if (
+                    _canonical_json(snapshot) != metadata
+                    or parsed.canonical_sha256 != pointer["manifest_sha256"]
+                    or snapshot.get("pack_revision") != pointer["pack_revision"]
+                    or snapshot.get("platform") != candidate["platform"]
+                    or snapshot.get("runtime")
+                    != {
+                        "name": candidate["runtime"]["name"],
+                        "version": candidate["runtime"]["version"],
+                    }
+                    or snapshot.get("validation_suite_version")
+                    != candidate["validation_suite_version"]
+                    or snapshot.get("artifacts") != candidate["artifacts"]
+                ):
+                    raise LocalValidationError(
+                        "Previously installed model pack is not verified"
+                    )
+            elif (
+                not isinstance(parsed, LocalAIManifest)
+                or parsed != manifest
+                or _canonical_json(_manifest_payload(parsed)) != metadata
+                or hashlib.sha256(metadata).hexdigest()
+                != pointer["manifest_sha256"]
+            ):
+                raise LocalValidationError(
+                    "Previously installed model pack is not verified"
+                )
+            self._verify_tree_fd(
+                root_fd,
+                manifest,
+                allow_manifest_metadata=True,
+                expected_metadata=metadata,
+            )
+            validations_fd = self._open_directory_fd(self.validations_dir)
+            receipt = self._read_regular_file_at(
+                validations_fd,
+                f'{pointer["manifest_sha256"]}.json',
+                max_bytes=1024 * 1024,
+            )
+            if (
+                hashlib.sha256(receipt).hexdigest()
+                != pointer["validation_receipt_sha256"]
+            ):
+                raise LocalValidationError(
+                    "Previously installed model pack is not verified"
+                )
+        except LocalValidationError:
+            raise
+        except OSError:
+            raise LocalValidationError(
+                "Previously installed model pack is not verified"
+            ) from None
+        finally:
+            if validations_fd >= 0:
+                os.close(validations_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+        return RetainedCandidateBinding(
+            path=pack,
+            pack_revision=pointer["pack_revision"],
+            manifest_sha256=pointer["manifest_sha256"],
+            validation_receipt_sha256=pointer["validation_receipt_sha256"],
+            metadata_sha256=hashlib.sha256(metadata).hexdigest(),
+            state_sha256=hashlib.sha256(state_bytes).hexdigest(),
+        )
+
+    def revalidate_retained_candidate(
+        self,
+        manifest: LocalAIManifest,
+        expected: RetainedCandidateBinding,
+    ) -> None:
+        """Require the retained candidate binding to remain byte-for-byte stable."""
+
+        if self.bind_retained_candidate(manifest) != expected:
+            raise LocalValidationError("The local model pack changed during validation")
 
     def previous_manifest(self) -> LocalAIManifest | None:
         """Return the hash-verified rollback candidate without selecting it."""
@@ -1289,3 +1482,23 @@ class ArtifactStore:
                 _fsync_directory(target_pack)
             except OSError as exc:
                 raise LocalValidationError("Model role could not be removed") from exc
+
+
+def resolve_retained_candidate_pack(
+    *,
+    manifest_path: Path | str,
+    model_root: Path | str,
+) -> ResolvedRetainedCandidate:
+    """Bind a configured v2 lock to retained active bytes without relabeling."""
+
+    locked_path = Path(manifest_path).absolute()
+    manifest = load_manifest(locked_path)
+    store = ArtifactStore(Path(model_root))
+    binding = store.bind_retained_candidate(manifest)
+    return ResolvedRetainedCandidate(
+        manifest=manifest,
+        manifest_path=locked_path,
+        pack_path=binding.path,
+        _store=store,
+        _binding=binding,
+    )

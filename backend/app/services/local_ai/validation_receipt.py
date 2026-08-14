@@ -9,6 +9,10 @@ from typing import Any
 
 from app.services.local_ai.errors import LocalValidationError
 from app.services.local_ai.manifest import LocalAIManifest
+from app.services.local_ai.runtime_identity import (
+    WorkerRuntimeIdentity,
+    require_manifest_runtime_identity,
+)
 
 VALIDATION_RECEIPT_KEYS = frozenset(
     {
@@ -17,6 +21,7 @@ VALIDATION_RECEIPT_KEYS = frozenset(
         "platform",
         "runtime_name",
         "runtime_version",
+        "worker_bundle_sha256",
         "validation_suite_version",
         "verifier_version",
     }
@@ -48,6 +53,7 @@ def expected_validation_payload(manifest: LocalAIManifest) -> dict[str, str]:
         "platform": manifest.platform,
         "runtime_name": manifest.runtime["name"],
         "runtime_version": manifest.runtime["version"],
+        "worker_bundle_sha256": manifest.runtime["worker_bundle_sha256"],
         "validation_suite_version": manifest.validation_suite_version,
         "verifier_version": VERIFIER_VERSION,
     }
@@ -55,9 +61,11 @@ def expected_validation_payload(manifest: LocalAIManifest) -> dict[str, str]:
 
 def _issue_runtime_validation_receipt(
     manifest: LocalAIManifest,
+    observed_identity: WorkerRuntimeIdentity,
 ) -> RuntimeValidationReceipt:
     """Seal a receipt after the caller has completed the runtime fixture gate."""
 
+    require_manifest_runtime_identity(manifest, observed_identity)
     return RuntimeValidationReceipt(
         payload=expected_validation_payload(manifest),
         _seal=_SEAL,

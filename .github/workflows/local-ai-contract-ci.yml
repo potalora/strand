@@ -10,14 +10,18 @@ on:
       - "backend/app/model_manifests/**"
       - "backend/app/services/local_ai/pack_operations.py"
       - "backend/scripts/local_ai_pack.py"
+      - "backend/scripts/local_ai_candidate_pack.py"
+      - "backend/scripts/lock_local_ai_manifest.py"
       - "backend/scripts/benchmark_local_ai.py"
       - "backend/scripts/promote_local_ai_release.py"
+      - "backend/scripts/run_local_ai_fidelity.py"
       - "backend/alembic/versions/**"
       - "backend/tests/test_local_ai_*.py"
       - "backend/tests/test_strict_local_*.py"
       - "workers/local_ai/**"
       - "scripts/setup-local-ai-macos.sh"
       - "justfile"
+      - ".env.example"
       - ".github/workflows/local-ai-contract-ci.yml"
   push:
     branches: ["main"]
@@ -29,14 +33,18 @@ on:
       - "backend/app/model_manifests/**"
       - "backend/app/services/local_ai/pack_operations.py"
       - "backend/scripts/local_ai_pack.py"
+      - "backend/scripts/local_ai_candidate_pack.py"
+      - "backend/scripts/lock_local_ai_manifest.py"
       - "backend/scripts/benchmark_local_ai.py"
       - "backend/scripts/promote_local_ai_release.py"
+      - "backend/scripts/run_local_ai_fidelity.py"
       - "backend/alembic/versions/**"
       - "backend/tests/test_local_ai_*.py"
       - "backend/tests/test_strict_local_*.py"
       - "workers/local_ai/**"
       - "scripts/setup-local-ai-macos.sh"
       - "justfile"
+      - ".env.example"
       - ".github/workflows/local-ai-contract-ci.yml"
 
 permissions:
@@ -104,6 +112,11 @@ jobs:
             tests/test_local_ai_pack_verifier.py \
             tests/test_local_ai_cleanup.py \
             tests/test_local_ai_log_privacy.py \
+            tests/test_local_ai_setup_script.py \
+            tests/test_local_ai_candidate_pack_cli.py \
+            tests/test_local_ai_ci_workflows.py \
+            tests/test_local_ai_runtime_identity.py \
+            tests/test_local_ai_release_evidence.py \
             tests/test_strict_local_egress.py \
             tests/test_strict_local_pipeline.py \
             -q

@@ -68,10 +68,15 @@ def _local_ai_manifest() -> dict:
             }
         )
     return {
-        "schema_version": 1,
-        "pack_revision": "apple-m4-16gb-v1",
+        "schema_version": 2,
+        "pack_revision": "apple-m4-16gb-v2",
         "platform": "apple_silicon",
-        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "runtime": {
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "d" * 64,
+        },
         "validation_suite_version": "local-ai-fixtures-v1",
         "artifacts": artifacts,
     }

@@ -292,7 +292,8 @@ async def test_cached_extraction_reapplies_lifecycle_quarantine(
     )
 
     class LifecycleManager(_Manager):
-        async def run(self, role, payload, on_progress=None):
+        async def run_attested(self, manifest, role, payload, on_progress=None):
+            self._require_attested_manifest(manifest)
             del on_progress
             self.calls.append((role, deepcopy(payload)))
             if role is ModelRole.OCR:

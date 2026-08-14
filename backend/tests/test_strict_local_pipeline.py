@@ -32,9 +32,11 @@ from app.services.local_ai.errors import (
 )
 from app.services.local_ai.extraction_validator import validate_clinical_extraction
 from app.services.local_ai.manifest import (
+    LocalAIManifest,
     canonicalize_manifest_snapshot,
     parse_manifest,
 )
+from app.services.local_ai.runtime_identity import WORKER_IDENTITY_SCHEME
 from app.services.local_ai.pipeline import (
     MemoryCheckpointStore,
     StrictLocalPipeline,
@@ -65,10 +67,15 @@ def _artifact(role: str) -> dict[str, object]:
 
 def _manifest_payload() -> dict[str, object]:
     return {
-        "schema_version": 1,
-        "pack_revision": "apple-m4-16gb-v1",
+        "schema_version": 2,
+        "pack_revision": "apple-m4-16gb-v2",
         "platform": "apple_silicon",
-        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "runtime": {
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": WORKER_IDENTITY_SCHEME,
+            "worker_bundle_sha256": "d" * 64,
+        },
         "validation_suite_version": "fixtures-v1",
         "artifacts": [_artifact(role) for role in ("ocr", "extraction", "summary")],
     }
@@ -121,13 +128,20 @@ class _Manager:
     def __init__(self, *, failure_role: ModelRole | None = None) -> None:
         self.calls: list[tuple[ModelRole, dict[str, Any]]] = []
         self.failure_role = failure_role
+        self.expected_manifest = parse_manifest(_manifest_payload())
 
-    async def run(
+    def _require_attested_manifest(self, manifest: object) -> None:
+        assert isinstance(manifest, LocalAIManifest)
+        assert manifest == self.expected_manifest
+
+    async def run_attested(
         self,
+        manifest: LocalAIManifest,
         role: ModelRole,
         payload: dict[str, Any],
         on_progress=None,
     ) -> dict[str, object]:
+        self._require_attested_manifest(manifest)
         del on_progress
         self.calls.append((role, deepcopy(payload)))
         if role is self.failure_role:
@@ -181,6 +195,64 @@ def _rasterizer(page_count: int):
             scratch.remove_file(filename)
 
     return rasterize
+
+
+@pytest.mark.asyncio
+async def test_pipeline_requires_attested_worker_calls_with_its_parsed_manifest(
+    tmp_path: Path,
+) -> None:
+    job, upload = _job_and_upload()
+    expected_manifest = parse_manifest(job.manifest_snapshot)
+    assert isinstance(expected_manifest, LocalAIManifest)
+
+    class AttestedOnlyManager:
+        def __init__(self) -> None:
+            self.calls: list[tuple[LocalAIManifest, ModelRole, dict[str, Any]]] = []
+
+        async def run(self, *_args, **_kwargs) -> None:
+            raise AssertionError("legacy worker calls are forbidden")
+
+        async def run_attested(
+            self,
+            manifest: LocalAIManifest,
+            role: ModelRole,
+            payload: dict[str, Any],
+            on_progress=None,
+            *,
+            on_liveness=None,
+        ) -> dict[str, object]:
+            del on_progress, on_liveness
+            self.calls.append((manifest, role, deepcopy(payload)))
+            if role is ModelRole.OCR:
+                return {
+                    "markdown": f"Page {payload['page_number']}: no clinical facts.",
+                    "page_number": payload["page_number"],
+                }
+            if role is ModelRole.EXTRACTION:
+                return _empty_extraction()
+            raise AssertionError("summary is not part of ingestion")
+
+    manager = AttestedOnlyManager()
+    pipeline = StrictLocalPipeline(
+        manager=manager,
+        checkpoints=MemoryCheckpointStore(),
+        manifest=expected_manifest,
+        scratch_root=tmp_path / "scratch",
+        model_dir=tmp_path / "pack",
+        rasterize=_rasterizer(1),
+        source_digest=_trusted_source_digest,
+    )
+
+    await pipeline.run_ingestion(job, upload, tmp_path / "encrypted.pdf")
+
+    assert [manifest for manifest, _role, _payload in manager.calls] == [
+        expected_manifest,
+        expected_manifest,
+    ]
+    assert [role for _manifest, role, _payload in manager.calls] == [
+        ModelRole.OCR,
+        ModelRole.EXTRACTION,
+    ]
 
 
 @pytest.mark.asyncio
@@ -264,7 +336,8 @@ async def test_pipeline_forwards_content_free_extraction_chunk_progress(
     observed: list[dict[str, object]] = []
 
     class ProgressManager(_Manager):
-        async def run(self, role, payload, on_progress=None):
+        async def run_attested(self, manifest, role, payload, on_progress=None):
+            self._require_attested_manifest(manifest)
             if role is ModelRole.EXTRACTION and on_progress is not None:
                 await on_progress(
                     {
@@ -274,7 +347,7 @@ async def test_pipeline_forwards_content_free_extraction_chunk_progress(
                         "total": 2,
                     }
                 )
-            return await super().run(role, payload, on_progress)
+            return await super().run_attested(manifest, role, payload, on_progress)
 
     pipeline = StrictLocalPipeline(
         manager=ProgressManager(),
@@ -312,18 +385,20 @@ async def test_pipeline_wires_internal_worker_liveness_without_public_progress(
     durable_heartbeats: list[int] = []
 
     class LivenessManager(_Manager):
-        async def run(
+        async def run_attested(
             self,
+            manifest,
             role,
             payload,
             on_progress=None,
             on_liveness=None,
         ):
+            self._require_attested_manifest(manifest)
             if on_liveness is not None:
                 value = on_liveness()
                 if hasattr(value, "__await__"):
                     await value
-            return await super().run(role, payload, on_progress)
+            return await super().run_attested(manifest, role, payload, on_progress)
 
     pipeline = StrictLocalPipeline(
         manager=LivenessManager(),
@@ -354,7 +429,8 @@ async def test_pipeline_merges_chunked_extraction_from_one_worker_run(
     job, upload = _job_and_upload()
 
     class LargeDocumentManager(_Manager):
-        async def run(self, role, payload, on_progress=None):
+        async def run_attested(self, manifest, role, payload, on_progress=None):
+            self._require_attested_manifest(manifest)
             del on_progress
             self.calls.append((role, deepcopy(payload)))
             if role is ModelRole.OCR:
@@ -1477,7 +1553,8 @@ async def test_pipeline_passes_only_bounded_selected_page_images_to_extraction(
             super().__init__()
             self.selected_images: dict[str, str] | None = None
 
-        async def run(self, role, payload, on_progress=None):
+        async def run_attested(self, manifest, role, payload, on_progress=None):
+            self._require_attested_manifest(manifest)
             if role is ModelRole.OCR:
                 page_number = payload["page_number"]
                 return {
@@ -1499,7 +1576,7 @@ async def test_pipeline_passes_only_bounded_selected_page_images_to_extraction(
                     for path in self.selected_images.values()
                 )
                 return _empty_extraction()
-            return await super().run(role, payload, on_progress)
+            return await super().run_attested(manifest, role, payload, on_progress)
 
     manager = TableManager()
     pipeline = StrictLocalPipeline(
@@ -1534,7 +1611,8 @@ async def test_pipeline_constrains_selected_images_to_aggregate_pixel_budget(
             super().__init__()
             self.selected_images: dict[str, str] | None = None
 
-        async def run(self, role, payload, on_progress=None):
+        async def run_attested(self, manifest, role, payload, on_progress=None):
+            self._require_attested_manifest(manifest)
             if role is ModelRole.OCR:
                 return {
                     "markdown": "| Test | Value |\n| --- | --- |\n| HbA1c | 6.1% |",
@@ -1543,7 +1621,7 @@ async def test_pipeline_constrains_selected_images_to_aggregate_pixel_budget(
             if role is ModelRole.EXTRACTION:
                 self.selected_images = dict(payload["image_paths"])
                 return _empty_extraction()
-            return await super().run(role, payload, on_progress)
+            return await super().run_attested(manifest, role, payload, on_progress)
 
     manager = TableManager()
     pipeline = StrictLocalPipeline(
@@ -2222,7 +2300,7 @@ async def test_strict_runner_rejects_job_with_a_different_upload_snapshot(
     await db_session.flush()
     upload_manifest, _ = canonicalize_manifest_snapshot(_manifest_payload())
     job_manifest = _manifest_payload()
-    job_manifest["pack_revision"] = "apple-m4-16gb-v2"
+    job_manifest["pack_revision"] = "apple-m4-16gb-v2-drift"
     job_manifest, _ = canonicalize_manifest_snapshot(job_manifest)
     upload = UploadedFile(
         user_id=user.id,

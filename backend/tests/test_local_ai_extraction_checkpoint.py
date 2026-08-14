@@ -58,10 +58,15 @@ def _manifest_payload() -> dict[str, object]:
             }
         )
     return {
-        "schema_version": 1,
-        "pack_revision": "apple-m4-16gb-v1",
+        "schema_version": 2,
+        "pack_revision": "apple-m4-16gb-v2",
         "platform": "apple_silicon",
-        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "runtime": {
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "d" * 64,
+        },
         "validation_suite_version": "fixtures-v1",
         "artifacts": artifacts,
     }
@@ -309,7 +314,8 @@ async def test_validation_failure_preserves_raw_checkpoint_and_retry_skips_manag
     upload_id = upload.id
 
     class InvalidExtractionManager(_Manager):
-        async def run(self, role, payload, on_progress=None):
+        async def run_attested(self, manifest, role, payload, on_progress=None):
+            self._require_attested_manifest(manifest)
             if role is ModelRole.EXTRACTION:
                 del on_progress
                 self.calls.append((role, payload))
@@ -317,9 +323,15 @@ async def test_validation_failure_preserves_raw_checkpoint_and_retry_skips_manag
                     "schema_version": "clinical-document-extraction.v1",
                     "unexpected_envelope_field": _RAW_PHI_MARKER,
                 }
-            return await super().run(role, payload, on_progress=on_progress)
+            return await super().run_attested(
+                manifest,
+                role,
+                payload,
+                on_progress=on_progress,
+            )
 
     manager = InvalidExtractionManager()
+    manager.expected_manifest = parse_manifest(snapshot)
     stages: list[str] = []
     pipeline = StrictLocalPipeline(
         manager=manager,

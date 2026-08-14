@@ -21,6 +21,8 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.services.local_ai.errors import LocalValidationError
+from app.config import settings
+from app.services.local_ai.errors import LocalAIError
 from app.services.local_ai.manifest import (
     ALLOWED_LICENSES,
     ALLOWED_SUFFIXES,
@@ -39,6 +41,12 @@ from app.services.local_ai.manifest import (
     safe_relative_manifest_path,
 )
 from app.services.local_ai.types import ModelRole
+from app.services.local_ai.runtime_identity import (
+    WORKER_IDENTITY_SCHEME,
+    WorkerRuntimeIdentity,
+    normalize_worker_runtime_binding,
+    resolve_worker_runtime_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +84,14 @@ _CANDIDATE_KEYS = frozenset(
 )
 _CANDIDATE_KEYS_WITH_LICENSE_SOURCE = _CANDIDATE_KEYS | {"license_source"}
 _LICENSE_SOURCE_KEYS = frozenset({"repository", "revision", "path", "sha256", "size"})
-_RUNTIME_KEYS = frozenset({"name", "version"})
+_RUNTIME_KEYS = frozenset(
+    {
+        "name",
+        "version",
+        "worker_identity_scheme",
+        "worker_bundle_sha256",
+    }
+)
 _DECODE_KEYS = frozenset({"max_input_tokens", "max_output_tokens"})
 _REMOTE_CODE_KEYS = frozenset({"auto_map", "requires_remote_code", "trust_remote_code"})
 _STATIC_TOKENIZER_JSON_FILES = frozenset({"tokenizer.json", "vocab.json"})
@@ -137,7 +152,10 @@ def _string(raw: dict[str, Any], key: str, context: str) -> str:
     return value
 
 
-def _load_catalog(path: Path) -> tuple[dict[str, Any], tuple[Candidate, ...]]:
+def _load_catalog(
+    path: Path,
+    observed_identity: WorkerRuntimeIdentity,
+) -> tuple[dict[str, Any], tuple[Candidate, ...]]:
     try:
         raw_value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
@@ -150,7 +168,7 @@ def _load_catalog(path: Path) -> tuple[dict[str, Any], tuple[Candidate, ...]]:
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version != 1
+        or schema_version != 2
     ):
         raise LocalValidationError("Candidate catalog schema version is invalid")
     if raw.get("platform") != "apple_silicon":
@@ -163,6 +181,23 @@ def _load_catalog(path: Path) -> tuple[dict[str, Any], tuple[Candidate, ...]]:
     runtime = _object(raw.get("runtime"), _RUNTIME_KEYS, "runtime")
     _string(runtime, "name", "runtime name")
     _string(runtime, "version", "runtime version")
+    identity_scheme = _string(
+        runtime,
+        "worker_identity_scheme",
+        "worker identity scheme",
+    )
+    bundle_sha256 = _string(
+        runtime,
+        "worker_bundle_sha256",
+        "worker bundle SHA-256",
+    )
+    if (
+        identity_scheme != WORKER_IDENTITY_SCHEME
+        or SHA256_RE.fullmatch(bundle_sha256) is None
+        or observed_identity.scheme != identity_scheme
+        or observed_identity.bundle_sha256 != bundle_sha256
+    ):
+        raise LocalValidationError("Candidate catalog worker identity is invalid")
 
     candidate_values = raw.get("candidates")
     if not isinstance(candidate_values, list):
@@ -721,7 +756,17 @@ def lock_catalog(catalog_path: Path, output_path: Path) -> int:
     This operation has no document inputs and never installs or activates a pack.
     """
 
-    catalog, candidates = _load_catalog(catalog_path)
+    try:
+        command, project = normalize_worker_runtime_binding(
+            settings.local_ai_worker_command,
+            settings.local_ai_worker_project_dir,
+        )
+        observed_identity = resolve_worker_runtime_identity(command, project)
+    except (LocalAIError, TypeError, ValueError):
+        raise LocalValidationError(
+            "Candidate catalog worker identity is unavailable"
+        ) from None
+    catalog, candidates = _load_catalog(catalog_path, observed_identity)
     output_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     headers = {"User-Agent": "MedTimeline-local-ai-lock/1"}
     timeout = httpx.Timeout(60.0, connect=15.0)

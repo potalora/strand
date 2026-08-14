@@ -30,6 +30,7 @@ from app.services.local_ai.manifest import (
     ManifestFile,
 )
 from app.services.local_ai.pack_operations import PackOperationStore
+from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
 from app.services.local_ai.types import ModelRole
 from app.services.local_ai.validation_receipt import (
     _issue_runtime_validation_receipt,
@@ -80,10 +81,15 @@ def _manifest(
     )
     return (
         LocalAIManifest(
-            schema_version=1,
+            schema_version=2,
             pack_revision=revision,
             platform="apple_silicon",
-            runtime={"name": "mlx-vlm", "version": "0.5.0"},
+            runtime={
+                "name": "mlx-vlm",
+                "version": "0.5.0",
+                "worker_identity_scheme": "local-ai-worker-bundle.v1",
+                "worker_bundle_sha256": "a" * 64,
+            },
             validation_suite_version="local-ai-fixtures-v1",
             artifacts=artifacts,
         ),
@@ -102,6 +108,16 @@ def _manifest_dict(manifest: LocalAIManifest) -> dict:
     return json.loads(json.dumps(asdict(manifest)))
 
 
+def _receipt(manifest: LocalAIManifest):
+    return _issue_runtime_validation_receipt(
+        manifest,
+        WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256=manifest.runtime["worker_bundle_sha256"],
+        ),
+    )
+
+
 def _install_pack(
     root: Path,
     manifest: LocalAIManifest,
@@ -117,7 +133,7 @@ def _install_pack(
     store.activate_validated(
         staging,
         manifest,
-        _issue_runtime_validation_receipt(manifest),
+        _receipt(manifest),
     )
     return store
 
@@ -1585,7 +1601,7 @@ async def test_verify_marks_only_a_successfully_verified_active_pack_ready(
     _install_pack(model_root, manifest, contents)
 
     async def verified(*_args, **_kwargs):
-        return _issue_runtime_validation_receipt(manifest)
+        return _receipt(manifest)
 
     monkeypatch.setattr("app.api.local_ai.verify_installed_pack", verified)
     response = await client.post("/api/v1/local-ai/verify", headers=headers)
@@ -1637,7 +1653,7 @@ async def test_install_validates_staging_before_atomic_activation(
         assert selected_manifest == manifest
         assert candidate_path.parent == store.staging_dir
         validation_saw_inactive_pack = store.active_revision() is None
-        return _issue_runtime_validation_receipt(manifest)
+        return _receipt(manifest)
 
     monkeypatch.setattr(
         "app.api.local_ai.download_manifest_to_stage",
@@ -1712,7 +1728,7 @@ async def test_job_admitted_during_validation_prevents_pack_activation(
             )
         )
         await db_session.commit()
-        return _issue_runtime_validation_receipt(manifest)
+        return _receipt(manifest)
 
     monkeypatch.setattr(
         "app.api.local_ai.download_manifest_to_stage",
@@ -1789,7 +1805,7 @@ async def test_failed_update_validation_preserves_prior_verified_active_pointer(
     store = _install_pack(model_root, prior, prior_contents)
     PackOperationStore(store).mark_validated(
         prior,
-        _issue_runtime_validation_receipt(prior),
+        _receipt(prior),
     )
 
     async def staged_download(selected_manifest, selected_store, _progress_callback):

@@ -13,7 +13,8 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.services.local_ai.errors import LocalValidationError
+from app.config import settings
+from app.services.local_ai.errors import LocalAIError, LocalValidationError
 from app.services.local_ai.artifact_store import manifest_sha256
 from app.services.local_ai.fidelity_metrics import FidelityGateError
 from app.services.local_ai.fidelity_runner import parse_fidelity_report_bytes
@@ -22,6 +23,11 @@ from app.services.local_ai.release_evidence import (
     _read_small_regular,
     build_release_evidence,
     load_release_evidence,
+)
+from app.services.local_ai.runtime_identity import (
+    normalize_worker_runtime_binding,
+    require_manifest_runtime_identity,
+    resolve_worker_runtime_identity,
 )
 from scripts.benchmark_local_ai import BenchmarkGateError, validate_acceptance
 
@@ -37,6 +43,12 @@ def promote(
 
     try:
         manifest = load_manifest(manifest_path)
+        command, project = normalize_worker_runtime_binding(
+            settings.local_ai_worker_command,
+            settings.local_ai_worker_project_dir,
+        )
+        observed_identity = resolve_worker_runtime_identity(command, project)
+        require_manifest_runtime_identity(manifest, observed_identity)
         benchmark_bytes = _read_small_regular(benchmark_path)
         fidelity_bytes = _read_small_regular(fidelity_path)
         benchmark = json.loads(benchmark_bytes.decode("utf-8"))
@@ -49,6 +61,10 @@ def promote(
             or report_manifest.get("sha256") != manifest_sha256(manifest)
             or report_manifest.get("runtime_name") != manifest.runtime["name"]
             or report_manifest.get("runtime_version") != manifest.runtime["version"]
+            or report_manifest.get("worker_identity_scheme")
+            != manifest.runtime["worker_identity_scheme"]
+            or report_manifest.get("worker_bundle_sha256")
+            != manifest.runtime["worker_bundle_sha256"]
         ):
             raise LocalValidationError("Local model release evidence is invalid")
         evidence = build_release_evidence(manifest, benchmark, fidelity)
@@ -63,8 +79,9 @@ def promote(
         ValueError,
         BenchmarkGateError,
         FidelityGateError,
-    ) as exc:
-        raise LocalValidationError("Local model release promotion failed") from exc
+        LocalAIError,
+    ):
+        raise LocalValidationError("Local model release promotion failed") from None
     output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = output.parent / f".{output.name}.{uuid.uuid4().hex}.tmp"
     try:
@@ -80,8 +97,8 @@ def promote(
             fidelity_path=fidelity_path,
         )
         os.replace(temporary, output)
-    except LocalValidationError as exc:
-        raise LocalValidationError("Local model release promotion failed") from exc
+    except LocalValidationError:
+        raise LocalValidationError("Local model release promotion failed") from None
     finally:
         temporary.unlink(missing_ok=True)
 

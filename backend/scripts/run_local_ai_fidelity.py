@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from pathlib import Path
 
@@ -12,11 +11,18 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import settings
+from app.services.local_ai.artifact_store import manifest_sha256
 from app.services.local_ai.errors import LocalAIError
 from app.services.local_ai.fidelity_metrics import FidelityGateError
 from app.services.local_ai.fidelity_runner import (
     run_installed_fidelity_suite,
     write_fidelity_report,
+)
+from app.services.local_ai.manifest import load_manifest
+from app.services.local_ai.runtime_identity import (
+    normalize_worker_runtime_binding,
+    require_manifest_runtime_identity,
+    resolve_worker_runtime_identity,
 )
 
 _DEFAULT_CORPUS = (
@@ -56,11 +62,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--private-fixtures-dir",
         type=Path,
-        default=(
-            Path(os.environ["REAL_MEDICAL_FIXTURES_DIR"])
-            if os.environ.get("REAL_MEDICAL_FIXTURES_DIR")
-            else None
-        ),
+        default=None,
     )
     parser.add_argument(
         "--output",
@@ -72,6 +74,13 @@ def _parser() -> argparse.ArgumentParser:
 
 async def _execute(args: argparse.Namespace) -> int:
     try:
+        manifest = load_manifest(args.manifest)
+        command, project = normalize_worker_runtime_binding(
+            settings.local_ai_worker_command,
+            settings.local_ai_worker_project_dir,
+        )
+        observed_identity = resolve_worker_runtime_identity(command, project)
+        require_manifest_runtime_identity(manifest, observed_identity)
         report = await run_installed_fidelity_suite(
             corpus_path=args.corpus,
             manifest_path=args.manifest,
@@ -79,6 +88,8 @@ async def _execute(args: argparse.Namespace) -> int:
             scratch_root=args.scratch_root,
             private_fixtures_dir=args.private_fixtures_dir,
         )
+        if report.manifest_sha256 != manifest_sha256(manifest):
+            raise FidelityGateError("Fidelity report does not match the manifest.")
         write_fidelity_report(args.output, report)
         report.assert_release_thresholds()
     except (FidelityGateError, LocalAIError) as exc:

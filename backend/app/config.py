@@ -243,15 +243,16 @@ class Settings(BaseSettings):
     local_ai_operator_user_ids: str = ""
     local_ai_model_dir: str = "./data/local-ai/models"
     local_ai_scratch_dir: str = "./data/local-ai/scratch"
-    local_ai_manifest_path: str = "./app/model_manifests/apple-m4-16gb-v1.lock.json"
+    local_ai_manifest_path: str = "./app/model_manifests/apple-m4-16gb-v2.lock.json"
     local_ai_release_evidence_path: str = (
-        "./app/model_manifests/apple-m4-16gb-v1.release.json"
+        "./app/model_manifests/apple-m4-16gb-v2.release.json"
     )
     local_ai_benchmark_path: str = "./artifacts/local-ai-benchmark.json"
     local_ai_fidelity_path: str = "./artifacts/local-ai-fidelity.json"
     local_ai_worker_command: str = (
         "../workers/local_ai/apple_mlx/.venv/bin/local-ai-mlx-worker"
     )
+    local_ai_worker_project_dir: str = "../workers/local_ai/apple_mlx"
     local_ai_max_files: int = 64
     local_ai_max_file_bytes: int = 8 * 1024 * 1024 * 1024
     local_ai_max_pack_bytes: int = 20 * 1024 * 1024 * 1024

@@ -14,15 +14,21 @@ from app.services.local_ai.manifest import (
     ManifestFile,
 )
 from app.services.local_ai.pack_verifier import verify_pack_candidate
+from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
 from app.services.local_ai.types import ModelRole
 
 
 def _manifest() -> LocalAIManifest:
     return LocalAIManifest(
-        schema_version=1,
-        pack_revision="apple-m4-16gb-v1",
+        schema_version=2,
+        pack_revision="apple-m4-16gb-v2",
         platform="apple_silicon",
-        runtime={"name": "mlx-vlm", "version": "0.5.0"},
+        runtime={
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "a" * 64,
+        },
         validation_suite_version="local-ai-fixtures-v1",
         artifacts=tuple(
             ManifestArtifact(
@@ -64,6 +70,11 @@ class FakeFixtureManager:
         self.stopped = False
         self.roles: list[ModelRole] = []
         self.payloads: list[dict] = []
+        self.manifests: list[LocalAIManifest] = []
+        self.runtime_identity = WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256="a" * 64,
+        )
 
     async def start(self) -> None:
         self.started = True
@@ -71,7 +82,14 @@ class FakeFixtureManager:
     async def stop(self) -> None:
         self.stopped = True
 
-    async def run(self, role: ModelRole, payload: dict, _on_progress=None):
+    async def run_attested(
+        self,
+        manifest: LocalAIManifest,
+        role: ModelRole,
+        payload: dict,
+        _on_progress=None,
+    ):
+        self.manifests.append(manifest)
         self.roles.append(role)
         self.payloads.append(payload)
         if role is ModelRole.OCR:
@@ -116,6 +134,91 @@ class FakeFixtureManager:
 
 
 @pytest.mark.asyncio
+async def test_verifier_rejects_runtime_identity_mismatch_before_fixtures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _manifest()
+    pack = tmp_path / "pack"
+    _write_pack(pack, manifest)
+    manager = FakeFixtureManager()
+    manager.runtime_identity = WorkerRuntimeIdentity(
+        scheme="local-ai-worker-bundle.v1",
+        bundle_sha256="b" * 64,
+    )
+    monkeypatch.setattr(
+        "app.services.local_ai.pack_verifier.platform_profile",
+        lambda: ("apple_silicon", True),
+    )
+
+    with pytest.raises(LocalValidationError, match="runtime identity"):
+        await verify_pack_candidate(
+            manifest,
+            pack,
+            manager=manager,
+            scratch_root=tmp_path / "scratch",
+        )
+
+    assert manager.started is False
+    assert manager.roles == []
+
+
+@pytest.mark.asyncio
+async def test_default_verifier_shares_one_normalized_bare_command_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.local_ai import pack_verifier as verifier_module
+
+    manifest = _manifest()
+    pack = tmp_path / "pack"
+    _write_pack(pack, manifest)
+    project = tmp_path / "worker-project"
+    project.mkdir()
+    manager = FakeFixtureManager()
+    resolved: list[tuple[tuple[str, ...], Path]] = []
+    constructed: list[tuple[tuple[str, ...], Path]] = []
+
+    def resolve(command, project_dir):
+        normalized = (tuple(command), Path(project_dir))
+        resolved.append(normalized)
+        return manager.runtime_identity
+
+    def construct(command, *, worker_project_dir):
+        normalized = (tuple(command), Path(worker_project_dir))
+        constructed.append(normalized)
+        return manager
+
+    monkeypatch.setattr(verifier_module.settings, "local_ai_worker_command", "python3")
+    monkeypatch.setattr(
+        verifier_module.settings,
+        "local_ai_worker_project_dir",
+        str(project),
+    )
+    monkeypatch.setattr(verifier_module, "resolve_worker_runtime_identity", resolve)
+    monkeypatch.setattr(verifier_module, "LocalModelManager", construct)
+    monkeypatch.setattr(
+        verifier_module,
+        "platform_profile",
+        lambda: ("apple_silicon", True),
+    )
+
+    await verify_pack_candidate(
+        manifest,
+        pack,
+        scratch_root=tmp_path / "scratch",
+    )
+
+    assert resolved == constructed
+    assert len(resolved) == 1
+    command, normalized_project = resolved[0]
+    assert Path(command[0]).is_absolute()
+    assert Path(command[0]).name == "python3"
+    assert normalized_project == project.absolute()
+    assert manager.manifests == [manifest, manifest, manifest]
+
+
+@pytest.mark.asyncio
 async def test_verifier_loads_all_roles_serially_and_runs_grounded_fixtures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -143,6 +246,7 @@ async def test_verifier_loads_all_roles_serially_and_runs_grounded_fixtures(
         ModelRole.EXTRACTION,
         ModelRole.SUMMARY,
     ]
+    assert manager.manifests == [manifest, manifest, manifest]
     assert all(
         Path(payload["model_dir"]) == pack.resolve() for payload in manager.payloads
     )

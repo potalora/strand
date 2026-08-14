@@ -19,11 +19,21 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import settings
-from app.services.local_ai.artifact_store import ArtifactStore, manifest_sha256
+from app.services.local_ai.artifact_store import (
+    manifest_sha256,
+    resolve_retained_candidate_pack,
+)
 from app.services.local_ai.errors import LocalAIError
+from app.services.local_ai.manifest import LocalAIManifest
 from app.services.local_ai.model_manager import LocalModelManager
-from app.services.local_ai.pack_operations import PackOperationStore, platform_profile
+from app.services.local_ai.pack_operations import platform_profile
 from app.services.local_ai.pack_verifier import verify_pack_candidate
+from app.services.local_ai.runtime_identity import (
+    WORKER_IDENTITY_SCHEME,
+    WorkerRuntimeIdentity,
+    normalize_worker_runtime_binding,
+    resolve_worker_runtime_identity,
+)
 from app.services.local_ai.types import ModelRole
 
 GIB = 1024**3
@@ -44,7 +54,14 @@ _MACHINE_KEYS = frozenset(
     {"platform_profile", "model", "physical_memory_bytes", "os_version"}
 )
 _MANIFEST_KEYS = frozenset(
-    {"pack_revision", "sha256", "runtime_name", "runtime_version"}
+    {
+        "pack_revision",
+        "sha256",
+        "runtime_name",
+        "runtime_version",
+        "worker_identity_scheme",
+        "worker_bundle_sha256",
+    }
 )
 _PROCESS_KEYS = frozenset({"max_live_models", "roles_started"})
 _ROLE_RUN_KEYS = frozenset(
@@ -147,6 +164,9 @@ def _validate_structure(
         )
         or not isinstance(manifest["sha256"], str)
         or _SHA256.fullmatch(manifest["sha256"]) is None
+        or not isinstance(manifest["worker_bundle_sha256"], str)
+        or _SHA256.fullmatch(manifest["worker_bundle_sha256"]) is None
+        or manifest["worker_identity_scheme"] != WORKER_IDENTITY_SCHEME
     ):
         raise BenchmarkGateError("Benchmark report structure is invalid.")
 
@@ -458,8 +478,31 @@ def _work_units(role: ModelRole, result: object) -> int:
 class _BenchmarkingManager:
     """Wrap the production manager with non-content process/resource sampling."""
 
-    def __init__(self) -> None:
-        self.manager = LocalModelManager()
+    def __init__(self, *, manager: Any | None = None) -> None:
+        if manager is None:
+            try:
+                command, project = normalize_worker_runtime_binding(
+                    settings.local_ai_worker_command,
+                    settings.local_ai_worker_project_dir,
+                )
+                self.manager = LocalModelManager(
+                    command,
+                    worker_project_dir=project,
+                )
+                self.runtime_identity = resolve_worker_runtime_identity(
+                    command,
+                    project,
+                )
+            except (LocalAIError, TypeError, ValueError):
+                raise BenchmarkGateError(
+                    "Benchmark local worker is unavailable."
+                ) from None
+        else:
+            observed = getattr(manager, "runtime_identity", None)
+            if not isinstance(observed, WorkerRuntimeIdentity):
+                raise BenchmarkGateError("Benchmark local worker is unavailable.")
+            self.manager = manager
+            self.runtime_identity = observed
         self.samples: dict[str, dict[str, int | float]] = {}
         self.observed_terminal_mlx_roles: set[str] = set()
 
@@ -469,7 +512,12 @@ class _BenchmarkingManager:
     async def stop(self) -> None:
         await self.manager.stop()
 
-    async def run(self, role: ModelRole, payload: dict[str, Any]) -> Any:
+    async def run_attested(
+        self,
+        manifest: LocalAIManifest,
+        role: ModelRole,
+        payload: dict[str, Any],
+    ) -> Any:
         started = time.monotonic()
         first_process_seen: float | None = None
         peak_rss = 0
@@ -496,7 +544,12 @@ class _BenchmarkingManager:
                 self.observed_terminal_mlx_roles.add(role.value)
 
         run_task = asyncio.create_task(
-            self.manager.run(role, payload, on_progress=on_progress)
+            self.manager.run_attested(
+                manifest,
+                role,
+                payload,
+                on_progress=on_progress,
+            )
         )
         try:
             while not run_task.done():
@@ -509,7 +562,12 @@ class _BenchmarkingManager:
                         await asyncio.to_thread(_rss_bytes, pid),
                     )
                 await asyncio.sleep(0.05)
-            result = await run_task
+            try:
+                result = await run_task
+            except LocalAIError:
+                raise BenchmarkGateError(
+                    "Benchmark local worker is unavailable."
+                ) from None
         finally:
             if not run_task.done():
                 run_task.cancel()
@@ -531,6 +589,20 @@ class _BenchmarkingManager:
         return result
 
 
+def _benchmark_manifest_identity(manifest: LocalAIManifest) -> dict[str, str]:
+    """Return the exact manifest and worker identity written to a report."""
+
+    runtime = manifest.runtime
+    return {
+        "pack_revision": manifest.pack_revision,
+        "sha256": manifest_sha256(manifest),
+        "runtime_name": runtime["name"],
+        "runtime_version": runtime["version"],
+        "worker_identity_scheme": runtime["worker_identity_scheme"],
+        "worker_bundle_sha256": runtime["worker_bundle_sha256"],
+    }
+
+
 async def run_benchmark(
     *,
     runs: int,
@@ -547,15 +619,17 @@ async def run_benchmark(
             "Benchmark requires Apple Silicon with at least 16 GiB of memory."
         )
 
-    store = ArtifactStore(Path(settings.local_ai_model_dir))
-    operations = PackOperationStore(store)
     try:
-        manifest = store.active_manifest()
-    except LocalAIError as exc:
-        raise BenchmarkGateError("Validated local model pack is unavailable.") from exc
-    if manifest is None or not operations.is_validated(manifest):
-        raise BenchmarkGateError("Validated local model pack is unavailable.")
-    pack_path = store.packs_dir / manifest.pack_revision
+        candidate = resolve_retained_candidate_pack(
+            manifest_path=Path(settings.local_ai_manifest_path),
+            model_root=Path(settings.local_ai_model_dir),
+        )
+    except LocalAIError:
+        raise BenchmarkGateError(
+            "Validated local model pack is unavailable."
+        ) from None
+    manifest = candidate.manifest
+    pack_path = candidate.pack_path
 
     swap_samples = [_swap_used_bytes()]
     role_samples: dict[str, list[dict[str, int | float]]] = {
@@ -567,11 +641,16 @@ async def run_benchmark(
     memory_pressure_termination = False
     for run_number in range(1, runs + 1):
         manager = _BenchmarkingManager()
-        await verify_pack_candidate(
-            manifest,
-            pack_path,
-            manager=manager,
-        )
+        try:
+            await verify_pack_candidate(
+                manifest,
+                pack_path,
+                manager=manager,
+            )
+        except LocalAIError:
+            raise BenchmarkGateError(
+                "Validated local model pack is unavailable."
+            ) from None
         max_live_models = max(
             max_live_models,
             manager.manager.metrics.max_live_processes,
@@ -596,6 +675,13 @@ async def run_benchmark(
             role_samples[role].append({"run": run_number, **sample})
         swap_samples.append(_swap_used_bytes())
 
+    try:
+        candidate.revalidate()
+    except LocalAIError:
+        raise BenchmarkGateError(
+            "Validated local model pack is unavailable."
+        ) from None
+
     swap_before = swap_samples[0]
     swap_after = swap_samples[-1]
     swap_delta = max(swap_after - swap_before, 0)
@@ -603,7 +689,6 @@ async def run_benchmark(
         role_samples,
         observed_roles=observed_terminal_mlx_roles,
     )
-    runtime = manifest.runtime
     report: dict[str, Any] = {
         "schema_version": 1,
         "content_free": True,
@@ -613,12 +698,7 @@ async def run_benchmark(
             "physical_memory_bytes": memory_bytes,
             "os_version": platform.mac_ver()[0] or platform.release(),
         },
-        "manifest": {
-            "pack_revision": manifest.pack_revision,
-            "sha256": manifest_sha256(manifest),
-            "runtime_name": runtime["name"],
-            "runtime_version": runtime["version"],
-        },
+        "manifest": _benchmark_manifest_identity(manifest),
         "processes": {
             "max_live_models": max_live_models,
             "roles_started": roles_started,

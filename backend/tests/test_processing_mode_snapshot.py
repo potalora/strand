@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from types import ModuleType
@@ -24,6 +24,7 @@ from app.schemas.llm_settings import RoutingUpdate
 from app.schemas.summary import GenerateSummaryRequest
 from app.services.local_ai.errors import LocalPolicyError
 from app.services.local_ai.errors import LocalValidationError
+from app.services.local_ai.errors import RuntimeIdentityRequiredError
 from app.services.local_ai.manifest import (
     LocalAIManifest,
     ManifestArtifact,
@@ -39,7 +40,12 @@ from app.services.local_ai.processing_snapshot import (
 )
 from app.services.local_ai.types import ModelRole
 from app.services.local_ai.types import ProcessingMode
+from app.services.local_ai.runtime_identity import (
+    WorkerRuntimeIdentity,
+    resolve_worker_runtime_identity,
+)
 from app.services.ai.llm.config import load_llm_config
+from tests.test_local_ai_runtime_identity import build_worker_project
 from app.utils.file_utils import encrypt_stream
 from tests.conftest import auth_headers
 
@@ -84,10 +90,15 @@ class _FakeDB:
 
 def _manifest() -> LocalAIManifest:
     return LocalAIManifest(
-        schema_version=1,
-        pack_revision="apple-m4-16gb-v1",
+        schema_version=2,
+        pack_revision="apple-m4-16gb-v2",
         platform="apple_silicon",
-        runtime={"name": "mlx-vlm", "version": "0.5.0"},
+        runtime={
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "a" * 64,
+        },
         validation_suite_version="fixtures-v1",
         artifacts=tuple(
             ManifestArtifact(
@@ -116,12 +127,17 @@ def _manifest() -> LocalAIManifest:
 
 def _enable_strict_pack(
     monkeypatch: pytest.MonkeyPatch,
+    manifest: LocalAIManifest | None = None,
 ) -> LocalAIManifest:
     import app.services.local_ai.processing_snapshot as snapshot_module
 
-    manifest = _manifest()
+    manifest = manifest or _manifest()
     monkeypatch.setattr(snapshot_module.settings, "local_ai_enabled", True)
-    monkeypatch.setattr(snapshot_module, "load_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        snapshot_module,
+        "load_manifest",
+        lambda _path, **_kwargs: manifest,
+    )
 
     class _Store:
         def __init__(self, _path: Path) -> None:
@@ -144,7 +160,35 @@ def _enable_strict_pack(
         "load_release_evidence",
         lambda *_args, **_kwargs: SimpleNamespace(),
     )
+    _stub_runtime_identity(monkeypatch, manifest)
     return manifest
+
+
+def _stub_runtime_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    manifest: LocalAIManifest,
+) -> None:
+    import app.services.local_ai.processing_snapshot as snapshot_module
+
+    command = ("/synthetic/worker",)
+    project = Path("/synthetic/project")
+    monkeypatch.setattr(
+        snapshot_module,
+        "normalize_worker_runtime_binding",
+        lambda _command, _project: (command, project),
+    )
+    monkeypatch.setattr(
+        snapshot_module,
+        "resolve_worker_runtime_identity",
+        lambda observed_command, observed_project: (
+            WorkerRuntimeIdentity(
+                scheme=manifest.runtime["worker_identity_scheme"],
+                bundle_sha256=manifest.runtime["worker_bundle_sha256"],
+            )
+            if observed_command == command and observed_project == project
+            else pytest.fail("unexpected worker runtime binding")
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -165,6 +209,117 @@ async def test_strict_admission_rejects_missing_release_evidence(
         await resolve_new_job_snapshot(
             _FakeDB(None), uuid4(), ProcessingMode.VALIDATED_STRICT_LOCAL
         )
+
+
+@pytest.mark.asyncio
+async def test_strict_admission_rejects_v1_before_release_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import app.services.local_ai.processing_snapshot as snapshot_module
+
+    legacy_manifest = replace(
+        _manifest(),
+        schema_version=1,
+        pack_revision="apple-m4-16gb-v1",
+        runtime={"name": "mlx-vlm", "version": "0.5.0"},
+    )
+    manifest_path = tmp_path / "legacy-manifest.json"
+    manifest_path.write_text(
+        json.dumps(asdict(legacy_manifest), sort_keys=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(snapshot_module.settings, "local_ai_enabled", True)
+    monkeypatch.setattr(
+        snapshot_module.settings,
+        "local_ai_manifest_path",
+        str(manifest_path),
+    )
+    release_calls = 0
+
+    def _release_evidence(*_args: object, **_kwargs: object) -> None:
+        nonlocal release_calls
+        release_calls += 1
+
+    monkeypatch.setattr(snapshot_module, "load_release_evidence", _release_evidence)
+
+    with pytest.raises(RuntimeIdentityRequiredError):
+        await resolve_new_job_snapshot(
+            _FakeDB(None), uuid4(), ProcessingMode.VALIDATED_STRICT_LOCAL
+        )
+
+    assert release_calls == 0
+
+
+@pytest.mark.parametrize("drifted_file", ["source", "lock"])
+@pytest.mark.asyncio
+async def test_strict_admission_rejects_worker_drift_before_pack_evidence_or_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    drifted_file: str,
+) -> None:
+    import app.services.local_ai.processing_snapshot as snapshot_module
+
+    project = build_worker_project(tmp_path / "worker")
+    observed = resolve_worker_runtime_identity(project.command, project.project_dir)
+    manifest = replace(
+        _manifest(),
+        runtime={
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": observed.scheme,
+            "worker_bundle_sha256": observed.bundle_sha256,
+        },
+    )
+    monkeypatch.setattr(snapshot_module.settings, "local_ai_enabled", True)
+    monkeypatch.setattr(
+        snapshot_module.settings,
+        "local_ai_worker_command",
+        project.command,
+    )
+    monkeypatch.setattr(
+        snapshot_module.settings,
+        "local_ai_worker_project_dir",
+        str(project.project_dir),
+    )
+    monkeypatch.setattr(
+        snapshot_module,
+        "load_manifest",
+        lambda _path, **_kwargs: manifest,
+    )
+    if drifted_file == "source":
+        (project.effective_package / "common.py").write_text(
+            "# drifted source\n",
+            encoding="utf-8",
+        )
+    else:
+        (project.project_dir / "uv.lock").write_text(
+            "version = 1\n# drifted lock\n",
+            encoding="utf-8",
+        )
+
+    pack_reads = 0
+
+    class _UnexpectedStore:
+        def __init__(self, _path: Path) -> None:
+            nonlocal pack_reads
+            pack_reads += 1
+
+    monkeypatch.setattr(snapshot_module, "ArtifactStore", _UnexpectedStore)
+    monkeypatch.setattr(
+        snapshot_module,
+        "load_release_evidence",
+        lambda *_args, **_kwargs: pytest.fail("release evidence loaded before identity"),
+    )
+
+    with pytest.raises(LocalPolicyError, match="unavailable"):
+        await resolve_new_job_snapshot(
+            _FakeDB(None),
+            uuid4(),
+            ProcessingMode.VALIDATED_STRICT_LOCAL,
+        )
+
+    assert pack_reads == 0
 
 
 def test_routing_update_accepts_only_explicit_processing_modes() -> None:
@@ -503,7 +658,7 @@ async def test_strict_snapshot_requires_enabled_exact_active_pack(
     monkeypatch.setattr(
         snapshot_module,
         "load_manifest",
-        lambda path: (
+        lambda path, **_kwargs: (
             manifest
             if path == Path("/locked/manifest.json")
             else pytest.fail("unexpected manifest path")
@@ -531,6 +686,7 @@ async def test_strict_snapshot_requires_enabled_exact_active_pack(
         "load_release_evidence",
         lambda *_args, **_kwargs: SimpleNamespace(),
     )
+    _stub_runtime_identity(monkeypatch, manifest)
 
     snapshot = await resolve_new_job_snapshot(
         _FakeDB(None),
@@ -558,7 +714,11 @@ async def test_strict_snapshot_fails_closed_when_pack_is_unavailable(
 
     manifest = _manifest()
     monkeypatch.setattr(snapshot_module.settings, "local_ai_enabled", enabled)
-    monkeypatch.setattr(snapshot_module, "load_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        snapshot_module,
+        "load_manifest",
+        lambda _path, **_kwargs: manifest,
+    )
 
     class _Store:
         def __init__(self, _path: Path) -> None:
@@ -623,7 +783,11 @@ async def test_strict_snapshot_rejects_hash_valid_active_pack_without_runtime_re
 
     manifest = _manifest()
     monkeypatch.setattr(snapshot_module.settings, "local_ai_enabled", True)
-    monkeypatch.setattr(snapshot_module, "load_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        snapshot_module,
+        "load_manifest",
+        lambda _path, **_kwargs: manifest,
+    )
 
     class _HashOnlyStore:
         def __init__(self, _path: Path) -> None:

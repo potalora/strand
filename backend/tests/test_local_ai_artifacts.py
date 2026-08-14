@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -21,9 +21,12 @@ from app.services.local_ai.manifest import (
     ManifestArtifact,
     ManifestFile,
 )
+from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
 from app.services.local_ai.types import ModelRole
 from app.services.local_ai.validation_receipt import (
     _issue_runtime_validation_receipt,
+    expected_validation_payload,
+    validate_persisted_receipt,
 )
 
 
@@ -58,15 +61,65 @@ def _manifest(
     )
     return (
         LocalAIManifest(
-            schema_version=1,
+            schema_version=2,
             pack_revision=pack_revision,
             platform="apple_silicon",
-            runtime={"name": "mlx-vlm", "version": "0.5.0"},
+            runtime={
+                "name": "mlx-vlm",
+                "version": "0.5.0",
+                "worker_identity_scheme": "local-ai-worker-bundle.v1",
+                "worker_bundle_sha256": "a" * 64,
+            },
             validation_suite_version="fixtures-v1",
             artifacts=artifacts,
         ),
         file_contents,
     )
+
+
+def _receipt(manifest: LocalAIManifest):
+    return _issue_runtime_validation_receipt(
+        manifest,
+        WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256=manifest.runtime["worker_bundle_sha256"],
+        ),
+    )
+
+
+def test_persisted_receipt_requires_worker_bundle_digest() -> None:
+    manifest, _ = _manifest("receipt-v2")
+    payload = expected_validation_payload(manifest)
+    payload.pop("worker_bundle_sha256")
+
+    with pytest.raises(LocalValidationError):
+        validate_persisted_receipt(payload, manifest)
+
+
+def test_persisted_receipt_rejects_substituted_worker_bundle_digest() -> None:
+    manifest, _ = _manifest("receipt-runtime-substitution")
+    payload = expected_validation_payload(manifest)
+    payload["worker_bundle_sha256"] = "b" * 64
+
+    with pytest.raises(LocalValidationError):
+        validate_persisted_receipt(payload, manifest)
+
+
+def test_active_pointer_and_receipt_cannot_be_reused_for_another_worker_bundle(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    manifest, _contents = _install(store, "receipt-pointer-binding")
+    substituted = replace(
+        manifest,
+        runtime={
+            **manifest.runtime,
+            "worker_bundle_sha256": "b" * 64,
+        },
+    )
+
+    assert store.has_validation_receipt(substituted) is False
+    assert store.active_manifest() == manifest
 
 
 def _write_manifest_files(
@@ -91,9 +144,89 @@ def _install(
     store.activate_validated(
         stage,
         manifest,
-        _issue_runtime_validation_receipt(manifest),
+        _receipt(manifest),
     )
     return manifest, contents
+
+
+def _rewrite_active_as_legacy(
+    store: ArtifactStore,
+    manifest: LocalAIManifest,
+) -> tuple[bytes, bytes]:
+    metadata_path = store.packs_dir / manifest.pack_revision / ".manifest.json"
+    state_path = store.root / "activation-state.json"
+    legacy = asdict(manifest)
+    legacy["schema_version"] = 1
+    legacy["runtime"] = {
+        "name": manifest.runtime["name"],
+        "version": manifest.runtime["version"],
+    }
+    metadata = json.dumps(
+        legacy,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    metadata_path.write_bytes(metadata)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    old_manifest_sha256 = state["active"]["manifest_sha256"]
+    new_manifest_sha256 = hashlib.sha256(metadata).hexdigest()
+    (store.validations_dir / f"{old_manifest_sha256}.json").rename(
+        store.validations_dir / f"{new_manifest_sha256}.json"
+    )
+    state["active"]["manifest_sha256"] = new_manifest_sha256
+    state_path.write_text(
+        json.dumps(state, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return metadata_path.read_bytes(), state_path.read_bytes()
+
+
+def test_retained_legacy_tree_binds_to_v2_candidate_without_relabeling(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    legacy, _contents = _install(store, "apple-m4-16gb-v1")
+    metadata_before, state_before = _rewrite_active_as_legacy(store, legacy)
+    candidate = replace(legacy, pack_revision="apple-m4-16gb-v2")
+
+    binding = store.bind_retained_candidate(candidate)
+    store.revalidate_retained_candidate(candidate, binding)
+
+    assert binding.path == store.packs_dir / "apple-m4-16gb-v1"
+    assert (binding.path / ".manifest.json").read_bytes() == metadata_before
+    assert (store.root / "activation-state.json").read_bytes() == state_before
+
+
+def test_retained_legacy_tree_rejects_candidate_or_artifact_drift(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    legacy, _contents = _install(store, "apple-m4-16gb-v1")
+    _rewrite_active_as_legacy(store, legacy)
+    candidate = replace(legacy, pack_revision="apple-m4-16gb-v2")
+    changed_artifact = replace(
+        candidate.artifacts[0],
+        revision="f" * 40,
+    )
+
+    with pytest.raises(LocalValidationError):
+        store.bind_retained_candidate(
+            replace(
+                candidate,
+                artifacts=(changed_artifact, *candidate.artifacts[1:]),
+            )
+        )
+
+    target = (
+        store.packs_dir
+        / legacy.pack_revision
+        / ModelRole.OCR.value
+        / "weights/model.safetensors"
+    )
+    target.write_bytes(b"changed")
+    with pytest.raises(LocalValidationError):
+        store.bind_retained_candidate(candidate)
 
 
 def test_activation_is_atomic_and_preserves_previous_pack(tmp_path: Path) -> None:
@@ -109,7 +242,7 @@ def test_activation_is_atomic_and_preserves_previous_pack(tmp_path: Path) -> Non
         store.activate_validated(
             stage,
             manifest,
-            _issue_runtime_validation_receipt(manifest),
+            _receipt(manifest),
         )
 
     assert store.active_revision() == "first"
@@ -168,7 +301,7 @@ def test_state_failure_restores_prior_pointer_and_removes_inactive_orphan(
         store.activate_validated(
             stage,
             manifest,
-            _issue_runtime_validation_receipt(manifest),
+            _receipt(manifest),
         )
 
     assert store.active_revision() == "first"
@@ -199,7 +332,7 @@ def test_receipt_write_failure_preserves_prior_active_pack(
         store.activate_validated(
             stage,
             manifest,
-            _issue_runtime_validation_receipt(manifest),
+            _receipt(manifest),
         )
 
     assert store.active_revision() == "first"
@@ -236,7 +369,7 @@ def test_state_fsync_failure_restores_prior_validated_active_pack(
         store.activate_validated(
             stage,
             manifest,
-            _issue_runtime_validation_receipt(manifest),
+            _receipt(manifest),
         )
 
     assert store.active_revision() == "first"
@@ -278,7 +411,7 @@ def test_post_rename_verification_failure_does_not_update_activation_state(
         store.activate_validated(
             stage,
             manifest,
-            _issue_runtime_validation_receipt(manifest),
+            _receipt(manifest),
         )
 
     assert replaced
@@ -339,13 +472,13 @@ def test_mutations_are_serialized_within_the_process(
                 store.activate_validated,
                 first_stage,
                 first_manifest,
-                _issue_runtime_validation_receipt(first_manifest),
+                _receipt(first_manifest),
             ),
             executor.submit(
                 second_store.activate_validated,
                 second_stage,
                 second_manifest,
-                _issue_runtime_validation_receipt(second_manifest),
+                _receipt(second_manifest),
             ),
         ]
         for future in futures:
@@ -403,7 +536,7 @@ def test_activation_rejects_a_stale_active_pointer_without_replacing_it(
         store.activate_validated(
             stage,
             manifest,
-            _issue_runtime_validation_receipt(manifest),
+            _receipt(manifest),
         )
 
     assert json.loads(state_path.read_text()) == stale_state
@@ -508,7 +641,7 @@ def test_verification_rejects_file_replaced_with_symlink_during_open(
         store.activate_validated(
             stage,
             manifest,
-            _issue_runtime_validation_receipt(manifest),
+            _receipt(manifest),
         )
 
     assert replaced
@@ -546,7 +679,7 @@ def test_verification_rejects_entry_replaced_while_descriptor_is_hashed(
         store.activate_validated(
             stage,
             manifest,
-            _issue_runtime_validation_receipt(manifest),
+            _receipt(manifest),
         )
 
     assert replaced

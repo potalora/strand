@@ -43,6 +43,9 @@ from app.services.local_ai.pack_operations import (
     platform_profile,
 )
 from app.services.local_ai.pack_verifier import verify_pack_candidate
+from app.services.local_ai.processing_snapshot import (
+    fail_legacy_runtime_identity_required,
+)
 from app.services.local_ai.release_evidence import (
     ReleaseEvidence,
     load_release_evidence,
@@ -189,6 +192,8 @@ async def _retry_local_ai_job(
     upload: UploadedFile | None = None,
 ) -> None:
     """Atomically requeue one failed, retryable strict-local job."""
+    if job.legacy_manifest_diagnostic() is not None:
+        raise HTTPException(status_code=409, detail="This job cannot be retried.")
     failure = job.failure if isinstance(job.failure, dict) else {}
     if job.status != "failed" or failure.get("retryable") is not True:
         raise HTTPException(status_code=409, detail="This job cannot be retried.")
@@ -889,6 +894,30 @@ async def cancel_local_ai_job(
     db: AsyncSession = Depends(get_db),
 ) -> LocalAIJobResponse:
     """Persist cancellation and terminate an active embedded worker when present."""
+    candidate = (
+        await db.execute(
+            select(LocalAIJob)
+            .where(
+                LocalAIJob.id == job_id,
+                LocalAIJob.user_id == user_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Local AI job not found.")
+
+    paired_upload = None
+    if candidate.kind == "ingestion" and candidate.upload_id is not None:
+        paired_upload = (
+            await db.execute(
+                select(UploadedFile)
+                .where(
+                    UploadedFile.id == candidate.upload_id,
+                    UploadedFile.user_id == user_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
     job = (
         await db.execute(
             select(LocalAIJob)
@@ -897,13 +926,25 @@ async def cancel_local_ai_job(
                 LocalAIJob.user_id == user_id,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=404, detail="Local AI job not found.")
 
     was_processing = job.status == "processing"
-    if job.status in _ACTIVE_JOB_STATES:
+    if fail_legacy_runtime_identity_required(job):
+        if paired_upload is not None:
+            paired_upload.ingestion_status = "failed"
+            paired_upload.progress_stage = None
+            paired_upload.progress_detail = None
+            paired_upload.ingestion_errors = [
+                {"error_type": "runtime_identity_required"}
+            ]
+            paired_upload.processing_completed_at = job.completed_at
+        await db.commit()
+        await db.refresh(job)
+    elif job.status in _ACTIVE_JOB_STATES:
         job.cancel_requested = True
         if job.status == "queued":
             job.status = "cancelled"

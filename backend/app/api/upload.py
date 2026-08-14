@@ -50,6 +50,8 @@ from app.utils.file_utils import EncryptedFileWriter
 from app.services.local_ai.processing_snapshot import (
     ProcessingSnapshot,
     build_ingestion_job,
+    fail_active_legacy_ingestion_jobs,
+    fail_legacy_runtime_identity_required,
     revalidate_strict_snapshot_admission,
     resolve_new_ingestion_snapshot,
 )
@@ -316,17 +318,29 @@ async def _recover_stuck_files() -> None:
 
     async with async_session_factory() as db:
         try:
+            await fail_active_legacy_ingestion_jobs(
+                db,
+                completed_at=recovered_at,
+            )
+
             # Cancellation is terminal and takes precedence over retry recovery.
             # Pair the upload/job writes in this one transaction so a strict job
             # can never remain queued behind a cancelled upload.
             await db.execute(
                 text(
-                    "UPDATE uploaded_files "
+                    "UPDATE uploaded_files AS u "
                     "SET ingestion_status = 'cancelled', progress_stage = NULL, "
                     "progress_detail = NULL, processing_completed_at = :now "
-                    "WHERE ingestion_status IN ('pending_extraction', 'processing') "
-                    "AND file_category = 'unstructured' "
-                    "AND cancel_requested = true"
+                    "WHERE u.ingestion_status IN ('pending_extraction', 'processing') "
+                    "AND u.file_category = 'unstructured' "
+                    "AND u.cancel_requested = true "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM local_ai_jobs AS j "
+                    "WHERE j.upload_id = u.id "
+                    "AND j.processing_mode = 'validated_strict_local' "
+                    "AND j.manifest_snapshot->>'schema_version' "
+                    "IS DISTINCT FROM '2'"
+                    ")"
                 ),
                 {"now": recovered_at},
             )
@@ -339,6 +353,7 @@ async def _recover_stuck_files() -> None:
                     "FROM uploaded_files AS u "
                     "WHERE j.upload_id = u.id "
                     "AND j.processing_mode = 'validated_strict_local' "
+                    "AND j.manifest_snapshot->>'schema_version' = '2' "
                     "AND j.status IN ('queued', 'processing') "
                     "AND u.ingestion_status = 'cancelled' "
                     "AND u.cancel_requested = true"
@@ -461,6 +476,7 @@ async def _recover_stuck_files() -> None:
                     "FROM uploaded_files AS u "
                     "WHERE j.upload_id = u.id "
                     "AND j.processing_mode = 'validated_strict_local' "
+                    "AND j.manifest_snapshot->>'schema_version' = '2' "
                     "AND j.status = 'processing' "
                     "AND u.ingestion_status = 'pending_extraction'"
                 ),
@@ -485,6 +501,7 @@ async def _recover_stuck_files() -> None:
                     "FROM uploaded_files AS u "
                     "WHERE j.upload_id = u.id "
                     "AND j.processing_mode = 'validated_strict_local' "
+                    "AND j.manifest_snapshot->>'schema_version' = '2' "
                     "AND j.status IN ('queued', 'processing') "
                     "AND u.ingestion_status = 'failed'"
                 ),
@@ -1195,6 +1212,24 @@ async def cancel_extraction(
         }
         cancelled_at = datetime.now(timezone.utc)
         for job in strict_jobs:
+            from app.services.local_ai.processing_snapshot import (
+                fail_legacy_runtime_identity_required,
+            )
+
+            if fail_legacy_runtime_identity_required(
+                job,
+                completed_at=cancelled_at,
+            ):
+                legacy_upload = owned.get(job.upload_id)
+                if legacy_upload is not None:
+                    legacy_upload.ingestion_status = "failed"
+                    legacy_upload.progress_stage = None
+                    legacy_upload.progress_detail = None
+                    legacy_upload.ingestion_errors = [
+                        {"error_type": "runtime_identity_required"}
+                    ]
+                    legacy_upload.processing_completed_at = cancelled_at
+                continue
             job.cancel_requested = True
             if job.status == "queued":
                 job.status = "cancelled"
@@ -1721,6 +1756,7 @@ async def _refresh_strict_local_job_lease(
                 "AND j.upload_id = :upload_id "
                 "AND j.user_id = :user_id "
                 "AND j.processing_mode = 'validated_strict_local' "
+                "AND j.manifest_snapshot->>'schema_version' = '2' "
                 "AND j.status = 'processing' "
                 "AND j.cancel_requested = false "
                 f"{attempt_clause}"
@@ -1795,6 +1831,7 @@ async def _persist_strict_local_progress(
             LocalAIJob.upload_id == upload_id,
             LocalAIJob.user_id == user_id,
             LocalAIJob.processing_mode == "validated_strict_local",
+            LocalAIJob.manifest_snapshot["schema_version"].as_integer() == 2,
             LocalAIJob.status == "processing",
             LocalAIJob.cancel_requested.is_(False),
         )
@@ -1817,6 +1854,7 @@ async def _persist_strict_local_progress(
             update(LocalAIJob)
             .where(
                 LocalAIJob.id == active_job.id,
+                LocalAIJob.manifest_snapshot["schema_version"].as_integer() == 2,
                 LocalAIJob.status == "processing",
                 LocalAIJob.cancel_requested.is_(False),
             )
@@ -1971,7 +2009,14 @@ async def _mark_cancelled(db: AsyncSession, upload: UploadedFile) -> None:
                 .scalars()
                 .all()
             )
+            legacy_failed = False
             for job in jobs:
+                if fail_legacy_runtime_identity_required(
+                    job,
+                    completed_at=completed_at,
+                ):
+                    legacy_failed = True
+                    continue
                 job.cancel_requested = True
                 job.status = "cancelled"
                 job.stage = "cancelled"
@@ -1982,6 +2027,11 @@ async def _mark_cancelled(db: AsyncSession, upload: UploadedFile) -> None:
                 )
                 job.failure = None
                 job.completed_at = completed_at
+            if legacy_failed:
+                upload.ingestion_status = "failed"
+                upload.ingestion_errors = [
+                    {"error_type": "runtime_identity_required"}
+                ]
         await db.commit()
     except Exception:
         logger.error("Failed to mark %s cancelled; retrying after rollback", upload_id)
@@ -2014,7 +2064,14 @@ async def _mark_cancelled(db: AsyncSession, upload: UploadedFile) -> None:
                 .scalars()
                 .all()
             )
+            legacy_failed = False
             for fallback_job in fallback_jobs:
+                if fail_legacy_runtime_identity_required(
+                    fallback_job,
+                    completed_at=completed_at,
+                ):
+                    legacy_failed = True
+                    continue
                 fallback_job.cancel_requested = True
                 fallback_job.status = "cancelled"
                 fallback_job.stage = "cancelled"
@@ -2025,6 +2082,17 @@ async def _mark_cancelled(db: AsyncSession, upload: UploadedFile) -> None:
                 )
                 fallback_job.failure = None
                 fallback_job.completed_at = completed_at
+            if legacy_failed:
+                await db.execute(
+                    text(
+                        "UPDATE uploaded_files SET ingestion_status = 'failed', "
+                        "progress_stage = NULL, progress_detail = NULL, "
+                        "ingestion_errors = "
+                        "'[{\"error_type\": \"runtime_identity_required\"}]'::jsonb, "
+                        "processing_completed_at = :now WHERE id = :id"
+                    ),
+                    {"now": completed_at, "id": upload_id},
+                )
         await db.commit()
 
 
@@ -2565,12 +2633,16 @@ async def _run_strict_local_ingestion_for_upload(
         LOCAL_WORKER_FAILURE_CATEGORIES,
         LocalAIError,
         LocalPolicyError,
+        RuntimeIdentityRequiredError,
     )
     from app.services.local_ai.manifest import (
         canonicalize_manifest_snapshot,
         parse_manifest,
     )
     from app.services.local_ai.model_manager import local_model_manager
+    from app.services.local_ai.processing_snapshot import (
+        fail_legacy_runtime_identity_required,
+    )
     from app.services.local_ai.pipeline import StrictLocalPipeline
 
     upload_id = upload.id
@@ -2608,6 +2680,20 @@ async def _run_strict_local_ingestion_for_upload(
             if current_job is not None:
                 job_id = current_job.id
         current_upload = await db.get(UploadedFile, upload_id)
+
+        if current_job is not None and fail_legacy_runtime_identity_required(
+            current_job
+        ):
+            if current_upload is not None:
+                current_upload.ingestion_status = "failed"
+                current_upload.progress_stage = None
+                current_upload.progress_detail = None
+                current_upload.ingestion_errors = [
+                    {"error_type": "runtime_identity_required"}
+                ]
+                current_upload.processing_completed_at = current_job.completed_at
+            await db.commit()
+            return True
 
         # Never rewrite a terminal job. In particular, an acknowledged cancel
         # must not become a failure merely because the runner was invoked again.
@@ -2721,6 +2807,41 @@ async def _run_strict_local_ingestion_for_upload(
         ).scalar_one_or_none()
         if locked_upload_id is None:
             raise LocalPolicyError("Strict-local upload is unavailable.")
+
+        legacy_candidate = (
+            (
+                await db.execute(
+                    select(LocalAIJob)
+                    .where(
+                        LocalAIJob.upload_id == upload_id,
+                        LocalAIJob.user_id == user_id,
+                        LocalAIJob.kind == "ingestion",
+                        LocalAIJob.processing_mode == "validated_strict_local",
+                        LocalAIJob.status.in_(("queued", "processing")),
+                    )
+                    .order_by(LocalAIJob.created_at.desc(), LocalAIJob.id.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if legacy_candidate is not None and fail_legacy_runtime_identity_required(
+            legacy_candidate
+        ):
+            job_id = legacy_candidate.id
+            upload.ingestion_status = "failed"
+            upload.progress_stage = None
+            upload.progress_detail = None
+            upload.ingestion_errors = [
+                {"error_type": "runtime_identity_required"}
+            ]
+            upload.processing_completed_at = legacy_candidate.completed_at
+            await db.commit()
+            raise RuntimeIdentityRequiredError(
+                "Strict-local worker runtime identity is required."
+            )
 
         try:
             upload_snapshot, upload_digest = canonicalize_manifest_snapshot(

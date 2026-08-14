@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.config import Settings
+
 WORKFLOWS = (
     ".github/workflows/backend-ci.yml",
     ".github/workflows/local-ai-contract-ci.yml",
@@ -98,3 +100,93 @@ def test_backend_ci_keeps_full_lint_but_scopes_the_formatter_gate() -> None:
         "tests/test_strict_local_*.py",
     ):
         assert path in content
+
+
+def test_v2_pack_paths_are_the_only_active_defaults_and_release_recipes() -> None:
+    configured = Settings(_env_file=None)
+    assert configured.local_ai_manifest_path.endswith(
+        "/apple-m4-16gb-v2.lock.json"
+    )
+    assert configured.local_ai_release_evidence_path.endswith(
+        "/apple-m4-16gb-v2.release.json"
+    )
+
+    justfile = (REPOSITORY_ROOT / "justfile").read_text(encoding="utf-8")
+    promotion = justfile.split("local-ai-release-promote:", 1)[1].split(
+        "\n\n", 1
+    )[0]
+    assert "apple-m4-16gb-v2.lock.json" in promotion
+    assert "apple-m4-16gb-v2.release.json" in promotion
+    assert "apple-m4-16gb-v1" not in promotion
+
+    environment = (REPOSITORY_ROOT / ".env.example").read_text(encoding="utf-8")
+    assert (
+        "LOCAL_AI_MANIFEST_PATH="
+        "./app/model_manifests/apple-m4-16gb-v2.lock.json"
+    ) in environment.splitlines()
+    assert (
+        "LOCAL_AI_RELEASE_EVIDENCE_PATH="
+        "./app/model_manifests/apple-m4-16gb-v2.release.json"
+    ) in environment.splitlines()
+    assert "apple-m4-16gb-v1" not in "\n".join(
+        line for line in environment.splitlines() if line.startswith("LOCAL_AI_")
+    )
+
+
+def test_static_v2_catalog_and_lock_preserve_model_revisions() -> None:
+    import json
+
+    manifests = REPOSITORY_ROOT / "backend" / "app" / "model_manifests"
+    catalog_v1 = json.loads((manifests / "catalog-v1.json").read_text())
+    catalog_v2 = json.loads((manifests / "catalog-v2.json").read_text())
+    lock_v1 = json.loads((manifests / "apple-m4-16gb-v1.lock.json").read_text())
+    lock_v2 = json.loads((manifests / "apple-m4-16gb-v2.lock.json").read_text())
+
+    expected_digest = "f847c4b69848029c0e6de7edfedbbfa2ea775910d424adc1e8b714974cd4db65"
+    for value in (catalog_v2, lock_v2):
+        assert value["schema_version"] == 2
+        assert value["pack_revision"] == "apple-m4-16gb-v2"
+        assert value["runtime"]["worker_identity_scheme"] == (
+            "local-ai-worker-bundle.v1"
+        )
+        assert value["runtime"]["worker_bundle_sha256"] == expected_digest
+
+    assert catalog_v2["candidates"] == catalog_v1["candidates"]
+    assert lock_v2["artifacts"] == lock_v1["artifacts"]
+
+
+def test_strict_local_contract_ci_covers_setup_only_change_contracts() -> None:
+    """Setup and justfile-only PRs need their deterministic contract nodes here."""
+
+    local_ai_workflow = (
+        REPOSITORY_ROOT / ".github/workflows/local-ai-contract-ci.yml"
+    ).read_text(encoding="utf-8")
+    selected_contract_tests = local_ai_workflow.split("uv run pytest \\", 1)[1].split(
+        "\n            -q", 1
+    )[0]
+    backend_workflow = (REPOSITORY_ROOT / ".github/workflows/backend-ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    for test_file in (
+        "tests/test_local_ai_setup_script.py",
+        "tests/test_local_ai_candidate_pack_cli.py",
+        "tests/test_local_ai_ci_workflows.py",
+        "tests/test_local_ai_runtime_identity.py",
+        "tests/test_local_ai_release_evidence.py",
+    ):
+        assert test_file in selected_contract_tests
+
+    workflow_triggers = local_ai_workflow.split("permissions:", 1)[0]
+    for watched_path in (
+        ".env.example",
+        "backend/scripts/local_ai_candidate_pack.py",
+        "backend/scripts/lock_local_ai_manifest.py",
+        "backend/scripts/run_local_ai_fidelity.py",
+        "scripts/setup-local-ai-macos.sh",
+        "justfile",
+    ):
+        assert workflow_triggers.count(f'- "{watched_path}"') == 2
+
+    assert '"scripts/setup-local-ai-macos.sh"' not in backend_workflow
+    assert '"justfile"' not in backend_workflow

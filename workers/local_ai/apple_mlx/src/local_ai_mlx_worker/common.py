@@ -74,7 +74,9 @@ _TOP_LEVEL_KEYS = frozenset(
         "artifacts",
     }
 )
-_RUNTIME_KEYS = frozenset({"name", "version"})
+_RUNTIME_KEYS = frozenset(
+    {"name", "version", "worker_identity_scheme", "worker_bundle_sha256"}
+)
 _ARTIFACT_KEYS = frozenset(
     {
         "role",
@@ -110,6 +112,7 @@ _PACK_REVISION = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_WORKER_IDENTITY_SCHEME = "local-ai-worker-bundle.v1"
 
 
 class WorkerInputError(ValueError):
@@ -404,7 +407,7 @@ def _validated_manifest(
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version != 1
+        or schema_version != 2
     ):
         raise ArtifactUnavailableError("Locked manifest is incompatible.")
     pack_revision = _manifest_string(raw, "pack_revision", context="pack revision")
@@ -413,8 +416,18 @@ def _validated_manifest(
     if raw.get("platform") != "apple_silicon":
         raise ArtifactUnavailableError("Locked manifest is incompatible.")
     runtime = _plain_object(raw.get("runtime"), keys=_RUNTIME_KEYS, context="runtime")
-    if runtime != {"name": "mlx-vlm", "version": "0.5.0"}:
+    if (
+        runtime.get("name") != "mlx-vlm"
+        or runtime.get("version") != "0.5.0"
+        or runtime.get("worker_identity_scheme") != _WORKER_IDENTITY_SCHEME
+    ):
         raise ArtifactUnavailableError("Locked manifest is incompatible.")
+    worker_bundle_sha256 = runtime.get("worker_bundle_sha256")
+    if (
+        not isinstance(worker_bundle_sha256, str)
+        or _SHA256.fullmatch(worker_bundle_sha256) is None
+    ):
+        raise ArtifactUnavailableError("Locked manifest runtime digest is invalid.")
     validation_suite_version = _manifest_string(
         raw,
         "validation_suite_version",
@@ -497,7 +510,12 @@ def _validated_manifest(
         "schema_version": schema_version,
         "pack_revision": pack_revision,
         "platform": "apple_silicon",
-        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "runtime": {
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": _WORKER_IDENTITY_SCHEME,
+            "worker_bundle_sha256": worker_bundle_sha256,
+        },
         "validation_suite_version": validation_suite_version,
     }
     return artifacts, header
