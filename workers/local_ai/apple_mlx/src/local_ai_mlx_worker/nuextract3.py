@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,11 +35,9 @@ EXTRACTION_OUTPUT_CAP = 4096
 # single-document extraction wall time.
 MAX_EXTRACTION_GENERATED_TOKENS = 32_768
 MAX_EXTRACTION_GENERATION_ATTEMPTS = 12
-# Split/fragment budgets form one binary tree: a depth-N tree needs at most
-# 2**N - 1 splits. Raised together (7/3 -> 31/5) so a genuinely long single
-# page can subdivide until each fragment fits the batch input cap instead of
-# dying at fragment_depth_limit.
-MAX_EXTRACTION_RUNTIME_SPLITS = 31
+# Eleven splits can create at most twelve isolated batches, matching the
+# generation-attempt ceiling while the independent fragment-depth guard stays five.
+MAX_EXTRACTION_RUNTIME_SPLITS = 11
 MAX_EXTRACTION_FRAGMENT_DEPTH = 5
 MAX_EXTRACTION_INPUT_BYTES = 4 * 1024 * 1024
 MAX_SELECTED_IMAGES = 8
@@ -78,23 +77,30 @@ _BILLED_MARKER = (
     r"revenue\s+code|place\s+of\s+service|allowed\s+amount|"
     r"amount\s+(?:billed|due|paid))"
 )
-# Mirrors the backend extraction validator's performed-wording guard so the
-# worker only downgrades billed line items that lack performance evidence.
-_PERFORMED_MARKER_RE = re.compile(
-    r"(?:\b(?:s/p|status post|underwent|performed|post-?op|history of|removed|"
-    r"resection|excision|completed|done on|biopsy)\b|"
-    r"\b\w+(?:ectomy|otomy|ostomy|oplasty|plasty)\b)",
-    re.IGNORECASE,
-)
 # Administrative billing-form signature, checked against the fact's own page.
-# Mirrors the backend extraction validator; the effect is only the conservative
-# downgrade of undated procedures without performance wording.
+# Mirrors the backend extraction validator: dated or undated administrative
+# present claims require explicit performance wording.
 _BILLING_FORM_SIGNATURE_RE = re.compile(
     r"(?:place\s+of\s+service|revenue\s+code|allowed\s+amount|line[\s-]*items?|"
     r"\bpayer\b|\bbilled\b|\bbilling\b|\binvoice[ds]?\b|"
     r"claim\s+(?:number|no\.?|#|id)|authorization\s+(?:for|number|no\.?|#)|"
     r"pre-?auth(?:orization)?\s+(?:number|no\.?|#)|benefit\s+(?:code|plan))",
     re.IGNORECASE,
+)
+EXTRACTION_INSTRUCTIONS = (
+    "Extract only values present in the document. Use JSON null only for optional "
+    "text fields without evidence, and use empty lists for absent categories. Never "
+    "use JSON null for enum-valued fields. Use unknown for status enums, uncertain "
+    "for assertion enums, and other for an unestablished category or visit type. "
+    "Set assertion to negated for explicit no, denies, absent, or negative evidence. "
+    "Set assertion to family_history only for explicit family-history context. Set "
+    "procedure assertion to mentioned_not_performed for planned, cancelled, deferred, "
+    "or not-done procedures, and for procedures listed only as billing, claim, or "
+    "authorization line items unless the source uses explicit performance wording "
+    "such as underwent, performed, or status post. A date or procedure name alone "
+    "is insufficient in administrative context. Use uncertain for explicit possible, "
+    "suspected, or unclear evidence; otherwise use present only when the source "
+    "affirms the fact. Preserve verbatim clinical values."
 )
 _UNCERTAIN_MARKER = (
     r"(?:possible|possibly|probable|probably|suspected?|question\s+of|"
@@ -251,6 +257,44 @@ _STATUS_SIGNALS: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
         ),
     ),
 }
+_NUMERIC_VALUE_RE = re.compile(
+    r"""
+    (?:
+        (?:[<>]=?|\u2264|\u2265|[~+\-\u00b1\u2212\u2248])?\s*
+        \d+(?:[.,]\d+)?(?:[eE][+\-\u2212]?\d+)?
+        (?:
+            \s*(?:/|[-\u2013\u2014])\s*
+            [+\-\u2212]?\d+(?:[.,]\d+)?(?:[eE][+\-\u2212]?\d+)?
+        )?
+        |
+        (?:[<>]=?|\u2264|\u2265|[~+\-\u00b1\u2212\u2248])?\s*
+        \d+(?:[.,]\d+)?\s*[x\u00d7]\s*10
+        (?:\s*\^\s*[+\-\u2212]?\d+|[\u207a\u207b]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+)
+    )
+    """,
+    re.VERBOSE,
+)
+_QUALIFIER_CONTINUATION_WORDS = frozenset(
+    {
+        "active", "administered", "as", "at", "bedtime", "bid", "bpm", "cm", "completed",
+        "continued", "current", "daily", "day", "days", "dl", "every", "g", "given", "hour",
+        "hours", "im", "in", "inhaled", "intramuscular", "intravenous", "iu", "iv", "kg", "l",
+        "mcg", "meq", "mg", "min", "ml", "mm", "mmhg", "mmol", "mol", "month", "monthly",
+        "months", "ng", "needed", "nightly", "once", "oral", "pg", "po", "performed", "prn", "qid",
+        "received", "subcutaneous", "tid", "times", "topical", "twice", "ug", "unit", "units",
+        "week",
+        "weekly", "weeks", "µg", "μg",
+    }
+)
+_LIFECYCLE_CONTINUATION_WORDS = _QUALIFIER_CONTINUATION_WORDS | frozenset(
+    {
+        "apply", "applies", "applying", "by", "capsule", "capsules", "directed", "doses", "drop",
+        "drops", "each", "ear", "ears", "eye", "eyes", "give", "injected", "instill", "instilled",
+        "instills", "instructed", "mouth", "nose", "of", "one", "pill", "pills", "puff", "puffs",
+        "take", "takes", "taking", "tablet", "tablets", "the", "then", "total", "under", "use",
+        "uses", "using", "with",
+    }
+)
 
 
 class _TruncatedGenerationError(GenerationError):
@@ -304,6 +348,31 @@ class _ExtractionWorkBudget:
             )
         self.attempts += 1
         self.publish_progress()
+
+    def require_prefit_capacity(self, batch_count: int) -> None:
+        """Reject deterministic work that needs more first calls than remain."""
+        if batch_count > MAX_EXTRACTION_GENERATION_ATTEMPTS - self.attempts:
+            raise GenerationError(
+                "Local extraction exceeded its attempt work limit.",
+                category="work_attempt_limit",
+            )
+
+    def require_runtime_split_capacity(self, queued_batches: int) -> None:
+        """Reserve one minimum generation for queued work and both split children."""
+        if self.attempts + queued_batches + 2 > MAX_EXTRACTION_GENERATION_ATTEMPTS:
+            raise GenerationError(
+                "Local extraction exceeded its attempt work limit.",
+                category="work_attempt_limit",
+            )
+
+    def reserve_prefit_split(self) -> None:
+        """Spend one deterministic split without masking work-cap overflow."""
+        if self.runtime_splits >= MAX_EXTRACTION_RUNTIME_SPLITS:
+            raise GenerationError(
+                "Local extraction exceeded its attempt work limit.",
+                category="work_attempt_limit",
+            )
+        self.runtime_splits += 1
 
     def charge_generation(self, generated_tokens: int) -> None:
         remaining = MAX_EXTRACTION_GENERATED_TOKENS - self.generated_tokens
@@ -519,6 +588,7 @@ def _split_page(
     page: dict[str, object],
     *,
     budget: _ExtractionWorkBudget | None = None,
+    reserve_split: bool = True,
 ) -> tuple[dict[str, object], dict[str, object]]:
     markdown = page.get("markdown")
     if not isinstance(markdown, str):
@@ -533,7 +603,7 @@ def _split_page(
         )
     if len(markdown) < 2:
         raise WorkerInputLimitError("Local extraction page cannot be split further.")
-    if budget is not None:
+    if budget is not None and reserve_split:
         budget.reserve_runtime_split()
     left_markdown, right_markdown = _split_markdown(markdown)
     final_fragment = page.get(_FRAGMENT_FINAL_KEY, True)
@@ -560,11 +630,12 @@ def _fits_extraction_batch(
     template: str,
     instructions: str,
     max_tokens: int,
+    retry: bool = True,
 ) -> bool:
     try:
         validate_token_budget(
             loaded,
-            [_prompt(pages, retry=True), template, instructions],
+            [_prompt(pages, retry=retry), template, instructions],
             max_output_tokens=(max_tokens + _CHAT_TEMPLATE_TOKEN_RESERVE),
             max_input_tokens=_EXTRACTION_BATCH_INPUT_CAP,
         )
@@ -581,7 +652,17 @@ def _fit_page_fragments(
     instructions: str,
     max_tokens: int,
     budget: _ExtractionWorkBudget,
+    prefer_unsplit_image: bool = False,
 ) -> list[dict[str, object]]:
+    if prefer_unsplit_image and _fits_extraction_batch(
+        [page],
+        loaded=loaded,
+        template=template,
+        instructions=instructions,
+        max_tokens=max_tokens,
+        retry=False,
+    ):
+        return [page]
     pending = [page]
     fitted: list[dict[str, object]] = []
     while pending:
@@ -595,7 +676,8 @@ def _fit_page_fragments(
         ):
             fitted.append(candidate)
             continue
-        left, right = _split_page(candidate, budget=budget)
+        budget.reserve_prefit_split()
+        left, right = _split_page(candidate, budget=budget, reserve_split=False)
         pending[0:0] = [left, right]
     return fitted
 
@@ -620,6 +702,7 @@ def _extraction_batches(
             instructions=instructions,
             max_tokens=max_tokens,
             budget=budget,
+            prefer_unsplit_image=int(page["page_number"]) in images_by_page,
         )
     ]
     batches: list[list[dict[str, object]]] = []
@@ -680,6 +763,7 @@ def _run_extraction_batch(
                 selected,
                 [prompt, template, instructions],
                 max_output_tokens=call_cap,
+                max_input_tokens=_EXTRACTION_BATCH_INPUT_CAP,
             )
         except WorkerInputLimitError:
             raise _FormattedInputLimitError(
@@ -705,6 +789,14 @@ def _run_extraction_batch(
                 instructions=instructions,
                 activity_fn=attempt_progress_fn,
             )
+        except WorkerInputLimitError:
+            if generate_fn is generate_content:
+                budget.charge_generation(0)
+                raise _FormattedInputLimitError(
+                    "Local extraction formatted input exceeds its runtime limit."
+                ) from None
+            budget.charge_generation(call_cap)
+            raise
         except Exception:
             budget.charge_generation(call_cap)
             raise
@@ -745,127 +837,246 @@ def _run_extraction_batch(
     raise GenerationError("Local extraction returned invalid JSON.")
 
 
-def _run_extraction_batch_with_runtime_splits(
-    pages: list[dict[str, object]],
-    *,
-    images_by_page: Mapping[int, str],
-    selected: LoadedRole,
-    template: str,
-    instructions: str,
-    max_tokens: int,
-    generate_fn: Generate,
-    progress_fn: Callable[[int], None] | None,
-    attempt_progress_fn: Callable[[], None] | None,
-    budget: _ExtractionWorkBudget,
-) -> list[tuple[list[dict[str, object]], dict[str, object]]]:
-    """Split only a formatted batch that the loaded runtime rejects as too large."""
-
-    failure: GenerationError | None = None
-    try:
-        result = _run_extraction_batch(
-            pages,
-            images_by_page=images_by_page,
-            selected=selected,
-            template=template,
-            instructions=instructions,
-            max_tokens=max_tokens,
-            generate_fn=generate_fn,
-            attempt_progress_fn=attempt_progress_fn,
-            budget=budget,
-        )
-    except _TruncatedGenerationError as exc:
-        failure = exc
-        should_split_page = True
-    except _FormattedInputLimitError:
-        should_split_page = True
-    except GenerationError as exc:
-        failure = exc
-        should_split_page = exc.category == "invalid_structured_output"
-    else:
-        if progress_fn is not None and all(
-            not _is_fragment(page) or page.get(_FRAGMENT_FINAL_KEY) is True for page in pages
-        ):
-            progress_fn(len(pages))
-        return [(pages, result)]
-
-    if not should_split_page:
-        if failure is None:
-            raise GenerationError("Local extraction returned invalid JSON.")
-        raise failure
+def _split_runtime_batch(
+    pages: list[dict[str, object]], *, budget: _ExtractionWorkBudget
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Split one failed batch into ordered children after capacity admission."""
     if len(pages) > 1:
         budget.reserve_runtime_split()
         midpoint = len(pages) // 2
-        return [
-            *_run_extraction_batch_with_runtime_splits(
-                pages[:midpoint],
-                images_by_page=images_by_page,
-                selected=selected,
-                template=template,
-                instructions=instructions,
-                max_tokens=max_tokens,
-                generate_fn=generate_fn,
-                progress_fn=progress_fn,
-                attempt_progress_fn=attempt_progress_fn,
-                budget=budget,
-            ),
-            *_run_extraction_batch_with_runtime_splits(
-                pages[midpoint:],
-                images_by_page=images_by_page,
-                selected=selected,
-                template=template,
-                instructions=instructions,
-                max_tokens=max_tokens,
-                generate_fn=generate_fn,
-                progress_fn=progress_fn,
-                attempt_progress_fn=attempt_progress_fn,
-                budget=budget,
-            ),
-        ]
+        return pages[:midpoint], pages[midpoint:]
+    left, right = _split_page(pages[0], budget=budget)
+    return [left], [right]
+
+
+def _fact_page_number(fact: Mapping[str, object]) -> int | None:
+    """Return a fact page number only when it can be converted safely."""
+    value = fact.get("page_number")
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        return None
     try:
-        left, right = _split_page(pages[0], budget=budget)
-    except WorkerInputLimitError:
-        if failure is not None:
-            raise failure from None
-        raise
-    return [
-        *_run_extraction_batch_with_runtime_splits(
-            [left],
-            images_by_page=images_by_page,
-            selected=selected,
-            template=template,
-            instructions=instructions,
-            max_tokens=max_tokens,
-            generate_fn=generate_fn,
-            progress_fn=progress_fn,
-            attempt_progress_fn=attempt_progress_fn,
-            budget=budget,
-        ),
-        *_run_extraction_batch_with_runtime_splits(
-            [right],
-            images_by_page=images_by_page,
-            selected=selected,
-            template=template,
-            instructions=instructions,
-            max_tokens=max_tokens,
-            generate_fn=generate_fn,
-            progress_fn=progress_fn,
-            attempt_progress_fn=attempt_progress_fn,
-            budget=budget,
-        ),
-    ]
+        page_number = int(value)  # type: ignore[arg-type]
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return page_number if page_number > 0 else None
 
 
-def _page_has_billing_form_signature(
-    fact: dict[str, object], page_markdown_by_number: dict[int, str]
+def _has_subject_bound_performance(context: str, subject: str) -> bool:
+    """Return whether performance wording is syntactically bound to the subject."""
+    subject_pattern = re.escape(subject.strip()).replace(r"\ ", r"\s+")
+    bounded_subject = rf"(?<!\w){subject_pattern}(?!\w)"
+    before_subject = (
+        rf"\b(?:underwent|performed|status\s+post|s\s*[/.-]\s*p)\s+"
+        rf"(?:(?:a|an|the)\s+)?{bounded_subject}"
+    )
+    after_subject = (
+        rf"{bounded_subject}\s+(?:was\s+)?(?:performed|completed|done)\b"
+    )
+    return re.search(
+        rf"(?:{before_subject}|{after_subject})",
+        context,
+        re.IGNORECASE,
+    ) is not None
+
+
+def _procedure_requires_explicit_performance(
+    context: str,
+    page_markdown: str,
+    subject: str,
+    performance_context: str | None = None,
 ) -> bool:
-    """Return whether the fact's referenced page reads as a billing form."""
+    """Return whether administrative procedure text lacks performance wording."""
+    administrative = re.search(rf"\b{_BILLED_MARKER}\b", context, re.IGNORECASE) is not None
+    administrative = administrative or _BILLING_FORM_SIGNATURE_RE.search(page_markdown) is not None
+    source = context if performance_context is None else performance_context
+    return administrative and not _has_subject_bound_performance(source, subject)
 
-    try:
-        page_number = int(fact.get("page_number"))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return False
-    markdown = page_markdown_by_number.get(page_number, "")
-    return bool(markdown) and _BILLING_FORM_SIGNATURE_RE.search(markdown) is not None
+
+def _semantic_boundaries(source: str) -> list[tuple[int, int]]:
+    """Return worker-local clause boundaries for subject-scoped lifecycle evidence."""
+    boundaries = [
+        (match.start(), match.end())
+        for match in re.finditer(
+            r"(?<!\d)[.,](?!\d)|[;|•●▪◦]|\b(?:and|but|while|whereas)\b",
+            source,
+            re.IGNORECASE,
+        )
+    ]
+    status_led_continuations = {
+        "active",
+        "continued",
+        "current",
+        "given",
+        "performed",
+    }
+    frequency_led_continuations = {
+        "bid",
+        "daily",
+        "monthly",
+        "nightly",
+        "once",
+        "qid",
+        "tid",
+        "twice",
+        "weekly",
+    }
+    continuation_words = {
+        "as",
+        "at",
+        "im",
+        "inhaled",
+        "intramuscular",
+        "intravenous",
+        "iv",
+        "oral",
+        "subcutaneous",
+        "topical",
+    }
+    for match in re.finditer(r"\r?\n+", source):
+        after = source[match.end() :]
+        next_token = re.match(r"[ \t]*(?P<token>[^\W\d_]+|\d+)", after)
+        if next_token is not None:
+            token = next_token.group("token").casefold()
+            line = re.split(r"\r?\n", after, maxsplit=1)[0].strip()
+            if token in status_led_continuations and re.fullmatch(
+                rf"{re.escape(token)}[\s.:;-]*",
+                line,
+                re.IGNORECASE,
+            ):
+                continue
+            line_words = [
+                word.casefold()
+                for word in re.findall(r"[^\W\d_]+", line, re.UNICODE)
+            ]
+            if (
+                token in frequency_led_continuations
+                and line_words
+                and all(word in frequency_led_continuations for word in line_words)
+            ):
+                continue
+            if (
+                token.isdigit() or token in continuation_words
+            ) and _is_qualifier_only_continuation(line):
+                continue
+        boundaries.append((match.start(), match.end()))
+    for match in re.finditer(r"/", source):
+        before = source[: match.start()]
+        after = source[match.end() :]
+        left_digit = re.search(r"\d\s*$", before) is not None
+        right_digit = re.match(r"\s*\d", after) is not None
+        if left_digit and right_digit:
+            continue
+        left_unit = re.search(
+            r"(?<![A-Za-zµμ])([A-Za-zµμ%]{1,4})\s*$",
+            before,
+        )
+        right_unit = re.match(
+            r"\s*([A-Za-zµμ%]{1,4})(?![A-Za-z])",
+            after,
+        )
+        if left_unit is not None and right_unit is not None:
+            continue
+        boundaries.append((match.start(), match.end()))
+    return sorted(set(boundaries))
+
+
+def _is_qualifier_only_continuation(line: str) -> bool:
+    """Return whether a wrapped line contains qualifiers but no named subject."""
+    without_numbers = _NUMERIC_VALUE_RE.sub(" ", line)
+    words = [
+        word.casefold()
+        for word in re.findall(r"[^\W\d_]+", without_numbers, re.UNICODE)
+    ]
+    return bool(words) and all(word in _QUALIFIER_CONTINUATION_WORDS for word in words)
+
+
+def _procedure_subject_source(fact: Mapping[str, object], subject: str) -> str:
+    """Return the unambiguous subject clause selected by exact verbatim evidence."""
+    excerpt = fact.get("evidence_excerpt")
+    verbatim = fact.get("verbatim")
+    if not isinstance(excerpt, str) or not isinstance(verbatim, str):
+        return ""
+    verbatim_chunks = re.split(r"(\s+)", verbatim.strip())
+    verbatim_pattern = "".join(
+        r"\s+" if chunk.isspace() else re.escape(chunk)
+        for chunk in verbatim_chunks
+    )
+    verbatim_matches = list(re.finditer(verbatim_pattern, excerpt, re.IGNORECASE))
+    if len(verbatim_matches) != 1:
+        return ""
+    verbatim_match = verbatim_matches[0]
+    boundaries = _semantic_boundaries(excerpt)
+    preceding = [end for _, end in boundaries if end <= verbatim_match.start()]
+    following = [start for start, _ in boundaries if start >= verbatim_match.end()]
+    clause_start = max(preceding) if preceding else 0
+    clause_end = min(following) if following else len(excerpt)
+    clause = excerpt[clause_start:clause_end]
+
+    subject_pattern = re.escape(subject.strip()).replace(r"\ ", r"\s+")
+    bounded_subject = rf"(?<!\w){subject_pattern}(?!\w)"
+    subject_matches = list(re.finditer(bounded_subject, clause, re.IGNORECASE))
+    if len(subject_matches) != 1:
+        return ""
+    subject_match = subject_matches[0]
+    clause_boundaries = _semantic_boundaries(clause)
+    subject_preceding = [
+        end for _, end in clause_boundaries if end <= subject_match.start()
+    ]
+    subject_following = [
+        start for start, _ in clause_boundaries if start >= subject_match.end()
+    ]
+    subject_start = max(subject_preceding) if subject_preceding else 0
+    subject_end = min(subject_following) if subject_following else len(clause)
+    return clause[subject_start:subject_end]
+
+
+def _is_lifecycle_continuation(clause: str) -> bool:
+    """Return whether a clause after the subject reads as its dosing tail."""
+    without_numbers = _NUMERIC_VALUE_RE.sub(" ", clause)
+    words = [
+        word.casefold()
+        for word in re.findall(r"[^\W\d_]+", without_numbers, re.UNICODE)
+    ]
+    return bool(words) and all(word in _LIFECYCLE_CONTINUATION_WORDS for word in words)
+
+
+def _lifecycle_subject_source(fact: Mapping[str, object], category: str) -> str:
+    """Return unambiguous subject evidence with safe dosing continuations only."""
+    excerpt = fact.get("evidence_excerpt")
+    subject = fact.get(_FACT_SUBJECT_FIELDS[category])
+    if not isinstance(excerpt, str) or not isinstance(subject, str) or not subject.strip():
+        return ""
+    subject_pattern = re.escape(subject.strip()).replace(r"\ ", r"\s+")
+    matches = list(re.finditer(rf"(?<!\w){subject_pattern}(?!\w)", excerpt, re.IGNORECASE))
+    if len(matches) != 1:
+        return ""
+    match = matches[0]
+    boundaries = _semantic_boundaries(excerpt)
+    segments: list[tuple[int, int]] = []
+    previous = 0
+    for boundary_start, boundary_end in boundaries:
+        segments.append((previous, boundary_start))
+        previous = boundary_end
+    segments.append((previous, len(excerpt)))
+    subject_index = next(
+        (
+            index
+            for index, (segment_start, segment_end) in enumerate(segments)
+            if segment_start <= match.start() and match.end() <= segment_end
+        ),
+        None,
+    )
+    if subject_index is None:
+        return ""
+    parts = [excerpt[segments[subject_index][0] : segments[subject_index][1]]]
+    for segment_start, segment_end in segments[subject_index + 1 :]:
+        clause = excerpt[segment_start:segment_end]
+        if not clause.strip():
+            continue
+        if not _is_lifecycle_continuation(clause):
+            break
+        parts.append(clause)
+    return "".join(parts)
 
 
 def _ground_explicit_assertions(
@@ -877,12 +1088,11 @@ def _ground_explicit_assertions(
     for page in pages or []:
         if not isinstance(page, dict):
             continue
-        try:
-            page_markdown_by_number[int(page.get("page_number"))] = str(  # type: ignore[arg-type]
-                page.get("markdown", "")
-            )
-        except (TypeError, ValueError):
+        page_number = _fact_page_number(page)
+        markdown = page.get("markdown")
+        if page_number is None or not isinstance(markdown, str):
             continue
+        page_markdown_by_number[page_number] = markdown
 
     for category in _ASSERTION_CATEGORIES:
         facts = value.get(category)
@@ -950,14 +1160,11 @@ def _ground_explicit_assertions(
                 re.IGNORECASE,
             ):
                 expected = "family_history"
-            elif (
-                category == "procedures"
-                and _PERFORMED_MARKER_RE.search(context) is None
-                and not (isinstance(fact.get("date"), str) and str(fact["date"]).strip())
-                and (
-                    re.search(rf"\b{_BILLED_MARKER}\b", context, re.IGNORECASE) is not None
-                    or _page_has_billing_form_signature(fact, page_markdown_by_number)
-                )
+            elif category == "procedures" and _procedure_requires_explicit_performance(
+                context,
+                page_markdown_by_number.get(_fact_page_number(fact) or 0, ""),
+                subject,
+                _procedure_subject_source(fact, subject),
             ):
                 expected = "mentioned_not_performed"
             else:
@@ -976,13 +1183,9 @@ def _ground_lifecycle_statuses(value: dict[str, object]) -> dict[str, object]:
         for fact in facts:
             if not isinstance(fact, dict):
                 continue
-            context = fact.get("verbatim")
-            if not isinstance(context, str) or not context.strip():
-                context = fact.get("evidence_excerpt")
-            if not isinstance(context, str):
-                context = ""
+            source = _lifecycle_subject_source(fact, category)
             fact["status"] = next(
-                (status for status, pattern in signals if pattern.search(context)),
+                (status for status, pattern in signals if pattern.search(source)),
                 "unknown",
             )
     return value
@@ -1406,38 +1609,19 @@ def run_extraction(
     if not isinstance(schema, dict) or not schema:
         raise WorkerInputError("Extraction schema is invalid.")
     pages = _source_pages(payload.get("page_markdown"))
-    if lifecycle_progress_fn is not None:
-        lifecycle_progress_fn()
     images_by_page = _selected_images(
         payload.get("image_paths"),
         {int(page["page_number"]) for page in pages},
         payload.get("scratch_dir"),
     )
-    if lifecycle_progress_fn is not None:
-        lifecycle_progress_fn()
     selected = loaded or load_role_from_payload("extraction", payload)
-    if lifecycle_progress_fn is not None:
-        lifecycle_progress_fn()
     max_tokens = requested_output_tokens(payload, selected, role_cap=EXTRACTION_OUTPUT_CAP)
     try:
         native_template = _native_template(schema)
     except (RecursionError, TypeError, ValueError):
         raise WorkerInputError("Extraction schema is invalid.") from None
     template = bounded_json(native_template, max_bytes=MAX_EXTRACTION_INPUT_BYTES)
-    instructions = (
-        "Extract only values present in the document. Use JSON null only for optional "
-        "text fields without evidence, and use empty lists for absent categories. Never "
-        "use JSON null for enum-valued fields. Use unknown for status enums, uncertain "
-        "for assertion enums, and other for an unestablished category or visit type. "
-        "Set assertion to negated for explicit no, denies, absent, or negative evidence. "
-        "Set assertion to family_history only for explicit family-history context. Set "
-        "procedure assertion to mentioned_not_performed for planned, cancelled, deferred, "
-        "or not-done procedures, and for procedures listed only as billing, claim, or "
-        "authorization line items without a statement or date that the procedure occurred. "
-        "Use uncertain for explicit possible, suspected, or unclear "
-        "evidence; otherwise use present only when the source affirms the fact. "
-        "Preserve verbatim clinical values."
-    )
+    instructions = EXTRACTION_INSTRUCTIONS
 
     budget = _ExtractionWorkBudget(progress_fn=budget_progress_fn)
     batches = _extraction_batches(
@@ -1449,8 +1633,10 @@ def run_extraction(
         max_tokens=max_tokens,
         budget=budget,
     )
+    budget.require_prefit_capacity(len(batches))
     if lifecycle_progress_fn is not None:
-        lifecycle_progress_fn()
+        for _ in range(4):
+            lifecycle_progress_fn()
     completed_pages = 0
 
     def publish_batch_progress(page_count: int) -> None:
@@ -1462,22 +1648,50 @@ def run_extraction(
     if progress_fn is not None:
         progress_fn(0, len(pages))
     budget.publish_progress()
-    resolved_batches = [
-        item
-        for batch in batches
-        for item in _run_extraction_batch_with_runtime_splits(
-            batch,
-            images_by_page=images_by_page,
-            selected=selected,
-            template=template,
-            instructions=instructions,
-            max_tokens=max_tokens,
-            generate_fn=generate_fn,
-            progress_fn=publish_batch_progress,
-            attempt_progress_fn=attempt_progress_fn,
-            budget=budget,
-        )
-    ]
+    pending_batches: deque[list[dict[str, object]]] = deque(batches)
+    resolved_batches: list[tuple[list[dict[str, object]], dict[str, object]]] = []
+    while pending_batches:
+        batch = pending_batches.popleft()
+        failure: GenerationError | None = None
+        should_split = False
+        try:
+            result = _run_extraction_batch(
+                batch,
+                images_by_page=images_by_page,
+                selected=selected,
+                template=template,
+                instructions=instructions,
+                max_tokens=max_tokens,
+                generate_fn=generate_fn,
+                attempt_progress_fn=attempt_progress_fn,
+                budget=budget,
+            )
+        except _TruncatedGenerationError as exc:
+            failure = exc
+            should_split = True
+        except _FormattedInputLimitError:
+            should_split = True
+        except GenerationError as exc:
+            failure = exc
+            should_split = exc.category == "invalid_structured_output"
+        if should_split:
+            budget.require_runtime_split_capacity(len(pending_batches))
+            try:
+                left, right = _split_runtime_batch(batch, budget=budget)
+            except WorkerInputLimitError:
+                if failure is not None:
+                    raise failure from None
+                raise
+            pending_batches.extendleft((right, left))
+        elif failure is not None:
+            raise failure
+        else:
+            if all(
+                not _is_fragment(page) or page.get(_FRAGMENT_FINAL_KEY) is True
+                for page in batch
+            ):
+                publish_batch_progress(len(batch))
+            resolved_batches.append((batch, result))
     consolidated = _consolidate_resolved_batches(resolved_batches)
     if len(consolidated) == 1:
         return consolidated[0][1]

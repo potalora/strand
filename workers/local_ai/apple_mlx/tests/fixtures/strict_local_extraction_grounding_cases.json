@@ -1,0 +1,171 @@
+{
+  "version": 1,
+  "procedure_cases": [
+    {
+      "id": "authorization_validity_date_is_not_performance",
+      "name": "Colonoscopy",
+      "context": "Authorization for Colonoscopy valid from 2026-01-01 through 2026-12-31.",
+      "page": "Authorization for Colonoscopy valid from 2026-01-01 through 2026-12-31.",
+      "date": "2026-01-01",
+      "backend_present_valid": false,
+      "worker_assertion": "mentioned_not_performed"
+    },
+    {
+      "id": "authorization_with_status_post_is_performance",
+      "name": "Colonoscopy",
+      "context": "Authorization record notes status post Colonoscopy performed on 2026-01-01.",
+      "page": "Authorization record notes status post Colonoscopy performed on 2026-01-01.",
+      "date": "2026-01-01",
+      "backend_present_valid": true,
+      "worker_assertion": "present"
+    },
+    {
+      "id": "authorization_with_underwent_subject_is_performance",
+      "name": "Colonoscopy",
+      "context": "Authorization record notes underwent Colonoscopy on 2026-01-01.",
+      "page": "Authorization record notes underwent Colonoscopy on 2026-01-01.",
+      "date": "2026-01-01",
+      "backend_present_valid": true,
+      "worker_assertion": "present"
+    },
+    {
+      "id": "authorization_with_performed_subject_is_performance",
+      "name": "Colonoscopy",
+      "context": "Authorization record notes Dr Smith performed Colonoscopy on 2026-01-01.",
+      "page": "Authorization record notes Dr Smith performed Colonoscopy on 2026-01-01.",
+      "date": "2026-01-01",
+      "backend_present_valid": true,
+      "worker_assertion": "present"
+    },
+    {
+      "id": "authorization_with_subject_completed_is_performance",
+      "name": "Colonoscopy",
+      "context": "Authorization record notes Colonoscopy was completed on 2026-01-01.",
+      "page": "Authorization record notes Colonoscopy was completed on 2026-01-01.",
+      "date": "2026-01-01",
+      "backend_present_valid": true,
+      "worker_assertion": "present"
+    },
+    {
+      "id": "other_procedure_performed_cannot_support_subject",
+      "name": "Colonoscopy",
+      "context": "Authorization for Colonoscopy with Appendectomy performed on 2026-01-01.",
+      "page": "Authorization for Colonoscopy with Appendectomy performed on 2026-01-01.",
+      "date": "2026-01-01",
+      "backend_present_valid": false,
+      "worker_assertion": "mentioned_not_performed"
+    },
+    {
+      "id": "other_procedure_status_post_cannot_support_subject",
+      "name": "Colonoscopy",
+      "context": "Authorization for Colonoscopy with status post Appendectomy on 2026-01-01.",
+      "page": "Authorization for Colonoscopy with status post Appendectomy on 2026-01-01.",
+      "date": "2026-01-01",
+      "backend_present_valid": false,
+      "worker_assertion": "mentioned_not_performed"
+    },
+    {
+      "id": "later_same_procedure_performance_cannot_support_selected_authorization",
+      "name": "Colonoscopy",
+      "context": "Authorization: Colonoscopy 2026-01-01. Colonoscopy performed 2025-01-01.",
+      "verbatim": "Authorization: Colonoscopy 2026-01-01",
+      "page": "Authorization: Colonoscopy 2026-01-01. Colonoscopy performed 2025-01-01.",
+      "date": "2026-01-01",
+      "backend_present_valid": false,
+      "backend_error": "ambiguous",
+      "worker_assertion": "mentioned_not_performed"
+    },
+    {
+      "id": "bare_appendectomy_name_is_not_performance",
+      "name": "Appendectomy",
+      "context": "Authorization for Appendectomy valid on 2026-01-01.",
+      "page": "Authorization for Appendectomy valid on 2026-01-01.",
+      "date": "2026-01-01",
+      "backend_present_valid": false,
+      "worker_assertion": "mentioned_not_performed"
+    },
+    {
+      "id": "bare_biopsy_name_is_not_performance",
+      "name": "Biopsy",
+      "context": "Authorization for Biopsy valid on 2026-01-01.",
+      "page": "Authorization for Biopsy valid on 2026-01-01.",
+      "date": "2026-01-01",
+      "backend_present_valid": false,
+      "worker_assertion": "mentioned_not_performed"
+    },
+    {
+      "id": "ordinary_clinical_date_remains_compatible",
+      "name": "Colonoscopy",
+      "context": "Colonoscopy on 2026-01-01.",
+      "page": "Colonoscopy on 2026-01-01.",
+      "date": "2026-01-01",
+      "backend_present_valid": true,
+      "worker_assertion": "present"
+    }
+  ],
+  "medication_cases": [
+    {
+      "id": "other_medication_blocker_cannot_reject_subject",
+      "name": "Metformin",
+      "context": "Metformin 500 mg oral daily; Lisinopril discontinued.",
+      "frequency": "daily",
+      "candidate_status": "active",
+      "backend_valid": true,
+      "worker_status": "active"
+    },
+    {
+      "id": "other_medication_active_cue_cannot_promote_subject",
+      "name": "Metformin",
+      "context": "Metformin 500 mg oral; Lisinopril active daily.",
+      "frequency": null,
+      "candidate_status": "active",
+      "backend_valid": false,
+      "worker_status": "unknown"
+    },
+    {
+      "id": "own_dosing_continuation_supports_subject",
+      "name": "Metformin",
+      "context": "Metformin 500 mg oral, Take one tablet daily; Lisinopril discontinued.",
+      "frequency": "daily",
+      "candidate_status": "active",
+      "backend_valid": true,
+      "worker_status": "active"
+    },
+    {
+      "id": "repeated_subject_fails_closed",
+      "name": "Metformin",
+      "context": "Metformin active daily; Metformin discontinued.",
+      "frequency": null,
+      "candidate_status": "active",
+      "backend_valid": false,
+      "worker_status": "unknown"
+    },
+    {
+      "id": "other_medication_active_after_newline_cannot_promote_subject",
+      "name": "Metformin",
+      "context": "Metformin 500 mg oral\nLisinopril active daily.",
+      "frequency": null,
+      "candidate_status": "active",
+      "backend_valid": false,
+      "worker_status": "unknown"
+    },
+    {
+      "id": "other_medication_active_after_slash_cannot_promote_subject",
+      "name": "Metformin",
+      "context": "Metformin 500 mg / Lisinopril active daily.",
+      "frequency": null,
+      "candidate_status": "active",
+      "backend_valid": false,
+      "worker_status": "unknown"
+    },
+    {
+      "id": "own_active_support_survives_other_medication_blocker",
+      "name": "Metformin",
+      "context": "Metformin active daily; Lisinopril planned.",
+      "frequency": "daily",
+      "candidate_status": "active",
+      "backend_valid": true,
+      "worker_status": "active"
+    }
+  ]
+}
