@@ -437,6 +437,7 @@ Upload a PDF, RTF, or TIFF for AI-powered text extraction and entity extraction.
 ```json
 {
   "upload_id": "uuid",
+  "filename": "record.pdf",
   "status": "processing",
   "file_type": "pdf"
 }
@@ -481,16 +482,29 @@ Upload multiple unstructured files for concurrent processing.
   "uploads": [
     {
       "upload_id": "uuid",
+      "filename": "record.pdf",
       "status": "processing",
       "file_type": "pdf"
     }
   ],
-  "total": 3
+  "rejected": [
+    {
+      "filename": "notes.txt",
+      "code": "unsupported_type"
+    }
+  ],
+  "total": 1
 }
 ```
 
 **Notes:**
-- Files with unsupported extensions, invalid magic bytes, or that exceed size limits are silently skipped
+- The request is best effort. Valid files are accepted even when another file
+  is rejected.
+- `total` is the number of accepted uploads, not the number of submitted files.
+- `rejected` contains at most 50 entries. Its stable codes are
+  `missing_filename`, `unsupported_type`, `file_too_large`, and
+  `invalid_signature`. It does not include raw validation details or local
+  paths.
 - Each file is processed independently in the background
 - Strict-local batch admission is atomic with model-pack maintenance. A pack
   update, verification, rollback, or removal cannot race a newly admitted job.
@@ -730,6 +744,14 @@ authority:
 | `GET` | `/local-ai/jobs/{job_id}` | Read one owner-scoped job |
 | `POST` | `/local-ai/jobs/{job_id}/retry` | Requeue one failed, retryable ingestion or summary job |
 | `POST` | `/local-ai/jobs/{job_id}/cancel` | Persist cancellation and terminate the active worker |
+
+`GET /local-ai/jobs` accepts `kind`, `active_only`, and
+`include_retryable_failed`. The retryable-failure flag is additive only when
+`active_only=true`; it has no effect when `active_only=false`. When enabled,
+the query adds exact owner-scoped failures whose stored retryability field is
+the JSON boolean `true`. Manual ZIP children, non-retryable failures,
+completed or cancelled jobs, and jobs owned by another account are excluded
+before the 50-row limit.
 
 Jobs report target UUIDs, processing mode, kind, status, stage, cancellation
 state, timestamps, and bounded progress/failure taxonomy. Progress exposes only
