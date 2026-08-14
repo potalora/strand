@@ -218,9 +218,25 @@ export interface ExtractionResult {
 
 export interface UnstructuredUploadResponse {
   upload_id: string;
+  filename: string;
   status: string;
   file_type: string;
   manual_extraction_required: boolean;
+}
+
+export type UnstructuredBatchRejectionCode =
+  | "missing_filename"
+  | "unsupported_type"
+  | "file_too_large"
+  | "invalid_signature";
+
+export interface UnstructuredBatchResponse {
+  uploads: UnstructuredUploadResponse[];
+  rejected: {
+    filename: string;
+    code: UnstructuredBatchRejectionCode;
+  }[];
+  total: number;
 }
 
 export interface DuplicateWarning {

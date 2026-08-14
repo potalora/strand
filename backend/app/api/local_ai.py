@@ -10,7 +10,7 @@ from typing import Callable, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
-from sqlalchemy import exists, func, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -726,6 +726,7 @@ async def get_local_pack_status(
 async def list_local_ai_jobs(
     kind: Literal["ingestion", "summary"] | None = None,
     active_only: bool = True,
+    include_retryable_failed: bool = False,
     user_id: UUID = Depends(get_authenticated_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> list[LocalAIJobResponse]:
@@ -739,9 +740,19 @@ async def list_local_ai_jobs(
             UploadedFile.user_id == user_id,
             UploadedFile.manual_extraction_required.is_(True),
         )
-        query = query.where(
+        active_visible = and_(
             LocalAIJob.status.in_(_ACTIVE_JOB_STATES),
             ~manual_upload_gate,
+        )
+        retryable_failed = and_(
+            LocalAIJob.status == "failed",
+            LocalAIJob.failure.contains({"retryable": True}),
+            ~manual_upload_gate,
+        )
+        query = query.where(
+            or_(active_visible, retryable_failed)
+            if include_retryable_failed
+            else active_visible
         )
     jobs = (
         (
@@ -894,80 +905,87 @@ async def cancel_local_ai_job(
     db: AsyncSession = Depends(get_db),
 ) -> LocalAIJobResponse:
     """Persist cancellation and terminate an active embedded worker when present."""
-    candidate = (
+    target = (
         await db.execute(
-            select(LocalAIJob)
-            .where(
+            select(
+                LocalAIJob.upload_id,
+                LocalAIJob.kind,
+                LocalAIJob.processing_mode,
+            ).where(
                 LocalAIJob.id == job_id,
                 LocalAIJob.user_id == user_id,
             )
         )
-    ).scalar_one_or_none()
-    if candidate is None:
+    ).one_or_none()
+    if target is None:
         raise HTTPException(status_code=404, detail="Local AI job not found.")
 
-    paired_upload = None
-    if candidate.kind == "ingestion" and candidate.upload_id is not None:
-        paired_upload = (
+    worker_cancel_required = False
+    if target.kind == "ingestion":
+        if (
+            target.upload_id is None
+            or target.processing_mode != "validated_strict_local"
+        ):
+            raise HTTPException(status_code=409, detail="This job cannot be cancelled.")
+        from app.services.local_ai.ingestion_lifecycle import (
+            cancel_strict_ingestion_pair,
+        )
+
+        result = await cancel_strict_ingestion_pair(
+            db,
+            user_id=user_id,
+            upload_id=target.upload_id,
+            expected_job_id=job_id,
+        )
+        job = result.job
+        worker_cancel_required = result.worker_cancel_required
+        await db.commit()
+        await db.refresh(job)
+    elif target.kind == "summary":
+        job = (
             await db.execute(
-                select(UploadedFile)
+                select(LocalAIJob)
                 .where(
-                    UploadedFile.id == candidate.upload_id,
-                    UploadedFile.user_id == user_id,
+                    LocalAIJob.id == job_id,
+                    LocalAIJob.user_id == user_id,
+                    LocalAIJob.kind == "summary",
                 )
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
-    job = (
-        await db.execute(
-            select(LocalAIJob)
-            .where(
-                LocalAIJob.id == job_id,
-                LocalAIJob.user_id == user_id,
+        if job is None:
+            raise HTTPException(status_code=404, detail="Local AI job not found.")
+        if fail_legacy_runtime_identity_required(job):
+            await db.commit()
+            await db.refresh(job)
+        elif job.status in _ACTIVE_JOB_STATES:
+            worker_cancel_required = job.status == "processing"
+            job.cancel_requested = True
+            if job.status == "queued":
+                job.status = "cancelled"
+                job.stage = "cancelled"
+                job.progress = {"stage": "cancelled"}
+                job.failure = None
+                job.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+            await db.refresh(job)
+    else:
+        raise HTTPException(status_code=409, detail="This job cannot be cancelled.")
+
+    if worker_cancel_required:
+        from app.services.local_ai.errors import LocalWorkerError
+        from app.services.local_ai.model_manager import local_model_manager
+
+        try:
+            registered = await local_model_manager.cancel_registered(str(job.id))
+            if not registered:
+                await local_model_manager.cancel(str(job.id))
+        except LocalWorkerError:
+            logger.warning(
+                "Local worker cancellation could not be confirmed",
+                extra={"job_id": str(job.id)},
             )
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one_or_none()
-    if job is None:
-        raise HTTPException(status_code=404, detail="Local AI job not found.")
-
-    was_processing = job.status == "processing"
-    if fail_legacy_runtime_identity_required(job):
-        if paired_upload is not None:
-            paired_upload.ingestion_status = "failed"
-            paired_upload.progress_stage = None
-            paired_upload.progress_detail = None
-            paired_upload.ingestion_errors = [
-                {"error_type": "runtime_identity_required"}
-            ]
-            paired_upload.processing_completed_at = job.completed_at
-        await db.commit()
-        await db.refresh(job)
-    elif job.status in _ACTIVE_JOB_STATES:
-        job.cancel_requested = True
-        if job.status == "queued":
-            job.status = "cancelled"
-            job.stage = "cancelled"
-            job.progress = {"stage": "cancelled"}
-            job.failure = None
-            job.completed_at = datetime.now(timezone.utc)
-        await db.commit()
-        await db.refresh(job)
-
-        if was_processing:
-            from app.services.local_ai.errors import LocalWorkerError
-            from app.services.local_ai.model_manager import local_model_manager
-
-            try:
-                registered = await local_model_manager.cancel_registered(str(job.id))
-                if not registered:
-                    await local_model_manager.cancel(str(job.id))
-            except LocalWorkerError:
-                logger.warning(
-                    "Local worker cancellation could not be confirmed",
-                    extra={"job_id": str(job.id)},
-                )
 
     await log_audit_event(
         db,

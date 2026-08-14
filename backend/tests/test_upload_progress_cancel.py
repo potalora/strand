@@ -200,12 +200,24 @@ async def test_cancel_terminates_active_strict_local_worker(
     db_session.add(job)
     await db_session.commit()
 
+    events: list[str] = []
+    original_commit = db_session.commit
+
+    async def track_commit() -> None:
+        await original_commit()
+        events.append("commit")
+
+    async def track_registered(job_id: str) -> bool:
+        events.append("cancel_registered")
+        return True
+
+    db_session.commit = track_commit  # type: ignore[method-assign]
+
     with (
         patch(
             "app.services.local_ai.model_manager.local_model_manager.cancel_registered",
-            new_callable=AsyncMock,
+            new=AsyncMock(side_effect=track_registered),
             create=True,
-            return_value=True,
         ) as cancel_registered,
         patch(
             "app.services.local_ai.model_manager.local_model_manager.cancel",
@@ -219,9 +231,15 @@ async def test_cancel_terminates_active_strict_local_worker(
         )
 
     assert response.status_code == 200
+    assert events[:2] == ["commit", "cancel_registered"]
+    assert events.count("cancel_registered") == 1
     cancel_registered.assert_awaited_once_with(str(job.id))
     cancel.assert_not_awaited()
+    await db_session.refresh(upload)
     await db_session.refresh(job)
+    assert upload.ingestion_status == "processing"
+    assert upload.cancel_requested is True
+    assert job.status == "processing"
     assert job.cancel_requested is True
 
 
@@ -284,12 +302,16 @@ async def test_cancel_finishes_queued_strict_job_without_reserving_worker_cancel
     cancel.assert_not_awaited()
     await db_session.refresh(upload)
     await db_session.refresh(job)
+    assert upload.cancel_requested is True
     assert upload.ingestion_status == "cancelled"
     assert upload.progress_stage is None
     assert upload.progress_detail is None
+    assert upload.processing_completed_at is not None
     assert job.status == "cancelled"
     assert job.stage == "cancelled"
     assert job.cancel_requested is True
+    assert job.failure is None
+    assert job.completed_at == upload.processing_completed_at
     assert job.progress == {
         "stage": "cancelled",
         "model_role": "extraction",

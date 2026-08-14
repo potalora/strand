@@ -100,6 +100,10 @@ export function BackgroundProcessingMonitor() {
     (state) => state.registerUploadLabels
   );
   const generation = useRef(0);
+  const hydrationLabels = useRef<{
+    generation: number;
+    labels: Record<string, string>;
+  }>({ generation: 0, labels: {} });
   const [expanded, setExpanded] = useState(false);
   const [, setClock] = useState(0);
 
@@ -118,16 +122,20 @@ export function BackgroundProcessingMonitor() {
 
   useEffect(() => {
     const requestGeneration = ++generation.current;
+    hydrationLabels.current = { generation: requestGeneration, labels: {} };
     reset();
     if (!accessToken) return;
     let mounted = true;
 
     void api
-      .getLocalAIJobs(true)
+      .getLocalAIJobs(true, true)
       .then((serverJobs) => {
         if (!mounted || generation.current !== requestGeneration) return;
         // Initial terminal state is intentionally silent.
         hydrate(serverJobs);
+        if (hydrationLabels.current.generation === requestGeneration) {
+          registerUploadLabels(hydrationLabels.current.labels);
+        }
       })
       .catch(() => {
         if (!mounted || generation.current !== requestGeneration) return;
@@ -137,11 +145,14 @@ export function BackgroundProcessingMonitor() {
       .getUploadHistory()
       .then((uploadHistory) => {
         if (!mounted || generation.current !== requestGeneration) return;
-        registerUploadLabels(
-          Object.fromEntries(
-            uploadHistory.items.map((item) => [item.id, item.filename])
-          )
+        const labels = Object.fromEntries(
+          uploadHistory.items.map((item) => [item.id, item.filename])
         );
+        hydrationLabels.current = {
+          generation: requestGeneration,
+          labels,
+        };
+        registerUploadLabels(labels);
       })
       .catch(() => {
         // Filenames are optional decoration; job hydration remains usable.

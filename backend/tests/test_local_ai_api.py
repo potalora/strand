@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID, uuid4
@@ -14,7 +15,7 @@ from uuid import UUID, uuid4
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 import app.services.local_ai.pack_operations as pack_operations_module
 from app.config import settings
@@ -28,6 +29,7 @@ from app.services.local_ai.manifest import (
     LocalAIManifest,
     ManifestArtifact,
     ManifestFile,
+    canonicalize_manifest_snapshot,
 )
 from app.services.local_ai.pack_operations import PackOperationStore
 from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
@@ -36,6 +38,7 @@ from app.services.local_ai.validation_receipt import (
     _issue_runtime_validation_receipt,
 )
 from tests.conftest import auth_headers, create_test_patient
+from tests.test_strict_local_pipeline import _manifest_payload
 
 
 @pytest_asyncio.fixture
@@ -756,6 +759,645 @@ async def test_retry_commit_precedes_audit_and_worker_wake(
     await db_session.refresh(job)
     assert upload.ingestion_status == "pending_extraction"
     assert job.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_job_cancel_terminalizes_queued_strict_ingestion_pair(
+    client,
+    db_session,
+) -> None:
+    headers, user_id = await auth_headers(client)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = UploadedFile(
+        user_id=UUID(user_id),
+        filename="queued-cancel.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=128,
+        file_hash=uuid4().hex,
+        storage_path="/tmp/queued-cancel.pdf",
+        ingestion_status="pending_extraction",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="queued",
+        stage="queued",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/v1/local-ai/jobs/{job.id}/cancel",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert (upload.ingestion_status, upload.cancel_requested) == ("cancelled", True)
+    assert upload.processing_completed_at is not None
+    assert (job.status, job.stage, job.cancel_requested) == (
+        "cancelled",
+        "cancelled",
+        True,
+    )
+    assert job.completed_at == upload.processing_completed_at
+
+
+@pytest.mark.asyncio
+async def test_job_cancel_commits_processing_pair_before_worker_ipc(
+    client,
+    db_session,
+) -> None:
+    import app.database as database_module
+
+    headers, user_id = await auth_headers(client)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    claimed_at = datetime.now(timezone.utc)
+    upload = UploadedFile(
+        user_id=UUID(user_id),
+        filename="processing-job-cancel.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=128,
+        file_hash=uuid4().hex,
+        storage_path="/tmp/processing-job-cancel.pdf",
+        ingestion_status="processing",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+        processing_started_at=claimed_at,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="ocr",
+        started_at=claimed_at,
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    events: list[str] = []
+    original_commit = db_session.commit
+
+    async def track_commit() -> None:
+        await original_commit()
+        events.append("commit")
+
+    async def observe_registered(job_id: str) -> bool:
+        events.append("cancel_registered")
+        async with database_module.async_session_factory() as observer:
+            durable_upload = await observer.get(UploadedFile, upload.id)
+            durable_job = await observer.get(LocalAIJob, job.id)
+            assert durable_upload is not None and durable_upload.cancel_requested
+            assert durable_job is not None and durable_job.cancel_requested
+            assert durable_upload.ingestion_status == "processing"
+            assert durable_job.status == "processing"
+        return False
+
+    async def observe_fallback(job_id: str) -> None:
+        events.append("cancel")
+
+    db_session.commit = track_commit  # type: ignore[method-assign]
+    with (
+        patch(
+            "app.services.local_ai.model_manager.local_model_manager.cancel_registered",
+            new=AsyncMock(side_effect=observe_registered),
+        ),
+        patch(
+            "app.services.local_ai.model_manager.local_model_manager.cancel",
+            new=AsyncMock(side_effect=observe_fallback),
+        ),
+    ):
+        response = await client.post(
+            f"/api/v1/local-ai/jobs/{job.id}/cancel",
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert events[:3] == ["commit", "cancel_registered", "cancel"]
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert (upload.ingestion_status, upload.cancel_requested) == (
+        "processing",
+        True,
+    )
+    assert (job.status, job.cancel_requested) == ("processing", True)
+
+
+@pytest.mark.asyncio
+async def test_job_cancel_reloads_pair_after_stale_route_discovery(
+    client,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.database as database_module
+
+    headers, user_id = await auth_headers(client)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    claimed_at = datetime.now(timezone.utc)
+    upload = UploadedFile(
+        user_id=UUID(user_id),
+        filename="stale-route-cancel.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=128,
+        file_hash=uuid4().hex,
+        storage_path="/tmp/stale-route-cancel.pdf",
+        ingestion_status="processing",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+        processing_started_at=claimed_at,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="ocr",
+        started_at=claimed_at,
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    original_execute = db_session.execute
+    race_injected = False
+
+    async def inject_incoherent_upload(statement, *args, **kwargs):
+        nonlocal race_injected
+        if not race_injected and "FROM uploaded_files" in str(statement):
+            race_injected = True
+            async with database_module.async_session_factory() as racer:
+                await racer.execute(
+                    update(UploadedFile)
+                    .where(UploadedFile.id == upload.id)
+                    .values(ingestion_status="completed")
+                )
+                await racer.commit()
+        return await original_execute(statement, *args, **kwargs)
+
+    db_session.execute = inject_incoherent_upload  # type: ignore[method-assign]
+    with patch(
+        "app.services.local_ai.model_manager.local_model_manager.cancel_registered",
+        new_callable=AsyncMock,
+    ) as cancel_registered:
+        response = await client.post(
+            f"/api/v1/local-ai/jobs/{job.id}/cancel",
+            headers=headers,
+        )
+
+    assert race_injected
+    assert response.status_code == 409
+    assert response.json()["detail"] == "This job cannot be cancelled."
+    cancel_registered.assert_not_awaited()
+    await db_session.rollback()
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert (upload.ingestion_status, upload.cancel_requested) == (
+        "completed",
+        False,
+    )
+    assert (job.status, job.cancel_requested) == ("processing", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity_defect",
+    (
+        "different_upload_manifest",
+        "noncanonical_upload_manifest",
+        "different_job_digest",
+        "wrong_upload_schema",
+    ),
+)
+async def test_strict_cancellation_rejects_identity_mismatch_without_mutation(
+    client,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+    identity_defect: str,
+) -> None:
+    headers, user_id = await auth_headers(client)
+    snapshot, digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload_snapshot = copy.deepcopy(snapshot)
+    schema_version = "clinical-document-extraction.v1"
+    if identity_defect == "different_upload_manifest":
+        changed = copy.deepcopy(snapshot)
+        changed["pack_revision"] = "different-revision"
+        upload_snapshot, _changed_digest = canonicalize_manifest_snapshot(changed)
+    elif identity_defect == "noncanonical_upload_manifest":
+        upload_snapshot["artifacts"][0]["license"] = "APACHE-2.0"
+    elif identity_defect == "wrong_upload_schema":
+        schema_version = "clinical-document-extraction.v2"
+
+    upload = UploadedFile(
+        user_id=UUID(user_id),
+        filename=f"{identity_defect}.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=128,
+        file_hash=uuid4().hex,
+        storage_path=f"/tmp/{identity_defect}.pdf",
+        ingestion_status="pending_extraction",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=upload_snapshot,
+        processing_schema_version=schema_version,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="queued",
+        stage="queued",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    if identity_defect == "different_job_digest":
+        original_canonicalize = canonicalize_manifest_snapshot
+
+        def mismatched_digest(value):
+            canonical, _actual_digest = original_canonicalize(value)
+            return canonical, "f" * 64 if digest != "f" * 64 else "e" * 64
+
+        monkeypatch.setattr(
+            "app.services.local_ai.ingestion_lifecycle.canonicalize_manifest_snapshot",
+            mismatched_digest,
+        )
+
+    job_response = await client.post(
+        f"/api/v1/local-ai/jobs/{job.id}/cancel",
+        headers=headers,
+    )
+    bulk_response = await client.post(
+        "/api/v1/upload/cancel",
+        json={"upload_ids": [str(upload.id)]},
+        headers=headers,
+    )
+
+    assert job_response.status_code == 409
+    assert job_response.json() == {"detail": "This job cannot be cancelled."}
+    assert bulk_response.status_code == 200
+    assert bulk_response.json() == {"cancelled": [], "skipped": [str(upload.id)]}
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert (job.status, job.cancel_requested) == ("queued", False)
+    assert (upload.ingestion_status, upload.cancel_requested) == (
+        "pending_extraction",
+        False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_strict_cancellation_rejects_incoherent_pair_without_repair(
+    client,
+    db_session,
+) -> None:
+    headers, user_id = await auth_headers(client)
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    upload = UploadedFile(
+        user_id=UUID(user_id),
+        filename="incoherent.pdf",
+        mime_type="application/pdf",
+        file_size_bytes=128,
+        file_hash=uuid4().hex,
+        storage_path="/tmp/incoherent.pdf",
+        ingestion_status="pending_extraction",
+        file_category="unstructured",
+        processing_mode="validated_strict_local",
+        processing_manifest=snapshot,
+        processing_schema_version="clinical-document-extraction.v1",
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    job = LocalAIJob(
+        user_id=UUID(user_id),
+        upload_id=upload.id,
+        kind="ingestion",
+        processing_mode="validated_strict_local",
+        manifest_snapshot=snapshot,
+        status="processing",
+        stage="preflight",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    job_response = await client.post(
+        f"/api/v1/local-ai/jobs/{job.id}/cancel",
+        headers=headers,
+    )
+    bulk_response = await client.post(
+        "/api/v1/upload/cancel",
+        json={"upload_ids": [str(upload.id)]},
+        headers=headers,
+    )
+
+    assert job_response.status_code == 409
+    assert bulk_response.json() == {"cancelled": [], "skipped": [str(upload.id)]}
+    await db_session.refresh(upload)
+    await db_session.refresh(job)
+    assert (job.status, job.cancel_requested) == ("processing", False)
+    assert (upload.ingestion_status, upload.cancel_requested) == (
+        "pending_extraction",
+        False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retryable_failed_hydration_is_owner_scoped_and_excludes_manual_children(
+    client,
+    db_session,
+) -> None:
+    owner_headers, owner_id = await auth_headers(
+        client,
+        email="retryable-hydration-owner@example.com",
+    )
+    _other_headers, other_id = await auth_headers(
+        client,
+        email="retryable-hydration-other@example.com",
+    )
+    owner_patient = await create_test_patient(db_session, owner_id)
+    other_patient = await create_test_patient(db_session, other_id)
+    manifest, _contents = _manifest()
+    snapshot = _manifest_dict(manifest)
+
+    async def add_summary_job(
+        *,
+        user_id: str,
+        patient_id: UUID,
+        status: str,
+        failure: dict | None = None,
+    ) -> LocalAIJob:
+        prompt = AISummaryPrompt(
+            id=uuid4(),
+            user_id=UUID(user_id),
+            patient_id=patient_id,
+            summary_type="full",
+            processing_mode="validated_strict_local",
+            scope_filter={},
+            system_prompt="synthetic system prompt",
+            user_prompt="synthetic user prompt",
+            target_model="locked-local-summary",
+            suggested_config={},
+            record_count=1,
+            model_provenance={},
+            generated_at=datetime.now(timezone.utc),
+        )
+        job = LocalAIJob(
+            user_id=UUID(user_id),
+            summary_prompt_id=prompt.id,
+            kind="summary",
+            processing_mode="validated_strict_local",
+            manifest_snapshot=snapshot,
+            status=status,
+            stage=status,
+            failure=failure,
+        )
+        db_session.add_all([prompt, job])
+        await db_session.flush()
+        return job
+
+    async def add_ingestion_job(
+        *,
+        status: str,
+        failure: dict | None = None,
+        manual: bool = False,
+        filename: str,
+    ) -> LocalAIJob:
+        upload = UploadedFile(
+            user_id=UUID(owner_id),
+            filename=filename,
+            mime_type="application/pdf",
+            file_size_bytes=128,
+            file_hash=uuid4().hex,
+            storage_path=f"/tmp/{filename}",
+            ingestion_status="failed" if status == "failed" else "completed",
+            file_category="unstructured",
+            manual_extraction_required=manual,
+            processing_mode="validated_strict_local",
+            processing_manifest=snapshot,
+            processing_schema_version="clinical-document-extraction.v1",
+        )
+        db_session.add(upload)
+        await db_session.flush()
+        job = LocalAIJob(
+            user_id=UUID(owner_id),
+            upload_id=upload.id,
+            kind="ingestion",
+            processing_mode="validated_strict_local",
+            manifest_snapshot=snapshot,
+            status=status,
+            stage=status,
+            failure=failure,
+        )
+        db_session.add(job)
+        await db_session.flush()
+        return job
+
+    active_summary = await add_summary_job(
+        user_id=owner_id,
+        patient_id=owner_patient.id,
+        status="processing",
+    )
+    retryable_failure = await add_summary_job(
+        user_id=owner_id,
+        patient_id=owner_patient.id,
+        status="failed",
+        failure={"code": "worker_timeout", "retryable": True},
+    )
+    manual_child = await add_ingestion_job(
+        status="failed",
+        failure={"code": "worker_timeout", "retryable": True},
+        manual=True,
+        filename="manual-zip-child.pdf",
+    )
+    non_retryable = await add_ingestion_job(
+        status="failed",
+        failure={"code": "policy_failure", "retryable": False},
+        filename="non-retryable.pdf",
+    )
+    cancelled = await add_ingestion_job(
+        status="cancelled",
+        filename="cancelled.pdf",
+    )
+    completed = await add_ingestion_job(
+        status="completed",
+        filename="completed.pdf",
+    )
+    foreign_retryable = await add_summary_job(
+        user_id=other_id,
+        patient_id=other_patient.id,
+        status="failed",
+        failure={"code": "worker_timeout", "retryable": True},
+    )
+    await db_session.commit()
+
+    expanded = await client.get(
+        "/api/v1/local-ai/jobs?active_only=true&include_retryable_failed=true",
+        headers=owner_headers,
+    )
+    active_only = await client.get(
+        "/api/v1/local-ai/jobs?active_only=true",
+        headers=owner_headers,
+    )
+    all_owner_jobs = await client.get(
+        "/api/v1/local-ai/jobs?active_only=false&include_retryable_failed=true",
+        headers=owner_headers,
+    )
+    summary_jobs = await client.get(
+        "/api/v1/local-ai/jobs?kind=summary&active_only=true&include_retryable_failed=true",
+        headers=owner_headers,
+    )
+
+    assert expanded.status_code == 200
+    assert {item["id"] for item in expanded.json()} == {
+        str(active_summary.id),
+        str(retryable_failure.id),
+    }
+    assert {item["id"] for item in active_only.json()} == {str(active_summary.id)}
+    assert {item["id"] for item in all_owner_jobs.json()} == {
+        str(active_summary.id),
+        str(retryable_failure.id),
+        str(manual_child.id),
+        str(non_retryable.id),
+        str(cancelled.id),
+        str(completed.id),
+    }
+    assert {item["id"] for item in summary_jobs.json()} == {
+        str(active_summary.id),
+        str(retryable_failure.id),
+    }
+    assert all("message" not in json.dumps(item) for item in expanded.json())
+    excluded = {
+        str(manual_child.id),
+        str(non_retryable.id),
+        str(cancelled.id),
+        str(completed.id),
+        str(foreign_retryable.id),
+    }
+    assert excluded.isdisjoint({item["id"] for item in expanded.json()})
+
+
+@pytest.mark.asyncio
+async def test_retryable_failed_hydration_skips_malformed_json_before_limit(
+    client,
+    db_session,
+) -> None:
+    headers, user_id = await auth_headers(
+        client,
+        email="retryable-hydration-malformed@example.com",
+    )
+    snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
+    base_time = datetime.now(timezone.utc)
+
+    async def add_job(
+        *,
+        index: int,
+        status: str,
+        failure: dict | None,
+        created_at: datetime,
+    ) -> LocalAIJob:
+        upload = UploadedFile(
+            user_id=UUID(user_id),
+            filename=f"hydration-limit-{index}.pdf",
+            mime_type="application/pdf",
+            file_size_bytes=128,
+            file_hash=uuid4().hex,
+            storage_path=f"/tmp/hydration-limit-{index}.pdf",
+            ingestion_status="processing" if status == "processing" else "failed",
+            file_category="unstructured",
+            processing_mode="validated_strict_local",
+            processing_manifest=snapshot,
+            processing_schema_version="clinical-document-extraction.v1",
+            created_at=created_at,
+        )
+        db_session.add(upload)
+        await db_session.flush()
+        job = LocalAIJob(
+            user_id=UUID(user_id),
+            upload_id=upload.id,
+            kind="ingestion",
+            processing_mode="validated_strict_local",
+            manifest_snapshot=snapshot,
+            status=status,
+            stage=status,
+            failure=failure,
+            created_at=created_at,
+        )
+        db_session.add(job)
+        await db_session.flush()
+        return job
+
+    for index in range(49):
+        await add_job(
+            index=index,
+            status="processing",
+            failure=None,
+            created_at=base_time - timedelta(seconds=index),
+        )
+    malformed_jobs = []
+    malformed_failures = (
+        None,
+        {},
+        {"retryable": None},
+        {"retryable": "true"},
+        {"retryable": "yes"},
+        {"retryable": 1},
+        {"retryable": {}},
+        {"retryable": []},
+        {"retryable": False},
+    )
+    for offset, failure in enumerate(malformed_failures, start=49):
+        malformed_jobs.append(
+            await add_job(
+                index=offset,
+                status="failed",
+                failure=failure,
+                created_at=base_time - timedelta(seconds=offset),
+            )
+        )
+    valid_retryable = await add_job(
+        index=58,
+        status="failed",
+        failure={"retryable": True},
+        created_at=base_time - timedelta(seconds=100),
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/v1/local-ai/jobs?active_only=true&include_retryable_failed=true",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    ids = [item["id"] for item in response.json()]
+    assert len(ids) == 50
+    assert str(valid_retryable.id) in ids
+    assert {str(job.id) for job in malformed_jobs}.isdisjoint(ids)
 
 
 @pytest.mark.asyncio

@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import io
+import json
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException, UploadFile
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.models.uploaded_file import UploadedFile
+from app.services.local_ai.processing_snapshot import ProcessingSnapshot
+from app.services.local_ai.types import ProcessingMode
 from tests.conftest import auth_headers, create_test_patient
 
 HAS_API_KEY = bool(os.environ.get("GEMINI_API_KEY"))
@@ -41,6 +50,7 @@ async def test_upload_rtf_creates_record(client: AsyncClient, db_session: AsyncS
     assert resp.status_code == 202
     data = resp.json()
     assert data["upload_id"]
+    assert data["filename"] == "note.rtf"
     assert data["status"] == "pending_extraction"
     assert data["file_type"] == "rtf"
 
@@ -278,6 +288,12 @@ async def test_batch_upload_endpoint(client: AsyncClient, db_session: AsyncSessi
     data = resp.json()
     assert data["total"] == 3
     assert len(data["uploads"]) == 3
+    assert [item["filename"] for item in data["uploads"]] == [
+        "batch1.rtf",
+        "batch2.rtf",
+        "batch3.pdf",
+    ]
+    assert data["rejected"] == []
 
     # Each upload should have a unique ID
     upload_ids = [u["upload_id"] for u in data["uploads"]]
@@ -370,24 +386,300 @@ async def test_batch_upload_skips_invalid_files(
     """Batch endpoint skips unsupported file types and invalid magic bytes."""
     headers, user_id = await auth_headers(client)
 
-    rtf_valid = rb"""{\rtf1\ansi Valid RTF note.}"""
+    rtf_valid = rb"""{\rtf1\ansi Later valid RTF note.}"""
+    pdf_valid = b"%PDF-1.4 final valid PDF"
     txt_invalid = b"plain text not allowed"
 
     with PATCH_BG_TASK:
         resp = await client.post(
             "/api/v1/upload/unstructured-batch",
             files=[
-                ("files", ("valid.rtf", io.BytesIO(rtf_valid), "application/rtf")),
-                ("files", ("invalid.txt", io.BytesIO(txt_invalid), "text/plain")),
+                ("files", ("first-invalid.txt", io.BytesIO(txt_invalid), "text/plain")),
+                ("files", ("later-valid.rtf", io.BytesIO(rtf_valid), "application/rtf")),
+                ("files", ("final-valid.pdf", io.BytesIO(pdf_valid), "application/pdf")),
             ],
             headers=headers,
             data={"processing_mode": "cloud_assisted"},
         )
     assert resp.status_code == 202
     data = resp.json()
-    # Only the valid RTF should be accepted
-    assert data["total"] == 1
-    assert data["uploads"][0]["file_type"] == "rtf"
+    assert data["total"] == 2
+    assert [(item["filename"], item["file_type"]) for item in data["uploads"]] == [
+        ("later-valid.rtf", "rtf"),
+        ("final-valid.pdf", "pdf"),
+    ]
+    assert data["rejected"] == [
+        {"filename": "first-invalid.txt", "code": "unsupported_type"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_upload_all_rejected_uses_stable_bounded_codes_without_snapshot(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _headers, _user_id = await auth_headers(client)
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "max_file_size_mb", 1)
+    resolver = AsyncMock(
+        side_effect=HTTPException(status_code=409, detail="unavailable")
+    )
+    monkeypatch.setattr(
+        "app.api.upload._resolve_ingestion_snapshot_or_409",
+        resolver,
+    )
+    oversized = rb"{\rtf1" + (b"x" * (1024 * 1024 + 1))
+
+    from app.api.upload import upload_unstructured_batch
+
+    result = await upload_unstructured_batch(
+        files=[
+            UploadFile(filename=None, file=io.BytesIO(rb"{\rtf1}")),
+            UploadFile(filename="unsupported.txt", file=io.BytesIO(b"plain")),
+            UploadFile(filename="oversized.rtf", file=io.BytesIO(oversized)),
+            UploadFile(filename="bad-signature.pdf", file=io.BytesIO(b"not a pdf")),
+        ],
+        processing_mode=ProcessingMode.VALIDATED_STRICT_LOCAL,
+        user_id=UUID(str(_user_id)),
+        db=db_session,
+    )
+
+    payload = result.model_dump()
+    assert payload == {
+        "uploads": [],
+        "rejected": [
+            {"filename": "", "code": "missing_filename"},
+            {"filename": "unsupported.txt", "code": "unsupported_type"},
+            {"filename": "oversized.rtf", "code": "file_too_large"},
+            {"filename": "bad-signature.pdf", "code": "invalid_signature"},
+        ],
+        "total": 0,
+    }
+    serialized = json.dumps(payload)
+    assert "/tmp/" not in serialized
+    assert "HTTPException" not in serialized
+    assert "unavailable" not in serialized
+    resolver.assert_not_awaited()
+    assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+
+@pytest.mark.asyncio
+async def test_batch_rejection_cap_does_not_block_later_valid_file(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    headers, _user_id = await auth_headers(client)
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
+    invalid_files = [
+        ("files", (f"invalid-{index}.txt", io.BytesIO(b"plain"), "text/plain"))
+        for index in range(51)
+    ]
+    invalid_files.append(
+        (
+            "files",
+            ("accepted-after-cap.rtf", io.BytesIO(rb"{\rtf1 valid}"), "application/rtf"),
+        )
+    )
+
+    response = await client.post(
+        "/api/v1/upload/unstructured-batch",
+        files=invalid_files,
+        headers=headers,
+        data={"processing_mode": "cloud_assisted"},
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["total"] == 1
+    assert [item["filename"] for item in payload["uploads"]] == [
+        "accepted-after-cap.rtf"
+    ]
+    assert len(payload["rejected"]) == 50
+    assert payload["rejected"][0] == {
+        "filename": "invalid-0.txt",
+        "code": "unsupported_type",
+    }
+    assert payload["rejected"][-1] == {
+        "filename": "invalid-49.txt",
+        "code": "unsupported_type",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ("http_409", "cancelled"))
+async def test_batch_snapshot_failure_removes_staged_ciphertext(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
+    _headers, _user_id = await auth_headers(client)
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
+    failure: BaseException = (
+        HTTPException(status_code=409, detail="unavailable")
+        if failure_kind == "http_409"
+        else asyncio.CancelledError()
+    )
+    monkeypatch.setattr(
+        "app.api.upload._resolve_ingestion_snapshot_or_409",
+        AsyncMock(side_effect=failure),
+    )
+
+    from app.api.upload import upload_unstructured_batch
+
+    request = upload_unstructured_batch(
+        files=[
+            UploadFile(
+                filename="valid-before-snapshot.rtf",
+                file=io.BytesIO(rb"{\rtf1 valid}"),
+            )
+        ],
+        processing_mode=ProcessingMode.VALIDATED_STRICT_LOCAL,
+        user_id=UUID(str(_user_id)),
+        db=db_session,
+    )
+    if failure_kind == "http_409":
+        with pytest.raises(HTTPException) as exc_info:
+            await request
+        assert exc_info.value.status_code == 409
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await request
+    assert not [path for path in tmp_path.rglob("*") if path.is_file()]
+
+
+@pytest.mark.asyncio
+async def test_batch_non_size_http_error_is_not_classified_as_rejection(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _headers, _user_id = await auth_headers(client)
+    monkeypatch.setattr(
+        "app.api.upload._stream_upload_to_disk",
+        AsyncMock(side_effect=HTTPException(status_code=409, detail="private")),
+    )
+
+    from app.api.upload import upload_unstructured_batch
+
+    with pytest.raises(HTTPException) as exc_info:
+        await upload_unstructured_batch(
+            files=[UploadFile(filename="valid.rtf", file=io.BytesIO(rb"{\rtf1}"))],
+            processing_mode=ProcessingMode.CLOUD_ASSISTED,
+            user_id=UUID(str(_user_id)),
+            db=db_session,
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+def _cloud_snapshot() -> ProcessingSnapshot:
+    return ProcessingSnapshot(
+        mode=ProcessingMode.CLOUD_ASSISTED,
+        manifest_snapshot=None,
+        manifest_sha256=None,
+        schema_version=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reprocess_new_upload_returns_stored_filename(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    headers, user_id = await auth_headers(client)
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
+    source_path = tmp_path / "server-source.rtf"
+    source_path.write_bytes(b"synthetic encrypted source")
+    source = UploadedFile(
+        id=uuid4(),
+        user_id=user_id,
+        filename="server-source.rtf",
+        mime_type="application/rtf",
+        file_size_bytes=27,
+        file_hash=uuid4().hex,
+        storage_path=str(source_path),
+        ingestion_status="completed",
+        file_category="unstructured",
+        processing_mode="prompt_only",
+    )
+    db_session.add(source)
+    await db_session.commit()
+    monkeypatch.setattr(
+        "app.api.upload._resolve_ingestion_snapshot_or_409",
+        AsyncMock(return_value=_cloud_snapshot()),
+    )
+
+    response = await client.post(
+        f"/api/v1/upload/{source.id}/reprocess",
+        json={"processing_mode": "cloud_assisted"},
+        headers=headers,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["filename"] == source.filename
+
+
+@pytest.mark.asyncio
+async def test_reprocess_existing_upload_returns_existing_stored_filename(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    headers, user_id = await auth_headers(client)
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
+    source_path = tmp_path / "canonical-source.rtf"
+    source_path.write_bytes(b"synthetic encrypted source")
+    source = UploadedFile(
+        id=uuid4(),
+        user_id=user_id,
+        filename="canonical-source.rtf",
+        mime_type="application/rtf",
+        file_size_bytes=27,
+        file_hash=uuid4().hex,
+        storage_path=str(source_path),
+        ingestion_status="completed",
+        file_category="unstructured",
+        processing_mode="prompt_only",
+    )
+    db_session.add(source)
+    await db_session.flush()
+    existing = UploadedFile(
+        id=uuid4(),
+        user_id=user_id,
+        filename="existing-server-name.rtf",
+        mime_type="application/rtf",
+        file_size_bytes=27,
+        file_hash=source.file_hash,
+        storage_path=str(source_path),
+        ingestion_status="pending_extraction",
+        ingestion_progress={"reprocesses_upload_id": str(source.id)},
+        file_category="unstructured",
+        processing_mode="cloud_assisted",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+    monkeypatch.setattr(
+        "app.api.upload._resolve_ingestion_snapshot_or_409",
+        AsyncMock(return_value=_cloud_snapshot()),
+    )
+
+    response = await client.post(
+        f"/api/v1/upload/{source.id}/reprocess",
+        json={"processing_mode": "cloud_assisted"},
+        headers=headers,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["filename"] == existing.filename
 
 
 @pytest.mark.asyncio

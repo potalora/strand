@@ -6,6 +6,7 @@ import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 from uuid import UUID, uuid4
 
 from fastapi import (
@@ -29,6 +30,7 @@ from app.models.patient import Patient
 from app.models.record import HealthRecord
 from app.models.uploaded_file import UploadedFile
 from app.schemas.upload import (
+    BatchRejectionCode,
     BatchUploadResponse,
     CancelExtractionRequest,
     CancelExtractionResponse,
@@ -39,6 +41,7 @@ from app.schemas.upload import (
     LocalRunInfo,
     PendingExtractionFile,
     ReprocessUploadRequest,
+    RejectedUnstructuredUpload,
     TriggerExtractionRequest,
     TriggerExtractionResponse,
     UnstructuredUploadResponse,
@@ -56,6 +59,9 @@ from app.services.local_ai.processing_snapshot import (
     resolve_new_ingestion_snapshot,
 )
 from app.services.local_ai.types import ProcessingMode
+
+if TYPE_CHECKING:
+    from app.services.local_ai.ingestion_lifecycle import StrictIngestionClaim
 
 # Per-event-loop semaphore caches.
 #
@@ -216,18 +222,41 @@ async def _extraction_worker() -> None:
                 last_stuck_check = now
 
             await sem.acquire()
-            allow_strict = not strict_sem.locked()
-            claimed = await _claim_pending_files(1, allow_strict=allow_strict)
+            if not strict_sem.locked():
+                await strict_sem.acquire()
+                from app.services.local_ai.ingestion_lifecycle import (
+                    claim_next_strict_ingestion_pair,
+                )
+
+                try:
+                    async with async_session_factory() as claim_db:
+                        strict_claim = await claim_next_strict_ingestion_pair(claim_db)
+                        if strict_claim is None:
+                            await claim_db.rollback()
+                        else:
+                            await claim_db.commit()
+                except Exception:
+                    strict_sem.release()
+                    sem.release()
+                    raise
+                if strict_claim is not None:
+                    scheduled = await _schedule_claimed_extraction(
+                        sem,
+                        strict_claim,
+                        strict_sem=strict_sem,
+                    )
+                    if not scheduled:
+                        await asyncio.sleep(poll_interval)
+                    continue
+                strict_sem.release()
+
+            claimed = await _claim_pending_files(1)
             if not claimed:
                 sem.release()
                 await asyncio.sleep(poll_interval)
                 continue
 
             upload_id, file_path, user_id, processing_mode = claimed[0]
-            strict_slot = None
-            if processing_mode == ProcessingMode.VALIDATED_STRICT_LOCAL.value:
-                await strict_sem.acquire()
-                strict_slot = strict_sem
             logger.info("Claimed file %s for extraction", upload_id)
             child = asyncio.create_task(
                 _process_and_release(
@@ -235,7 +264,6 @@ async def _extraction_worker() -> None:
                     upload_id,
                     Path(file_path),
                     user_id,
-                    strict_sem=strict_slot,
                 )
             )
             _extraction_tasks.add(child)
@@ -248,10 +276,8 @@ async def _extraction_worker() -> None:
 
 async def _claim_pending_files(
     batch_size: int,
-    *,
-    allow_strict: bool = True,
 ) -> list[tuple[str, str, str, str]]:
-    """Claim pending extraction files using SELECT FOR UPDATE SKIP LOCKED."""
+    """Claim non-strict extraction files using SELECT FOR UPDATE SKIP LOCKED."""
     async with async_session_factory() as db:
         try:
             result = await db.execute(
@@ -261,14 +287,12 @@ async def _claim_pending_files(
                     "WHERE ingestion_status = 'pending_extraction' "
                     "AND file_category = 'unstructured' "
                     "AND manual_extraction_required = false "
-                    "AND (:allow_strict "
-                    "OR processing_mode != 'validated_strict_local') "
+                    "AND processing_mode != 'validated_strict_local' "
                     "ORDER BY created_at ASC "
                     "LIMIT :batch_size "
                     "FOR UPDATE SKIP LOCKED"
                 ),
                 {
-                    "allow_strict": allow_strict,
                     "batch_size": batch_size,
                 },
             )
@@ -297,6 +321,81 @@ async def _claim_pending_files(
             logger.error("Failed to claim pending files")
             await db.rollback()
             return []
+
+
+async def _schedule_claimed_extraction(
+    sem: asyncio.Semaphore,
+    claim: "StrictIngestionClaim",
+    *,
+    strict_sem: asyncio.Semaphore,
+    create_task_fn: Callable[[object], asyncio.Task[None]] | None = None,
+    callback_drain_timeout_seconds: float = 1.0,
+) -> bool:
+    from app.services.local_ai.ingestion_lifecycle import (
+        compensate_unstarted_strict_ingestion_claim,
+    )
+
+    released = False
+
+    def release_slots() -> None:
+        nonlocal released
+        if released:
+            return
+        released = True
+        strict_sem.release()
+        sem.release()
+
+    async def compensate() -> None:
+        async with async_session_factory() as compensation_db:
+            compensated = await compensate_unstarted_strict_ingestion_claim(
+                compensation_db,
+                claim,
+            )
+            if compensated:
+                await compensation_db.commit()
+            else:
+                await compensation_db.rollback()
+
+    coroutine = _process_and_release(
+        sem,
+        claim.upload_id,
+        Path(claim.storage_path),
+        claim.user_id,
+        strict_claim=claim,
+        release_slots=release_slots,
+    )
+    task_factory = create_task_fn or asyncio.create_task
+    try:
+        child = task_factory(coroutine)
+    except Exception:
+        coroutine.close()
+        release_slots()
+        await compensate()
+        logger.error("Strict-local task creation failed after durable claim")
+        return False
+
+    _extraction_tasks.add(child)
+    # A configured eager task factory can enter the child before callback
+    # registration. The failure path below therefore always drains the child
+    # before compensating the exact durable claim.
+    await asyncio.sleep(0)
+    try:
+        child.add_done_callback(_extraction_tasks.discard)
+    except Exception:
+        child.cancel()
+        terminated = await _wait_for_extraction_tasks(
+            [child],
+            timeout_seconds=callback_drain_timeout_seconds,
+        )
+        if not terminated:
+            logger.error("Strict-local task did not terminate after callback failure")
+            return False
+        _extraction_tasks.discard(child)
+        release_slots()
+        await compensate()
+        logger.error("Strict-local task callback registration failed")
+        return False
+    return True
 
 
 async def _recover_stuck_files() -> None:
@@ -521,16 +620,26 @@ async def _process_and_release(
     user_id: UUID | str,
     *,
     strict_sem: asyncio.Semaphore | None = None,
+    strict_claim: "StrictIngestionClaim | None" = None,
+    release_slots: Callable[[], None] | None = None,
 ) -> None:
     """Process one file then release the semaphore."""
     try:
         uid = UUID(str(upload_id)) if not isinstance(upload_id, UUID) else upload_id
         uid_user = UUID(str(user_id)) if not isinstance(user_id, UUID) else user_id
-        await _process_unstructured(uid, file_path, uid_user)
+        await _process_unstructured(
+            uid,
+            file_path,
+            uid_user,
+            strict_claim=strict_claim,
+        )
     finally:
-        if strict_sem is not None:
-            strict_sem.release()
-        sem.release()
+        if release_slots is not None:
+            release_slots()
+        else:
+            if strict_sem is not None:
+                strict_sem.release()
+            sem.release()
 
 
 def start_extraction_worker() -> None:
@@ -562,19 +671,41 @@ async def stop_extraction_worker() -> None:
         child.cancel()
     if children:
         await _drain_extraction_shutdown_tasks(children)
-    _extraction_tasks.clear()
+    for child in children:
+        if child.done():
+            _extraction_tasks.discard(child)
 
 
 async def _drain_extraction_shutdown_tasks(tasks: list[asyncio.Task[object]]) -> None:
     """Bound shutdown waits so durable recovery cannot be held by a stuck task."""
-    drain = asyncio.gather(*tasks, return_exceptions=True)
-    try:
-        await asyncio.wait_for(
-            asyncio.shield(drain),
-            timeout=settings.local_ai_shutdown_drain_seconds,
-        )
-    except TimeoutError:
+    terminated = await _wait_for_extraction_tasks(
+        tasks,
+        timeout_seconds=settings.local_ai_shutdown_drain_seconds,
+    )
+    if not terminated:
         logger.warning("Strict-local extraction shutdown drain timed out")
+
+
+async def _wait_for_extraction_tasks(
+    tasks: list[asyncio.Task[object]],
+    *,
+    timeout_seconds: float,
+) -> bool:
+    """Wait without registering callbacks on tasks that rejected registration."""
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            while any(not task.done() for task in tasks):
+                await asyncio.sleep(0)
+    except TimeoutError:
+        return False
+    for task in tasks:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.error("Extraction task terminated with an error")
+    return True
 
 
 # Statuses that count as "done" for batch progress. ``cancelled`` is terminal
@@ -1159,118 +1290,111 @@ async def cancel_extraction(
         except (ValueError, AttributeError):
             parsed[raw] = None  # unparseable → always skipped
 
-    valid_uuids = [u for u in parsed.values() if u is not None]
-    owned: dict[UUID, UploadedFile] = {}
+    valid_uuids = list({u for u in parsed.values() if u is not None})
+    discovered: dict[UUID, str] = {}
     if valid_uuids:
-        result = await db.execute(
-            select(UploadedFile)
-            .where(
-                UploadedFile.id.in_(valid_uuids),
-                UploadedFile.user_id == user_id,
+        rows = (
+            await db.execute(
+                select(UploadedFile.id, UploadedFile.processing_mode).where(
+                    UploadedFile.id.in_(valid_uuids),
+                    UploadedFile.user_id == user_id,
+                )
             )
-            .order_by(UploadedFile.id)
-            .with_for_update()
+        ).all()
+        discovered = {row.id: row.processing_mode for row in rows}
+
+    outcomes: dict[UUID, bool] = {}
+    strict_results = []
+    strict_ids = sorted(
+        (
+            upload_id
+            for upload_id, processing_mode in discovered.items()
+            if processing_mode == "validated_strict_local"
+        ),
+        key=str,
+    )
+    if strict_ids:
+        from app.services.local_ai.ingestion_lifecycle import (
+            cancel_strict_ingestion_pair,
         )
-        owned = {u.id: u for u in result.scalars().all()}
 
-    cancelled: list[str] = []
-    skipped: list[str] = []
-    strict_upload_ids: list[UUID] = []
-    for raw in body.upload_ids:
-        uid = parsed.get(raw)
-        upload = owned.get(uid) if uid is not None else None
-        if upload is not None and upload.ingestion_status in _CANCELLABLE_STATUSES:
-            upload.cancel_requested = True
-            cancelled.append(raw)
-            if upload.processing_mode == "validated_strict_local":
-                strict_upload_ids.append(upload.id)
-        else:
-            skipped.append(raw)
+        for upload_id in strict_ids:
+            try:
+                result = await cancel_strict_ingestion_pair(
+                    db,
+                    user_id=user_id,
+                    upload_id=upload_id,
+                )
+            except HTTPException as exc:
+                if exc.status_code not in {404, 409}:
+                    raise
+                outcomes[upload_id] = False
+            else:
+                outcomes[upload_id] = True
+                strict_results.append(result)
 
-    active_strict_jobs = []
-    if strict_upload_ids:
-        from app.models.local_ai import LocalAIJob
-
-        strict_jobs = (
+    non_strict_ids = [
+        upload_id
+        for upload_id, processing_mode in discovered.items()
+        if processing_mode != "validated_strict_local"
+    ]
+    if non_strict_ids:
+        non_strict_uploads = (
             (
                 await db.execute(
-                    select(LocalAIJob)
+                    select(UploadedFile)
                     .where(
-                        LocalAIJob.upload_id.in_(strict_upload_ids),
-                        LocalAIJob.user_id == user_id,
-                        LocalAIJob.status.in_(("queued", "processing")),
+                        UploadedFile.id.in_(non_strict_ids),
+                        UploadedFile.user_id == user_id,
+                        UploadedFile.processing_mode != "validated_strict_local",
                     )
-                    .order_by(LocalAIJob.upload_id, LocalAIJob.id)
+                    .order_by(UploadedFile.id)
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             )
             .scalars()
             .all()
         )
-        processing_upload_ids = {
-            job.upload_id for job in strict_jobs if job.status == "processing"
-        }
-        cancelled_at = datetime.now(timezone.utc)
-        for job in strict_jobs:
-            from app.services.local_ai.processing_snapshot import (
-                fail_legacy_runtime_identity_required,
-            )
-
-            if fail_legacy_runtime_identity_required(
-                job,
-                completed_at=cancelled_at,
-            ):
-                legacy_upload = owned.get(job.upload_id)
-                if legacy_upload is not None:
-                    legacy_upload.ingestion_status = "failed"
-                    legacy_upload.progress_stage = None
-                    legacy_upload.progress_detail = None
-                    legacy_upload.ingestion_errors = [
-                        {"error_type": "runtime_identity_required"}
-                    ]
-                    legacy_upload.processing_completed_at = cancelled_at
-                continue
-            job.cancel_requested = True
-            if job.status == "queued":
-                job.status = "cancelled"
-                job.stage = "cancelled"
-                job.progress = _merge_strict_local_progress(
-                    job.progress,
-                    {},
-                    stage="cancelled",
-                )
-                job.completed_at = cancelled_at
-                if job.upload_id not in processing_upload_ids:
-                    queued_upload = owned.get(job.upload_id)
-                    if queued_upload is not None:
-                        queued_upload.ingestion_status = "cancelled"
-                        queued_upload.progress_stage = None
-                        queued_upload.progress_detail = None
-                        queued_upload.processing_completed_at = cancelled_at
+        for upload in non_strict_uploads:
+            if upload.ingestion_status in _CANCELLABLE_STATUSES:
+                upload.cancel_requested = True
+                outcomes[upload.id] = True
             else:
-                active_strict_jobs.append(job)
+                outcomes[upload.id] = False
+
+    cancelled = [
+        raw
+        for raw in body.upload_ids
+        if (uid := parsed.get(raw)) is not None and outcomes.get(uid, False)
+    ]
+    skipped = [
+        raw
+        for raw in body.upload_ids
+        if (uid := parsed.get(raw)) is None or not outcomes.get(uid, False)
+    ]
 
     if cancelled:
         await db.commit()
 
-    if active_strict_jobs:
+    active_strict_results = [
+        result for result in strict_results if result.worker_cancel_required
+    ]
+    if active_strict_results:
         from app.services.local_ai.errors import LocalWorkerError
         from app.services.local_ai.model_manager import local_model_manager
 
-        for job in active_strict_jobs:
+        for result in active_strict_results:
             try:
                 cancelled_registered = await local_model_manager.cancel_registered(
-                    str(job.id)
+                    str(result.job.id)
                 )
                 if not cancelled_registered:
-                    logger.info(
-                        "Strict-local job %s had no registered worker to terminate",
-                        job.id,
-                    )
+                    await local_model_manager.cancel(str(result.job.id))
             except LocalWorkerError:
                 logger.warning(
-                    "Strict-local worker cancellation could not be confirmed for job %s",
-                    job.id,
+                    "Strict-local worker cancellation could not be confirmed",
+                    extra={"job_id": str(result.job.id)},
                 )
 
     await log_audit_event(
@@ -1633,6 +1757,17 @@ async def delete_upload(
 
 
 ALLOWED_UNSTRUCTURED = {".pdf", ".rtf", ".tif", ".tiff"}
+MAX_BATCH_REJECTIONS = 50
+
+
+def _append_batch_rejection(
+    rejected: list[RejectedUnstructuredUpload],
+    *,
+    filename: str,
+    code: BatchRejectionCode,
+) -> None:
+    if len(rejected) < MAX_BATCH_REJECTIONS:
+        rejected.append(RejectedUnstructuredUpload(filename=filename, code=code))
 
 
 async def _ensure_patient(db: AsyncSession, user_id: UUID) -> Patient:
@@ -2622,6 +2757,8 @@ async def _run_strict_local_ingestion_for_upload(
     upload: UploadedFile,
     file_path: Path,
     user_id: UUID,
+    *,
+    strict_claim: "StrictIngestionClaim | None" = None,
 ) -> None:
     """Run one immutable strict-local job without entering provider routing."""
     from types import SimpleNamespace
@@ -2797,98 +2934,130 @@ async def _run_strict_local_ingestion_for_upload(
         await db.commit()
         return True
 
-    try:
-        locked_upload_id = (
-            await db.execute(
-                select(UploadedFile.id)
-                .where(UploadedFile.id == upload_id)
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if locked_upload_id is None:
-            raise LocalPolicyError("Strict-local upload is unavailable.")
+    if strict_claim is not None:
+        from app.services.local_ai.ingestion_lifecycle import (
+            lock_active_strict_ingestion_claim,
+        )
 
-        legacy_candidate = (
-            (
+        if (
+            upload_id != strict_claim.upload_id
+            or user_id != strict_claim.user_id
+            or file_path != Path(strict_claim.storage_path)
+        ):
+            await db.rollback()
+            return
+        locked_pair = await lock_active_strict_ingestion_claim(db, strict_claim)
+        if locked_pair is None:
+            await db.rollback()
+            return
+        upload, job = locked_pair
+        upload_id = upload.id
+        job_id = job.id
+        claim_started_at = strict_claim.claimed_at
+        await db.commit()
+    else:
+        try:
+            locked_upload_id = (
+                await db.execute(
+                    select(UploadedFile.id)
+                    .where(UploadedFile.id == upload_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if locked_upload_id is None:
+                raise LocalPolicyError("Strict-local upload is unavailable.")
+
+            legacy_candidate = (
+                (
+                    await db.execute(
+                        select(LocalAIJob)
+                        .where(
+                            LocalAIJob.upload_id == upload_id,
+                            LocalAIJob.user_id == user_id,
+                            LocalAIJob.kind == "ingestion",
+                            LocalAIJob.processing_mode == "validated_strict_local",
+                            LocalAIJob.status.in_(("queued", "processing")),
+                        )
+                        .order_by(LocalAIJob.created_at.desc(), LocalAIJob.id.desc())
+                        .limit(1)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if legacy_candidate is not None and fail_legacy_runtime_identity_required(
+                legacy_candidate
+            ):
+                job_id = legacy_candidate.id
+                upload.ingestion_status = "failed"
+                upload.progress_stage = None
+                upload.progress_detail = None
+                upload.ingestion_errors = [
+                    {"error_type": "runtime_identity_required"}
+                ]
+                upload.processing_completed_at = legacy_candidate.completed_at
+                await db.commit()
+                raise RuntimeIdentityRequiredError(
+                    "Strict-local worker runtime identity is required."
+                )
+
+            try:
+                upload_snapshot, upload_digest = canonicalize_manifest_snapshot(
+                    upload.processing_manifest
+                )
+            except LocalAIError as exc:
+                raise LocalPolicyError(
+                    "Strict-local upload snapshot is invalid."
+                ) from exc
+            if upload_snapshot != upload.processing_manifest:
+                raise LocalPolicyError("Strict-local upload snapshot is invalid.")
+
+            job = (
                 await db.execute(
                     select(LocalAIJob)
                     .where(
                         LocalAIJob.upload_id == upload_id,
                         LocalAIJob.user_id == user_id,
-                        LocalAIJob.kind == "ingestion",
                         LocalAIJob.processing_mode == "validated_strict_local",
-                        LocalAIJob.status.in_(("queued", "processing")),
+                        LocalAIJob.manifest_snapshot == upload_snapshot,
+                        LocalAIJob.manifest_sha256 == upload_digest,
                     )
-                    .order_by(LocalAIJob.created_at.desc(), LocalAIJob.id.desc())
                     .limit(1)
                     .with_for_update()
                 )
-            )
-            .scalars()
-            .first()
-        )
-        if legacy_candidate is not None and fail_legacy_runtime_identity_required(
-            legacy_candidate
-        ):
-            job_id = legacy_candidate.id
-            upload.ingestion_status = "failed"
-            upload.progress_stage = None
-            upload.progress_detail = None
-            upload.ingestion_errors = [
-                {"error_type": "runtime_identity_required"}
-            ]
-            upload.processing_completed_at = legacy_candidate.completed_at
-            await db.commit()
-            raise RuntimeIdentityRequiredError(
-                "Strict-local worker runtime identity is required."
-            )
+            ).scalar_one_or_none()
+            if job is None:
+                raise LocalPolicyError("Strict-local job snapshot is unavailable.")
+            job_id = job.id
+            if job.status == "processing":
+                await db.rollback()
+                return
+            if job.status != "queued" or await _strict_cancel_requested(
+                db, upload_id, job_id
+            ):
+                raise LocalPolicyError("Strict-local job was cancelled.")
+        except Exception as exc:
+            if not await terminalize_failure(exc):
+                return
+            if isinstance(exc, LocalAIError):
+                raise
+            raise LocalAIError("Strict-local processing did not complete.") from None
 
-        try:
-            upload_snapshot, upload_digest = canonicalize_manifest_snapshot(
-                upload.processing_manifest
-            )
-        except LocalAIError as exc:
-            raise LocalPolicyError("Strict-local upload snapshot is invalid.") from exc
-        if upload_snapshot != upload.processing_manifest:
-            raise LocalPolicyError("Strict-local upload snapshot is invalid.")
+        claim_started_at = datetime.now(timezone.utc)
+        job.status = "processing"
+        job.stage = failure_stage
+        job.started_at = claim_started_at
+        job.failure = None
+        await db.commit()
 
-        job = (
-            await db.execute(
-                select(LocalAIJob)
-                .where(
-                    LocalAIJob.upload_id == upload_id,
-                    LocalAIJob.user_id == user_id,
-                    LocalAIJob.processing_mode == "validated_strict_local",
-                    LocalAIJob.manifest_snapshot == upload_snapshot,
-                    LocalAIJob.manifest_sha256 == upload_digest,
-                )
-                .limit(1)
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if job is None:
-            raise LocalPolicyError("Strict-local job snapshot is unavailable.")
-        job_id = job.id
-        if job.status == "processing":
-            await db.rollback()
-            return
-        if job.status != "queued" or await _strict_cancel_requested(
-            db, upload_id, job_id
-        ):
-            raise LocalPolicyError("Strict-local job was cancelled.")
-    except Exception as exc:
-        if not await terminalize_failure(exc):
-            return
-        if isinstance(exc, LocalAIError):
-            raise
-        raise LocalAIError("Strict-local processing did not complete.") from None
-
-    claim_started_at = datetime.now(timezone.utc)
-    job.status = "processing"
-    job.stage = failure_stage
-    job.started_at = claim_started_at
-    job.failure = None
-    await db.commit()
+    if strict_claim is not None and await _strict_cancel_requested(
+        db,
+        upload_id,
+        job_id,
+    ):
+        await terminalize_failure(LocalPolicyError("Strict-local job was cancelled."))
+        return
 
     async def publish_progress(value: dict[str, object]) -> None:
         nonlocal failure_stage
@@ -3153,7 +3322,11 @@ async def _run_strict_local_ingestion_for_upload(
 
 
 async def _process_unstructured(
-    upload_id: UUID, file_path: Path, user_id: UUID
+    upload_id: UUID,
+    file_path: Path,
+    user_id: UUID,
+    *,
+    strict_claim: "StrictIngestionClaim | None" = None,
 ) -> None:
     """Background task: extract text then entities from an unstructured file.
 
@@ -3176,6 +3349,23 @@ async def _process_unstructured(
         if not upload:
             return
         is_strict_local = upload.processing_mode == "validated_strict_local"
+
+        if strict_claim is not None:
+            if (
+                not is_strict_local
+                or upload.id != strict_claim.upload_id
+                or user_id != strict_claim.user_id
+            ):
+                await db.rollback()
+                return
+            await _run_strict_local_ingestion_for_upload(
+                db,
+                upload,
+                file_path,
+                user_id,
+                strict_claim=strict_claim,
+            )
+            return
 
         # Cooperative cancel: if cancellation was requested before the worker
         # got here, abort immediately without doing any extraction work.
@@ -3523,6 +3713,7 @@ async def upload_unstructured(
 
     return UnstructuredUploadResponse(
         upload_id=str(upload_record.id),
+        filename=upload_record.filename,
         status=upload_record.ingestion_status,
         file_type=_unstructured_file_type(ext),
     )
@@ -3542,37 +3733,66 @@ async def upload_unstructured_batch(
     """Upload multiple unstructured files for concurrent processing."""
     from app.services.ingestion.reextraction import find_prior_extracted_upload
 
-    snapshot = await _resolve_ingestion_snapshot_or_409(
-        db,
-        user_id,
-        processing_mode,
-    )
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    results = []
+    snapshot: ProcessingSnapshot | None = None
+    results: list[UnstructuredUploadResponse] = []
+    rejected: list[RejectedUnstructuredUpload] = []
     for file in files:
         if not file.filename:
+            _append_batch_rejection(
+                rejected,
+                filename="",
+                code="missing_filename",
+            )
             continue
 
         ext = Path(file.filename).suffix.lower()
         if ext not in ALLOWED_UNSTRUCTURED:
+            _append_batch_rejection(
+                rejected,
+                filename=file.filename,
+                code="unsupported_type",
+            )
             continue
 
         file_path = _safe_file_path(upload_dir, user_id, file.filename)
-        # SEC-DOS-01: stream each file to disk under the size cap; oversize files
-        # abort + unlink and are silently skipped (batch is best-effort).
+        # SEC-DOS-01: stream each file to disk under the size cap.
         # CRYPTO-02: encrypt each unstructured PHI document at rest as it streams.
         try:
             file_size, header, file_hash = await _stream_upload_to_disk(
                 file, file_path, settings.max_file_size_mb * 1024 * 1024
             )
-        except HTTPException:
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_413_CONTENT_TOO_LARGE:
+                raise
+            _append_batch_rejection(
+                rejected,
+                filename=file.filename,
+                code="file_too_large",
+            )
             continue
 
         if not _validate_magic_bytes(header, ext):
             file_path.unlink(missing_ok=True)
+            _append_batch_rejection(
+                rejected,
+                filename=file.filename,
+                code="invalid_signature",
+            )
             continue
+
+        if snapshot is None:
+            try:
+                snapshot = await _resolve_ingestion_snapshot_or_409(
+                    db,
+                    user_id,
+                    processing_mode,
+                )
+            except BaseException:
+                file_path.unlink(missing_ok=True)
+                raise
 
         # Plaintext SHA-256 from the streaming pass (deterministic re-upload dedup).
         prior = await find_prior_extracted_upload(
@@ -3633,6 +3853,7 @@ async def upload_unstructured_batch(
         results.append(
             UnstructuredUploadResponse(
                 upload_id=str(upload_record.id),
+                filename=upload_record.filename,
                 status=upload_record.ingestion_status,
                 file_type=_unstructured_file_type(ext),
             )
@@ -3642,7 +3863,11 @@ async def upload_unstructured_batch(
 
     # Worker will pick up files automatically via DB polling (duplicate_file rows are skipped)
 
-    return BatchUploadResponse(uploads=results, total=len(results))
+    return BatchUploadResponse(
+        uploads=results,
+        rejected=rejected,
+        total=len(results),
+    )
 
 
 @router.post(
@@ -3754,6 +3979,7 @@ async def reprocess_unstructured_upload(
     if existing is not None:
         return UnstructuredUploadResponse(
             upload_id=str(existing.id),
+            filename=existing.filename,
             status=existing.ingestion_status,
             file_type=_unstructured_file_type(extension),
         )
@@ -3800,6 +4026,7 @@ async def reprocess_unstructured_upload(
 
     return UnstructuredUploadResponse(
         upload_id=str(upload_record.id),
+        filename=upload_record.filename,
         status=upload_record.ingestion_status,
         file_type=_unstructured_file_type(extension),
     )

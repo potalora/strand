@@ -19,6 +19,8 @@ import { getFilesFromDrop } from "@/lib/getFilesFromDrop";
 import { api, getLlmSettings, type OcrNotice } from "@/lib/api";
 import type {
   UploadResponse,
+  UnstructuredBatchRejectionCode,
+  UnstructuredBatchResponse,
   UnstructuredUploadResponse,
 } from "@/types/api";
 import { OcrNotices } from "@/components/retro/OcrNotices";
@@ -61,6 +63,15 @@ const UPLOAD_PROCESSING_MODES = new Set<ProcessingMode>([
   "validated_strict_local",
   "cloud_assisted",
 ]);
+const BATCH_REJECTION_COPY: Record<
+  UnstructuredBatchRejectionCode,
+  string
+> = {
+  missing_filename: "This file did not include a filename.",
+  unsupported_type: "This file type is not supported.",
+  file_too_large: "This file is larger than the upload limit.",
+  invalid_signature: "This file does not match its claimed format.",
+};
 function uploadBlockedModeLabel(mode: ProcessingMode): string {
   if (mode === "custom_local") return "Custom local (unverified)";
   if (mode === "prompt_only") return "Prompt only";
@@ -476,10 +487,14 @@ export default function UploadPage() {
           "/upload/unstructured",
           formData
         );
-        results.push({ type: "unstructured", filename: file.name, response: resp });
+        results.push({
+          type: "unstructured",
+          filename: resp.filename,
+          response: resp,
+        });
         batchInputs.push({
           upload_id: resp.upload_id,
-          filename: file.name,
+          filename: resp.filename,
           status: resp.status || "pending_extraction",
           needsTrigger: resp.manual_extraction_required === true,
         });
@@ -497,26 +512,41 @@ export default function UploadPage() {
           formData.append("files", file);
         }
         formData.append("processing_mode", uploadProcessingMode);
-        const resp = await api.postForm<{
-          uploads: UnstructuredUploadResponse[];
-        }>("/upload/unstructured-batch", formData);
-        for (let i = 0; i < resp.uploads.length; i++) {
-          const upload = resp.uploads[i];
-          const filename = unstructured[i]?.name || `file-${i}`;
-          results.push({ type: "unstructured", filename, response: upload });
+        const resp = await api.postForm<UnstructuredBatchResponse>(
+          "/upload/unstructured-batch",
+          formData
+        );
+        for (const upload of resp.uploads) {
+          results.push({
+            type: "unstructured",
+            filename: upload.filename,
+            response: upload,
+          });
           batchInputs.push({
             upload_id: upload.upload_id,
-            filename,
+            filename: upload.filename,
             status: upload.status || "pending_extraction",
             needsTrigger: upload.manual_extraction_required === true,
           });
         }
-      } catch (err) {
+        for (const rejection of resp.rejected) {
+          results.push({
+            type: "unstructured",
+            filename: rejection.filename || "Unnamed file",
+            error: BATCH_REJECTION_COPY[rejection.code],
+          });
+        }
+        if (resp.uploads.length === 0 && resp.rejected.length > 0) {
+          setUploadError(
+            "No files were accepted. Choose a supported PDF, RTF, or TIFF and try again."
+          );
+        }
+      } catch {
         for (const file of unstructured) {
           results.push({
             type: "unstructured",
             filename: file.name,
-            error: err instanceof Error ? err.message : "Batch upload failed",
+            error: "Batch upload failed",
           });
         }
       }
@@ -1003,7 +1033,14 @@ export default function UploadPage() {
       {uploadResults.length > 0 && !uploading && (
         <div className="card-surface pad">
           <div className="card-h">
-            <h3 className="sec-title">Upload complete</h3>
+            <h3 className="sec-title">
+              {uploadResults.every(
+                (result) =>
+                  result.type === "unstructured" && result.error !== undefined
+              )
+                ? "Upload results"
+                : "Upload complete"}
+            </h3>
           </div>
           <div>
             {uploadResults.map((result, i) => (
