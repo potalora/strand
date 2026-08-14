@@ -321,6 +321,7 @@ async def test_retry_sweeps_orphan_staging_before_requeue(
 @pytest.mark.asyncio
 async def test_ready_pack_remains_ready_after_failed_maintenance_operation(
     lifecycle_paths,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.api.local_ai import get_local_pack_status
 
@@ -336,7 +337,10 @@ async def test_ready_pack_remains_ready_after_failed_maintenance_operation(
         retryable=True,
     )
 
-    response = await get_local_pack_status(UUID(int=1))
+    operator_id = UUID(int=1)
+    monkeypatch.setattr(settings, "_local_ai_operator_ids", frozenset({operator_id}))
+
+    response = await get_local_pack_status(operator_id)
     body = response.model_dump(mode="json")
 
     assert body["state"] == "ready"
@@ -622,6 +626,7 @@ async def test_restart_rejects_operation_while_prior_runner_holds_lease(
 @pytest.mark.asyncio
 async def test_active_maintenance_precedes_ready_pack_status(
     lifecycle_paths,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.api.local_ai import get_local_pack_status
 
@@ -636,7 +641,10 @@ async def test_active_maintenance_precedes_ready_pack_status(
         message="Running local validation fixtures.",
     )
 
-    response = await get_local_pack_status(UUID(int=1))
+    operator_id = UUID(int=1)
+    monkeypatch.setattr(settings, "_local_ai_operator_ids", frozenset({operator_id}))
+
+    response = await get_local_pack_status(operator_id)
 
     assert response.state == "verifying"
     assert response.operation is not None

@@ -219,6 +219,7 @@ async function mockBackend(
       return json({
         platform: "apple_silicon",
         compatible: true,
+        can_manage_pack: false,
         state: "ready",
         active_revision: "apple-m4-16gb-v1",
         available_revision: "apple-m4-16gb-v1",

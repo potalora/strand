@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID, uuid4
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import select
 
@@ -34,6 +35,16 @@ from app.services.local_ai.validation_receipt import (
     _issue_runtime_validation_receipt,
 )
 from tests.conftest import auth_headers, create_test_patient
+
+
+@pytest_asyncio.fixture
+async def local_ai_operator_headers(client, monkeypatch: pytest.MonkeyPatch):
+    headers, user_id = await auth_headers(
+        client,
+        email="local-ai-operator@example.com",
+    )
+    monkeypatch.setattr(settings, "_local_ai_operator_ids", frozenset({UUID(user_id)}))
+    return headers, UUID(user_id)
 
 
 def _manifest(
@@ -1117,11 +1128,173 @@ def local_ai_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    (
+        ("post", "/api/v1/local-ai/install"),
+        (
+            "get",
+            "/api/v1/local-ai/operations/00000000-0000-0000-0000-000000000001",
+        ),
+        (
+            "post",
+            "/api/v1/local-ai/operations/00000000-0000-0000-0000-000000000001/resume",
+        ),
+        (
+            "post",
+            "/api/v1/local-ai/operations/00000000-0000-0000-0000-000000000001/retry",
+        ),
+        ("post", "/api/v1/local-ai/verify"),
+        ("post", "/api/v1/local-ai/update"),
+        ("post", "/api/v1/local-ai/rollback"),
+        ("delete", "/api/v1/local-ai/models/summary"),
+        ("delete", "/api/v1/local-ai"),
+    ),
+)
+async def test_non_operator_cannot_access_any_global_pack_endpoint(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+    local_ai_paths,
+    method: str,
+    path: str,
+) -> None:
+    headers, _user_id = await auth_headers(
+        client,
+        email="ordinary-pack-user@example.com",
+    )
+    monkeypatch.setattr(settings, "_local_ai_operator_ids", frozenset({uuid4()}))
+
+    async def leave_queued(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr("app.api.local_ai.run_operation", leave_queued)
+
+    response = await getattr(client, method)(path, headers=headers)
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "detail": "Local model pack management requires a machine operator."
+    }
+
+
+@pytest.mark.asyncio
+async def test_global_pack_endpoint_preserves_401_without_credentials(client) -> None:
+    response = await client.post("/api/v1/local-ai/install")
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_status_is_readable_but_hides_operation_detail_from_non_operator(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+    local_ai_paths,
+) -> None:
+    manifest, _contents, model_root = local_ai_paths
+    headers, _user_id = await auth_headers(
+        client,
+        email="status-only-user@example.com",
+    )
+    monkeypatch.setattr(settings, "_local_ai_operator_ids", frozenset({uuid4()}))
+    PackOperationStore(ArtifactStore(model_root)).create(
+        action="install",
+        manifest=manifest,
+    )
+
+    response = await client.get("/api/v1/local-ai/status", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["can_manage_pack"] is False
+    assert response.json()["operation"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation_state", ("queued", "paused"))
+async def test_non_operator_verify_operation_reports_truthful_verifying_state(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+    local_ai_paths,
+    operation_state: str,
+) -> None:
+    manifest, contents, model_root = local_ai_paths
+    headers, _user_id = await auth_headers(
+        client,
+        email=f"status-verify-{operation_state}@example.com",
+    )
+    monkeypatch.setattr(settings, "_local_ai_operator_ids", frozenset({uuid4()}))
+    store = _install_pack(model_root, manifest, contents)
+    operation_store = PackOperationStore(store)
+    operation = operation_store.create(action="verify", manifest=manifest)
+    if operation_state == "paused":
+        operation_store.transition(
+            operation["id"],
+            expected_states="queued",
+            state="paused",
+            message="Model pack operation paused.",
+            retryable=True,
+        )
+
+    response = await client.get("/api/v1/local-ai/status", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["can_manage_pack"] is False
+    assert response.json()["operation"] is None
+    assert response.json()["state"] == "verifying"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ("install", "update"))
+@pytest.mark.parametrize(
+    ("operation_state", "message", "expected_pack_state"),
+    (
+        ("queued", None, "downloading"),
+        ("running", "Running local validation fixtures.", "verifying"),
+    ),
+)
+async def test_non_operator_install_update_status_distinguishes_lifecycle_phase(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+    local_ai_paths,
+    action: str,
+    operation_state: str,
+    message: str | None,
+    expected_pack_state: str,
+) -> None:
+    manifest, _contents, model_root = local_ai_paths
+    headers, _user_id = await auth_headers(
+        client,
+        email=f"status-{action}-{operation_state}@example.com",
+    )
+    monkeypatch.setattr(settings, "_local_ai_operator_ids", frozenset({uuid4()}))
+    store = ArtifactStore(model_root)
+    if action == "update":
+        prior, prior_contents = _manifest("apple-m4-16gb-prior")
+        store = _install_pack(model_root, prior, prior_contents)
+    operation_store = PackOperationStore(store)
+    operation = operation_store.create(action=action, manifest=manifest)
+    if operation_state == "running":
+        operation_store.transition(
+            operation["id"],
+            expected_states="queued",
+            state="running",
+            message=message,
+        )
+
+    response = await client.get("/api/v1/local-ai/status", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["can_manage_pack"] is False
+    assert response.json()["operation"] is None
+    assert response.json()["state"] == expected_pack_state
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("action", ("install", "update", "verify"))
 async def test_public_lifecycle_rejects_missing_release_evidence(
     client,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
     action: str,
 ) -> None:
     import app.api.local_ai as local_ai_module
@@ -1138,7 +1311,7 @@ async def test_public_lifecycle_rejects_missing_release_evidence(
             )
         ),
     )
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
 
     response = await client.post(f"/api/v1/local-ai/{action}", headers=headers)
 
@@ -1151,8 +1324,9 @@ async def test_install_returns_document_free_operation(
     client,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
 
     async def leave_queued(*_args, **_kwargs) -> None:
         return None
@@ -1175,8 +1349,9 @@ async def test_operation_status_is_persisted_and_document_free(
     client,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
 
     async def leave_queued(*_args, **_kwargs) -> None:
         return None
@@ -1212,8 +1387,9 @@ async def test_second_lifecycle_mutation_is_refused_while_one_is_nonterminal(
     client,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
 
     async def leave_queued(*_args, **_kwargs) -> None:
         return None
@@ -1231,8 +1407,9 @@ async def test_resume_and_retry_enforce_operation_state(
     client,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
 
     async def leave_queued(*_args, **_kwargs) -> None:
         return None
@@ -1259,9 +1436,10 @@ async def test_resume_and_retry_restart_from_zero_after_staging_cleanup(
     client,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
     _manifest_value, _contents, model_root = local_ai_paths
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
 
     async def leave_queued(*_args, **_kwargs) -> None:
         return None
@@ -1321,6 +1499,7 @@ async def test_status_reflects_exact_validation_receipt_without_fake_memory(
     client,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
     manifest, contents, model_root = local_ai_paths
     monkeypatch.setattr(settings, "local_ai_enabled", False)
@@ -1329,7 +1508,7 @@ async def test_status_reflects_exact_validation_receipt_without_fake_memory(
         "local_ai_release_evidence_path",
         str(model_root.parent / "missing.release.json"),
     )
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
     _install_pack(model_root, manifest, contents)
 
     response = await client.get("/api/v1/local-ai/status", headers=headers)
@@ -1339,6 +1518,7 @@ async def test_status_reflects_exact_validation_receipt_without_fake_memory(
     assert body["platform"] == "apple_silicon"
     assert body["compatible"] is True
     assert body["enabled"] is False
+    assert body["can_manage_pack"] is True
     assert body["active_revision"] == manifest.pack_revision
     assert body["state"] == "preview"
     assert body["status_reason"] == "feature_disabled"
@@ -1398,9 +1578,10 @@ async def test_verify_marks_only_a_successfully_verified_active_pack_ready(
     client,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
     manifest, contents, model_root = local_ai_paths
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
     _install_pack(model_root, manifest, contents)
 
     async def verified(*_args, **_kwargs):
@@ -1422,9 +1603,10 @@ async def test_install_validates_staging_before_atomic_activation(
     db_session,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
     manifest, contents, model_root = local_ai_paths
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
     store = ArtifactStore(model_root)
     validation_saw_inactive_pack = False
 
@@ -1488,12 +1670,10 @@ async def test_job_admitted_during_validation_prevents_pack_activation(
     db_session,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
     manifest, contents, model_root = local_ai_paths
-    headers, user_id = await auth_headers(
-        client,
-        email="activation-race@example.com",
-    )
+    headers, user_id = local_ai_operator_headers
     store = ArtifactStore(model_root)
 
     async def staged_download(selected_manifest, selected_store, _progress_callback):
@@ -1507,7 +1687,7 @@ async def test_job_admitted_during_validation_prevents_pack_activation(
 
     async def admit_job_before_activation(_manifest, _candidate_path):
         upload = UploadedFile(
-            user_id=UUID(user_id),
+            user_id=user_id,
             filename="already-admitted.pdf",
             mime_type="application/pdf",
             file_hash="b" * 64,
@@ -1522,7 +1702,7 @@ async def test_job_admitted_during_validation_prevents_pack_activation(
         await db_session.flush()
         db_session.add(
             LocalAIJob(
-                user_id=UUID(user_id),
+                user_id=user_id,
                 upload_id=upload.id,
                 kind="ingestion",
                 processing_mode="validated_strict_local",
@@ -1559,9 +1739,10 @@ async def test_failed_runtime_validation_never_activates_staged_pack(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
     manifest, contents, model_root = local_ai_paths
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
     store = ArtifactStore(model_root)
 
     async def staged_download(selected_manifest, selected_store, _progress_callback):
@@ -1600,9 +1781,10 @@ async def test_failed_update_validation_preserves_prior_verified_active_pointer(
     client,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
     available, available_contents, model_root = local_ai_paths
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
     prior, prior_contents = _manifest("apple-m4-16gb-prior")
     store = _install_pack(model_root, prior, prior_contents)
     PackOperationStore(store).mark_validated(
@@ -1672,9 +1854,10 @@ async def test_rollback_never_points_at_an_unvalidated_previous_pack(
     client,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
     current, current_contents, model_root = local_ai_paths
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
     prior, prior_contents = _manifest("apple-m4-16gb-prior")
     store = _install_pack(model_root, prior, prior_contents)
     _install_pack(model_root, current, current_contents)
@@ -1704,11 +1887,12 @@ async def test_remove_refuses_any_active_local_job(
     client,
     db_session,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
     manifest, _contents, _model_root = local_ai_paths
-    headers, user_id = await auth_headers(client)
+    headers, user_id = local_ai_operator_headers
     upload = UploadedFile(
-        user_id=UUID(user_id),
+        user_id=user_id,
         filename="note.pdf",
         mime_type="application/pdf",
         file_hash="a" * 64,
@@ -1721,7 +1905,7 @@ async def test_remove_refuses_any_active_local_job(
     await db_session.flush()
     db_session.add(
         LocalAIJob(
-            user_id=UUID(user_id),
+            user_id=user_id,
             upload_id=upload.id,
             kind="ingestion",
             processing_mode="validated_strict_local",
@@ -1738,13 +1922,34 @@ async def test_remove_refuses_any_active_local_job(
 
 
 @pytest.mark.asyncio
+async def test_operator_can_remove_one_model_role(
+    client,
+    local_ai_paths,
+    local_ai_operator_headers,
+) -> None:
+    manifest, contents, model_root = local_ai_paths
+    headers, _user_id = local_ai_operator_headers
+    store = _install_pack(model_root, manifest, contents)
+
+    response = await client.delete(
+        "/api/v1/local-ai/models/summary",
+        headers=headers,
+    )
+
+    assert response.status_code == 204
+    assert store.active_revision() is None
+    assert not (store.packs_dir / manifest.pack_revision / "summary").exists()
+
+
+@pytest.mark.asyncio
 async def test_pack_audit_details_are_content_free(
     client,
     db_session,
     monkeypatch: pytest.MonkeyPatch,
     local_ai_paths,
+    local_ai_operator_headers,
 ) -> None:
-    headers, _ = await auth_headers(client)
+    headers, _ = local_ai_operator_headers
 
     async def leave_queued(*_args, **_kwargs) -> None:
         return None

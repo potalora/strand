@@ -19,6 +19,7 @@ const PACK_STATUS: LocalPackStatus = {
   platform: "apple_silicon",
   compatible: true,
   enabled: true,
+  can_manage_pack: true,
   state: "ready",
   status_reason: null,
   active_revision: "apple-m4-16gb-v1",

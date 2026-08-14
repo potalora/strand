@@ -73,6 +73,7 @@ export interface LocalPackStatus {
     | "unsupported";
   compatible: boolean;
   enabled: boolean;
+  can_manage_pack: boolean;
   state: PackState;
   status_reason: LocalPackStatusReason | null;
   active_revision: string | null;

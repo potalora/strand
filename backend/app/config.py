@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from uuid import UUID
 
-from pydantic import Field, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -16,8 +17,26 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", ""})
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # backend/../..
 
 
+def _parse_local_ai_operator_ids(raw: str) -> frozenset[UUID]:
+    if raw.strip() == "":
+        return frozenset()
+    values = [value.strip() for value in raw.split(",")]
+    if any(not value for value in values):
+        raise ValueError(
+            "LOCAL_AI_OPERATOR_USER_IDS must be empty or a comma-separated list of UUIDs"
+        )
+    try:
+        return frozenset(UUID(value) for value in values)
+    except ValueError as exc:
+        raise ValueError(
+            "LOCAL_AI_OPERATOR_USER_IDS must be empty or a comma-separated list of UUIDs"
+        ) from exc
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
+
+    _local_ai_operator_ids: frozenset[UUID] = PrivateAttr(default_factory=frozenset)
 
     model_config = SettingsConfigDict(
         env_file=str(_PROJECT_ROOT / ".env"),
@@ -40,6 +59,17 @@ class Settings(BaseSettings):
             "local",
             "test",
         }
+
+    @model_validator(mode="after")
+    def validate_local_ai_operator_user_ids(self) -> "Settings":
+        self._local_ai_operator_ids = _parse_local_ai_operator_ids(
+            self.local_ai_operator_user_ids
+        )
+        return self
+
+    @property
+    def local_ai_operator_ids(self) -> frozenset[UUID]:
+        return self._local_ai_operator_ids
 
     @model_validator(mode="after")
     def validate_production_secrets(self) -> "Settings":
@@ -210,6 +240,7 @@ class Settings(BaseSettings):
     # Validated strict-local model pack. The shipped profile is opt-in and
     # still requires an installed pack, exact receipt, and release evidence.
     local_ai_enabled: bool = False
+    local_ai_operator_user_ids: str = ""
     local_ai_model_dir: str = "./data/local-ai/models"
     local_ai_scratch_dir: str = "./data/local-ai/scratch"
     local_ai_manifest_path: str = "./app/model_manifests/apple-m4-16gb-v1.lock.json"

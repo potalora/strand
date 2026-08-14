@@ -115,7 +115,8 @@ async function setup(
   previewReason: "feature_disabled" | "release_evidence_missing" =
     "feature_disabled",
   statusOperation?: StatusOperation,
-  terminalOutcome: "completed" | "failed" = "completed"
+  terminalOutcome: "completed" | "failed" = "completed",
+  canManagePack = true
 ) {
   await page.addInitScript((auth) => {
     localStorage.setItem("medtimeline-auth", JSON.stringify(auth));
@@ -142,6 +143,7 @@ async function setup(
         enabled:
           state === "ready" ||
           (state === "preview" && previewReason !== "feature_disabled"),
+        can_manage_pack: canManagePack,
         state,
         status_reason: state === "preview" ? previewReason : null,
         active_revision:
@@ -156,7 +158,7 @@ async function setup(
           expected_memory_bytes:
             modelMemory?.[model.role] ?? model.expected_memory_bytes,
         })),
-        operation: statusOperationSnapshot,
+        operation: canManagePack ? statusOperationSnapshot : null,
       });
     }
     if (url.endsWith("/local-ai") && method === "DELETE") {
@@ -168,6 +170,9 @@ async function setup(
       return json({ operation_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", state: "queued" }, 202);
     }
     if (url.includes("/local-ai/operations/")) {
+      if (!canManagePack && method === "GET") {
+        throw new Error("Non-operator status must not poll local-pack operations");
+      }
       if (operationPollFailures > 0) {
         operationPollFailures -= 1;
         return json({ detail: "temporary status failure" }, 503);
@@ -256,6 +261,45 @@ async function setup(
     return json({});
   });
 }
+
+test("non-operator sees readiness without local-pack controls", async ({ page }) => {
+  await setup(
+    page,
+    "not_installed",
+    undefined,
+    0,
+    undefined,
+    undefined,
+    undefined,
+    "feature_disabled",
+    undefined,
+    "completed",
+    false
+  );
+  await page.goto("/admin?tab=sys");
+
+  const card = page
+    .getByRole("heading", { name: "Validated local pack" })
+    .locator("..")
+    .locator("..")
+    .locator("..");
+  await expect(card).toContainText("Optional download");
+  await expect(card).toContainText(
+    "This model pack is managed by the machine operator."
+  );
+  for (const name of [
+    /install local pack/i,
+    /verify again/i,
+    /install verified update/i,
+    /roll back/i,
+    /resume operation/i,
+    /retry operation/i,
+    /remove pack/i,
+    /retry status check/i,
+  ]) {
+    await expect(card.getByRole("button", { name })).toHaveCount(0);
+  }
+});
 
 test("installs and verifies the platform pack without adding an Admin tab", async ({
   page,

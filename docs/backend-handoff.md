@@ -568,6 +568,13 @@ Confirm extracted entities and create FHIR health records.
 All endpoints below require authentication and are prefixed with
 `/api/v1/local-ai`.
 
+`LOCAL_AI_OPERATOR_USER_IDS` is a comma-separated UUID allowlist for browser
+accounts that may manage the machine-global pack. An empty value denies all web
+pack maintenance, and a malformed non-empty value stops backend startup. A
+missing or revoked credential receives `401`. An authenticated account absent
+from the allowlist receives `403` with `Local model pack management requires a
+machine operator.`
+
 The shipped platform profile is native Apple Silicon with at least 16 GB
 unified memory; 16 GB is both the minimum and recommended baseline. Its locked
 9.02 GiB pack uses OvisOCR2 for OCR, NuExtract3 for clinical extraction, and
@@ -594,12 +601,16 @@ three role identities, and at most one current lifecycle operation. Artifact
 download bytes are reported separately from expected resident memory. Expected
 memory is taken from the release evidence when the selected profile has
 measurements; it remains `null` for an unmeasured future profile.
+Every authenticated user can read this endpoint. `can_manage_pack` states
+whether the account may use the lifecycle controls. A non-operator receives
+`operation: null` even while `state` still reports `downloading` or `verifying`.
 
 ```json
 {
   "platform": "apple_silicon",
   "compatible": true,
   "enabled": false,
+  "can_manage_pack": false,
   "state": "not_installed",
   "status_reason": null,
   "active_revision": null,
@@ -660,6 +671,8 @@ otherwise validated active pack.
 
 ### Pack lifecycle
 
+Every route in this table requires a machine operator:
+
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/local-ai/install` | Download, hash-check, test offline, and activate the locked pack |
@@ -687,9 +700,16 @@ document text, prompts, evidence, patient identifiers, or model output.
 
 Only one lifecycle operation may be non-terminal. Pack mutation and
 strict-local job admission share a database advisory lock. Mutations return
-`409` while a clinical local-AI job is queued or processing.
+`409` while a clinical local-AI job is queued or processing, but only after
+operator authorization succeeds.
+
+Browser authorization does not restrict an operating-system owner using the
+documented local CLI maintenance commands.
 
 ### Local processing jobs
+
+These routes remain owner-scoped. They do not require machine-operator
+authority:
 
 | Method | Path | Purpose |
 | --- | --- | --- |

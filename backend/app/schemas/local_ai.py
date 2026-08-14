@@ -89,11 +89,12 @@ class LocalModelArtifactResponse(_StrictResponse):
 
 
 class LocalPackStatusResponse(_StrictResponse):
-    """Current platform, manifest, artifacts, and lifecycle operation."""
+    """Current pack readiness plus this user's management capability."""
 
     platform: PackPlatform
     compatible: bool
     enabled: bool
+    can_manage_pack: bool
     state: PackState
     status_reason: (
         Literal[

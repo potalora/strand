@@ -6,6 +6,7 @@ import { useLocalPackOperation } from "@/hooks/useLocalPackOperation";
 import type {
   LocalModelArtifact,
   LocalPackOperation,
+  LocalPackStatus,
   PackState,
 } from "@/types/local-ai";
 
@@ -18,6 +19,15 @@ const STATE_LABELS: Record<PackState, string> = {
   update_available: "Update available",
   failed: "Needs attention",
 };
+
+export const LOCAL_PACK_OPERATOR_COPY =
+  "This model pack is managed by the machine operator. You can review its status here.";
+
+export function canManageValidatedLocalPack(
+  status: Pick<LocalPackStatus, "can_manage_pack">
+): boolean {
+  return status.can_manage_pack;
+}
 
 function bytes(value: number): string {
   return `${(value / 1024 ** 3).toFixed(value >= 1024 ** 3 ? 1 : 2)} GiB`;
@@ -218,19 +228,19 @@ export function ValidatedLocalPackCard() {
             </p>
           )}
 
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
-            {status.state === "not_installed" && (
-              <button
-                type="button"
-                className="btn"
-                disabled={!status.compatible || busy}
-                onClick={() => void start("install")}
-              >
-                <Download size={14} /> Install local pack
-              </button>
-            )}
-            {status.state === "ready" && (
-              <>
+          {canManageValidatedLocalPack(status) ? (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
+              {status.state === "not_installed" && (
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={!status.compatible || busy}
+                  onClick={() => void start("install")}
+                >
+                  <Download size={14} /> Install local pack
+                </button>
+              )}
+              {status.state === "ready" && (
                 <button
                   type="button"
                   className="btn ghost sm"
@@ -239,70 +249,77 @@ export function ValidatedLocalPackCard() {
                 >
                   <RefreshCw size={14} /> Verify again
                 </button>
-              </>
-            )}
-            {status.state === "update_available" && (
-              <>
+              )}
+              {status.state === "update_available" && (
+                <>
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy}
+                    onClick={() => void start("update")}
+                  >
+                    <Download size={14} /> Install verified update
+                  </button>
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    disabled={busy}
+                    onClick={() => void start("rollback")}
+                  >
+                    <RotateCcw size={14} /> Roll back
+                  </button>
+                </>
+              )}
+              {operation?.state === "paused" && (
                 <button
                   type="button"
                   className="btn"
                   disabled={busy}
-                  onClick={() => void start("update")}
+                  onClick={() => void restart("resume")}
                 >
-                  <Download size={14} /> Install verified update
+                  Resume operation
                 </button>
+              )}
+              {operation?.state === "failed" && operation.retryable && (
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={busy}
+                  onClick={() => void restart("retry")}
+                >
+                  Retry operation
+                </button>
+              )}
+              {pollingInterrupted &&
+                operation &&
+                ["queued", "running"].includes(operation.state) && (
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy}
+                    onClick={retryPolling}
+                  >
+                    Retry status check
+                  </button>
+                )}
+              {artifactsMayBeInstalled && !busy && (
                 <button
                   type="button"
                   className="btn ghost sm"
-                  disabled={busy}
-                  onClick={() => void start("rollback")}
+                  onClick={() => void remove()}
                 >
-                  <RotateCcw size={14} /> Roll back
-                </button>
-              </>
-            )}
-            {operation?.state === "paused" && (
-              <button
-                type="button"
-                className="btn"
-                disabled={busy}
-                onClick={() => void restart("resume")}
-              >
-                Resume operation
-              </button>
-            )}
-            {operation?.state === "failed" && operation.retryable && (
-              <button
-                type="button"
-                className="btn"
-                disabled={busy}
-                onClick={() => void restart("retry")}
-              >
-                Retry operation
-              </button>
-            )}
-            {pollingInterrupted &&
-              operation &&
-              ["queued", "running"].includes(operation.state) && (
-                <button
-                  type="button"
-                  className="btn"
-                  disabled={busy}
-                  onClick={retryPolling}
-                >
-                  Retry status check
+                  <Trash2 size={14} /> Remove pack
                 </button>
               )}
-            {artifactsMayBeInstalled && !busy && (
-              <button
-                type="button"
-                className="btn ghost sm"
-                onClick={() => void remove()}
-              >
-                <Trash2 size={14} /> Remove pack
-              </button>
-            )}
-          </div>
+            </div>
+          ) : (
+            <p
+              className="muted"
+              style={{ fontSize: 13, lineHeight: 1.55, margin: "14px 0 0" }}
+            >
+              {LOCAL_PACK_OPERATOR_COPY}
+            </p>
+          )}
         </>
       )}
     </div>

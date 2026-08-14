@@ -8,6 +8,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db
 from app.middleware.auth import decode_token, get_current_user_id, security
 from app.models.token_blacklist import RevokedToken
@@ -47,4 +48,21 @@ async def get_authenticated_user_id(
                 detail="Token has been revoked",
             )
 
+    return user_id
+
+
+def is_local_ai_operator(user_id: UUID) -> bool:
+    """Return whether this authenticated user can manage the machine-global pack."""
+    return user_id in settings.local_ai_operator_ids
+
+
+async def require_local_ai_operator(
+    user_id: UUID = Depends(get_authenticated_user_id),
+) -> UUID:
+    """Require configured machine-operator authority for pack management."""
+    if not is_local_ai_operator(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Local model pack management requires a machine operator.",
+        )
     return user_id
