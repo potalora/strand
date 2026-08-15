@@ -129,9 +129,9 @@ _PERFORMED_RE = re.compile(
     re.IGNORECASE,
 )
 # Billing, claims, and authorization line-item wording. On those forms a listed
-# procedure is billed or requested, not clinically documented as performed, so
-# the wording supports a mentioned-not-performed assertion without forbidding
-# a present assertion that carries its own date or performance evidence.
+# procedure is billed or requested, not clinically documented as performed.
+# Administrative context therefore requires explicit performance wording for a
+# present assertion; ordinary clinical context may still use a date as support.
 _BILLED_RE = re.compile(
     r"(?:\bbill(?:ed|ing)?\b|\bcharge[ds]?\b|\bclaims?\b|\binvoice[ds]?\b|"
     r"\bline[\s-]*items?\b|\bcpt\b|\bhcpcs\b|"
@@ -141,8 +141,8 @@ _BILLED_RE = re.compile(
     re.IGNORECASE,
 )
 # Administrative billing-form signature, checked against the fact's own page.
-# Mirrors the worker's deterministic grounding; the effect is only to support
-# a conservative mentioned-not-performed assertion.
+# Mirrors the worker's deterministic grounding: dated or undated administrative
+# present claims require explicit performance wording.
 _BILLING_FORM_SIGNATURE_RE = re.compile(
     r"(?:place\s+of\s+service|revenue\s+code|allowed\s+amount|line[\s-]*items?|"
     r"\bpayer\b|\bbilled\b|\bbilling\b|\binvoice[ds]?\b|"
@@ -835,6 +835,7 @@ _LIFECYCLE_CONTINUATION_WORDS = _QUALIFIER_CONTINUATION_WORDS | frozenset(
         "mouth",
         "nose",
         "of",
+        "one",
         "pill",
         "pills",
         "puff",
@@ -1113,6 +1114,38 @@ def _is_supported_date(value: str) -> bool:
     return False
 
 
+def _has_subject_bound_performance(context: str, subject: str) -> bool:
+    """Return whether performance wording is syntactically bound to the subject."""
+    normalized_subject = subject.strip()
+    if not normalized_subject:
+        return False
+    subject_pattern = re.escape(normalized_subject).replace(r"\ ", r"\s+")
+    bounded_subject = rf"(?<!\w){subject_pattern}(?!\w)"
+    before_subject = (
+        rf"\b(?:underwent|performed|status\s+post|s\s*[/.-]\s*p)\s+"
+        rf"(?:(?:a|an|the)\s+)?{bounded_subject}"
+    )
+    after_subject = rf"{bounded_subject}\s+(?:was\s+)?(?:performed|completed|done)\b"
+    return (
+        re.search(
+            rf"(?:{before_subject}|{after_subject})",
+            context,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+def _procedure_requires_explicit_performance(
+    context: str, page_text: str | None, subject: str
+) -> bool:
+    """Return whether administrative procedure text lacks performance wording."""
+    administrative = _BILLED_RE.search(context) is not None or (
+        _BILLING_FORM_SIGNATURE_RE.search(page_text or "") is not None
+    )
+    return administrative and not _has_subject_bound_performance(context, subject)
+
+
 def _validate_assertion_guards(
     fact: EvidenceFact, category: str, path: str, page_text: str | None = None
 ) -> None:
@@ -1200,12 +1233,21 @@ def _validate_assertion_guards(
                 f"{path}.assertion",
                 "mentioned-not-performed assertion lacks source support",
             )
-        if (
-            assertion == AssertionState.PRESENT
-            and getattr(fact, "date", None) is None
-            and _PERFORMED_RE.search(context) is None
+        if assertion == AssertionState.PRESENT and (
+            _procedure_requires_explicit_performance(
+                context,
+                page_text,
+                _subject_text(fact, category),
+            )
+            or (
+                getattr(fact, "date", None) is None
+                and _PERFORMED_RE.search(context) is None
+            )
         ):
-            _fail(f"{path}.assertion", "performed assertion lacks source support")
+            _fail(
+                f"{path}.assertion",
+                "performed assertion lacks source performance evidence",
+            )
 
 
 def _validate_local_precision_guards(
@@ -1295,17 +1337,17 @@ def _unit_is_truncated(source: str, unit: str) -> bool:
     return found
 
 
-def _lifecycle_support_source(fact: EvidenceFact, category: str, path: str) -> str:
-    """Return the subject clause plus any trailing dosing-instruction clauses.
+def _lifecycle_subject_source(fact: EvidenceFact, category: str, path: str) -> str:
+    """Return the unique subject clause plus trailing dosing-instruction clauses.
 
-    Lifecycle support must come from the fact's own evidence. Dosing cues
-    routinely follow the subject after a boundary on real-world lines
-    ("Drug 20 mg tablet, Take 1 by mouth daily"), so walk the clauses after
-    the subject's clause and include each one that reads purely as a dosing
-    continuation (qualifier words, numbers, units). Stop at the first clause
-    that can carry its own clinical subject, so a qualifier belonging to
-    another subject never leaks into this fact (2026-08-07 medication blind
-    spot).
+    Lifecycle support, blockers, and uncertainty all share this subject-local
+    source. Dosing cues routinely follow the subject after a boundary on
+    real-world lines ("Drug 20 mg tablet, Take 1 by mouth daily"), so walk the
+    clauses after the subject's clause and include each one that reads purely
+    as a dosing continuation (qualifier words, numbers, units). Stop at the
+    first clause that can carry its own clinical subject, so a qualifier
+    belonging to another subject never leaks into this fact (2026-08-07
+    medication blind spot).
     """
     excerpt = fact.evidence_excerpt
     subject = _subject_text(fact, category)
@@ -1314,8 +1356,7 @@ def _lifecycle_support_source(fact: EvidenceFact, category: str, path: str) -> s
         return _fact_context(fact, category, path)
     matches = list(re.finditer(pattern, excerpt, re.IGNORECASE))
     if len(matches) != 1:
-        # Let the ordinary grounding path own this failure.
-        return _fact_context(fact, category, path)
+        return ""
     match = matches[0]
     boundaries = _semantic_boundaries(excerpt)
     segments: list[tuple[int, int]] = []
@@ -1359,14 +1400,7 @@ def _validate_lifecycle_status(
         and getattr(fact, "assertion", None) != AssertionState.PRESENT
     ):
         return
-    # Blocking/uncertain cues scan the full clause around the evidence
-    # occurrence: it is conservative to let anything inside the fact's own
-    # span defeat a promoted claim.
-    blocker_source = _verbatim_context(fact, path)
-    # Supporting cues scan only the subject clause plus dosing continuations:
-    # a signal may promote the claim only when it cannot belong to another
-    # subject inside the same span.
-    source = _lifecycle_support_source(fact, category, path)
+    source = _lifecycle_subject_source(fact, category, path)
     detected = next(
         (status for status, pattern in signals if pattern.search(source)),
         None,
@@ -1376,8 +1410,8 @@ def _validate_lifecycle_status(
     promoted = _PROMOTED_LIFECYCLE_STATES[category]
     blocker = _LIFECYCLE_BLOCKERS.get(category)
     if claimed == promoted and (
-        _UNCERTAIN_RE.search(blocker_source) is not None
-        or (blocker is not None and blocker.search(blocker_source) is not None)
+        _UNCERTAIN_RE.search(source) is not None
+        or (blocker is not None and blocker.search(source) is not None)
     ):
         _fail(f"{path}.status", "lifecycle state contradicts source evidence")
     if detected is not None and claimed not in {detected, "unknown"}:

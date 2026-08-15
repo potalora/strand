@@ -187,7 +187,7 @@ LOCAL_AI_JOB_DATABASE_GUARDS: tuple[DDL, ...] = (
                         RETURN false;
                     END IF;
                     IF jsonb_typeof(payload->'schema_version') <> 'number'
-                       OR payload->>'schema_version' <> '1'
+                       OR payload->>'schema_version' <> '2'
                        OR jsonb_typeof(payload->'pack_revision') <> 'string'
                        OR NOT local_ai_manifest_string_is_valid(payload->>'pack_revision')
                        OR payload->>'pack_revision'
@@ -201,7 +201,12 @@ LOCAL_AI_JOB_DATABASE_GUARDS: tuple[DDL, ...] = (
                     END IF;
                     IF NOT local_ai_json_has_exact_keys(
                         payload->'runtime',
-                        ARRAY['name', 'version']
+                        ARRAY[
+                            'name',
+                            'version',
+                            'worker_identity_scheme',
+                            'worker_bundle_sha256'
+                        ]
                     )
                        OR jsonb_typeof(payload->'runtime'->'name') <> 'string'
                        OR NOT local_ai_manifest_string_is_valid(
@@ -210,7 +215,17 @@ LOCAL_AI_JOB_DATABASE_GUARDS: tuple[DDL, ...] = (
                        OR jsonb_typeof(payload->'runtime'->'version') <> 'string'
                        OR NOT local_ai_manifest_string_is_valid(
                             payload->'runtime'->>'version'
-                       ) THEN
+                       )
+                       OR jsonb_typeof(
+                            payload->'runtime'->'worker_identity_scheme'
+                       ) <> 'string'
+                       OR payload->'runtime'->>'worker_identity_scheme'
+                            <> 'local-ai-worker-bundle.v1'
+                       OR jsonb_typeof(
+                            payload->'runtime'->'worker_bundle_sha256'
+                       ) <> 'string'
+                       OR payload->'runtime'->>'worker_bundle_sha256'
+                            !~ '^[0-9a-f]{64}$' THEN
                         RETURN false;
                     END IF;
                     IF jsonb_typeof(payload->'artifacts') <> 'array'
@@ -365,6 +380,53 @@ LOCAL_AI_JOB_DATABASE_GUARDS: tuple[DDL, ...] = (
     ).execute_if(dialect="postgresql"),
     DDL(
         """
+                CREATE OR REPLACE FUNCTION local_ai_legacy_manifest_is_valid(
+                    payload jsonb
+                )
+                RETURNS boolean
+                LANGUAGE plpgsql
+                IMMUTABLE
+                STRICT
+                AS $$
+                DECLARE
+                    attested_payload jsonb;
+                BEGIN
+                    IF NOT local_ai_json_has_exact_keys(
+                        payload,
+                        ARRAY[
+                            'schema_version',
+                            'pack_revision',
+                            'platform',
+                            'runtime',
+                            'validation_suite_version',
+                            'artifacts'
+                        ]
+                    )
+                       OR jsonb_typeof(payload->'schema_version') <> 'number'
+                       OR payload->>'schema_version' <> '1'
+                       OR NOT local_ai_json_has_exact_keys(
+                            payload->'runtime',
+                            ARRAY['name', 'version']
+                       ) THEN
+                        RETURN false;
+                    END IF;
+                    attested_payload := jsonb_set(
+                        jsonb_set(payload, '{schema_version}', '2'::jsonb),
+                        '{runtime}',
+                        payload->'runtime' || jsonb_build_object(
+                            'worker_identity_scheme',
+                            'local-ai-worker-bundle.v1',
+                            'worker_bundle_sha256',
+                            repeat('0', 64)
+                        )
+                    );
+                    RETURN local_ai_manifest_is_valid(attested_payload);
+                END;
+                $$
+                """
+    ).execute_if(dialect="postgresql"),
+    DDL(
+        """
                 CREATE OR REPLACE FUNCTION enforce_local_ai_job_identity()
                 RETURNS trigger
                 LANGUAGE plpgsql
@@ -396,11 +458,6 @@ LOCAL_AI_JOB_DATABASE_GUARDS: tuple[DDL, ...] = (
                             ERRCODE = '23514',
                             MESSAGE = 'local AI job processing mode is invalid';
                     END IF;
-                    IF NOT local_ai_manifest_is_valid(NEW.manifest_snapshot) THEN
-                        RAISE EXCEPTION USING
-                            ERRCODE = '23514',
-                            MESSAGE = 'local AI job manifest is invalid';
-                    END IF;
                     canonical_digest := encode(
                         sha256(
                             convert_to(
@@ -410,6 +467,46 @@ LOCAL_AI_JOB_DATABASE_GUARDS: tuple[DDL, ...] = (
                         ),
                         'hex'
                     );
+                    IF NOT local_ai_manifest_is_valid(NEW.manifest_snapshot) THEN
+                        IF NOT (
+                            TG_OP = 'UPDATE'
+                            AND local_ai_legacy_manifest_is_valid(
+                                OLD.manifest_snapshot
+                            )
+                            AND OLD.manifest_sha256 ~ '^[0-9a-f]{64}$'
+                            AND OLD.manifest_sha256 = canonical_digest
+                            AND NEW.id IS NOT DISTINCT FROM OLD.id
+                            AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at
+                            AND NEW.user_id IS NOT DISTINCT FROM OLD.user_id
+                            AND NEW.kind IS NOT DISTINCT FROM OLD.kind
+                            AND NEW.upload_id IS NOT DISTINCT FROM OLD.upload_id
+                            AND NEW.summary_prompt_id
+                                IS NOT DISTINCT FROM OLD.summary_prompt_id
+                            AND NEW.processing_mode
+                                IS NOT DISTINCT FROM OLD.processing_mode
+                            AND NEW.manifest_snapshot
+                                IS NOT DISTINCT FROM OLD.manifest_snapshot
+                            AND NEW.manifest_sha256
+                                IS NOT DISTINCT FROM OLD.manifest_sha256
+                            AND NEW.audit_metadata
+                                IS NOT DISTINCT FROM OLD.audit_metadata
+                            AND NEW.cancel_requested
+                                IS NOT DISTINCT FROM OLD.cancel_requested
+                            AND NEW.started_at
+                                IS NOT DISTINCT FROM OLD.started_at
+                            AND OLD.status IN ('queued', 'processing')
+                            AND NEW.status = 'failed'
+                            AND NEW.stage = 'failed'
+                            AND NEW.progress = '{"stage": "failed"}'::jsonb
+                            AND NEW.failure = '{"stage": "failed", "code": "runtime_identity_required", "retryable": false, "checkpoint_preserved": false, "cloud_fallback_attempted": false}'::jsonb
+                            AND NEW.completed_at IS NOT NULL
+                        ) THEN
+                            RAISE EXCEPTION USING
+                                ERRCODE = '23514',
+                                MESSAGE = 'local AI job manifest is invalid';
+                        END IF;
+                        RETURN NEW;
+                    END IF;
                     IF NEW.manifest_sha256 !~ '^[0-9a-f]{64}$'
                        OR NEW.manifest_sha256 <> canonical_digest THEN
                         RAISE EXCEPTION USING

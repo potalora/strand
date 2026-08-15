@@ -6,10 +6,12 @@ import os
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -24,8 +26,11 @@ from app.services.local_ai.errors import (
 from app.services.local_ai.model_manager import (
     LocalModelManager as ProductionLocalModelManager,
 )
+from app.services.local_ai.runtime_identity import resolve_worker_runtime_identity
 from app.services.local_ai.types import ModelRole
 from app.services.ai.summarizer import _bounded_summary_output_tokens
+from tests.test_local_ai_pack_verifier import _manifest as _runtime_manifest
+from tests.test_local_ai_runtime_identity import build_worker_project
 
 
 class LocalModelManager(ProductionLocalModelManager):
@@ -37,6 +42,17 @@ class LocalModelManager(ProductionLocalModelManager):
             _allow_unisolated_test_worker=True,
             **kwargs,
         )
+
+
+def _attested_manifest(bundle_sha256: str = "a" * 64):
+    manifest = _runtime_manifest()
+    return replace(
+        manifest,
+        runtime={
+            **manifest.runtime,
+            "worker_bundle_sha256": bundle_sha256,
+        },
+    )
 
 
 @pytest.fixture
@@ -309,14 +325,18 @@ def test_parent_watchdog_releases_sandboxed_lock_after_backend_crash(
             "from app.config import settings",
             "from app.services.local_ai.model_manager import LocalModelManager",
             "from app.services.local_ai.types import ModelRole",
+            "from tests.test_local_ai_model_manager import _attested_manifest",
             f"settings.local_ai_worker_command = {configured_command!r}",
             f"settings.local_ai_model_dir = {str(model_root)!r}",
             f"started_marker = Path({str(started_marker)!r})",
             "async def main():",
             f"    manager = LocalModelManager(worker_home={str(worker_home)!r})",
             "    await manager.start()",
+            "    manifest = _attested_manifest()",
+            "    def require_runtime(candidate): assert candidate is manifest",
+            "    manager._require_current_runtime = require_runtime",
             (
-                "    asyncio.create_task(manager.run("
+                "    asyncio.create_task(manager.run_attested(manifest, "
                 "ModelRole.OCR, {'job_id': 'hung-orphan', 'block': True, "
                 f"'started_marker_path': {str(started_marker)!r}}}))"
             ),
@@ -344,13 +364,17 @@ def test_parent_watchdog_releases_sandboxed_lock_after_backend_crash(
             "from app.config import settings",
             "from app.services.local_ai.model_manager import LocalModelManager",
             "from app.services.local_ai.types import ModelRole",
+            "from tests.test_local_ai_model_manager import _attested_manifest",
             f"settings.local_ai_worker_command = {configured_command!r}",
             f"settings.local_ai_model_dir = {str(model_root)!r}",
             "async def main():",
             f"    manager = LocalModelManager(worker_home={str(worker_home)!r})",
             "    await manager.start()",
+            "    manifest = _attested_manifest()",
+            "    def require_runtime(candidate): assert candidate is manifest",
+            "    manager._require_current_runtime = require_runtime",
             "    started = time.monotonic()",
-            "    await manager.run(ModelRole.OCR, {})",
+            "    await manager.run_attested(manifest, ModelRole.OCR, {})",
             "    print(json.dumps({'elapsed': time.monotonic() - started}), flush=True)",
             "    await manager.stop()",
             "asyncio.run(main())",
@@ -394,11 +418,15 @@ def test_parent_watchdog_retains_lock_through_failed_cleanup_and_backend_crash(
             "from app.services.local_ai.errors import LocalWorkerError",
             "from app.services.local_ai.model_manager import LocalModelManager",
             "from app.services.local_ai.types import ModelRole",
+            "from tests.test_local_ai_model_manager import _attested_manifest",
             f"settings.local_ai_worker_command = {configured_command!r}",
             f"settings.local_ai_model_dir = {str(model_root)!r}",
             "async def main():",
             f"    manager = LocalModelManager(worker_home={str(worker_home)!r})",
             "    await manager.start()",
+            "    manifest = _attested_manifest()",
+            "    def require_runtime(candidate): assert candidate is manifest",
+            "    manager._require_current_runtime = require_runtime",
             "    async def fail_after_parent_exit(process):",
             (
                 "        child_pids = [int(value) for value in "
@@ -417,7 +445,7 @@ def test_parent_watchdog_retains_lock_through_failed_cleanup_and_backend_crash(
             "    manager._terminate_process = fail_after_parent_exit",
             "    try:",
             (
-                "        await manager.run("
+                "        await manager.run_attested(manifest, "
                 "ModelRole.OCR, {'spawn_descendant': True, "
                 "'descendant_ignores_term': True, 'malformed': True})"
             ),
@@ -458,6 +486,7 @@ def test_parent_watchdog_retains_lock_through_failed_cleanup_and_backend_crash(
                 "from app.config import settings",
                 "from app.services.local_ai.model_manager import LocalModelManager",
                 "from app.services.local_ai.types import ModelRole",
+                "from tests.test_local_ai_model_manager import _attested_manifest",
                 f"settings.local_ai_worker_command = {configured_command!r}",
                 f"settings.local_ai_model_dir = {str(model_root)!r}",
                 "async def main():",
@@ -466,7 +495,10 @@ def test_parent_watchdog_retains_lock_through_failed_cleanup_and_backend_crash(
                     f"{str(worker_home.parent / 'follower-home')!r})"
                 ),
                 "    await manager.start()",
-                "    result = await manager.run(ModelRole.OCR, {})",
+                "    manifest = _attested_manifest()",
+                "    def require_runtime(candidate): assert candidate is manifest",
+                "    manager._require_current_runtime = require_runtime",
+                "    result = await manager.run_attested(manifest, ModelRole.OCR, {})",
                 "    print(json.dumps(result), flush=True)",
                 "    await manager.stop()",
                 "asyncio.run(main())",
@@ -536,13 +568,19 @@ async def test_default_manager_os_sandbox_denies_worker_network(
     )
     manager = ProductionLocalModelManager(worker_home=worker_home)
     await manager.start()
+    manifest = _attested_manifest()
+    monkeypatch.setattr(manager, "_require_current_runtime", lambda candidate: None)
 
-    result = await manager.run(ModelRole.OCR, {"probe_network": True})
+    result = await manager.run_attested(
+        manifest, ModelRole.OCR, {"probe_network": True}
+    )
 
     assert result["network_denied"] is True
     assert result["network_errno"] in {1, 13}
 
-    result = await manager.run(ModelRole.OCR, {"inspect_lock_fd": True})
+    result = await manager.run_attested(
+        manifest, ModelRole.OCR, {"inspect_lock_fd": True}
+    )
     assert result["lock_fd_inherited"] is True
     assert result["lock_identity_matches"] is True
     assert result["lock_path_exposed"] is False
@@ -553,7 +591,8 @@ async def test_default_manager_os_sandbox_denies_worker_network(
         try:
             server.bind(socket_path)
             server.listen(1)
-            result = await manager.run(
+            result = await manager.run_attested(
+                manifest,
                 ModelRole.OCR,
                 {"probe_unix_socket_path": socket_path},
             )
@@ -583,8 +622,12 @@ async def test_explicit_worker_command_does_not_bypass_os_sandbox(
         worker_home=worker_home,
     )
     await manager.start()
+    manifest = _attested_manifest()
+    monkeypatch.setattr(manager, "_require_current_runtime", lambda candidate: None)
 
-    result = await manager.run(ModelRole.OCR, {"probe_network": True})
+    result = await manager.run_attested(
+        manifest, ModelRole.OCR, {"probe_network": True}
+    )
 
     assert result["network_denied"] is True
     assert result["network_errno"] in {1, 13}
@@ -819,8 +862,8 @@ async def test_task_cancellation_during_spawn_reaps_created_process(
     spawned = asyncio.Event()
     spawned_pids: list[int] = []
 
-    async def delayed_spawn() -> asyncio.subprocess.Process:
-        process = await original_spawn()
+    async def delayed_spawn(environment: dict[str, str]) -> asyncio.subprocess.Process:
+        process = await original_spawn(environment)
         spawned_pids.append(process.pid)
         spawned.set()
         await asyncio.sleep(0.05)
@@ -851,11 +894,14 @@ async def test_task_cancellation_during_spawn_reaps_created_process(
 async def test_task_cancellation_during_cleanup_reaps_group_and_releases_lock(
     fake_worker_command: list[str], worker_home: Path
 ) -> None:
+    import app.services.local_ai.model_manager as manager_module
+
     manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
     await manager.start()
     original_terminate = manager._terminate_process
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()
+    followup_task: asyncio.Task[object] | None = None
 
     async def delayed_terminate(process: asyncio.subprocess.Process) -> None:
         cleanup_started.set()
@@ -863,39 +909,80 @@ async def test_task_cancellation_during_cleanup_reaps_group_and_releases_lock(
         await original_terminate(process)
 
     manager._terminate_process = delayed_terminate  # type: ignore[method-assign]
+    started_marker = worker_home.parent / "cleanup-cancel-started"
     task = asyncio.create_task(
         manager.run(
             ModelRole.OCR,
-            {"job_id": "cleanup-cancel", "spawn_descendant": True},
+            {
+                "job_id": "cleanup-cancel",
+                "spawn_descendant": True,
+                "started_marker_path": str(started_marker),
+            },
         )
     )
-    await asyncio.wait_for(cleanup_started.wait(), 1)
-    descendant_pid = int((worker_home / "descendant.pid").read_text())
+    try:
+        await manager.wait_until_running("cleanup-cancel")
+        for _attempt in range(500):
+            if started_marker.exists():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("fake worker did not reach its request")
+        descendant_pid = int((worker_home / "descendant.pid").read_text())
+        await asyncio.wait_for(cleanup_started.wait(), 3)
 
-    task.cancel()
-    release_cleanup.set()
+        task.cancel()
+        release_cleanup.set()
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 1)
-    with pytest.raises(ProcessLookupError):
-        os.kill(descendant_pid, 0)
-    assert manager.active_pid is None
-    assert manager.metrics.live_processes == 0
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        with pytest.raises(ProcessLookupError):
+            os.kill(descendant_pid, 0)
+        assert manager.active_pid is None
+        assert manager.metrics.live_processes == 0
+        assert manager._worker_process_lock_fd is None
+        assert manager._retained_worker_process_lease is None
+        assert not manager_module._global_role_process_lock().locked()
 
-    manager._terminate_process = original_terminate  # type: ignore[method-assign]
-    assert await asyncio.wait_for(manager.run(ModelRole.OCR, {}), 1) == {
-        "markdown": "# Synthetic OCR",
-        "page_number": 1,
-    }
-    await manager.stop()
+        manager._terminate_process = original_terminate  # type: ignore[method-assign]
+        followup_task = asyncio.create_task(
+            manager.run(
+                ModelRole.OCR,
+                {"job_id": "cleanup-followup"},
+            )
+        )
+        await manager.wait_until_running("cleanup-followup")
+        assert await asyncio.wait_for(followup_task, 5) == {
+            "markdown": "# Synthetic OCR",
+            "page_number": 1,
+        }
+    finally:
+        release_cleanup.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True),
+                5,
+            )
+        if followup_task is not None and not followup_task.done():
+            followup_task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(followup_task, return_exceptions=True),
+                5,
+            )
+        manager._terminate_process = original_terminate  # type: ignore[method-assign]
+        await manager.stop()
 
 
 @pytest.mark.asyncio
 async def test_cleanup_failure_before_group_death_poison_blocks_until_recovery(
-    fake_worker_command: list[str], worker_home: Path
+    fake_worker_command: list[str],
+    worker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
     await manager.start()
+    captured_environments = _capture_spawn_environments(manager, monkeypatch)
     original_terminate = manager._terminate_process
 
     async def failing_terminate(process: asyncio.subprocess.Process) -> None:
@@ -914,6 +1001,8 @@ async def test_cleanup_failure_before_group_death_poison_blocks_until_recovery(
     assert manager.active_pid is not None
     assert manager.metrics.live_processes == 1
     assert "cleanup-error" not in manager._jobs
+    retained_pycache = Path(captured_environments[0]["PYTHONPYCACHEPREFIX"])
+    assert retained_pycache.is_dir()
 
     roles_started = list(manager.metrics.roles_started)
     with pytest.raises(LocalWorkerError, match="unavailable"):
@@ -934,6 +1023,7 @@ async def test_cleanup_failure_before_group_death_poison_blocks_until_recovery(
     await manager.stop()
     assert manager.active_pid is None
     assert manager.metrics.live_processes == 0
+    assert not retained_pycache.exists()
     with pytest.raises(ProcessLookupError):
         os.kill(descendant_pid, 0)
 
@@ -1070,9 +1160,9 @@ async def test_repeated_cancellation_during_spawn_and_cleanup_never_loses_proces
     release_cleanup = asyncio.Event()
     spawned_pid: int | None = None
 
-    async def delayed_spawn() -> asyncio.subprocess.Process:
+    async def delayed_spawn(environment: dict[str, str]) -> asyncio.subprocess.Process:
         nonlocal spawned_pid
-        process = await original_spawn()
+        process = await original_spawn(environment)
         spawned_pid = process.pid
         spawn_created.set()
         await release_spawn.wait()
@@ -1427,26 +1517,28 @@ async def test_timeout_reaps_worker_and_returns_safe_taxonomy(
 
 
 @pytest.mark.asyncio
-async def test_forward_progress_extends_idle_timeout_but_not_hard_deadline(
+async def test_forward_progress_extends_idle_timeout_when_total_work_exceeds_idle(
     fake_worker_command: list[str], worker_home: Path
 ) -> None:
     manager = LocalModelManager(
         fake_worker_command,
         worker_home=worker_home,
-        timeout_seconds=0.25,
-        hard_timeout_seconds=1.0,
+        timeout_seconds=1.0,
+        hard_timeout_seconds=5.0,
     )
     await manager.start()
 
+    started_at = time.monotonic()
     result = await manager.run(
         ModelRole.EXTRACTION,
         {
             "progress_steps": 3,
-            "progress_delay_ms": 150,
+            "progress_delay_ms": 600,
         },
     )
 
     assert result["entities"] == []
+    assert time.monotonic() - started_at > 1.0
     assert manager.active_pid is None
     await manager.stop()
 
@@ -2092,34 +2184,44 @@ async def test_hard_timeout_includes_async_progress_callback(
 ) -> None:
     callback_started = asyncio.Event()
 
-    async def blocked_callback(_progress: dict[str, object]) -> None:
+    async def blocked_callback(progress: dict[str, object]) -> None:
+        if progress["current"] == 0:
+            return
         callback_started.set()
         await asyncio.Event().wait()
 
     manager = LocalModelManager(
         fake_worker_command,
         worker_home=worker_home,
-        timeout_seconds=0.3,
-        hard_timeout_seconds=0.5,
+        timeout_seconds=3.0,
+        hard_timeout_seconds=3.0,
     )
     await manager.start()
 
-    with pytest.raises(LocalWorkerTimeout, match="timed out"):
-        await asyncio.wait_for(
-            manager.run(
-                ModelRole.EXTRACTION,
-                {
-                    "progress_steps": 2,
-                    "progress_delay_ms": 20,
-                },
-                blocked_callback,
-            ),
-            timeout=1,
+    started_at = time.monotonic()
+    run_task = asyncio.create_task(
+        manager.run(
+            ModelRole.EXTRACTION,
+            {
+                "progress_steps": 2,
+                "progress_delay_ms": 2000,
+            },
+            blocked_callback,
         )
+    )
+    try:
+        await asyncio.wait_for(callback_started.wait(), timeout=5)
+        with pytest.raises(LocalWorkerTimeout, match="timed out"):
+            await asyncio.wait_for(run_task, timeout=5)
 
-    assert callback_started.is_set()
-    assert manager.active_pid is None
-    await manager.stop()
+        elapsed = time.monotonic() - started_at
+        assert 2.5 <= elapsed < 4.5
+        assert manager.active_pid is None
+    finally:
+        await manager.stop()
+        if not run_task.done():
+            run_task.cancel()
+        await asyncio.gather(run_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -2428,3 +2530,593 @@ async def test_enabled_lifespan_attempts_stop_after_partial_start_failure(
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         main_module._background_tasks.clear()
+
+
+@pytest.mark.asyncio
+async def test_production_manager_raw_worker_calls_are_unavailable(
+    fake_worker_command: list[str],
+    worker_home: Path,
+) -> None:
+    manager = ProductionLocalModelManager(
+        fake_worker_command,
+        worker_home=worker_home,
+    )
+    run_command = AsyncMock()
+    manager._run_command = run_command  # type: ignore[method-assign]
+
+    with pytest.raises(LocalWorkerError, match="runtime attestation"):
+        await manager.run(ModelRole.OCR, {})
+    with pytest.raises(LocalWorkerError, match="runtime attestation"):
+        await manager.count_summary_tokens({})
+
+    run_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_attested_wrapper_binds_manifest_before_private_run(
+    fake_worker_command: list[str],
+    worker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
+    manifest = _attested_manifest()
+    observed: list[object] = []
+
+    def require_runtime(candidate: object) -> None:
+        observed.append(candidate)
+
+    run_command = AsyncMock(return_value={"markdown": "ok", "page_number": 1})
+    monkeypatch.setattr(
+        manager, "_require_current_runtime", require_runtime, raising=False
+    )
+    monkeypatch.setattr(manager, "_run_command", run_command)
+
+    result = await manager.run_attested(manifest, ModelRole.OCR, {"job_id": "job"})
+
+    assert result == {"markdown": "ok", "page_number": 1}
+    assert observed == [manifest]
+    assert run_command.await_args.kwargs["manifest"] is manifest
+
+
+@pytest.mark.asyncio
+async def test_attested_run_rechecks_drift_after_wait_and_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings
+    from app.services.local_ai import model_manager as manager_module
+
+    project = build_worker_project(tmp_path / "worker")
+    observed = resolve_worker_runtime_identity(project.command, project.project_dir)
+    manifest = _attested_manifest(observed.bundle_sha256)
+    manager = LocalModelManager(
+        project.command,
+        worker_home=tmp_path / "worker-home",
+    )
+    monkeypatch.setattr(
+        settings,
+        "local_ai_worker_project_dir",
+        str(project.project_dir),
+    )
+    await manager.start()
+    worker_home = manager._worker_home
+    baseline_children = set(worker_home.iterdir())
+    original_acquire = manager._acquire_worker_process_lease
+    original_require = manager._require_current_runtime
+    original_environment = manager._child_environment
+    checks = 0
+    environment_built = False
+    created_prefixes: list[Path] = []
+
+    def require_with_scratch(candidate) -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            assert environment_built is True
+            created = set(worker_home.iterdir()) - baseline_children
+            assert len(created) == 1
+            prefix = created.pop()
+            assert prefix.is_dir()
+            assert stat.S_IMODE(prefix.stat().st_mode) == 0o700
+            assert list(prefix.iterdir()) == []
+            created_prefixes.append(prefix)
+        original_require(candidate)
+
+    def record_environment(prefix: Path) -> dict[str, str]:
+        nonlocal environment_built
+        environment = original_environment(prefix)
+        environment_built = True
+        return environment
+
+    async def acquire_then_drift(state):
+        lease = await original_acquire(state)
+        source = project.effective_package / "nuextract3.py"
+        source.write_text("# drifted after wrapper attestation\n", encoding="utf-8")
+        return lease
+
+    spawn = AsyncMock()
+    monkeypatch.setattr(manager, "_acquire_worker_process_lease", acquire_then_drift)
+    monkeypatch.setattr(manager, "_require_current_runtime", require_with_scratch)
+    monkeypatch.setattr(manager, "_child_environment", record_environment)
+    monkeypatch.setattr(manager_module.asyncio, "create_subprocess_exec", spawn)
+
+    with pytest.raises(LocalWorkerError, match="identity"):
+        await manager.run_attested(manifest, ModelRole.OCR, {"job_id": "drift"})
+
+    spawn.assert_not_awaited()
+    assert checks == 2
+    assert len(created_prefixes) == 1
+    assert not created_prefixes[0].exists()
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_runtime_attestation_uses_cached_command_and_project_after_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings
+    from app.services.local_ai import model_manager as manager_module
+
+    first = build_worker_project(tmp_path / "first")
+    second = build_worker_project(tmp_path / "second")
+    first_identity = resolve_worker_runtime_identity(first.command, first.project_dir)
+    manifest = _attested_manifest(first_identity.bundle_sha256)
+    manager = LocalModelManager(
+        first.command,
+        worker_home=tmp_path / "worker-home",
+        worker_project_dir=first.project_dir,
+    )
+    await manager.start()
+    monkeypatch.setattr(settings, "local_ai_worker_command", second.command[0])
+    monkeypatch.setattr(
+        settings,
+        "local_ai_worker_project_dir",
+        str(second.project_dir),
+    )
+    monkeypatch.chdir(second.project_dir)
+    observed: list[tuple[object, object]] = []
+    original_resolver = manager_module.resolve_worker_runtime_identity
+
+    def record_resolver(command, project_dir):
+        observed.append((command, project_dir))
+        return original_resolver(command, project_dir)
+
+    run_command = AsyncMock(return_value={"markdown": "ok", "page_number": 1})
+    monkeypatch.setattr(
+        manager_module, "resolve_worker_runtime_identity", record_resolver
+    )
+    monkeypatch.setattr(manager, "_run_command", run_command)
+
+    await manager.run_attested(manifest, ModelRole.OCR, {"job_id": "cached"})
+
+    assert observed == [(first.command, first.project_dir.absolute())]
+    assert manager._worker_command == first.command
+    await manager.stop()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox contract")
+@pytest.mark.asyncio
+async def test_real_spawn_path_attests_and_spawns_one_cached_runtime_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings
+    from app.services.local_ai import model_manager as manager_module
+
+    first = build_worker_project(tmp_path / "first")
+    second = build_worker_project(tmp_path / "second")
+    observed_identity = resolve_worker_runtime_identity(
+        first.command,
+        first.project_dir,
+    )
+    manifest = _attested_manifest(observed_identity.bundle_sha256)
+    worker_home = tmp_path / "worker-home"
+    monkeypatch.setattr(settings, "local_ai_model_dir", str(tmp_path / "models"))
+    manager = ProductionLocalModelManager(
+        first.command,
+        worker_home=worker_home,
+        worker_project_dir=first.project_dir,
+    )
+    await manager.start()
+    cached_command = manager._worker_command
+    cached_project = manager._worker_project_dir
+
+    monkeypatch.setattr(settings, "local_ai_worker_command", second.command)
+    monkeypatch.setattr(
+        settings,
+        "local_ai_worker_project_dir",
+        str(second.project_dir),
+    )
+    monkeypatch.chdir(second.project_dir)
+    observed: list[tuple[object, object]] = []
+    original_resolver = manager_module.resolve_worker_runtime_identity
+
+    def record_resolver(command, project_dir):
+        observed.append((command, project_dir))
+        return original_resolver(command, project_dir)
+
+    spawn = AsyncMock(side_effect=OSError("synthetic spawn failure"))
+    monkeypatch.setattr(
+        manager_module, "resolve_worker_runtime_identity", record_resolver
+    )
+    monkeypatch.setattr(manager_module.asyncio, "create_subprocess_exec", spawn)
+
+    with pytest.raises(LocalWorkerError, match="unavailable"):
+        await manager.run_attested(manifest, ModelRole.OCR, {"job_id": "cached-spawn"})
+
+    assert observed == [
+        (cached_command, cached_project),
+        (cached_command, cached_project),
+    ]
+    assert spawn.await_args.args == (
+        *manager._network_sandbox_prefix,
+        *cached_command,
+    )
+    assert spawn.await_args.kwargs["cwd"] == worker_home
+    assert not list(worker_home.glob(".worker-pycache-*"))
+    await manager.stop()
+
+
+def _capture_spawn_environments(
+    manager: LocalModelManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[dict[str, str]]:
+    captured: list[dict[str, str]] = []
+    original = manager._child_environment
+
+    def capture(*args, **kwargs) -> dict[str, str]:
+        environment = original(*args, **kwargs)
+        prefix = Path(environment["PYTHONPYCACHEPREFIX"])
+        assert prefix.is_dir()
+        assert stat.S_IMODE(prefix.stat().st_mode) == 0o700
+        assert list(prefix.iterdir()) == []
+        captured.append(environment)
+        return environment
+
+    monkeypatch.setattr(manager, "_child_environment", capture)
+    return captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_home", [False, True])
+async def test_relative_default_worker_home_is_bound_at_start(
+    fake_worker_command: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_home: bool,
+) -> None:
+    from app.config import settings
+
+    construction_cwd = tmp_path / "construction"
+    start_cwd = tmp_path / "start"
+    construction_cwd.mkdir()
+    start_cwd.mkdir()
+    monkeypatch.setattr(settings, "local_ai_scratch_dir", "../default-scratch")
+    monkeypatch.chdir(construction_cwd)
+    manager = LocalModelManager(
+        fake_worker_command,
+        worker_home="../explicit-home" if explicit_home else None,
+    )
+
+    monkeypatch.chdir(start_cwd)
+    await manager.start()
+    captured = _capture_spawn_environments(manager, monkeypatch)
+    result = await manager.run(ModelRole.OCR, {"inspect_env": True})
+
+    expected = (
+        tmp_path / "explicit-home"
+        if explicit_home
+        else tmp_path / "default-scratch" / "worker-home"
+    )
+    assert manager._worker_home == expected
+    assert manager._worker_home.is_dir()
+    assert result["cwd_matches"] is True
+    assert captured[0]["HOME"] == str(expected)
+    assert Path(captured[0]["PYTHONPYCACHEPREFIX"]).parent == expected
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_each_spawn_uses_fresh_sanitized_pycache_scratch_and_cleans_success(
+    fake_worker_command: list[str],
+    worker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONPATH", "/hostile/pythonpath")
+    monkeypatch.setenv("PYTHONHOME", "/hostile/pythonhome")
+    monkeypatch.setenv("GEMINI_API_KEY", "provider-secret")
+    manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
+    await manager.start()
+    captured = _capture_spawn_environments(manager, monkeypatch)
+
+    await manager.run(ModelRole.OCR, {"job_id": "env-one"})
+    await manager.run(ModelRole.OCR, {"job_id": "env-two"})
+
+    assert len(captured) == 2
+    prefixes = [Path(item["PYTHONPYCACHEPREFIX"]) for item in captured]
+    assert prefixes[0] != prefixes[1]
+    assert all(not prefix.exists() for prefix in prefixes)
+    for environment in captured:
+        assert environment["PYTHONNOUSERSITE"] == "1"
+        assert environment["PYTHONSAFEPATH"] == "1"
+        assert "PYTHONPATH" not in environment
+        assert "PYTHONHOME" not in environment
+        assert "GEMINI_API_KEY" not in environment
+        assert environment["HOME"] == str(worker_home)
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_spawn_pycache_scratch_cleans_on_worker_error_and_spawn_failure(
+    fake_worker_command: list[str],
+    worker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.local_ai import model_manager as manager_module
+
+    manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
+    await manager.start()
+    captured = _capture_spawn_environments(manager, monkeypatch)
+
+    with pytest.raises(LocalWorkerError, match="failed"):
+        await manager.run(ModelRole.OCR, {"job_id": "worker-error", "safe_error": True})
+    first_prefix = Path(captured[-1]["PYTHONPYCACHEPREFIX"])
+    assert not first_prefix.exists()
+
+    monkeypatch.setattr(
+        manager_module.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=OSError("synthetic spawn failure")),
+    )
+    with pytest.raises(LocalWorkerError, match="unavailable"):
+        await manager.run(ModelRole.OCR, {"job_id": "spawn-error"})
+    second_prefix = Path(captured[-1]["PYTHONPYCACHEPREFIX"])
+    assert second_prefix != first_prefix
+    assert not second_prefix.exists()
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_spawn_pycache_scratch_cleans_after_cancellation(
+    fake_worker_command: list[str],
+    worker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.local_ai.model_manager as manager_module
+
+    manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
+    await manager.start()
+    captured = _capture_spawn_environments(manager, monkeypatch)
+    termination_observations: list[tuple[float, int | None, bool]] = []
+    timeline: dict[str, float] = {}
+    timeline_origin = time.monotonic()
+    terminate_process = manager._terminate_process
+    finalize_lease = manager._finalize_lease_or_retain
+
+    async def observe_termination(process) -> None:
+        pgid = process.pid
+        started_at = time.monotonic()
+        timeline["terminate_start"] = started_at - timeline_origin
+        try:
+            await terminate_process(process)
+        finally:
+            timeline["terminate_end"] = time.monotonic() - timeline_origin
+            termination_observations.append(
+                (
+                    time.monotonic() - started_at,
+                    process.returncode,
+                    manager._process_group_exists(pgid),
+                )
+            )
+
+    def observe_finalize(lease) -> bool:
+        result = finalize_lease(lease)
+        timeline["lease_finalize"] = time.monotonic() - timeline_origin
+        return result
+
+    monkeypatch.setattr(manager, "_terminate_process", observe_termination)
+    monkeypatch.setattr(manager, "_finalize_lease_or_retain", observe_finalize)
+    started_marker = worker_home.parent / "pycache-cancel-started"
+    task = asyncio.create_task(
+        manager.run(
+            ModelRole.OCR,
+            {
+                "job_id": "pycache-cancel",
+                "block": True,
+                "started_marker_path": str(started_marker),
+            },
+        )
+    )
+    await manager.wait_until_running("pycache-cancel")
+    for _attempt in range(500):
+        if started_marker.exists():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise AssertionError("fake worker did not reach its blocking request") from None
+    prefix = Path(captured[0]["PYTHONPYCACHEPREFIX"])
+    assert prefix.is_dir()
+
+    task.add_done_callback(
+        lambda _task: timeline.__setitem__(
+            "task_done",
+            time.monotonic() - timeline_origin,
+        )
+    )
+    timeline["cancel_requested"] = time.monotonic() - timeline_origin
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=30)
+    except TimeoutError:
+        task_stack = [
+            f"{frame.f_code.co_name}:{frame.f_lineno}" for frame in task.get_stack()
+        ]
+        diagnostics = {
+            "timeline": timeline,
+            "termination_observations": termination_observations,
+            "task_stack": task_stack,
+            "task_cancelling": task.cancelling(),
+            "cleanup_lock_locked": manager._cleanup_lock.locked(),
+            "retained_lease": manager._retained_worker_process_lease is not None,
+            "cleanup_poisoned": manager._cleanup_poisoned,
+            "global_poisoned": manager_module._GLOBAL_PROCESS_BOUNDARY_POISONED,
+            "global_lock_locked": manager_module._global_role_process_lock().locked(),
+            "prefix_exists": prefix.exists(),
+        }
+        raise AssertionError(
+            f"ordinary cancellation diagnostics: {diagnostics!r}"
+        ) from None
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True),
+                5,
+            )
+
+    assert len(termination_observations) == 1
+    elapsed, returncode, group_exists = termination_observations[0]
+    assert elapsed < 3.0
+    assert returncode is not None
+    assert group_exists is False
+    assert list(timeline) == [
+        "cancel_requested",
+        "terminate_start",
+        "terminate_end",
+        "lease_finalize",
+        "task_done",
+    ]
+    assert not prefix.exists()
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_pycache_cleanup_rejects_replaced_prefix_without_deleting_replacement(
+    fake_worker_command: list[str],
+    worker_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_fd_count = len(os.listdir("/dev/fd"))
+    manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
+    await manager.start()
+    captured = _capture_spawn_environments(manager, monkeypatch)
+    started_marker = worker_home.parent / "replace-prefix-started"
+    task = asyncio.create_task(
+        manager.run(
+            ModelRole.OCR,
+            {
+                "job_id": "replace-prefix",
+                "block": True,
+                "started_marker_path": str(started_marker),
+            },
+        )
+    )
+    await manager.wait_until_running("replace-prefix")
+    for _attempt in range(500):
+        if started_marker.exists():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise AssertionError("fake worker did not reach its blocking request") from None
+    prefix = Path(captured[0]["PYTHONPYCACHEPREFIX"])
+    saved = worker_home / "saved-original-prefix"
+    prefix.rename(saved)
+    prefix.mkdir(mode=0o700)
+    sentinel = prefix / "sentinel"
+    sentinel.write_text("do not delete", encoding="utf-8")
+
+    task.cancel()
+    with pytest.raises(LocalWorkerError, match="unavailable"):
+        await task
+
+    assert sentinel.read_text(encoding="utf-8") == "do not delete"
+    assert saved.is_dir()
+    assert list(saved.iterdir()) == []
+    retained = manager._retained_worker_process_lease
+    assert retained is not None
+    assert retained.pycache_root_fd >= 0
+    assert retained.pycache_prefix_fd >= 0
+    assert manager._cleanup_poisoned is True
+    retained_fd_count = len(os.listdir("/dev/fd"))
+    with pytest.raises(LocalWorkerError, match="unavailable"):
+        await asyncio.wait_for(
+            manager.run(ModelRole.OCR, {"job_id": "blocked-after-replacement"}),
+            timeout=0.5,
+        )
+    assert manager._retained_worker_process_lease is retained
+    assert len(os.listdir("/dev/fd")) == retained_fd_count
+
+    await manager.stop()
+    assert retained.pycache_root_fd == -1
+    assert retained.pycache_prefix_fd == -1
+    assert manager._retained_worker_process_lease is None
+    assert manager._cleanup_poisoned is False
+    assert sentinel.read_text(encoding="utf-8") == "do not delete"
+    assert list(saved.iterdir()) == []
+    assert len(os.listdir("/dev/fd")) == baseline_fd_count
+
+    fresh = LocalModelManager(
+        fake_worker_command,
+        worker_home=worker_home.parent / "fresh-worker-home",
+    )
+    await fresh.start()
+    result = await fresh.run(ModelRole.OCR, {"job_id": "after-finalized-poison"})
+    assert result["page_number"] == 1
+    await fresh.stop()
+
+
+@pytest.mark.asyncio
+async def test_pycache_cleanup_rejects_replaced_worker_home_without_outside_deletion(
+    fake_worker_command: list[str],
+    worker_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = LocalModelManager(fake_worker_command, worker_home=worker_home)
+    await manager.start()
+    captured = _capture_spawn_environments(manager, monkeypatch)
+    started_marker = worker_home.parent / "replace-home-started"
+    task = asyncio.create_task(
+        manager.run(
+            ModelRole.OCR,
+            {
+                "job_id": "replace-home",
+                "block": True,
+                "started_marker_path": str(started_marker),
+            },
+        )
+    )
+    await manager.wait_until_running("replace-home")
+    for _attempt in range(500):
+        if started_marker.exists():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise AssertionError("fake worker did not reach its blocking request") from None
+    prefix = Path(captured[0]["PYTHONPYCACHEPREFIX"])
+    saved_home = tmp_path / "saved-worker-home"
+    worker_home.rename(saved_home)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / prefix.name / "sentinel"
+    sentinel.parent.mkdir(mode=0o700)
+    sentinel.write_text("do not delete", encoding="utf-8")
+    worker_home.symlink_to(outside, target_is_directory=True)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=30)
+
+    assert sentinel.read_text(encoding="utf-8") == "do not delete"
+    assert not (saved_home / prefix.name).exists()
+    assert manager._retained_worker_process_lease is None
+    assert manager._cleanup_poisoned is False
+    await manager.stop()

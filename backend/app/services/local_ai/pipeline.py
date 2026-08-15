@@ -119,8 +119,9 @@ _IMAGE_ESCALATION_MARKERS = (
 class WorkerManager(Protocol):
     """The subset of the isolated manager used by ingestion."""
 
-    async def run(
+    async def run_attested(
         self,
+        manifest: LocalAIManifest,
         role: ModelRole,
         payload: dict[str, Any],
         on_progress: Callable[[dict[str, object]], object] | None = None,
@@ -822,13 +823,15 @@ class StrictLocalPipeline:
                         locked_manifest_path,
                     )
                     if self.on_liveness is None:
-                        raw_extraction = await self.manager.run(
+                        raw_extraction = await self.manager.run_attested(
+                            self.manifest,
                             ModelRole.EXTRACTION,
                             extraction_payload,
                             on_progress=extraction_progress,
                         )
                     else:
-                        raw_extraction = await self.manager.run(
+                        raw_extraction = await self.manager.run_attested(
+                            self.manifest,
                             ModelRole.EXTRACTION,
                             extraction_payload,
                             on_progress=extraction_progress,
@@ -965,9 +968,14 @@ class StrictLocalPipeline:
             return cached
         payload = self._ocr_payload(job_id, page, locked_manifest_path)
         if self.on_liveness is None:
-            raw_result = await self.manager.run(ModelRole.OCR, payload)
+            raw_result = await self.manager.run_attested(
+                self.manifest,
+                ModelRole.OCR,
+                payload,
+            )
         else:
-            raw_result = await self.manager.run(
+            raw_result = await self.manager.run_attested(
+                self.manifest,
                 ModelRole.OCR,
                 payload,
                 on_liveness=self.on_liveness,

@@ -4,10 +4,55 @@ from __future__ import annotations
 
 import json
 import os
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import ANY
 
 import pytest
+
+from app.services.local_ai.manifest import (
+    LocalAIManifest,
+    ManifestArtifact,
+    ManifestFile,
+)
+from app.services.local_ai.types import ModelRole
+
+
+def _runtime_manifest() -> LocalAIManifest:
+    return LocalAIManifest(
+        schema_version=2,
+        pack_revision="apple-m4-16gb-v2",
+        platform="apple_silicon",
+        runtime={
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "a" * 64,
+        },
+        validation_suite_version="local-ai-fixtures-v1",
+        artifacts=tuple(
+            ManifestArtifact(
+                role=role,
+                repository=f"owner/{role.value}",
+                revision=str(index) * 40,
+                quantization="4bit",
+                license="apache-2.0",
+                attribution=f"https://huggingface.co/owner/{role.value}",
+                decode_limits={
+                    "max_input_tokens": 32768,
+                    "max_output_tokens": 4096,
+                },
+                files=(
+                    ManifestFile(
+                        path="model.safetensors",
+                        sha256=str(index) * 64,
+                        size=index,
+                    ),
+                ),
+            )
+            for index, role in enumerate(ModelRole, start=1)
+        ),
+    )
 
 
 def _passing_report() -> dict[str, object]:
@@ -29,10 +74,12 @@ def _passing_report() -> dict[str, object]:
             "os_version": "27.0",
         },
         "manifest": {
-            "pack_revision": "apple-m4-16gb-v1",
+            "pack_revision": "apple-m4-16gb-v2",
             "sha256": "a" * 64,
             "runtime_name": "mlx-vlm",
             "runtime_version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "a" * 64,
         },
         "processes": {
             "max_live_models": 1,
@@ -62,6 +109,50 @@ def test_benchmark_report_acceptance_is_strict_and_content_free() -> None:
     from scripts.benchmark_local_ai import validate_acceptance
 
     validate_acceptance(_passing_report(), required_runs=3)
+
+
+def test_benchmark_report_requires_worker_bundle_digest() -> None:
+    from scripts.benchmark_local_ai import BenchmarkGateError, validate_acceptance
+
+    report = _passing_report()
+    del report["manifest"]["worker_bundle_sha256"]
+
+    with pytest.raises(BenchmarkGateError, match="structure"):
+        validate_acceptance(report, required_runs=3)
+
+
+@pytest.mark.parametrize(
+    "identity_scheme",
+    [None, "local-ai-worker-bundle.v2"],
+)
+def test_benchmark_report_requires_exact_worker_identity_scheme(
+    identity_scheme: str | None,
+) -> None:
+    from scripts.benchmark_local_ai import BenchmarkGateError, validate_acceptance
+
+    report = _passing_report()
+    if identity_scheme is None:
+        del report["manifest"]["worker_identity_scheme"]
+    else:
+        report["manifest"]["worker_identity_scheme"] = identity_scheme
+
+    with pytest.raises(BenchmarkGateError, match="structure"):
+        validate_acceptance(report, required_runs=3)
+
+
+def test_benchmark_output_identity_contains_exact_worker_binding() -> None:
+    from scripts.benchmark_local_ai import _benchmark_manifest_identity
+
+    manifest = _runtime_manifest()
+
+    assert _benchmark_manifest_identity(manifest) == {
+        "pack_revision": "apple-m4-16gb-v2",
+        "sha256": ANY,
+        "runtime_name": "mlx-vlm",
+        "runtime_version": "0.5.0",
+        "worker_identity_scheme": "local-ai-worker-bundle.v1",
+        "worker_bundle_sha256": "a" * 64,
+    }
 
 
 @pytest.mark.parametrize(
@@ -189,13 +280,15 @@ def test_unexpected_worker_exit_is_a_memory_pressure_gate_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_benchmark_role_fails_closed_without_final_mlx_progress(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_benchmark_role_fails_closed_without_final_mlx_progress() -> None:
     import scripts.benchmark_local_ai as benchmark
 
     class MissingTelemetryManager:
         active_pid = None
+        runtime_identity = benchmark.WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256="a" * 64,
+        )
 
         async def start(self) -> None:
             return None
@@ -203,8 +296,9 @@ async def test_benchmark_role_fails_closed_without_final_mlx_progress(
         async def stop(self) -> None:
             return None
 
-        async def run(
+        async def run_attested(
             self,
+            _manifest: object,
             _role: object,
             _payload: object,
             *,
@@ -213,12 +307,15 @@ async def test_benchmark_role_fails_closed_without_final_mlx_progress(
             assert callable(on_progress)
             return {"sections": []}
 
-    monkeypatch.setattr(benchmark, "LocalModelManager", MissingTelemetryManager)
-    manager = benchmark._BenchmarkingManager()
+    manager = benchmark._BenchmarkingManager(manager=MissingTelemetryManager())
     await manager.start()
 
     with pytest.raises(benchmark.BenchmarkGateError, match="MLX telemetry"):
-        await manager.run(benchmark.ModelRole.SUMMARY, {"job_id": "bench-summary"})
+        await manager.run_attested(
+            _runtime_manifest(),
+            benchmark.ModelRole.SUMMARY,
+            {"job_id": "bench-summary"},
+        )
 
 
 @pytest.mark.local_model

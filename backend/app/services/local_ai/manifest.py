@@ -12,9 +12,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from app.services.local_ai.errors import LocalValidationError
+from app.services.local_ai.runtime_identity import WORKER_IDENTITY_SCHEME
 from app.services.local_ai.types import ModelRole
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_MANIFEST_FILES = 64
 MAX_MANIFEST_FILE_BYTES = 8 * 1024 * 1024 * 1024
 MAX_MANIFEST_PACK_BYTES = 20 * 1024 * 1024 * 1024
@@ -65,7 +66,10 @@ _ARTIFACT_KEYS = frozenset(
     }
 )
 _FILE_KEYS = frozenset({"path", "sha256", "size"})
-_RUNTIME_KEYS = frozenset({"name", "version"})
+_RUNTIME_KEYS = frozenset(
+    {"name", "version", "worker_identity_scheme", "worker_bundle_sha256"}
+)
+_LEGACY_RUNTIME_KEYS = frozenset({"name", "version"})
 _DECODE_KEYS = frozenset({"max_input_tokens", "max_output_tokens"})
 _SECRET_PREFIX_RE = re.compile(
     r"(?:\A|[/@:=\s])(?:"
@@ -142,6 +146,16 @@ class LocalAIManifest:
     runtime: dict[str, str]
     validation_suite_version: str
     artifacts: tuple[ManifestArtifact, ...]
+
+
+@dataclass(frozen=True)
+class LegacyManifestDiagnostic:
+    """Canonical v1 evidence that must never be used for admission or spawn."""
+
+    schema_version: int
+    canonical_snapshot: dict[str, Any]
+    canonical_sha256: str
+    requires_revalidation: bool
 
 
 def is_secret_shaped_manifest_text(value: object) -> bool:
@@ -301,17 +315,22 @@ def _safe_artifact(raw_value: Any) -> ManifestArtifact:
     )
 
 
-def parse_manifest(raw_value: Any) -> LocalAIManifest:
-    """Validate an in-memory version-1 immutable local-AI manifest payload."""
-
+def _parse_manifest_version(
+    raw_value: Any,
+    *,
+    schema_version_required: int,
+    runtime_keys: frozenset[str],
+) -> LocalAIManifest:
     raw = _require_object(raw_value, keys=_TOP_LEVEL_KEYS, context="root")
     schema_version = raw.get("schema_version")
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version != SCHEMA_VERSION
+        or schema_version != schema_version_required
     ):
-        raise LocalValidationError("Manifest schema version must be 1")
+        raise LocalValidationError(
+            f"Manifest schema version must be {schema_version_required}"
+        )
 
     pack_revision = _require_string(raw, "pack_revision", context="pack revision")
     if PACK_REVISION_RE.fullmatch(pack_revision) is None:
@@ -321,13 +340,33 @@ def parse_manifest(raw_value: Any) -> LocalAIManifest:
 
     runtime_raw = _require_object(
         raw.get("runtime"),
-        keys=_RUNTIME_KEYS,
+        keys=runtime_keys,
         context="runtime",
     )
     runtime = {
         "name": _require_string(runtime_raw, "name", context="runtime name"),
         "version": _require_string(runtime_raw, "version", context="runtime version"),
     }
+    if schema_version_required == SCHEMA_VERSION:
+        worker_identity_scheme = _require_string(
+            runtime_raw,
+            "worker_identity_scheme",
+            context="worker identity scheme",
+        )
+        if worker_identity_scheme != WORKER_IDENTITY_SCHEME:
+            raise LocalValidationError("Manifest worker identity scheme is invalid")
+        worker_bundle_sha256 = runtime_raw.get("worker_bundle_sha256")
+        if (
+            not isinstance(worker_bundle_sha256, str)
+            or SHA256_RE.fullmatch(worker_bundle_sha256) is None
+        ):
+            raise LocalValidationError(
+                "Manifest worker bundle SHA-256 must be 64 lowercase hex characters"
+            )
+        runtime.update(
+            worker_identity_scheme=worker_identity_scheme,
+            worker_bundle_sha256=worker_bundle_sha256,
+        )
     validation_suite_version = _require_string(
         raw,
         "validation_suite_version",
@@ -364,20 +403,67 @@ def parse_manifest(raw_value: Any) -> LocalAIManifest:
     )
 
 
-def load_manifest(path: Path) -> LocalAIManifest:
-    """Load and fully validate a version-1 immutable local-AI manifest."""
+def parse_manifest(
+    raw_value: Any,
+    *,
+    allow_legacy_diagnostic: bool = False,
+) -> LocalAIManifest | LegacyManifestDiagnostic:
+    """Validate a v2 manifest or identify canonical v1 evidence diagnostically."""
+
+    raw = _require_object(raw_value, keys=_TOP_LEVEL_KEYS, context="root")
+    if raw.get("schema_version") == 1 and allow_legacy_diagnostic:
+        legacy = _parse_manifest_version(
+            raw,
+            schema_version_required=1,
+            runtime_keys=_LEGACY_RUNTIME_KEYS,
+        )
+        canonical_bytes = json.dumps(
+            asdict(legacy),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        return LegacyManifestDiagnostic(
+            schema_version=1,
+            canonical_snapshot=json.loads(canonical_bytes),
+            canonical_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
+            requires_revalidation=True,
+        )
+    return _parse_manifest_version(
+        raw,
+        schema_version_required=SCHEMA_VERSION,
+        runtime_keys=_RUNTIME_KEYS,
+    )
+
+
+def load_manifest(
+    path: Path,
+    *,
+    allow_legacy_diagnostic: bool = False,
+) -> LocalAIManifest | LegacyManifestDiagnostic:
+    """Load a manifest for v2 admission or bounded legacy diagnosis."""
 
     try:
         raw_value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise LocalValidationError("Manifest could not be read as JSON") from exc
-    return parse_manifest(raw_value)
+    manifest = parse_manifest(
+        raw_value,
+        allow_legacy_diagnostic=allow_legacy_diagnostic,
+    )
+    if isinstance(manifest, LegacyManifestDiagnostic) and allow_legacy_diagnostic:
+        return manifest
+    if not isinstance(manifest, LocalAIManifest):  # pragma: no cover - defensive
+        raise LocalValidationError("Manifest cannot be used for admission")
+    return manifest
 
 
 def canonicalize_manifest_snapshot(raw_value: Any) -> tuple[dict[str, Any], str]:
-    """Return a detached canonical schema-v1 snapshot and lowercase digest."""
+    """Return a detached canonical schema-v2 snapshot and lowercase digest."""
 
     manifest = parse_manifest(raw_value)
+    if not isinstance(manifest, LocalAIManifest):  # pragma: no cover - defensive
+        raise LocalValidationError("Manifest cannot be used for admission")
     canonical_bytes = json.dumps(
         asdict(manifest),
         sort_keys=True,

@@ -23,6 +23,43 @@ SAFETY_RULES = [
 ]
 
 
+def _grounding_cases() -> dict[str, object]:
+    root = Path(__file__).resolve().parents[4]
+    return json.loads(
+        (
+            root / "workers/local_ai/apple_mlx/tests/fixtures/"
+            "strict_local_extraction_grounding_cases.json"
+        ).read_text(encoding="utf-8")
+    )
+
+
+def test_strict_local_grounding_case_matrix_is_versioned_and_nonempty() -> None:
+    cases = _grounding_cases()
+    assert cases["version"] == 1
+    assert {case["id"] for case in cases["procedure_cases"]} == {
+        "authorization_validity_date_is_not_performance",
+        "authorization_with_status_post_is_performance",
+        "authorization_with_underwent_subject_is_performance",
+        "authorization_with_performed_subject_is_performance",
+        "authorization_with_subject_completed_is_performance",
+        "other_procedure_performed_cannot_support_subject",
+        "other_procedure_status_post_cannot_support_subject",
+        "later_same_procedure_performance_cannot_support_selected_authorization",
+        "bare_appendectomy_name_is_not_performance",
+        "bare_biopsy_name_is_not_performance",
+        "ordinary_clinical_date_remains_compatible",
+    }
+    assert {case["id"] for case in cases["medication_cases"]} == {
+        "other_medication_blocker_cannot_reject_subject",
+        "other_medication_active_cue_cannot_promote_subject",
+        "own_dosing_continuation_supports_subject",
+        "repeated_subject_fails_closed",
+        "other_medication_active_after_newline_cannot_promote_subject",
+        "other_medication_active_after_slash_cannot_promote_subject",
+        "own_active_support_survives_other_medication_blocker",
+    }
+
+
 class _Tokenizer:
     model_max_length = 65_536
 
@@ -608,7 +645,7 @@ def test_quiet_extraction_dispatch_preserves_page_and_budget_counters_only(
                 "output_tokens": 17,
                 "output_token_limit": 32_768,
                 "splits_used": 0,
-                "split_limit": 31,
+                "split_limit": 11,
             }
         )
         extraction_heartbeat()
@@ -665,7 +702,7 @@ def test_quiet_extraction_dispatch_preserves_page_and_budget_counters_only(
                 "output_tokens": 17,
                 "output_token_limit": 32_768,
                 "splits_used": 0,
-                "split_limit": 31,
+                "split_limit": 11,
             },
         },
         {
@@ -681,7 +718,7 @@ def test_quiet_extraction_dispatch_preserves_page_and_budget_counters_only(
                 "output_tokens": 17,
                 "output_token_limit": 32_768,
                 "splits_used": 0,
-                "split_limit": 31,
+                "split_limit": 11,
             },
         },
         {
@@ -697,7 +734,7 @@ def test_quiet_extraction_dispatch_preserves_page_and_budget_counters_only(
                 "output_tokens": 17,
                 "output_token_limit": 32_768,
                 "splits_used": 0,
-                "split_limit": 31,
+                "split_limit": 11,
             },
         },
     ]
@@ -969,6 +1006,59 @@ def test_extraction_batches_long_documents_without_reloading_the_model(
     ]
 
 
+def test_image_retry_over_batch_cap_splits_before_second_generation(tmp_path: Path) -> None:
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    markdown = ("left marker " + ("A" * 1_350)) + "\n\n" + ("right marker " + ("B" * 1_350))
+    image = _png(tmp_path, "page-1.png")
+    calls: list[tuple[str, list[str], int]] = []
+
+    def generate(**kwargs: object) -> str:
+        source = json.loads(str(kwargs["prompt"]).split("INPUT_JSON=", 1)[1])
+        source_markdown = str(source["source_pages"][0]["markdown"])
+        calls.append(
+            (
+                source_markdown,
+                list(kwargs["images"]),  # type: ignore[arg-type]
+                int(kwargs["input_token_limit"]),
+            )
+        )
+        if source_markdown == markdown:
+            return "{"
+        return json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            }
+        )
+
+    result = run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": markdown}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {"1": str(image)},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            },
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        generate_fn=generate,
+    )
+
+    assert [source for source, _images, _limit in calls].count(markdown) == 1
+    assert calls[0] == (markdown, [str(image)], 4_096)
+    assert len(calls) == 3
+    assert all(not images for _source, images, _limit in calls[1:])
+    assert calls[1][0].startswith("left marker")
+    assert calls[2][0].endswith("B" * 64)
+    assert all(limit == 4_096 for _source, _images, limit in calls)
+    assert result == {
+        "schema_version": "clinical-document-extraction.v1",
+        "unresolved_fields": [],
+    }
+
+
 def test_extraction_isolates_selected_image_pages_without_splitting_text_batches(
     tmp_path: Path,
 ) -> None:
@@ -1168,6 +1258,79 @@ def test_extraction_recursively_splits_a_formatted_batch_over_the_runtime_limit(
     )
     assert progress == [(0, 6), (1, 6), (3, 6), (4, 6), (6, 6)]
     assert budget_progress[-1]["splits_used"] == 3
+
+
+def test_chat_template_input_overflow_splits_before_stream_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import mlx_vlm
+
+    from local_ai_mlx_worker.nuextract3 import _EXTRACTION_BATCH_INPUT_CAP, run_extraction
+
+    markdown = ("first bounded section " * 30) + "\n\n" + ("second bounded section " * 30)
+    stream_calls: list[str] = []
+    budget_events: list[dict[str, int]] = []
+
+    def apply_chat_template(
+        _processor: object,
+        _config: object,
+        prompt: str,
+        **_kwargs: object,
+    ) -> str:
+        source = json.loads(prompt.split("INPUT_JSON=", 1)[1])
+        source_markdown = str(source["source_pages"][0]["markdown"])
+        if source_markdown == markdown:
+            return "x" * (_EXTRACTION_BATCH_INPUT_CAP + 1)
+        return prompt
+
+    class StreamResult:
+        text = json.dumps(
+            {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            }
+        )
+        generation_tokens = 32
+
+    def stream_generate(
+        _model: object,
+        _processor: object,
+        prompt: str,
+        **_kwargs: object,
+    ) -> Iterator[StreamResult]:
+        source = json.loads(prompt.split("INPUT_JSON=", 1)[1])
+        stream_calls.append(str(source["source_pages"][0]["markdown"]))
+        yield StreamResult()
+
+    monkeypatch.setattr(mlx_vlm, "apply_chat_template", apply_chat_template)
+    monkeypatch.setattr(mlx_vlm, "stream_generate", stream_generate)
+
+    result = run_extraction(
+        {
+            "page_markdown": [{"page_number": 1, "markdown": markdown}],
+            "scratch_dir": str(tmp_path),
+            "image_paths": {},
+            "schema": {
+                "schema_version": "clinical-document-extraction.v1",
+                "unresolved_fields": [],
+            },
+        },
+        loaded=_loaded("extraction"),  # type: ignore[arg-type]
+        budget_progress_fn=budget_events.append,
+    )
+
+    assert markdown not in stream_calls
+    assert len(stream_calls) == 2
+    assert stream_calls[0].startswith("first bounded section")
+    assert stream_calls[1].endswith("second bounded section ")
+    assert budget_events[-1]["attempt"] == 3
+    assert budget_events[-1]["output_tokens"] == 64
+    assert budget_events[-1]["splits_used"] == 1
+    assert result == {
+        "schema_version": "clinical-document-extraction.v1",
+        "unresolved_fields": [],
+    }
 
 
 def test_extraction_recursively_splits_a_batch_that_cannot_finish_valid_json(
@@ -1496,7 +1659,7 @@ def test_extraction_uses_exact_stream_token_count_to_split_truncated_output(
     }
 
 
-def test_extraction_stops_at_fragment_depth_after_repeated_invalid_output(
+def test_extraction_stops_at_attempt_limit_before_fragment_depth_after_invalid_output(
     tmp_path: Path,
 ) -> None:
     from local_ai_mlx_worker.common import GenerationError
@@ -1505,8 +1668,8 @@ def test_extraction_stops_at_fragment_depth_after_repeated_invalid_output(
     with pytest.raises(GenerationError) as error:
         run_extraction(
             {
-                # Long enough that repeated splits reach the fragment depth
-                # limit before any fragment becomes too short to split.
+                # Long enough to remain splittable until attempt admission
+                # rejects work that would require a thirteenth generation.
                 "page_markdown": [{"page_number": 1, "markdown": "bounded clinical text " * 128}],
                 "scratch_dir": str(tmp_path),
                 "image_paths": {},
@@ -1516,7 +1679,7 @@ def test_extraction_stops_at_fragment_depth_after_repeated_invalid_output(
             generate_fn=lambda **_kwargs: "{",
         )
 
-    assert error.value.category == "fragment_depth_limit"
+    assert error.value.category == "work_attempt_limit"
 
 
 def test_extraction_splits_after_two_under_cap_invalid_structured_outputs(
@@ -1705,6 +1868,115 @@ def test_generation_preserves_exact_cap_metadata_without_rejecting_valid_json(
         loaded=_loaded("extraction"),  # type: ignore[arg-type]
         generate_fn=lambda **_kwargs: generated,
     ) == {"schema_version": "clinical-document-extraction.v1"}
+
+
+def test_prefit_batches_over_attempt_limit_fail_before_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from local_ai_mlx_worker import nuextract3
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.nuextract3 import run_extraction
+
+    pages = [{"page_number": index, "markdown": "bounded OCR"} for index in range(1, 14)]
+    page_events: list[tuple[int, int]] = []
+    attempt_events: list[int] = []
+    lifecycle_events: list[int] = []
+    budget_events: list[dict[str, int]] = []
+
+    def over_limit_batches(*_args: object, **kwargs: object) -> list[list[dict[str, object]]]:
+        budget = kwargs["budget"]
+        assert isinstance(budget, nuextract3._ExtractionWorkBudget)
+        budget.reserve_prefit_split()
+        return [[page] for page in pages]
+
+    monkeypatch.setattr(nuextract3, "_extraction_batches", over_limit_batches)
+    calls = 0
+
+    def generate(**_kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("must not generate")
+
+    with pytest.raises(GenerationError, match="attempt work limit") as error:
+        run_extraction(
+            {
+                "page_markdown": pages,
+                "scratch_dir": str(tmp_path),
+                "image_paths": {},
+                "schema": {"schema_version": "clinical-document-extraction.v1"},
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=generate,
+            progress_fn=lambda completed, total: page_events.append((completed, total)),
+            attempt_progress_fn=lambda: attempt_events.append(1),
+            lifecycle_progress_fn=lambda: lifecycle_events.append(1),
+            budget_progress_fn=budget_events.append,
+        )
+    assert calls == 0
+    assert page_events == []
+    assert attempt_events == []
+    assert lifecycle_events == []
+    assert budget_events == []
+    assert error.value.category == "work_attempt_limit"
+
+
+def test_runtime_splits_never_make_a_thirteenth_generation_call(tmp_path: Path) -> None:
+    from local_ai_mlx_worker.common import GenerationError
+    from local_ai_mlx_worker.nuextract3 import (
+        MAX_EXTRACTION_GENERATION_ATTEMPTS,
+        run_extraction,
+    )
+
+    calls: list[int] = []
+
+    def invalid_json(**_kwargs: object) -> str:
+        calls.append(1)
+        return "{"
+
+    with pytest.raises(GenerationError) as error:
+        run_extraction(
+            {
+                "page_markdown": [
+                    {
+                        "page_number": 1,
+                        "markdown": "bounded clinical text " * 128,
+                    }
+                ],
+                "scratch_dir": str(tmp_path),
+                "image_paths": {},
+                "schema": {"schema_version": "clinical-document-extraction.v1"},
+            },
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            generate_fn=invalid_json,
+        )
+    assert error.value.category == "work_attempt_limit"
+    assert len(calls) <= MAX_EXTRACTION_GENERATION_ATTEMPTS
+
+
+def test_prefit_fragment_overflow_uses_work_attempt_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from local_ai_mlx_worker import nuextract3
+    from local_ai_mlx_worker.common import GenerationError
+
+    monkeypatch.setattr(
+        nuextract3,
+        "_fits_extraction_batch",
+        lambda *_args, **_kwargs: False,
+    )
+    budget = nuextract3._ExtractionWorkBudget(
+        runtime_splits=nuextract3.MAX_EXTRACTION_RUNTIME_SPLITS
+    )
+    with pytest.raises(GenerationError) as error:
+        nuextract3._fit_page_fragments(
+            {"page_number": 1, "markdown": "bounded text " * 2048},
+            loaded=_loaded("extraction"),  # type: ignore[arg-type]
+            template="{}",
+            instructions="bounded",
+            max_tokens=128,
+            budget=budget,
+        )
+    assert error.value.category == "work_attempt_limit"
 
 
 def test_extraction_work_budget_enforces_exact_independent_limits() -> None:
@@ -2096,7 +2368,7 @@ def test_grounding_downgrades_billed_procedure_line_items_to_mentioned_not_perfo
 
     grounded = _ground_explicit_assertions(value)
 
-    assert grounded["procedures"][0]["assertion"] == "mentioned_not_performed"  # type: ignore[index]
+    assert grounded["procedures"][0]["assertion"] == ("mentioned_not_performed")  # type: ignore[index]
 
 
 def test_grounding_keeps_billed_procedure_present_when_performance_is_documented() -> None:
@@ -2123,7 +2395,177 @@ def test_grounding_keeps_billed_procedure_present_when_performance_is_documented
     grounded = _ground_explicit_assertions(value)
 
     assert grounded["procedures"][0]["assertion"] == "present"  # type: ignore[index]
-    assert grounded["procedures"][1]["assertion"] == "present"  # type: ignore[index]
+    assert grounded["procedures"][1]["assertion"] == ("mentioned_not_performed")  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "case",
+    _grounding_cases()["procedure_cases"],
+    ids=lambda case: str(case["id"]),
+)
+def test_worker_administrative_procedure_grounding_matches_shared_matrix(
+    case: dict[str, object],
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    context = str(case["context"])
+    value = {
+        "procedures": [
+            {
+                "name": str(case["name"]),
+                "assertion": "present",
+                "date": str(case["date"]),
+                "verbatim": str(case.get("verbatim", context)),
+                "evidence_excerpt": context,
+                "page_number": 1,
+            }
+        ]
+    }
+    grounded = _ground_explicit_assertions(
+        value, [{"page_number": 1, "markdown": str(case["page"])}]
+    )
+
+    assert grounded["procedures"][0]["assertion"] == case["worker_assertion"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "case",
+    _grounding_cases()["medication_cases"],
+    ids=lambda case: str(case["id"]),
+)
+def test_worker_medication_lifecycle_scope_matches_shared_matrix(
+    case: dict[str, object],
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_lifecycle_statuses
+
+    context = str(case["context"])
+    grounded = _ground_lifecycle_statuses(
+        {
+            "medications": [
+                {
+                    "name": str(case["name"]),
+                    "status": str(case["candidate_status"]),
+                    "verbatim": context,
+                    "evidence_excerpt": context,
+                }
+            ]
+        }
+    )
+
+    assert grounded["medications"][0]["status"] == case["worker_status"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("category", "subject_field", "subject", "evidence"),
+    [
+        ("allergies", "substance", "Penicillin", "Penicillin allergy active."),
+        ("care_plans", "title", "Physical therapy", "Physical therapy current."),
+    ],
+)
+def test_worker_lifecycle_scope_uses_each_category_subject_field(
+    category: str,
+    subject_field: str,
+    subject: str,
+    evidence: str,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_lifecycle_statuses
+
+    grounded = _ground_lifecycle_statuses(
+        {
+            category: [
+                {
+                    subject_field: subject,
+                    "status": "unknown",
+                    "verbatim": evidence,
+                    "evidence_excerpt": evidence,
+                }
+            ]
+        }
+    )
+
+    assert grounded[category][0]["status"] == "active"  # type: ignore[index]
+
+
+def test_worker_prompt_requires_explicit_administrative_performance_wording() -> None:
+    from local_ai_mlx_worker.nuextract3 import EXTRACTION_INSTRUCTIONS
+
+    lowered = EXTRACTION_INSTRUCTIONS.casefold()
+    assert "underwent" in lowered
+    assert "performed" in lowered
+    assert "status post" in lowered
+    assert "date or procedure name alone is insufficient" in lowered
+
+
+@pytest.mark.parametrize(
+    ("page_number", "expected"),
+    [
+        (float("inf"), None),
+        (True, None),
+        (1.5, None),
+        (0, None),
+        (-1, None),
+        ("2", 2),
+    ],
+)
+def test_worker_fact_page_number_accepts_only_positive_integral_values(
+    page_number: object, expected: int | None
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import _fact_page_number
+
+    assert _fact_page_number({"page_number": page_number}) == expected
+
+
+@pytest.mark.parametrize("malformed_page_number", [float("inf"), True, 1.5, 0, -1])
+def test_worker_grounding_ignores_malformed_page_map_entries(
+    malformed_page_number: object,
+) -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "page_number": 1,
+                "verbatim": "Colonoscopy on 2026-01-01.",
+                "evidence_excerpt": "Colonoscopy on 2026-01-01.",
+            }
+        ]
+    }
+    pages = [
+        {"page_number": 1, "markdown": "Clinical procedure list."},
+        {
+            "page_number": malformed_page_number,
+            "markdown": "Place of Service: 11. Payer: Aetna.",
+        },
+    ]
+
+    grounded = _ground_explicit_assertions(value, pages)
+
+    assert grounded["procedures"][0]["assertion"] == "present"  # type: ignore[index]
+
+
+def test_worker_grounding_ignores_non_string_page_markdown() -> None:
+    from local_ai_mlx_worker.nuextract3 import _ground_explicit_assertions
+
+    value = {
+        "procedures": [
+            {
+                "name": "Colonoscopy",
+                "assertion": "present",
+                "page_number": 1,
+                "verbatim": "Colonoscopy on 2026-01-01.",
+                "evidence_excerpt": "Colonoscopy on 2026-01-01.",
+            }
+        ]
+    }
+
+    grounded = _ground_explicit_assertions(
+        value,
+        [{"page_number": 1, "markdown": {"form": "Payer: Aetna"}}],
+    )
+
+    assert grounded["procedures"][0]["assertion"] == "present"  # type: ignore[index]
 
 
 def test_grounding_downgrades_undated_procedure_on_billing_form_page() -> None:
@@ -2144,7 +2586,7 @@ def test_grounding_downgrades_undated_procedure_on_billing_form_page() -> None:
 
     grounded = _ground_explicit_assertions(value, pages)
 
-    assert grounded["procedures"][0]["assertion"] == "mentioned_not_performed"  # type: ignore[index]
+    assert grounded["procedures"][0]["assertion"] == ("mentioned_not_performed")  # type: ignore[index]
 
 
 def test_grounding_ignores_billing_signature_on_other_pages() -> None:
@@ -2368,7 +2810,8 @@ def test_extraction_filters_wrappers_and_prefers_vital_category(
 
     assert result["labs"] == []
     assert len(result["vital_signs"]) == 1  # type: ignore[arg-type]
-    assert [item["name"] for item in result["diagnostic_reports"]] == ["CT chest"]  # type: ignore[union-attr]
+    diagnostic_reports = result["diagnostic_reports"]
+    assert [item["name"] for item in diagnostic_reports] == ["CT chest"]  # type: ignore[union-attr]
     assert result["rejected_fields"] == [
         "labs[0]",
         "diagnostic_reports[0]",
@@ -2855,7 +3298,8 @@ def test_summary_typed_observation_unit_bound_matches_server_contract(
             loaded=_loaded("summary"),  # type: ignore[arg-type]
             generate_fn=lambda **_kwargs: raw,
         )
-        assert result["sections"][0]["claims"][0]["fact_id"] == fact["fact_id"]  # type: ignore[index]
+        claim = result["sections"][0]["claims"][0]  # type: ignore[index]
+        assert claim["fact_id"] == fact["fact_id"]
     else:
         with pytest.raises(WorkerInputError, match="observation value"):
             run_summary(

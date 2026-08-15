@@ -18,6 +18,7 @@ from app.models.record import HealthRecord
 from app.models.uploaded_file import UploadedFile
 from app.services.ai.llm.types import LLMRequest, LLMResponse, LLMUsage
 from app.services.local_ai.manifest import (
+    LocalAIManifest,
     canonicalize_manifest_snapshot,
     parse_manifest,
 )
@@ -341,8 +342,15 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         commits += 1
         await original_commit()
 
-    async def run(role: ModelRole, payload: dict, on_progress=None) -> dict:
+    async def run(
+        attested_manifest: object,
+        role: ModelRole,
+        payload: dict,
+        on_progress=None,
+    ) -> dict:
         inference_events.append("generate")
+        assert isinstance(attested_manifest, LocalAIManifest)
+        assert attested_manifest == manifest
         assert commits >= 1
         assert worker_session is not None
         assert worker_session.in_transaction() is False
@@ -401,8 +409,10 @@ async def test_strict_local_summary_commits_then_queues_background_work(
             "uncertainties": [],
         }
 
-    async def count_reference_tokens(payload: dict) -> int:
+    async def count_reference_tokens(attested_manifest: object, payload: dict) -> int:
         inference_events.append("count")
+        assert isinstance(attested_manifest, LocalAIManifest)
+        assert attested_manifest == manifest
         assert set(payload["reference_document"]) == {"sections", "uncertainties"}
         assert worker_session is not None
         stage_row = (
@@ -478,10 +488,10 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         )
     monkeypatch.setattr("app.services.local_ai.artifact_store.ArtifactStore", Store)
     monkeypatch.setattr(
-        "app.services.local_ai.model_manager.local_model_manager.run", model_run
+        "app.services.local_ai.model_manager.local_model_manager.run_attested", model_run
     )
     monkeypatch.setattr(
-        "app.services.local_ai.model_manager.local_model_manager.count_summary_tokens",
+        "app.services.local_ai.model_manager.local_model_manager.count_summary_tokens_attested",
         token_count,
     )
     monkeypatch.setattr(
@@ -563,7 +573,9 @@ async def test_strict_local_summary_commits_then_queues_background_work(
         model_run.assert_awaited_once()
         token_count.assert_awaited_once()
         assert inference_events == ["count", "generate"]
-        token_payload = token_count.await_args.args[0]
+        assert isinstance(token_count.await_args.args[0], LocalAIManifest)
+        assert token_count.await_args.args[0] == manifest
+        token_payload = token_count.await_args.args[1]
         assert set(token_payload) == {
             "job_id",
             "reference_document",
@@ -959,18 +971,26 @@ async def test_strict_local_summary_cancellation_finalizes_job_before_reraising(
         def active_manifest(self):
             return manifest
 
-    async def cancel(*_args, **_kwargs):
+    async def cancel(attested_manifest: object, *_args, **_kwargs):
+        assert isinstance(attested_manifest, LocalAIManifest)
+        assert attested_manifest == manifest
         job.cancel_requested = True
         await db_session.commit()
         raise asyncio.CancelledError
 
     monkeypatch.setattr("app.services.local_ai.artifact_store.ArtifactStore", Store)
+
+    async def count_tokens(attested_manifest: object, _payload: dict) -> int:
+        assert isinstance(attested_manifest, LocalAIManifest)
+        assert attested_manifest == manifest
+        return 100
+
     monkeypatch.setattr(
-        "app.services.local_ai.model_manager.local_model_manager.run", cancel
+        "app.services.local_ai.model_manager.local_model_manager.run_attested", cancel
     )
     monkeypatch.setattr(
-        "app.services.local_ai.model_manager.local_model_manager.count_summary_tokens",
-        AsyncMock(return_value=100),
+        "app.services.local_ai.model_manager.local_model_manager.count_summary_tokens_attested",
+        count_tokens,
     )
     monkeypatch.setattr(
         "app.services.ai.summarizer.settings.local_ai_scratch_dir",
@@ -1064,7 +1084,9 @@ async def test_final_summary_completion_honors_cancellation_under_its_terminal_l
         def active_manifest(self):
             return manifest
 
-    async def complete_model(*_args, **_kwargs) -> dict:
+    async def complete_model(attested_manifest: object, *_args, **_kwargs) -> dict:
+        assert isinstance(attested_manifest, LocalAIManifest)
+        assert attested_manifest == manifest
         return {}
 
     job_id = job.id
@@ -1104,13 +1126,19 @@ async def test_final_summary_completion_honors_cancellation_under_its_terminal_l
         return await original_execute(*args, **kwargs)
 
     monkeypatch.setattr("app.services.local_ai.artifact_store.ArtifactStore", Store)
+
+    async def count_tokens(attested_manifest: object, _payload: dict) -> int:
+        assert isinstance(attested_manifest, LocalAIManifest)
+        assert attested_manifest == manifest
+        return 100
+
     monkeypatch.setattr(
-        "app.services.local_ai.model_manager.local_model_manager.run",
+        "app.services.local_ai.model_manager.local_model_manager.run_attested",
         complete_model,
     )
     monkeypatch.setattr(
-        "app.services.local_ai.model_manager.local_model_manager.count_summary_tokens",
-        AsyncMock(return_value=100),
+        "app.services.local_ai.model_manager.local_model_manager.count_summary_tokens_attested",
+        count_tokens,
     )
     monkeypatch.setattr(
         "app.services.local_ai.grounded_summary.validate_and_render_summary",
@@ -1215,10 +1243,15 @@ def _strict_manifest() -> dict:
         }
 
     return {
-        "schema_version": 1,
-        "pack_revision": "apple-m4-16gb-v1",
+        "schema_version": 2,
+        "pack_revision": "apple-m4-16gb-v2",
         "platform": "apple_silicon",
-        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "runtime": {
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "d" * 64,
+        },
         "validation_suite_version": "local-ai-fixtures-v1",
         "artifacts": [
             artifact("ocr", "a"),

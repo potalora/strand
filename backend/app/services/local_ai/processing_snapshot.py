@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -12,19 +13,123 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.llm_settings import UserLLMPreferences
-from app.models.local_ai import LocalAIJob
+from app.models.local_ai import LEGACY_RUNTIME_IDENTITY_FAILURE, LocalAIJob
 from app.services.local_ai.artifact_store import ArtifactStore
-from app.services.local_ai.errors import LocalPolicyError, LocalValidationError
+from app.services.local_ai.errors import (
+    LocalPolicyError,
+    LocalValidationError,
+    LocalWorkerError,
+    RuntimeIdentityRequiredError,
+)
 from app.services.local_ai.manifest import (
+    LegacyManifestDiagnostic,
     canonicalize_manifest_snapshot,
     load_manifest,
 )
 from app.services.local_ai.lifecycle_lock import acquire_local_ai_lifecycle_lock
 from app.services.local_ai.pack_operations import PackOperationStore
 from app.services.local_ai.release_evidence import load_release_evidence
+from app.services.local_ai.runtime_identity import (
+    normalize_worker_runtime_binding,
+    require_manifest_runtime_identity,
+    resolve_worker_runtime_identity,
+)
 from app.services.local_ai.types import ProcessingMode
 
 EXTRACTION_SCHEMA_VERSION = "clinical-document-extraction.v1"
+
+
+def fail_legacy_runtime_identity_required(
+    job: LocalAIJob,
+    *,
+    completed_at: datetime | None = None,
+) -> bool:
+    """Fail one canonical v1 row without changing its immutable identity."""
+
+    if job.legacy_manifest_diagnostic() is None:
+        return False
+    if job.status not in {"queued", "processing"}:
+        return False
+    job.status = "failed"
+    job.stage = "failed"
+    job.progress = {"stage": "failed"}
+    job.failure = dict(LEGACY_RUNTIME_IDENTITY_FAILURE)
+    job.completed_at = completed_at or datetime.now(timezone.utc)
+    return True
+
+
+async def fail_active_legacy_ingestion_jobs(
+    db: AsyncSession,
+    *,
+    completed_at: datetime,
+) -> int:
+    """Terminalize active v1 ingestion pairs in upload-then-job lock order."""
+
+    from app.models.uploaded_file import UploadedFile
+
+    candidates = (
+        (
+            await db.execute(
+                select(LocalAIJob)
+                .where(
+                    LocalAIJob.kind == "ingestion",
+                    LocalAIJob.processing_mode == "validated_strict_local",
+                    LocalAIJob.status.in_(("queued", "processing")),
+                )
+                .order_by(LocalAIJob.upload_id.asc(), LocalAIJob.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    failed = 0
+    for candidate in candidates:
+        if (
+            candidate.upload_id is None
+            or candidate.legacy_manifest_diagnostic() is None
+        ):
+            continue
+        locked_upload = (
+            await db.execute(
+                select(UploadedFile)
+                .where(
+                    UploadedFile.id == candidate.upload_id,
+                    UploadedFile.user_id == candidate.user_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        locked_job = (
+            await db.execute(
+                select(LocalAIJob)
+                .where(
+                    LocalAIJob.id == candidate.id,
+                    LocalAIJob.upload_id == candidate.upload_id,
+                    LocalAIJob.user_id == candidate.user_id,
+                    LocalAIJob.kind == "ingestion",
+                    LocalAIJob.processing_mode == "validated_strict_local",
+                    LocalAIJob.status.in_(("queued", "processing")),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if locked_job is None or not fail_legacy_runtime_identity_required(
+            locked_job,
+            completed_at=completed_at,
+        ):
+            continue
+        if locked_upload is not None:
+            locked_upload.ingestion_status = "failed"
+            locked_upload.progress_stage = None
+            locked_upload.progress_detail = None
+            locked_upload.ingestion_errors = [
+                {"error_type": "runtime_identity_required"}
+            ]
+            locked_upload.processing_completed_at = completed_at
+        failed += 1
+    return failed
 
 
 @dataclass(frozen=True)
@@ -83,7 +188,23 @@ def _current_strict_snapshot() -> ProcessingSnapshot:
     if not settings.local_ai_enabled:
         raise LocalPolicyError(unavailable)
     try:
-        locked = load_manifest(Path(settings.local_ai_manifest_path))
+        locked = load_manifest(
+            Path(settings.local_ai_manifest_path),
+            allow_legacy_diagnostic=True,
+        )
+        if isinstance(locked, LegacyManifestDiagnostic):
+            raise RuntimeIdentityRequiredError(
+                "Strict-local worker runtime identity is required."
+            )
+        worker_command, worker_project = normalize_worker_runtime_binding(
+            settings.local_ai_worker_command,
+            settings.local_ai_worker_project_dir,
+        )
+        observed_runtime = resolve_worker_runtime_identity(
+            worker_command,
+            worker_project,
+        )
+        require_manifest_runtime_identity(locked, observed_runtime)
         store = ArtifactStore(Path(settings.local_ai_model_dir))
         operations = PackOperationStore(store)
         active = store.active_manifest()
@@ -103,7 +224,7 @@ def _current_strict_snapshot() -> ProcessingSnapshot:
         snapshot, digest = canonicalize_manifest_snapshot(detached_manifest)
     except LocalPolicyError:
         raise
-    except (LocalValidationError, OSError) as exc:
+    except (LocalValidationError, LocalWorkerError, OSError) as exc:
         raise LocalPolicyError(unavailable) from exc
     return ProcessingSnapshot(
         mode=ProcessingMode.VALIDATED_STRICT_LOCAL,

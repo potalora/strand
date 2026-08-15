@@ -96,6 +96,13 @@ OS-enforced network deny. Cloud-assisted PDF and TIFF ingestion sends the
 original document or pages to the selected vision provider before OCR text is
 available for scrubbing.
 
+Every signed-in user can see whether the validated local pack is ready. Only
+account UUIDs listed by the machine owner in `LOCAL_AI_OPERATOR_USER_IDS` can
+maintain it through the web app. Those accounts can install, verify, update,
+roll back, resume or retry operations, and remove the pack. Leaving the setting
+empty disables web maintenance. The operating-system owner can still use the
+local CLI.
+
 ## Privacy and AI
 
 - **AI is optional.** Prompt-only builds a de-identified payload and makes no model call.

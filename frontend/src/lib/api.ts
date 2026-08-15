@@ -324,10 +324,12 @@ class ApiClient {
   }
 
   async getLocalAIJobs(
-    activeOnly = false
+    activeOnly = false,
+    includeRetryableFailed = false
   ): Promise<LocalAIJobResponse[]> {
     return this.get<LocalAIJobResponse[]>(
-      `/local-ai/jobs?active_only=${activeOnly ? "true" : "false"}`
+      `/local-ai/jobs?active_only=${activeOnly ? "true" : "false"}` +
+        `&include_retryable_failed=${includeRetryableFailed ? "true" : "false"}`
     );
   }
 

@@ -79,6 +79,28 @@ interface MockState {
   triggerCalls: string[][];
   processingMode?: "validated_strict_local" | "cloud_assisted";
   directUploadId?: string;
+  directUploadFilename?: string;
+  batchUploadResponse?: {
+    uploads: {
+      upload_id: string;
+      filename: string;
+      status: string;
+      file_type: string;
+      manual_extraction_required: boolean;
+    }[];
+    rejected: {
+      filename: string;
+      code:
+        | "missing_filename"
+        | "unsupported_type"
+        | "file_too_large"
+        | "invalid_signature";
+    }[];
+    total: number;
+    detail?: string;
+  };
+  batchUploadCalls?: number;
+  extractionProgressCalls?: number;
   jobAfterUpload?: ReturnType<typeof localJob>;
   extractionProgress?: {
     total: number;
@@ -93,6 +115,10 @@ interface MockState {
     filename: string;
     ingestion_status: string;
   }[];
+  jobsDelayMs?: number;
+  historyDelayMs?: number;
+  historyGate?: Promise<void>;
+  jobListQueries?: string[];
 }
 
 async function mockBackend(page: Page, state: MockState): Promise<void> {
@@ -104,12 +130,23 @@ async function mockBackend(page: Page, state: MockState): Promise<void> {
     // Explicitly handle local jobs before this file's broad API fallback.
     if (path === "/api/v1/local-ai/jobs") {
       const activeOnly = url.searchParams.get("active_only") !== "false";
+      const includeRetryableFailed =
+        url.searchParams.get("include_retryable_failed") === "true";
+      state.jobListQueries?.push(url.search);
+      if (state.jobsDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, state.jobsDelayMs));
+      }
       return route.fulfill(
         json(
           activeOnly
             ? state.jobs.filter(
                 (job) =>
-                  (job.status === "queued" || job.status === "processing") &&
+                  ((job.status === "queued" || job.status === "processing") ||
+                    (includeRetryableFailed &&
+                      job.status === "failed" &&
+                      (
+                        job.failure as { retryable?: boolean } | null
+                      )?.retryable === true)) &&
                   !state.history.some(
                     (upload) =>
                       upload.id === job.upload_id &&
@@ -172,6 +209,10 @@ async function mockBackend(page: Page, state: MockState): Promise<void> {
       return route.fulfill(json(job));
     }
     if (path === "/api/v1/upload/history") {
+      if (state.historyGate) await state.historyGate;
+      if (state.historyDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, state.historyDelayMs));
+      }
       return route.fulfill(
         json({ items: state.history, total: state.history.length })
       );
@@ -208,13 +249,30 @@ async function mockBackend(page: Page, state: MockState): Promise<void> {
       return route.fulfill(
         json({
           upload_id: state.directUploadId ?? "direct-upload",
+          filename: state.directUploadFilename ?? "direct.pdf",
           status: "pending_extraction",
           file_type: "pdf",
           manual_extraction_required: false,
         })
       );
     }
+    if (
+      path === "/api/v1/upload/unstructured-batch" &&
+      request.method() === "POST"
+    ) {
+      state.batchUploadCalls = (state.batchUploadCalls ?? 0) + 1;
+      return route.fulfill(
+        json(
+          state.batchUploadResponse ?? {
+            uploads: [],
+            rejected: [],
+            total: 0,
+          }
+        )
+      );
+    }
     if (path === "/api/v1/upload/extraction-progress") {
+      state.extractionProgressCalls = (state.extractionProgressCalls ?? 0) + 1;
       return route.fulfill(
         json(
           state.extractionProgress ?? {
@@ -277,6 +335,110 @@ async function mockBackend(page: Page, state: MockState): Promise<void> {
 }
 
 test.describe("server-hydrated background processing", () => {
+  for (const resolutionOrder of ["history-first", "jobs-first"] as const) {
+    test(`retryable failure reload stays silent and keeps labels when ${resolutionOrder}`, async ({
+      page,
+    }) => {
+      await injectAuth(page);
+      const failedJob = localJob("retryable-job", "retryable-upload", {
+        status: "failed",
+        stage: "failed",
+        progress: null,
+        failure: {
+          stage: "ocr",
+          code: "worker_timeout",
+          retryable: true,
+          checkpoint_preserved: true,
+          cloud_fallback_attempted: false,
+        },
+      });
+      const state: MockState = {
+        jobs: [failedJob],
+        history: [
+          historyItem("retryable-upload", "server-retryable.pdf", "failed"),
+        ],
+        pollInFlight: 0,
+        maxPollInFlight: 0,
+        retryFailures: 0,
+        cancelFailures: 0,
+        triggerCalls: [],
+        jobsDelayMs: resolutionOrder === "history-first" ? 150 : 0,
+        historyDelayMs: resolutionOrder === "jobs-first" ? 150 : 0,
+        jobListQueries: [],
+      };
+      await mockBackend(page, state);
+
+      await page.goto("/upload");
+      await page.reload();
+      const monitor = page.getByRole("region", {
+        name: "Background processing",
+      });
+      await expect(monitor).toBeVisible();
+      await monitor
+        .getByRole("button", { name: /background processing/i })
+        .click();
+      await expect(monitor).toContainText("server-retryable.pdf");
+      await expect(monitor.getByRole("button", { name: /^retry$/i })).toBeVisible();
+      await expect(page.getByText(/could not be processed\.$/)).toHaveCount(0);
+      expect(
+        state.jobListQueries?.some((query) =>
+          query.includes("include_retryable_failed=true")
+        )
+      ).toBe(true);
+      expect(state.maxPollInFlight).toBe(0);
+
+      await monitor.getByRole("button", { name: /^retry$/i }).click();
+      await expect
+        .poll(() => failedJob.status)
+        .toBe("queued");
+      await expect(monitor.getByRole("button", { name: /^cancel$/i })).toBeVisible();
+      await expect
+        .poll(() => state.maxPollInFlight, { timeout: 8_000 })
+        .toBe(1);
+    });
+  }
+
+  test("retryable job hydration does not wait for hung upload history", async ({
+    page,
+  }) => {
+    await injectAuth(page);
+    let releaseHistory!: () => void;
+    const historyGate = new Promise<void>((resolve) => {
+      releaseHistory = resolve;
+    });
+    const state: MockState = {
+      jobs: [
+        localJob("hung-history-job", "hung-history-upload", {
+          status: "failed",
+          stage: "failed",
+          progress: null,
+          failure: { code: "worker_timeout", retryable: true },
+        }),
+      ],
+      history: [historyItem("hung-history-upload", "late-label.pdf", "failed")],
+      pollInFlight: 0,
+      maxPollInFlight: 0,
+      retryFailures: 0,
+      cancelFailures: 0,
+      triggerCalls: [],
+      historyGate,
+    };
+    await mockBackend(page, state);
+
+    await page.goto("/upload");
+    const monitor = page.getByRole("region", {
+      name: "Background processing",
+    });
+    await expect(monitor).toBeVisible({ timeout: 2_000 });
+    await monitor
+      .getByRole("button", { name: /background processing/i })
+      .click();
+    await expect(monitor.getByRole("button", { name: /^retry$/i })).toBeVisible();
+
+    releaseHistory();
+    await expect(monitor).toContainText("late-label.pdf");
+  });
+
   test("discovers active jobs on initial load and reload, stays visible off-page, and polls serially", async ({
     page,
   }) => {
@@ -384,9 +546,14 @@ test.describe("server-hydrated background processing", () => {
     await mockBackend(page, state);
 
     await page.goto("/upload");
-    await expect(
-      page.getByRole("region", { name: "Background processing" })
-    ).toHaveCount(0);
+    const hydratedMonitor = page.getByRole("region", {
+      name: "Background processing",
+    });
+    await expect(hydratedMonitor).toBeVisible();
+    await hydratedMonitor
+      .getByRole("button", { name: /background processing/i })
+      .click();
+    await expect(hydratedMonitor).toContainText("retryable.pdf");
     await page.getByRole("button", { name: /upload history/i }).click();
 
     const processingRow = page.locator("tr", { hasText: "processing.pdf" });
@@ -431,6 +598,7 @@ test.describe("server-hydrated background processing", () => {
       triggerCalls: [],
       processingMode: "cloud_assisted",
       directUploadId: "cloud-upload",
+      directUploadFilename: "cloud.pdf",
       extractionProgress: {
         total: 1,
         completed: 0,
@@ -494,6 +662,7 @@ test.describe("server-hydrated background processing", () => {
       cancelFailures: 0,
       triggerCalls: [],
       directUploadId: "strict-upload",
+      directUploadFilename: "strict.pdf",
       jobAfterUpload: localJob("strict-job", "strict-upload"),
     };
     await mockBackend(page, state);
@@ -511,5 +680,137 @@ test.describe("server-hydrated background processing", () => {
     await expect(monitor).toContainText("strict.pdf");
     expect(state.jobs).toHaveLength(1);
     expect(state.jobs[0].upload_id).toBe("strict-upload");
+  });
+
+  test("compacted batch uses accepted server filenames after a rejection", async ({
+    page,
+  }) => {
+    await injectAuth(page);
+    const state: MockState = {
+      jobs: [],
+      history: [],
+      pollInFlight: 0,
+      maxPollInFlight: 0,
+      retryFailures: 0,
+      cancelFailures: 0,
+      triggerCalls: [],
+      processingMode: "cloud_assisted",
+      batchUploadResponse: {
+        uploads: [
+          {
+            upload_id: "later-valid-id",
+            filename: "later-valid.rtf",
+            status: "pending_extraction",
+            file_type: "rtf",
+            manual_extraction_required: false,
+          },
+          {
+            upload_id: "final-valid-id",
+            filename: "final-valid.pdf",
+            status: "pending_extraction",
+            file_type: "pdf",
+            manual_extraction_required: false,
+          },
+        ],
+        rejected: [
+          { filename: "first-rejected.rtf", code: "invalid_signature" },
+        ],
+        total: 2,
+      },
+    };
+    await mockBackend(page, state);
+    await page.goto("/upload");
+
+    await page.locator('input[type="file"]').first().setInputFiles([
+      {
+        name: "first-rejected.rtf",
+        mimeType: "application/rtf",
+        buffer: Buffer.from("not an rtf"),
+      },
+      {
+        name: "browser-second.rtf",
+        mimeType: "application/rtf",
+        buffer: Buffer.from("{\\rtf1 second}"),
+      },
+      {
+        name: "browser-third.pdf",
+        mimeType: "application/pdf",
+        buffer: Buffer.from("%PDF-1.4 third"),
+      },
+    ]);
+    await page.getByRole("button", { name: /upload all/i }).click();
+
+    await expect(page.getByText("later-valid.rtf")).toHaveCount(2);
+    await expect(page.getByText("final-valid.pdf")).toHaveCount(2);
+    await expect(page.getByText("first-rejected.rtf")).toBeVisible();
+    await expect(
+      page.getByText("This file does not match its claimed format.")
+    ).toBeVisible();
+    await expect(page.getByText("browser-second.rtf")).toHaveCount(0);
+    await expect(page.getByText("browser-third.pdf")).toHaveCount(0);
+    expect(state.batchUploadCalls).toBe(1);
+  });
+
+  test("all rejected batch shows fixed guidance without starting progress", async ({
+    page,
+  }) => {
+    await injectAuth(page);
+    const state: MockState = {
+      jobs: [],
+      history: [],
+      pollInFlight: 0,
+      maxPollInFlight: 0,
+      retryFailures: 0,
+      cancelFailures: 0,
+      triggerCalls: [],
+      processingMode: "cloud_assisted",
+      batchUploadResponse: {
+        uploads: [],
+        rejected: [
+          { filename: "bad-name.rtf", code: "invalid_signature" },
+          { filename: "too-large.pdf", code: "file_too_large" },
+        ],
+        total: 0,
+        detail: "private resolver failure at /tmp/secret",
+      },
+    };
+    await mockBackend(page, state);
+    await page.goto("/upload");
+
+    await page.locator('input[type="file"]').first().setInputFiles([
+      {
+        name: "bad-name.rtf",
+        mimeType: "application/rtf",
+        buffer: Buffer.from("not an rtf"),
+      },
+      {
+        name: "too-large.pdf",
+        mimeType: "application/pdf",
+        buffer: Buffer.from("%PDF-1.4 mock"),
+      },
+    ]);
+    await page.getByRole("button", { name: /upload all/i }).click();
+
+    await expect(
+      page.getByText(
+        "No files were accepted. Choose a supported PDF, RTF, or TIFF and try again."
+      )
+    ).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Upload results" })
+    ).toBeVisible();
+    await expect(
+      page.getByText("This file does not match its claimed format.")
+    ).toBeVisible();
+    await expect(
+      page.getByText("This file is larger than the upload limit.")
+    ).toBeVisible();
+    await expect(page.getByText("private resolver failure")).toHaveCount(0);
+    await expect(page.getByText("/tmp/secret")).toHaveCount(0);
+    await expect(
+      page.getByRole("region", { name: "Extraction status" })
+    ).toHaveCount(0);
+    expect(state.batchUploadCalls).toBe(1);
+    expect(state.extractionProgressCalls ?? 0).toBe(0);
   });
 });

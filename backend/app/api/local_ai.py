@@ -10,12 +10,16 @@ from typing import Callable, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
-from sqlalchemy import exists, func, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.dependencies import get_authenticated_user_id
+from app.dependencies import (
+    get_authenticated_user_id,
+    is_local_ai_operator,
+    require_local_ai_operator,
+)
 from app.middleware.audit import log_audit_event
 from app.models.local_ai import LocalAIJob
 from app.models.uploaded_file import UploadedFile
@@ -39,6 +43,9 @@ from app.services.local_ai.pack_operations import (
     platform_profile,
 )
 from app.services.local_ai.pack_verifier import verify_pack_candidate
+from app.services.local_ai.processing_snapshot import (
+    fail_legacy_runtime_identity_required,
+)
 from app.services.local_ai.release_evidence import (
     ReleaseEvidence,
     load_release_evidence,
@@ -185,6 +192,8 @@ async def _retry_local_ai_job(
     upload: UploadedFile | None = None,
 ) -> None:
     """Atomically requeue one failed, retryable strict-local job."""
+    if job.legacy_manifest_diagnostic() is not None:
+        raise HTTPException(status_code=409, detail="This job cannot be retried.")
     failure = job.failure if isinstance(job.failure, dict) else {}
     if job.status != "failed" or failure.get("retryable") is not True:
         raise HTTPException(status_code=409, detail="This job cannot be retried.")
@@ -591,10 +600,11 @@ async def _queue_operation(
 
 @router.get("/status", response_model=LocalPackStatusResponse)
 async def get_local_pack_status(
-    _user_id: UUID = Depends(get_authenticated_user_id),
+    user_id: UUID = Depends(get_authenticated_user_id),
 ) -> LocalPackStatusResponse:
     """Return current pack state without model paths or clinical identifiers."""
 
+    can_manage_pack = is_local_ai_operator(user_id)
     platform_name, compatible = platform_profile()
     store = _store()
     operation_store = _operations(store)
@@ -606,12 +616,15 @@ async def get_local_pack_status(
             platform=platform_name,  # type: ignore[arg-type]
             compatible=compatible,
             enabled=settings.local_ai_enabled,
+            can_manage_pack=can_manage_pack,
             state="failed",
             active_revision=None,
             available_revision=None,
             models=[],
             operation=(
-                _operation_response(operation_store, latest) if latest else None
+                _operation_response(operation_store, latest)
+                if can_manage_pack and latest
+                else None
             ),
         )
 
@@ -668,7 +681,8 @@ async def get_local_pack_status(
     elif latest and latest["state"] in {"queued", "running", "paused"}:
         pack_state = (
             "verifying"
-            if latest["message"] == "Running local validation fixtures."
+            if latest["action"] == "verify"
+            or latest["message"] == "Running local validation fixtures."
             else "downloading"
         )
     elif validated:
@@ -694,12 +708,17 @@ async def get_local_pack_status(
         platform=platform_name,  # type: ignore[arg-type]
         compatible=compatible,
         enabled=settings.local_ai_enabled,
+        can_manage_pack=can_manage_pack,
         state=pack_state,  # type: ignore[arg-type]
         status_reason=status_reason,
         active_revision=active_revision,
         available_revision=manifest.pack_revision,
         models=models,
-        operation=_operation_response(operation_store, latest) if latest else None,
+        operation=(
+            _operation_response(operation_store, latest)
+            if can_manage_pack and latest
+            else None
+        ),
     )
 
 
@@ -707,6 +726,7 @@ async def get_local_pack_status(
 async def list_local_ai_jobs(
     kind: Literal["ingestion", "summary"] | None = None,
     active_only: bool = True,
+    include_retryable_failed: bool = False,
     user_id: UUID = Depends(get_authenticated_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> list[LocalAIJobResponse]:
@@ -720,9 +740,19 @@ async def list_local_ai_jobs(
             UploadedFile.user_id == user_id,
             UploadedFile.manual_extraction_required.is_(True),
         )
-        query = query.where(
+        active_visible = and_(
             LocalAIJob.status.in_(_ACTIVE_JOB_STATES),
             ~manual_upload_gate,
+        )
+        retryable_failed = and_(
+            LocalAIJob.status == "failed",
+            LocalAIJob.failure.contains({"retryable": True}),
+            ~manual_upload_gate,
+        )
+        query = query.where(
+            or_(active_visible, retryable_failed)
+            if include_retryable_failed
+            else active_visible
         )
     jobs = (
         (
@@ -875,44 +905,87 @@ async def cancel_local_ai_job(
     db: AsyncSession = Depends(get_db),
 ) -> LocalAIJobResponse:
     """Persist cancellation and terminate an active embedded worker when present."""
-    job = (
+    target = (
         await db.execute(
-            select(LocalAIJob)
-            .where(
+            select(
+                LocalAIJob.upload_id,
+                LocalAIJob.kind,
+                LocalAIJob.processing_mode,
+            ).where(
                 LocalAIJob.id == job_id,
                 LocalAIJob.user_id == user_id,
             )
-            .with_for_update()
         )
-    ).scalar_one_or_none()
-    if job is None:
+    ).one_or_none()
+    if target is None:
         raise HTTPException(status_code=404, detail="Local AI job not found.")
 
-    was_processing = job.status == "processing"
-    if job.status in _ACTIVE_JOB_STATES:
-        job.cancel_requested = True
-        if job.status == "queued":
-            job.status = "cancelled"
-            job.stage = "cancelled"
-            job.progress = {"stage": "cancelled"}
-            job.failure = None
-            job.completed_at = datetime.now(timezone.utc)
+    worker_cancel_required = False
+    if target.kind == "ingestion":
+        if (
+            target.upload_id is None
+            or target.processing_mode != "validated_strict_local"
+        ):
+            raise HTTPException(status_code=409, detail="This job cannot be cancelled.")
+        from app.services.local_ai.ingestion_lifecycle import (
+            cancel_strict_ingestion_pair,
+        )
+
+        result = await cancel_strict_ingestion_pair(
+            db,
+            user_id=user_id,
+            upload_id=target.upload_id,
+            expected_job_id=job_id,
+        )
+        job = result.job
+        worker_cancel_required = result.worker_cancel_required
         await db.commit()
         await db.refresh(job)
-
-        if was_processing:
-            from app.services.local_ai.errors import LocalWorkerError
-            from app.services.local_ai.model_manager import local_model_manager
-
-            try:
-                registered = await local_model_manager.cancel_registered(str(job.id))
-                if not registered:
-                    await local_model_manager.cancel(str(job.id))
-            except LocalWorkerError:
-                logger.warning(
-                    "Local worker cancellation could not be confirmed",
-                    extra={"job_id": str(job.id)},
+    elif target.kind == "summary":
+        job = (
+            await db.execute(
+                select(LocalAIJob)
+                .where(
+                    LocalAIJob.id == job_id,
+                    LocalAIJob.user_id == user_id,
+                    LocalAIJob.kind == "summary",
                 )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if job is None:
+            raise HTTPException(status_code=404, detail="Local AI job not found.")
+        if fail_legacy_runtime_identity_required(job):
+            await db.commit()
+            await db.refresh(job)
+        elif job.status in _ACTIVE_JOB_STATES:
+            worker_cancel_required = job.status == "processing"
+            job.cancel_requested = True
+            if job.status == "queued":
+                job.status = "cancelled"
+                job.stage = "cancelled"
+                job.progress = {"stage": "cancelled"}
+                job.failure = None
+                job.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+            await db.refresh(job)
+    else:
+        raise HTTPException(status_code=409, detail="This job cannot be cancelled.")
+
+    if worker_cancel_required:
+        from app.services.local_ai.errors import LocalWorkerError
+        from app.services.local_ai.model_manager import local_model_manager
+
+        try:
+            registered = await local_model_manager.cancel_registered(str(job.id))
+            if not registered:
+                await local_model_manager.cancel(str(job.id))
+        except LocalWorkerError:
+            logger.warning(
+                "Local worker cancellation could not be confirmed",
+                extra={"job_id": str(job.id)},
+            )
 
     await log_audit_event(
         db,
@@ -938,7 +1011,7 @@ async def cancel_local_ai_job(
 async def install_local_pack(
     background_tasks: BackgroundTasks,
     request: Request,
-    user_id: UUID = Depends(get_authenticated_user_id),
+    user_id: UUID = Depends(require_local_ai_operator),
     db: AsyncSession = Depends(get_db),
 ) -> LocalPackOperationCreated:
     return await _queue_operation(
@@ -956,7 +1029,7 @@ async def install_local_pack(
 )
 async def get_local_pack_operation(
     operation_id: UUID,
-    _user_id: UUID = Depends(get_authenticated_user_id),
+    _operator_id: UUID = Depends(require_local_ai_operator),
 ) -> LocalPackOperationResponse:
     operation_store = _operations()
     operation = operation_store.get(str(operation_id))
@@ -1044,7 +1117,7 @@ async def resume_local_pack_operation(
     operation_id: UUID,
     background_tasks: BackgroundTasks,
     request: Request,
-    user_id: UUID = Depends(get_authenticated_user_id),
+    user_id: UUID = Depends(require_local_ai_operator),
     db: AsyncSession = Depends(get_db),
 ) -> LocalPackOperationResponse:
     return await _restart_operation(
@@ -1065,7 +1138,7 @@ async def retry_local_pack_operation(
     operation_id: UUID,
     background_tasks: BackgroundTasks,
     request: Request,
-    user_id: UUID = Depends(get_authenticated_user_id),
+    user_id: UUID = Depends(require_local_ai_operator),
     db: AsyncSession = Depends(get_db),
 ) -> LocalPackOperationResponse:
     return await _restart_operation(
@@ -1086,7 +1159,7 @@ async def retry_local_pack_operation(
 async def verify_local_pack(
     background_tasks: BackgroundTasks,
     request: Request,
-    user_id: UUID = Depends(get_authenticated_user_id),
+    user_id: UUID = Depends(require_local_ai_operator),
     db: AsyncSession = Depends(get_db),
 ) -> LocalPackOperationCreated:
     return await _queue_operation(
@@ -1106,7 +1179,7 @@ async def verify_local_pack(
 async def update_local_pack(
     background_tasks: BackgroundTasks,
     request: Request,
-    user_id: UUID = Depends(get_authenticated_user_id),
+    user_id: UUID = Depends(require_local_ai_operator),
     db: AsyncSession = Depends(get_db),
 ) -> LocalPackOperationCreated:
     return await _queue_operation(
@@ -1126,7 +1199,7 @@ async def update_local_pack(
 async def rollback_local_pack(
     background_tasks: BackgroundTasks,
     request: Request,
-    user_id: UUID = Depends(get_authenticated_user_id),
+    user_id: UUID = Depends(require_local_ai_operator),
     db: AsyncSession = Depends(get_db),
 ) -> LocalPackOperationCreated:
     return await _queue_operation(
@@ -1145,7 +1218,7 @@ async def rollback_local_pack(
 async def remove_local_model(
     role: ModelRole,
     request: Request,
-    user_id: UUID = Depends(get_authenticated_user_id),
+    user_id: UUID = Depends(require_local_ai_operator),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     await _acquire_pack_mutation_db_guard(db)
@@ -1176,7 +1249,7 @@ async def remove_local_model(
 @router.delete("", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_local_pack(
     request: Request,
-    user_id: UUID = Depends(get_authenticated_user_id),
+    user_id: UUID = Depends(require_local_ai_operator),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     await _acquire_pack_mutation_db_guard(db)

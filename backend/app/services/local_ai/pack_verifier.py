@@ -27,6 +27,12 @@ from app.services.local_ai.grounded_summary import (
 from app.services.local_ai.manifest import LocalAIManifest, ManifestArtifact
 from app.services.local_ai.model_manager import LocalModelManager
 from app.services.local_ai.pack_operations import platform_profile
+from app.services.local_ai.runtime_identity import (
+    WorkerRuntimeIdentity,
+    normalize_worker_runtime_binding,
+    require_manifest_runtime_identity,
+    resolve_worker_runtime_identity,
+)
 from app.services.local_ai.types import ModelRole
 from app.services.local_ai.validation_receipt import (
     RuntimeValidationReceipt,
@@ -39,11 +45,18 @@ _FIXTURE_TEXT = "Hemoglobin A1c 6.8 %"
 
 
 class _Manager(Protocol):
+    runtime_identity: WorkerRuntimeIdentity
+
     async def start(self) -> None: ...
 
     async def stop(self) -> None: ...
 
-    async def run(self, role: ModelRole, payload: dict[str, Any]) -> Any: ...
+    async def run_attested(
+        self,
+        manifest: LocalAIManifest,
+        role: ModelRole,
+        payload: dict[str, Any],
+    ) -> Any: ...
 
 
 def _artifact(manifest: LocalAIManifest, role: ModelRole) -> ManifestArtifact:
@@ -205,17 +218,45 @@ async def verify_pack_candidate(
     ):
         raise LocalValidationError("Local model validation platform is incompatible")
     if (
-        manifest.runtime != _SUPPORTED_RUNTIME
+        {key: manifest.runtime.get(key) for key in _SUPPORTED_RUNTIME}
+        != _SUPPORTED_RUNTIME
         or manifest.validation_suite_version != _SUPPORTED_FIXTURE_SUITE
     ):
         raise LocalValidationError("Local model validation runtime is incompatible")
     candidate = _assert_candidate_path(Path(pack_path))
+    if manager is None:
+        try:
+            command, project = normalize_worker_runtime_binding(
+                settings.local_ai_worker_command,
+                settings.local_ai_worker_project_dir,
+            )
+            observed_identity = resolve_worker_runtime_identity(command, project)
+            selected_manager: _Manager = LocalModelManager(
+                command,
+                worker_project_dir=project,
+            )
+        except (LocalAIError, TypeError, ValueError):
+            raise LocalValidationError(
+                "Local model validation runtime identity is unavailable"
+            ) from None
+    else:
+        selected_manager = manager
+        observed_identity = getattr(manager, "runtime_identity", None)
+        if not isinstance(observed_identity, WorkerRuntimeIdentity):
+            raise LocalValidationError(
+                "Local model validation runtime identity is unavailable"
+            )
+    try:
+        require_manifest_runtime_identity(manifest, observed_identity)
+    except LocalAIError:
+        raise LocalValidationError(
+            "Local model validation runtime identity is incompatible"
+        ) from None
     scratch = _make_scratch(
         Path(scratch_root)
         if scratch_root is not None
         else Path(settings.local_ai_scratch_dir) / "pack-validation"
     )
-    selected_manager: _Manager = manager or LocalModelManager()
     started = False
     try:
         manifest_path = _write_manifest(scratch, manifest)
@@ -224,7 +265,8 @@ async def verify_pack_candidate(
         started = True
 
         ocr_artifact = _artifact(manifest, ModelRole.OCR)
-        ocr_value = await selected_manager.run(
+        ocr_value = await selected_manager.run_attested(
+            manifest,
             ModelRole.OCR,
             {
                 **_transport(
@@ -243,7 +285,8 @@ async def verify_pack_candidate(
         markdown = _validate_ocr(ocr_value)
 
         extraction_artifact = _artifact(manifest, ModelRole.EXTRACTION)
-        extraction_value = await selected_manager.run(
+        extraction_value = await selected_manager.run_attested(
+            manifest,
             ModelRole.EXTRACTION,
             {
                 **_transport(
@@ -301,7 +344,8 @@ async def verify_pack_candidate(
             requested_scope={"summary_type": "full_health"},
         )
         summary_artifact = _artifact(manifest, ModelRole.SUMMARY)
-        summary_value = await selected_manager.run(
+        summary_value = await selected_manager.run_attested(
+            manifest,
             ModelRole.SUMMARY,
             {
                 **summary_input.model_dump(mode="json"),
@@ -327,7 +371,7 @@ async def verify_pack_candidate(
         )
         if not rendered.markdown.endswith(SERVER_MEDICAL_DISCLAIMER):
             raise LocalValidationError("Local model validation fixture failed")
-        return _issue_runtime_validation_receipt(manifest)
+        return _issue_runtime_validation_receipt(manifest, observed_identity)
     except LocalValidationError:
         raise
     except LocalAIError as exc:

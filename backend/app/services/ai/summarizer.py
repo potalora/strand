@@ -1236,6 +1236,7 @@ async def _claim_strict_summary_job(
             LocalAIJob.user_id == user_id,
             LocalAIJob.kind == "summary",
             LocalAIJob.processing_mode == ProcessingMode.VALIDATED_STRICT_LOCAL.value,
+            LocalAIJob.manifest_snapshot["schema_version"].as_integer() == 2,
             LocalAIJob.status == "queued",
             LocalAIJob.cancel_requested.is_(False),
         )
@@ -1289,6 +1290,13 @@ async def _finish_strict_summary_job(
     ).scalar_one_or_none()
     if job is None:
         await db.rollback()
+        return
+    from app.services.local_ai.processing_snapshot import (
+        fail_legacy_runtime_identity_required,
+    )
+
+    if fail_legacy_runtime_identity_required(job):
+        await db.commit()
         return
     if claim_started_at is not None and (
         job.status != "processing" or job.started_at != claim_started_at
@@ -1380,6 +1388,7 @@ async def _persist_strict_summary_progress(
                     LocalAIJob.kind == "summary",
                     LocalAIJob.processing_mode
                     == ProcessingMode.VALIDATED_STRICT_LOCAL.value,
+                    LocalAIJob.manifest_snapshot["schema_version"].as_integer() == 2,
                     LocalAIJob.status == "processing",
                     LocalAIJob.cancel_requested.is_(False),
                     LocalAIJob.started_at == claim_started_at,
@@ -1411,13 +1420,20 @@ async def resume_grounded_local_summary_jobs(
         session_factory = async_session_factory
     for job_id in job_ids:
         async with session_factory() as db:
-            job = await db.get(LocalAIJob, job_id)
+            job = await db.get(LocalAIJob, job_id, with_for_update=True)
             if (
                 job is None
                 or job.kind != "summary"
                 or job.processing_mode != ProcessingMode.VALIDATED_STRICT_LOCAL.value
                 or job.status not in {"queued", "processing"}
             ):
+                continue
+            from app.services.local_ai.processing_snapshot import (
+                fail_legacy_runtime_identity_required,
+            )
+
+            if fail_legacy_runtime_identity_required(job):
+                await db.commit()
                 continue
             prompt = await db.get(AISummaryPrompt, job.summary_prompt_id)
             if prompt is None or prompt.user_id != job.user_id:
@@ -1532,6 +1548,15 @@ async def requeue_interrupted_summary_jobs(*, session_factory=None) -> list[UUID
             cursor = (jobs[-1].created_at, jobs[-1].id)
             recovered_at = datetime.now().astimezone()
             for job in jobs:
+                from app.services.local_ai.processing_snapshot import (
+                    fail_legacy_runtime_identity_required,
+                )
+
+                if fail_legacy_runtime_identity_required(
+                    job,
+                    completed_at=recovered_at,
+                ):
+                    continue
                 if job.cancel_requested:
                     job.status = "cancelled"
                     job.stage = "cancelled"
@@ -1570,7 +1595,11 @@ async def generate_grounded_local_summary(
     from app.models.ai_summary import AISummaryPrompt
     from app.models.local_ai import LocalAIJob
     from app.services.local_ai.artifact_store import ArtifactStore
-    from app.services.local_ai.errors import LocalAIError, LocalPolicyError
+    from app.services.local_ai.errors import (
+        LocalAIError,
+        LocalPolicyError,
+        RuntimeIdentityRequiredError,
+    )
     from app.services.local_ai.grounded_summary import (
         SERVER_SAFETY_RULES,
         build_maximal_reference_document,
@@ -1579,6 +1608,9 @@ async def generate_grounded_local_summary(
     )
     from app.services.local_ai.manifest import parse_manifest
     from app.services.local_ai.model_manager import local_model_manager
+    from app.services.local_ai.processing_snapshot import (
+        fail_legacy_runtime_identity_required,
+    )
     from app.services.local_ai.scratch import ScratchJob
     from app.services.local_ai.summary_projection import project_summary_records
     from app.services.local_ai.types import ModelRole
@@ -1595,9 +1627,15 @@ async def generate_grounded_local_summary(
                     LocalAIJob.processing_mode
                     == ProcessingMode.VALIDATED_STRICT_LOCAL.value,
                 )
+                .with_for_update()
                 .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
+        if current is not None and fail_legacy_runtime_identity_required(current):
+            await db.commit()
+            raise RuntimeIdentityRequiredError(
+                "Strict-local worker runtime identity is required."
+            )
         if current is not None and current.status == "processing":
             return {"already_processing": True}
         if (
@@ -1720,6 +1758,7 @@ async def generate_grounded_local_summary(
             update(LocalAIJob)
             .where(
                 LocalAIJob.id == stable_job_id,
+                LocalAIJob.manifest_snapshot["schema_version"].as_integer() == 2,
                 LocalAIJob.status == "processing",
                 LocalAIJob.started_at == claim_started_at,
             )
@@ -1788,6 +1827,7 @@ async def generate_grounded_local_summary(
                 update(LocalAIJob)
                 .where(
                     LocalAIJob.id == stable_job_id,
+                    LocalAIJob.manifest_snapshot["schema_version"].as_integer() == 2,
                     LocalAIJob.status == "processing",
                     LocalAIJob.started_at == claim_started_at,
                 )
@@ -1809,14 +1849,15 @@ async def generate_grounded_local_summary(
             # The cancellation read opened a transaction. Release it before
             # model inference so worker progress owns only isolated sessions.
             await db.rollback()
-            token_count = await local_model_manager.count_summary_tokens(
+            token_count = await local_model_manager.count_summary_tokens_attested(
+                manifest,
                 {
                     "job_id": str(stable_job_id),
                     "reference_document": maximal_reference.model_dump(mode="json"),
                     "manifest_path": str(locked_manifest_path),
                     "model_dir": str(model_dir),
                     "manifest_identity": manifest_identity,
-                }
+                },
             )
             summary_limit = min(
                 artifact.decode_limits["max_output_tokens"],
@@ -1834,6 +1875,8 @@ async def generate_grounded_local_summary(
                     update(LocalAIJob)
                     .where(
                         LocalAIJob.id == stable_job_id,
+                        LocalAIJob.manifest_snapshot["schema_version"].as_integer()
+                        == 2,
                         LocalAIJob.status == "processing",
                         LocalAIJob.started_at == claim_started_at,
                     )
@@ -1857,6 +1900,7 @@ async def generate_grounded_local_summary(
                 update(LocalAIJob)
                 .where(
                     LocalAIJob.id == stable_job_id,
+                    LocalAIJob.manifest_snapshot["schema_version"].as_integer() == 2,
                     LocalAIJob.status == "processing",
                     LocalAIJob.started_at == claim_started_at,
                 )
@@ -1882,6 +1926,7 @@ async def generate_grounded_local_summary(
                 update(LocalAIJob)
                 .where(
                     LocalAIJob.id == stable_job_id,
+                    LocalAIJob.manifest_snapshot["schema_version"].as_integer() == 2,
                     LocalAIJob.status == "processing",
                     LocalAIJob.started_at == claim_started_at,
                 )
@@ -1900,7 +1945,8 @@ async def generate_grounded_local_summary(
                 return {"superseded": True}
             await db.commit()
             worker_payload["max_output_tokens"] = max_output_tokens
-            raw_output = await local_model_manager.run(
+            raw_output = await local_model_manager.run_attested(
+                manifest,
                 ModelRole.SUMMARY,
                 worker_payload,
                 on_progress=publish_summary_progress,

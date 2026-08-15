@@ -118,6 +118,7 @@ test("strict summary 202 registers a durable background card and clears loading"
           platform: "apple_silicon",
           compatible: true,
           enabled: true,
+          can_manage_pack: false,
           state: "ready",
           status_reason: null,
           active_revision: "v1",

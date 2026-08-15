@@ -18,6 +18,7 @@ from app.services.local_ai.manifest import (
     ManifestFile,
 )
 from app.services.local_ai.pack_operations import PackOperationStore
+from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
 from app.services.local_ai.types import ModelRole
 from app.services.local_ai.validation_receipt import (
     _issue_runtime_validation_receipt,
@@ -62,8 +63,7 @@ async def test_preflight_explains_that_a_candidate_catalog_is_not_installable(
     assert result == 1
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "ERROR: no validated locked local model pack is shipped; "
-        "the candidate catalog cannot be installed.\n"
+        "ERROR: validated local model release evidence is unavailable.\n"
     )
 
 
@@ -87,8 +87,36 @@ async def test_install_reports_candidate_only_when_no_lock_is_shipped(
     assert result == 1
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "ERROR: no validated locked local model pack is shipped; "
-        "the candidate catalog cannot be installed.\n"
+        "ERROR: validated local model release evidence is unavailable.\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_normal_verify_stays_blocked_without_v2_release_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = StringIO()
+    stderr = StringIO()
+    monkeypatch.setattr(pack_cli, "platform_profile", lambda: ("apple_silicon", True))
+    monkeypatch.setattr(
+        pack_cli,
+        "_load_released_manifest",
+        lambda: (_ for _ in ()).throw(LocalValidationError("missing release")),
+    )
+    monkeypatch.setattr(
+        pack_cli,
+        "ArtifactStore",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("store must not open before release evidence")
+        ),
+    )
+
+    result = await pack_cli.execute("verify", stdout=stdout, stderr=stderr)
+
+    assert result == 1
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "ERROR: validated local model release evidence is unavailable.\n"
     )
 
 
@@ -117,12 +145,27 @@ def _manifest() -> LocalAIManifest:
         for index, role in enumerate(ModelRole, start=1)
     )
     return LocalAIManifest(
-        schema_version=1,
+        schema_version=2,
         pack_revision="apple-m4-16gb-v1",
         platform="apple_silicon",
-        runtime={"name": "mlx-vlm", "version": "0.5.0"},
+        runtime={
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "a" * 64,
+        },
         validation_suite_version="local-ai-fixtures-v1",
         artifacts=artifacts,
+    )
+
+
+def _receipt(manifest: LocalAIManifest):
+    return _issue_runtime_validation_receipt(
+        manifest,
+        WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256=manifest.runtime["worker_bundle_sha256"],
+        ),
     )
 
 
@@ -166,7 +209,7 @@ async def test_install_uses_persisted_lifecycle_and_requires_completion(
         store.activate_validated(
             staging,
             manifest,
-            _issue_runtime_validation_receipt(manifest),
+            _receipt(manifest),
         )
         operation = operations.get(operation_id)
         assert operation is not None

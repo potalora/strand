@@ -17,9 +17,16 @@ import pytest
 
 from app.services.local_ai.errors import LocalValidationError
 from app.services.local_ai.manifest import (
+    SCHEMA_VERSION,
+    LegacyManifestDiagnostic,
+    _RUNTIME_KEYS,
     is_secret_shaped_manifest_text,
     load_manifest,
     parse_manifest,
+)
+from app.services.local_ai.runtime_identity import (
+    WORKER_IDENTITY_SCHEME,
+    WorkerRuntimeIdentity,
 )
 from app.services.local_ai.types import ModelRole
 
@@ -49,6 +56,29 @@ def _stable_validation_disk_capacity(
         "disk_usage",
         lambda _: ample_usage,
     )
+    monkeypatch.setattr(
+        lock_script,
+        "load_manifest",
+        lambda path: parse_manifest(
+            json.loads(path.read_text(encoding="utf-8")),
+            allow_legacy_diagnostic=True,
+        ),
+    )
+    monkeypatch.setattr(
+        lock_script,
+        "normalize_worker_runtime_binding",
+        lambda command, project: ((str(command),), Path(project)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        lock_script,
+        "resolve_worker_runtime_identity",
+        lambda _command, _project: WorkerRuntimeIdentity(
+            scheme=WORKER_IDENTITY_SCHEME,
+            bundle_sha256="a" * 64,
+        ),
+        raising=False,
+    )
 
 
 def _pathological_json_nesting(depth: int = 2_000) -> bytes:
@@ -76,10 +106,15 @@ def _artifact(role: str) -> dict[str, Any]:
 
 def _valid_manifest() -> dict[str, Any]:
     return {
-        "schema_version": 1,
-        "pack_revision": "apple-m4-16gb-v1",
+        "schema_version": 2,
+        "pack_revision": "apple-m4-16gb-v2",
         "platform": "apple_silicon",
-        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "runtime": {
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": WORKER_IDENTITY_SCHEME,
+            "worker_bundle_sha256": "a" * 64,
+        },
         "validation_suite_version": "local-ai-fixtures-v1",
         "artifacts": [_artifact(role) for role in ROLES],
     }
@@ -93,7 +128,13 @@ def _write_json(path: Path, value: Any) -> Path:
 def test_manifest_loads_exactly_one_of_each_role(tmp_path: Path) -> None:
     manifest = load_manifest(_write_json(tmp_path / "manifest.json", _valid_manifest()))
 
-    assert manifest.schema_version == 1
+    assert manifest.schema_version == SCHEMA_VERSION == 2
+    assert manifest.runtime == {
+        "name": "mlx-vlm",
+        "version": "0.5.0",
+        "worker_identity_scheme": "local-ai-worker-bundle.v1",
+        "worker_bundle_sha256": "a" * 64,
+    }
     assert tuple(artifact.role for artifact in manifest.artifacts) == (
         ModelRole.OCR,
         ModelRole.EXTRACTION,
@@ -191,7 +232,7 @@ def test_manifest_rejects_repository_code_and_pickle(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
-        (lambda value: value.update(schema_version=2), "schema version"),
+        (lambda value: value.update(schema_version=1), "schema version"),
         (lambda value: value.update(schema_version=True), "schema version"),
         (lambda value: value.pop("artifacts"), "structure"),
         (lambda value: value.update(artifacts={}), "structure"),
@@ -296,6 +337,59 @@ def test_manifest_normalizes_pathological_json_nesting(tmp_path: Path) -> None:
         load_manifest(path)
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update(schema_version=1),
+        lambda value: value["runtime"].pop("worker_identity_scheme"),
+        lambda value: value["runtime"].pop("worker_bundle_sha256"),
+        lambda value: value["runtime"].update(extra="unexpected"),
+        lambda value: value["runtime"].update(worker_bundle_sha256="A" * 64),
+        lambda value: value["runtime"].update(
+            worker_identity_scheme="other-worker-identity.v1"
+        ),
+    ],
+)
+def test_manifest_v2_rejects_legacy_or_invalid_worker_identity(
+    mutate: Any,
+) -> None:
+    raw = _valid_manifest()
+    mutate(raw)
+
+    with pytest.raises(LocalValidationError):
+        parse_manifest(raw)
+
+
+def test_manifest_v1_is_available_only_as_non_admitting_diagnostic() -> None:
+    legacy = _valid_manifest()
+    legacy["schema_version"] = 1
+    legacy["runtime"] = {"name": "mlx-vlm", "version": "0.5.0"}
+
+    diagnostic = parse_manifest(legacy, allow_legacy_diagnostic=True)
+
+    assert isinstance(diagnostic, LegacyManifestDiagnostic)
+    assert diagnostic.schema_version == 1
+    assert diagnostic.requires_revalidation is True
+    assert re.fullmatch(r"[0-9a-f]{64}", diagnostic.canonical_sha256)
+    assert not hasattr(diagnostic, "runtime")
+    assert not hasattr(diagnostic, "artifacts")
+
+
+def test_manifest_schema_v2_matches_runtime_parser_contract() -> None:
+    schema_path = Path(__file__).parents[1] / "app/model_manifests/schema-v2.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    runtime_schema = schema["properties"]["runtime"]
+
+    assert schema["properties"]["schema_version"]["const"] == SCHEMA_VERSION == 2
+    assert set(runtime_schema["required"]) == set(_RUNTIME_KEYS)
+    assert set(runtime_schema["properties"]) == set(_RUNTIME_KEYS)
+    assert runtime_schema["additionalProperties"] is False
+    assert (
+        runtime_schema["properties"]["worker_identity_scheme"]["const"]
+        == WORKER_IDENTITY_SCHEME
+    )
+
+
 def test_manifest_and_schema_reject_uppercase_file_suffix(tmp_path: Path) -> None:
     raw = _valid_manifest()
     raw["artifacts"][0]["files"][0]["path"] = "model.JSON"
@@ -303,7 +397,7 @@ def test_manifest_and_schema_reject_uppercase_file_suffix(tmp_path: Path) -> Non
     with pytest.raises(LocalValidationError, match="lowercase"):
         load_manifest(_write_json(tmp_path / "manifest.json", raw))
 
-    schema_path = Path(__file__).parents[1] / "app/model_manifests/schema-v1.json"
+    schema_path = Path(__file__).parents[1] / "app/model_manifests/schema-v2.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     pattern = schema["properties"]["artifacts"]["items"]["properties"]["files"][
         "items"
@@ -337,10 +431,15 @@ def test_manifest_enforces_file_count_and_byte_bounds(tmp_path: Path) -> None:
 
 def _catalog() -> dict[str, Any]:
     return {
-        "schema_version": 1,
-        "pack_revision": "apple-m4-16gb-v1",
+        "schema_version": 2,
+        "pack_revision": "apple-m4-16gb-v2",
         "platform": "apple_silicon",
-        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "runtime": {
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": WORKER_IDENTITY_SCHEME,
+            "worker_bundle_sha256": "a" * 64,
+        },
         "validation_suite_version": "local-ai-fixtures-v1",
         "candidates": [
             {
@@ -678,25 +777,36 @@ def test_lock_catalog_resolves_hashes_and_writes_canonical_lock_atomically(
         )
         + "\n"
     )
-    manifest = load_manifest(output)
-    assert {artifact.role for artifact in manifest.artifacts} == set(ModelRole)
-    assert all(len(artifact.revision) == 40 for artifact in manifest.artifacts)
+    locked = json.loads(output.read_text(encoding="utf-8"))
+    assert locked["schema_version"] == 2
+    assert locked["pack_revision"] == "apple-m4-16gb-v2"
+    assert locked["runtime"] == {
+        "name": "mlx-vlm",
+        "version": "0.5.0",
+        "worker_identity_scheme": WORKER_IDENTITY_SCHEME,
+        "worker_bundle_sha256": "a" * 64,
+    }
+    artifacts = locked["artifacts"]
+    assert {artifact["role"] for artifact in artifacts} == {
+        role.value for role in ModelRole
+    }
+    assert all(len(artifact["revision"]) == 40 for artifact in artifacts)
     assert all(
-        len(file.sha256) == 64
-        for artifact in manifest.artifacts
-        for file in artifact.files
+        len(file["sha256"]) == 64
+        for artifact in artifacts
+        for file in artifact["files"]
     )
     assert not any(
-        ".gitattributes" in file.path
-        for artifact in manifest.artifacts
-        for file in artifact.files
+        ".gitattributes" in file["path"]
+        for artifact in artifacts
+        for file in artifact["files"]
     )
     extraction = next(
         artifact
-        for artifact in manifest.artifacts
-        if artifact.role == ModelRole.EXTRACTION
+        for artifact in artifacts
+        if artifact["role"] == ModelRole.EXTRACTION.value
     )
-    assert f"license-sha256={LICENSE_SOURCE_SHA256}" in extraction.attribution
+    assert f"license-sha256={LICENSE_SOURCE_SHA256}" in extraction["attribution"]
 
 
 def test_lock_catalog_accepts_missing_quant_license_only_with_verified_pinned_source(
@@ -889,11 +999,13 @@ def test_lock_catalog_accepts_large_static_tokenizer_json_but_still_inspects_con
         output,
     )
 
-    manifest = load_manifest(output)
+    legacy_lock = json.loads(output.read_text(encoding="utf-8"))
     ocr = next(
-        artifact for artifact in manifest.artifacts if artifact.role is ModelRole.OCR
+        artifact
+        for artifact in legacy_lock["artifacts"]
+        if artifact["role"] == ModelRole.OCR.value
     )
-    assert any(file.path == "tokenizer.json" for file in ocr.files)
+    assert any(file["path"] == "tokenizer.json" for file in ocr["files"])
     assert any(request.endswith("/config.json") for request in transport.requests)
 
 
@@ -910,11 +1022,13 @@ def test_lock_catalog_accepts_large_static_vocab_json_but_still_inspects_config(
         output,
     )
 
-    manifest = load_manifest(output)
+    legacy_lock = json.loads(output.read_text(encoding="utf-8"))
     ocr = next(
-        artifact for artifact in manifest.artifacts if artifact.role is ModelRole.OCR
+        artifact
+        for artifact in legacy_lock["artifacts"]
+        if artifact["role"] == ModelRole.OCR.value
     )
-    assert any(file.path == "vocab.json" for file in ocr.files)
+    assert any(file["path"] == "vocab.json" for file in ocr["files"])
     assert any(request.endswith("/config.json") for request in transport.requests)
 
 
@@ -1251,11 +1365,16 @@ def test_local_ai_env_is_documented_only_in_canonical_example() -> None:
         "LOCAL_AI_ENABLED=false",
         "LOCAL_AI_MODEL_DIR=./data/local-ai/models",
         "LOCAL_AI_SCRATCH_DIR=./data/local-ai/scratch",
-        "LOCAL_AI_MANIFEST_PATH=./app/model_manifests/apple-m4-16gb-v1.lock.json",
+        "LOCAL_AI_MANIFEST_PATH=./app/model_manifests/apple-m4-16gb-v2.lock.json",
+        (
+            "LOCAL_AI_RELEASE_EVIDENCE_PATH="
+            "./app/model_manifests/apple-m4-16gb-v2.release.json"
+        ),
         (
             "LOCAL_AI_WORKER_COMMAND="
             "../workers/local_ai/apple_mlx/.venv/bin/local-ai-mlx-worker"
         ),
+        "LOCAL_AI_WORKER_PROJECT_DIR=../workers/local_ai/apple_mlx",
         "LOCAL_AI_MAX_FILES=64",
         "LOCAL_AI_MAX_FILE_BYTES=8589934592",
         "LOCAL_AI_MAX_PACK_BYTES=21474836480",

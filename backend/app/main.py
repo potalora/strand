@@ -95,15 +95,31 @@ def _reconcile_model_pack_operations_on_startup() -> int:
 
 async def _recover_unstructured_jobs_on_startup(db: AsyncSession) -> int:
     """Pair strict cancellation state, then requeue only uncancelled work."""
+    from app.services.local_ai.processing_snapshot import (
+        fail_active_legacy_ingestion_jobs,
+    )
+
     recovered_at = datetime.now(timezone.utc)
+    await fail_active_legacy_ingestion_jobs(
+        db,
+        completed_at=recovered_at,
+    )
+
     await db.execute(
         text(
-            "UPDATE uploaded_files "
+            "UPDATE uploaded_files AS u "
             "SET ingestion_status = 'cancelled', progress_stage = NULL, "
             "progress_detail = NULL, processing_completed_at = :now "
-            "WHERE ingestion_status IN ('pending_extraction', 'processing') "
-            "AND file_category = 'unstructured' "
-            "AND cancel_requested = true"
+            "WHERE u.ingestion_status IN ('pending_extraction', 'processing') "
+            "AND u.file_category = 'unstructured' "
+            "AND u.cancel_requested = true "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM local_ai_jobs AS j "
+            "WHERE j.upload_id = u.id "
+            "AND j.processing_mode = 'validated_strict_local' "
+            "AND j.manifest_snapshot->>'schema_version' "
+            "IS DISTINCT FROM '2'"
+            ")"
         ),
         {"now": recovered_at},
     )
@@ -116,6 +132,7 @@ async def _recover_unstructured_jobs_on_startup(db: AsyncSession) -> int:
             "FROM uploaded_files AS u "
             "WHERE j.upload_id = u.id "
             "AND j.processing_mode = 'validated_strict_local' "
+            "AND j.manifest_snapshot->>'schema_version' = '2' "
             "AND j.status IN ('queued', 'processing') "
             "AND u.ingestion_status = 'cancelled' "
             "AND u.cancel_requested = true"
@@ -139,6 +156,7 @@ async def _recover_unstructured_jobs_on_startup(db: AsyncSession) -> int:
             "FROM uploaded_files AS u "
             "WHERE j.upload_id = u.id "
             "AND j.processing_mode = 'validated_strict_local' "
+            "AND j.manifest_snapshot->>'schema_version' = '2' "
             "AND j.status = 'processing' "
             "AND u.ingestion_status = 'pending_extraction'"
         )
@@ -174,7 +192,9 @@ async def _recover_strict_local_summary_jobs_on_startup(
                     query.order_by(
                         LocalAIJob.created_at.asc(),
                         LocalAIJob.id.asc(),
-                    ).limit(_LOCAL_AI_RECOVERY_BATCH_SIZE)
+                    )
+                    .limit(_LOCAL_AI_RECOVERY_BATCH_SIZE)
+                    .with_for_update()
                 )
             )
             .scalars()
@@ -185,6 +205,15 @@ async def _recover_strict_local_summary_jobs_on_startup(
         cursor = (jobs[-1].created_at, jobs[-1].id)
         recovered_at = datetime.now(timezone.utc)
         for job in jobs:
+            from app.services.local_ai.processing_snapshot import (
+                fail_legacy_runtime_identity_required,
+            )
+
+            if fail_legacy_runtime_identity_required(
+                job,
+                completed_at=recovered_at,
+            ):
+                continue
             if job.cancel_requested:
                 job.status = "cancelled"
                 job.stage = "cancelled"

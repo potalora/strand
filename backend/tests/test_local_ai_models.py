@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import uuid
+from copy import deepcopy
 
 import pytest
 from sqlalchemy import CheckConstraint, UniqueConstraint, text
@@ -45,10 +46,15 @@ def _artifact(role: str) -> dict:
 
 def _valid_manifest() -> dict:
     return {
-        "schema_version": 1,
-        "pack_revision": "apple-m4-16gb-v1",
+        "schema_version": 2,
+        "pack_revision": "apple-m4-16gb-v2",
         "platform": "apple_silicon",
-        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "runtime": {
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "d" * 64,
+        },
         "validation_suite_version": "local-ai-fixtures-v1",
         "artifacts": [_artifact(role) for role in ("ocr", "extraction", "summary")],
     }
@@ -456,7 +462,7 @@ async def test_persisted_local_job_identity_is_immutable_in_orm(
         value: object = "custom_local"
     elif attribute == "manifest_snapshot":
         value = _valid_manifest()
-        value["pack_revision"] = "apple-m4-16gb-v2"
+        value["pack_revision"] = "apple-m4-16gb-v2-drift"
     else:
         value = "f" * 64
     setattr(job, attribute, value)
@@ -699,6 +705,63 @@ async def _database_manifest_digest(db_session, manifest_json: str) -> str:
     ).scalar_one()
 
 
+async def _database_manifest_is_valid(db_session, manifest: dict) -> bool:
+    return bool(
+        (
+            await db_session.execute(
+                text("SELECT local_ai_manifest_is_valid(CAST(:payload AS jsonb))"),
+                {"payload": json.dumps(manifest)},
+            )
+        ).scalar_one()
+    )
+
+
+async def test_fresh_database_accepts_only_exact_attested_v2_runtime(
+    db_session,
+) -> None:
+    valid = _valid_manifest()
+    legacy = deepcopy(valid)
+    legacy["schema_version"] = 1
+    legacy["pack_revision"] = "apple-m4-16gb-v1"
+    legacy["runtime"] = {"name": "mlx-vlm", "version": "0.5.0"}
+    missing_digest = deepcopy(valid)
+    del missing_digest["runtime"]["worker_bundle_sha256"]
+    uppercase_digest = deepcopy(valid)
+    uppercase_digest["runtime"]["worker_bundle_sha256"] = "D" * 64
+    extra_runtime = deepcopy(valid)
+    extra_runtime["runtime"]["extra"] = "rejected"
+
+    assert await _database_manifest_is_valid(db_session, valid) is True
+    for manifest in (legacy, missing_digest, uppercase_digest, extra_runtime):
+        assert await _database_manifest_is_valid(db_session, manifest) is False
+
+
+async def test_fresh_database_rejects_legacy_raw_job_insert(db_session) -> None:
+    user = User(email="fresh-v1-rejected@example.com", password_hash="x")
+    db_session.add(user)
+    await db_session.flush()
+    upload = _upload_for(user)
+    db_session.add(upload)
+    await db_session.flush()
+    legacy = _valid_manifest()
+    legacy["schema_version"] = 1
+    legacy["pack_revision"] = "apple-m4-16gb-v1"
+    legacy["runtime"] = {"name": "mlx-vlm", "version": "0.5.0"}
+
+    try:
+        with pytest.raises(IntegrityError):
+            await _raw_insert_local_job(
+                db_session,
+                user_id=user.id,
+                upload_id=upload.id,
+                processing_mode="validated_strict_local",
+                manifest=legacy,
+                digest=_manifest_digest(legacy),
+            )
+    finally:
+        await db_session.rollback()
+
+
 @pytest.mark.parametrize("case", ("empty_manifest", "bad_digest", "invalid_mode"))
 async def test_database_rejects_invalid_raw_local_job_insert(
     db_session,
@@ -808,7 +871,7 @@ async def test_database_rejects_float_manifest_integer_fields(
 @pytest.mark.parametrize(
     ("field", "old_token", "exponent_token"),
     (
-        ("schema_version", '"schema_version":1', '"schema_version":1.00e0'),
+        ("schema_version", '"schema_version":2', '"schema_version":2.00e0'),
         ("decode_limit", '"max_input_tokens":4096', '"max_input_tokens":4.0960e3'),
         ("file_size", '"size":10', '"size":1.00e1'),
     ),

@@ -437,6 +437,7 @@ Upload a PDF, RTF, or TIFF for AI-powered text extraction and entity extraction.
 ```json
 {
   "upload_id": "uuid",
+  "filename": "record.pdf",
   "status": "processing",
   "file_type": "pdf"
 }
@@ -481,16 +482,29 @@ Upload multiple unstructured files for concurrent processing.
   "uploads": [
     {
       "upload_id": "uuid",
+      "filename": "record.pdf",
       "status": "processing",
       "file_type": "pdf"
     }
   ],
-  "total": 3
+  "rejected": [
+    {
+      "filename": "notes.txt",
+      "code": "unsupported_type"
+    }
+  ],
+  "total": 1
 }
 ```
 
 **Notes:**
-- Files with unsupported extensions, invalid magic bytes, or that exceed size limits are silently skipped
+- The request is best effort. Valid files are accepted even when another file
+  is rejected.
+- `total` is the number of accepted uploads, not the number of submitted files.
+- `rejected` contains at most 50 entries. Its stable codes are
+  `missing_filename`, `unsupported_type`, `file_too_large`, and
+  `invalid_signature`. It does not include raw validation details or local
+  paths.
 - Each file is processed independently in the background
 - Strict-local batch admission is atomic with model-pack maintenance. A pack
   update, verification, rollback, or removal cannot race a newly admitted job.
@@ -568,19 +582,38 @@ Confirm extracted entities and create FHIR health records.
 All endpoints below require authentication and are prefixed with
 `/api/v1/local-ai`.
 
-The shipped platform profile is native Apple Silicon with at least 16 GB
-unified memory; 16 GB is both the minimum and recommended baseline. Its locked
-9.02 GiB pack uses OvisOCR2 for OCR, NuExtract3 for clinical extraction, and
-Qwen3.5-9B for final summarization. The M4 16 GB release passed the committed
-fidelity suite with every rate metric at `1.0`. Three cold benchmark runs
-measured peak MLX allocations of about 0.86 GB for OCR, 4.73 GB for extraction,
-and 7.10 GB for summarization. The release evidence binds the exact manifest,
-benchmark report, fidelity report, corpus identity, and hard thresholds.
+`LOCAL_AI_OPERATOR_USER_IDS` is a comma-separated UUID allowlist for browser
+accounts that may manage the machine-global pack. An empty value denies all web
+pack maintenance, and a malformed non-empty value stops backend startup. A
+missing or revoked credential receives `401`. An authenticated account absent
+from the allowlist receives `403` with `Local model pack management requires a
+machine operator.`
+
+The v2 candidate profile is native Apple Silicon with at least 16 GB unified
+memory; 16 GB is both the minimum and recommended baseline. Its locked 9.02
+GiB pack uses OvisOCR2 for OCR, NuExtract3 for clinical extraction, and
+Qwen3.5-9B for final summarization. The static candidate references are
+`catalog-v2.json` and `apple-m4-16gb-v2.lock.json`.
+
+This Track D state has no verified v2 release evidence. The file
+`apple-m4-16gb-v2.release.json` is written only after the separately authorized
+benchmark, synthetic fidelity, promotion, and post-promotion verification
+gates pass. Historical v1 metrics and evidence remain diagnostic history; they
+do not validate the v2 candidate.
 
 Strict local remains opt-in through `LOCAL_AI_ENABLED=false`. Once enabled, a
 pack is `ready` only when the active files match the exact immutable manifest,
 a sealed runtime-validation receipt exists for that manifest, and the bound
 benchmark and fidelity evidence passes revalidation.
+
+Schema-v2 manifests also carry `worker_identity_scheme` and
+`worker_bundle_sha256`. The `local-ai-worker-bundle.v1` digest covers the fixed
+`local-ai-mlx-worker=local_ai_mlx_worker.__main__:main` entry point,
+`pyproject.toml`, `uv.lock`, and the effective worker `.py` tree. Launcher,
+virtual-environment, CPython, and import-surface checks are fail-closed
+preconditions but are not hashed. This identity does not attest the operating
+system owner or root of trust.
+
 The native macOS worker is launched under a fixed OS network-deny profile. An
 owner-only cross-process lock remains held through worker-group cleanup, so
 separate backend processes cannot load two model roles at once. A parent-death
@@ -594,16 +627,20 @@ three role identities, and at most one current lifecycle operation. Artifact
 download bytes are reported separately from expected resident memory. Expected
 memory is taken from the release evidence when the selected profile has
 measurements; it remains `null` for an unmeasured future profile.
+Every authenticated user can read this endpoint. `can_manage_pack` states
+whether the account may use the lifecycle controls. A non-operator receives
+`operation: null` even while `state` still reports `downloading` or `verifying`.
 
 ```json
 {
   "platform": "apple_silicon",
   "compatible": true,
   "enabled": false,
+  "can_manage_pack": false,
   "state": "not_installed",
   "status_reason": null,
   "active_revision": null,
-  "available_revision": "apple-m4-16gb-v1",
+  "available_revision": "apple-m4-16gb-v2",
   "models": [
     {
       "role": "ocr",
@@ -613,7 +650,7 @@ measurements; it remains `null` for an unmeasured future profile.
       "runtime": "mlx-vlm 0.5.0",
       "license": "apache-2.0",
       "download_bytes": 652031947,
-      "expected_memory_bytes": 1409286144,
+      "expected_memory_bytes": null,
       "installed": false,
       "validated": false
     },
@@ -625,7 +662,7 @@ measurements; it remains `null` for an unmeasured future profile.
       "runtime": "mlx-vlm 0.5.0",
       "license": "apache-2.0",
       "download_bytes": 3054403529,
-      "expected_memory_bytes": 5234491392,
+      "expected_memory_bytes": null,
       "installed": false,
       "validated": false
     },
@@ -637,7 +674,7 @@ measurements; it remains `null` for an unmeasured future profile.
       "runtime": "mlx-vlm 0.5.0",
       "license": "apache-2.0",
       "download_bytes": 5977073021,
-      "expected_memory_bytes": 7851737088,
+      "expected_memory_bytes": null,
       "installed": false,
       "validated": false
     }
@@ -648,7 +685,8 @@ measurements; it remains `null` for an unmeasured future profile.
 
 `not_installed` still reports the available locked pack and its three model
 artifacts. `installed` and `validated` remain `false` until that exact pack is
-present and passes validation.
+present and passes validation. `expected_memory_bytes` remains `null` until
+matching release evidence provides measured values.
 
 `state` is one of `not_installed`, `downloading`, `verifying`, `preview`,
 `ready`, `update_available`, or `failed`. When `state` is `preview`,
@@ -659,6 +697,8 @@ takes precedence over `ready`; a terminal maintenance failure does not hide an
 otherwise validated active pack.
 
 ### Pack lifecycle
+
+Every route in this table requires a machine operator:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -687,9 +727,16 @@ document text, prompts, evidence, patient identifiers, or model output.
 
 Only one lifecycle operation may be non-terminal. Pack mutation and
 strict-local job admission share a database advisory lock. Mutations return
-`409` while a clinical local-AI job is queued or processing.
+`409` while a clinical local-AI job is queued or processing, but only after
+operator authorization succeeds.
+
+Browser authorization does not restrict an operating-system owner using the
+documented local CLI maintenance commands.
 
 ### Local processing jobs
+
+These routes remain owner-scoped. They do not require machine-operator
+authority:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -697,6 +744,14 @@ strict-local job admission share a database advisory lock. Mutations return
 | `GET` | `/local-ai/jobs/{job_id}` | Read one owner-scoped job |
 | `POST` | `/local-ai/jobs/{job_id}/retry` | Requeue one failed, retryable ingestion or summary job |
 | `POST` | `/local-ai/jobs/{job_id}/cancel` | Persist cancellation and terminate the active worker |
+
+`GET /local-ai/jobs` accepts `kind`, `active_only`, and
+`include_retryable_failed`. The retryable-failure flag is additive only when
+`active_only=true`; it has no effect when `active_only=false`. When enabled,
+the query adds exact owner-scoped failures whose stored retryability field is
+the JSON boolean `true`. Manual ZIP children, non-retryable failures,
+completed or cancelled jobs, and jobs owned by another account are excluded
+before the 50-row limit.
 
 Jobs report target UUIDs, processing mode, kind, status, stage, cancellation
 state, timestamps, and bounded progress/failure taxonomy. Progress exposes only
@@ -708,6 +763,21 @@ ingestion or summary jobs. Ingestion retry resets the paired upload and job
 together while keeping strict-local checkpoints. Summary retry preserves its
 stored prompt scope and immutable model snapshot. All other job states return
 `409`.
+
+The schema-v2 runtime identity is checked before strict-local admission and
+again immediately before each worker spawn. Admission-time drift is rejected
+before provider construction, release-evidence loading, or creation of a new
+job or upload snapshot. The public failure boundary is content-free and does
+not expose local paths, source filenames, manifest bytes, or digests.
+
+Queued or processing schema-v1 ingestion snapshots can make only the legacy
+terminal transition to `failed` with code `runtime_identity_required`; the
+paired upload is failed in the same transaction. Schema-v1 summary jobs use
+the same code but remain job-only. These failures are non-retryable and leave
+the stored manifest unchanged. After repairing and revalidating the worker,
+the client must submit new schema-v2 work rather than retry or rewrite the
+legacy snapshot. Deployment must follow the no-active-job preflight documented
+in [Strict-local AI operations](operations-strict-local-ai.md).
 
 ### GET `/records/{record_id}/evidence`
 
@@ -723,7 +793,7 @@ model pack. The list is bounded by the evidence-source limit. Summary-model
 provenance is not mixed into ingestion evidence.
 
 See [Strict-local AI operations](operations-strict-local-ai.md) for the
-download/processing network boundary and shipped release evidence.
+download/processing network boundary and the v2 release-gate status.
 
 ---
 
@@ -863,7 +933,7 @@ List previously built prompts.
       "model_provenance": {
         "processing_mode": "validated_strict_local",
         "manifest_sha256": "64-character SHA-256",
-        "pack_revision": "apple-m4-16gb-v1",
+        "pack_revision": "apple-m4-16gb-v2",
         "model": {
           "role": "summary",
           "repository": "mlx-community/Qwen3.5-9B-MLX-4bit",
@@ -912,7 +982,7 @@ Get a single prompt detail, including any stored response.
   "model_provenance": {
     "processing_mode": "validated_strict_local",
     "manifest_sha256": "64-character SHA-256",
-    "pack_revision": "apple-m4-16gb-v1",
+    "pack_revision": "apple-m4-16gb-v2",
     "model": {
       "role": "summary",
       "repository": "mlx-community/Qwen3.5-9B-MLX-4bit",

@@ -21,10 +21,11 @@ async def test_pipeline_purges_plaintext_scratch_after_validation_failure(
     job, upload = _job_and_upload()
 
     class MalformedExtractionManager(_Manager):
-        async def run(self, role, payload, on_progress=None):
+        async def run_attested(self, manifest, role, payload, on_progress=None):
+            self._require_attested_manifest(manifest)
             if role.value == "extraction":
                 return {"patient": {"name": "Private Name"}}
-            return await super().run(role, payload, on_progress)
+            return await super().run_attested(manifest, role, payload, on_progress)
 
     pipeline = StrictLocalPipeline(
         manager=MalformedExtractionManager(),

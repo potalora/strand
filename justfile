@@ -52,6 +52,10 @@ local-ai-pack-download:
     cd backend && uv run python scripts/local_ai_pack.py install
 
 # Re-run the exact offline runtime and synthetic-fixture validation gate.
+local-ai-candidate-verify:
+    cd backend && uv run python scripts/local_ai_candidate_pack.py verify
+
+# Re-run the promoted release-evidence-required lifecycle validation gate.
 local-ai-pack-verify:
     cd backend && uv run python scripts/local_ai_pack.py verify
 
@@ -59,9 +63,13 @@ local-ai-pack-verify:
 local-ai-benchmark:
     cd backend && uv run python scripts/benchmark_local_ai.py --runs 3 --output artifacts/local-ai-benchmark.json
 
+# Run only the source-controlled synthetic fidelity suite.
+local-ai-fidelity:
+    cd backend && env -u REAL_MEDICAL_FIXTURES_DIR uv run python scripts/run_local_ai_fidelity.py --output artifacts/local-ai-fidelity.json
+
 # Bind passing benchmark and fidelity artifacts to the exact shipped lock.
 local-ai-release-promote:
-    cd backend && uv run python scripts/promote_local_ai_release.py --manifest app/model_manifests/apple-m4-16gb-v1.lock.json --benchmark artifacts/local-ai-benchmark.json --fidelity artifacts/local-ai-fidelity.json --output app/model_manifests/apple-m4-16gb-v1.release.json
+    cd backend && uv run python scripts/promote_local_ai_release.py --manifest app/model_manifests/apple-m4-16gb-v2.lock.json --benchmark artifacts/local-ai-benchmark.json --fidelity artifacts/local-ai-fidelity.json --output app/model_manifests/apple-m4-16gb-v2.release.json
 
 # Remove model artifacts only. Clinical records, evidence, and checkpoints remain.
 local-ai-pack-remove:

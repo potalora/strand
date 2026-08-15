@@ -36,6 +36,7 @@ from app.services.local_ai.manifest import (
 )
 from app.services.local_ai.pack_operations import PackOperationStore
 from app.services.local_ai.release_evidence import build_release_evidence
+from app.services.local_ai.runtime_identity import WorkerRuntimeIdentity
 from app.services.local_ai.types import ModelRole
 from app.services.local_ai.validation_receipt import (
     _issue_runtime_validation_receipt,
@@ -71,14 +72,29 @@ def _manifest(
     )
     return (
         LocalAIManifest(
-            schema_version=1,
+            schema_version=2,
             pack_revision=revision,
             platform="apple_silicon",
-            runtime={"name": "mlx-vlm", "version": "0.5.0"},
+            runtime={
+                "name": "mlx-vlm",
+                "version": "0.5.0",
+                "worker_identity_scheme": "local-ai-worker-bundle.v1",
+                "worker_bundle_sha256": "a" * 64,
+            },
             validation_suite_version="fixtures-v1",
             artifacts=artifacts,
         ),
         contents,
+    )
+
+
+def _receipt(manifest: LocalAIManifest):
+    return _issue_runtime_validation_receipt(
+        manifest,
+        WorkerRuntimeIdentity(
+            scheme="local-ai-worker-bundle.v1",
+            bundle_sha256=manifest.runtime["worker_bundle_sha256"],
+        ),
     )
 
 
@@ -114,6 +130,8 @@ def _write_release_evidence(
             "sha256": manifest_sha256(manifest),
             "runtime_name": manifest.runtime["name"],
             "runtime_version": manifest.runtime["version"],
+            "worker_identity_scheme": manifest.runtime["worker_identity_scheme"],
+            "worker_bundle_sha256": manifest.runtime["worker_bundle_sha256"],
         },
         "processes": {"max_live_models": 1, "roles_started": 9},
         "roles": {
@@ -192,7 +210,7 @@ def _install(
     store.activate_validated(
         staging,
         manifest,
-        _issue_runtime_validation_receipt(manifest),
+        _receipt(manifest),
     )
     return store
 
@@ -321,6 +339,7 @@ async def test_retry_sweeps_orphan_staging_before_requeue(
 @pytest.mark.asyncio
 async def test_ready_pack_remains_ready_after_failed_maintenance_operation(
     lifecycle_paths,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.api.local_ai import get_local_pack_status
 
@@ -336,7 +355,10 @@ async def test_ready_pack_remains_ready_after_failed_maintenance_operation(
         retryable=True,
     )
 
-    response = await get_local_pack_status(UUID(int=1))
+    operator_id = UUID(int=1)
+    monkeypatch.setattr(settings, "_local_ai_operator_ids", frozenset({operator_id}))
+
+    response = await get_local_pack_status(operator_id)
     body = response.model_dump(mode="json")
 
     assert body["state"] == "ready"
@@ -622,6 +644,7 @@ async def test_restart_rejects_operation_while_prior_runner_holds_lease(
 @pytest.mark.asyncio
 async def test_active_maintenance_precedes_ready_pack_status(
     lifecycle_paths,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.api.local_ai import get_local_pack_status
 
@@ -636,7 +659,10 @@ async def test_active_maintenance_precedes_ready_pack_status(
         message="Running local validation fixtures.",
     )
 
-    response = await get_local_pack_status(UUID(int=1))
+    operator_id = UUID(int=1)
+    monkeypatch.setattr(settings, "_local_ai_operator_ids", frozenset({operator_id}))
+
+    response = await get_local_pack_status(operator_id)
 
     assert response.state == "verifying"
     assert response.operation is not None

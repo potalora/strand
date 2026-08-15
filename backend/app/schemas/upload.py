@@ -90,6 +90,7 @@ class UploadHistoryResponse(BaseModel):
 
 class UnstructuredUploadResponse(BaseModel):
     upload_id: str
+    filename: str
     status: str
     file_type: str
     manual_extraction_required: bool = False
@@ -112,8 +113,25 @@ class ExtractionResultResponse(BaseModel):
     error: str | None = None
 
 
+BatchRejectionCode = Literal[
+    "missing_filename",
+    "unsupported_type",
+    "file_too_large",
+    "invalid_signature",
+]
+
+
+class RejectedUnstructuredUpload(BaseModel):
+    filename: str
+    code: BatchRejectionCode
+
+
 class BatchUploadResponse(BaseModel):
     uploads: list[UnstructuredUploadResponse]
+    rejected: list[RejectedUnstructuredUpload] = Field(
+        default_factory=list,
+        max_length=50,
+    )
     total: int
 
 

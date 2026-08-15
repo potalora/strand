@@ -9,8 +9,6 @@ import inspect
 import logging
 import os
 import resource
-import shlex
-import shutil
 import signal
 import stat
 import sys
@@ -29,6 +27,7 @@ from app.services.local_ai.errors import (
     LocalWorkerError,
     LocalWorkerTimeout,
 )
+from app.services.local_ai.manifest import LocalAIManifest
 from app.services.local_ai.protocol import (
     MAX_MESSAGE_BYTES,
     ErrorPayload,
@@ -39,6 +38,11 @@ from app.services.local_ai.protocol import (
     encode_message,
     parse_response_line,
     validate_identifier,
+)
+from app.services.local_ai.runtime_identity import (
+    normalize_worker_runtime_binding,
+    require_manifest_runtime_identity,
+    resolve_worker_runtime_identity,
 )
 from app.services.local_ai.types import ModelRole
 
@@ -125,6 +129,7 @@ class LocalModelMetrics:
 @dataclass
 class _RunState:
     job_id: str
+    manifest: LocalAIManifest | None = None
     running_event: asyncio.Event = field(default_factory=asyncio.Event)
     done_event: asyncio.Event = field(default_factory=asyncio.Event)
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -144,13 +149,108 @@ class _RunCancelled(RuntimeError):
 
 
 @dataclass
+class _OwnedDirectoryIdentity:
+    device: int
+    inode: int
+    uid: int
+    mode: int
+
+
+def _owned_directory_identity(metadata: os.stat_result) -> _OwnedDirectoryIdentity:
+    return _OwnedDirectoryIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        uid=metadata.st_uid,
+        mode=stat.S_IMODE(metadata.st_mode),
+    )
+
+
+def _require_owned_directory_identity(
+    metadata: os.stat_result,
+    expected: _OwnedDirectoryIdentity,
+) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or _owned_directory_identity(metadata) != expected
+        or expected.mode != 0o700
+        or (hasattr(os, "getuid") and expected.uid != os.getuid())
+    ):
+        raise LocalWorkerError("Local worker is unavailable.")
+
+
+def _empty_owned_directory_fd(descriptor: int) -> None:
+    try:
+        entries = list(os.scandir(descriptor))
+    except OSError:
+        raise LocalWorkerError("Local worker is unavailable.") from None
+    for entry in entries:
+        name = entry.name
+        child_descriptor = -1
+        try:
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                child_descriptor = os.open(
+                    name,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=descriptor,
+                )
+                opened = os.fstat(child_descriptor)
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    raise LocalWorkerError("Local worker is unavailable.")
+                _empty_owned_directory_fd(child_descriptor)
+                os.close(child_descriptor)
+                child_descriptor = -1
+                os.rmdir(name, dir_fd=descriptor)
+            else:
+                os.unlink(name, dir_fd=descriptor)
+        except LocalWorkerError:
+            raise
+        except OSError:
+            raise LocalWorkerError("Local worker is unavailable.") from None
+        finally:
+            if child_descriptor >= 0:
+                os.close(child_descriptor)
+
+
+@dataclass
 class _WorkerProcessLease:
     """Local and cross-process ownership held through worker-group cleanup."""
 
     local_lock: asyncio.Lock
     descriptor: int
+    pycache_root_fd: int = -1
+    pycache_prefix_fd: int = -1
+    pycache_prefix_name: str | None = None
+    pycache_root_identity: _OwnedDirectoryIdentity | None = None
+    pycache_prefix_identity: _OwnedDirectoryIdentity | None = None
+    pycache_root: Path | None = None
+    pycache_prefix: Path | None = None
 
     def release(self) -> None:
+        if self.pycache_prefix_name is not None:
+            _remove_worker_pycache_prefix(self)
+        self.finalize_without_removal()
+
+    def finalize_without_removal(self) -> None:
+        """Close retained ownership without touching an unprovable path."""
+
+        for cache_descriptor in (self.pycache_prefix_fd, self.pycache_root_fd):
+            if cache_descriptor >= 0:
+                try:
+                    os.close(cache_descriptor)
+                except OSError:
+                    pass
+        self.pycache_prefix_fd = -1
+        self.pycache_root_fd = -1
+        self.pycache_prefix_name = None
+        self.pycache_root_identity = None
+        self.pycache_prefix_identity = None
+        self.pycache_root = None
+        self.pycache_prefix = None
         try:
             fcntl.flock(self.descriptor, fcntl.LOCK_UN)
         except OSError:
@@ -160,6 +260,34 @@ class _WorkerProcessLease:
         except OSError:
             pass
         self.local_lock.release()
+
+
+def _remove_worker_pycache_prefix(lease: _WorkerProcessLease) -> None:
+    """Empty and unlink only the exact directories bound to this lease."""
+
+    root_fd = lease.pycache_root_fd
+    prefix_fd = lease.pycache_prefix_fd
+    name = lease.pycache_prefix_name
+    root_identity = lease.pycache_root_identity
+    prefix_identity = lease.pycache_prefix_identity
+    if (
+        root_fd < 0
+        or prefix_fd < 0
+        or name is None
+        or not name.startswith(".worker-pycache-")
+        or root_identity is None
+        or prefix_identity is None
+    ):
+        raise LocalWorkerError("Local worker is unavailable.")
+    try:
+        _require_owned_directory_identity(os.fstat(root_fd), root_identity)
+        _require_owned_directory_identity(os.fstat(prefix_fd), prefix_identity)
+        _empty_owned_directory_fd(prefix_fd)
+        current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        _require_owned_directory_identity(current, prefix_identity)
+        os.rmdir(name, dir_fd=root_fd)
+    except OSError:
+        raise LocalWorkerError("Local worker is unavailable.") from None
 
 
 def _global_role_process_lock() -> asyncio.Lock:
@@ -196,17 +324,20 @@ class LocalModelManager:
         worker_home: str | Path | None = None,
         timeout_seconds: float | None = None,
         hard_timeout_seconds: float | None = None,
+        worker_project_dir: str | Path | None = None,
         _allow_unisolated_test_worker: bool = False,
     ) -> None:
         if _allow_unisolated_test_worker and worker_command is None:
             raise ValueError("An unisolated test worker command is required.")
         self._worker_command_spec = worker_command
         self._worker_command: tuple[str, ...] | None = None
+        self._worker_project_dir_spec = worker_project_dir
+        self._worker_project_dir: Path | None = None
+        self._allow_unisolated_test_worker = _allow_unisolated_test_worker
         self._enforce_network_sandbox = not _allow_unisolated_test_worker
         self._network_sandbox_prefix: tuple[str, ...] = ()
-        self._worker_home = (
-            Path(worker_home) if worker_home else self._default_worker_home()
-        )
+        self._worker_home_spec = worker_home
+        self._worker_home = Path()
         self._worker_process_lock_path: Path | None = None
         self._worker_process_lock_fd: int | None = None
         self._timeout_seconds = (
@@ -270,42 +401,29 @@ class LocalModelManager:
             raise LocalWorkerError("Local worker manager is stopped.")
         if self._started:
             return
+        worker_home = self._worker_home_spec
+        if worker_home is None:
+            worker_home = self._default_worker_home()
+        home = Path(worker_home).expanduser()
+        if not home.is_absolute():
+            home = Path.cwd() / home
+        self._worker_home = Path(os.path.abspath(os.fspath(home)))
         self._prepare_worker_home()
-        self._worker_command = self._resolve_command()
+        command = self._worker_command_spec
+        project = self._worker_project_dir_spec
+        if command is None or project is None:
+            from app.config import settings
+
+            if command is None:
+                command = settings.local_ai_worker_command
+            if project is None:
+                project = settings.local_ai_worker_project_dir
+        self._worker_command, self._worker_project_dir = (
+            normalize_worker_runtime_binding(command, project, cwd=Path.cwd())
+        )
         self._prepare_worker_process_lock()
         self._network_sandbox_prefix = self._resolve_network_sandbox()
         self._started = True
-
-    def _resolve_command(self) -> tuple[str, ...]:
-        worker_command = self._worker_command_spec
-        if worker_command is None:
-            from app.config import settings
-
-            worker_command = settings.local_ai_worker_command
-        if isinstance(worker_command, str):
-            parts = tuple(shlex.split(worker_command))
-        else:
-            try:
-                parts = tuple(os.fspath(item) for item in worker_command)
-            except TypeError:
-                parts = ()
-        if not parts or any(not part for part in parts):
-            raise LocalWorkerError("Local worker is unavailable.")
-
-        executable = Path(parts[0]).expanduser()
-        if not executable.is_absolute():
-            if executable.parent != Path("."):
-                executable = (Path.cwd() / executable).absolute()
-            else:
-                located = shutil.which(parts[0], path=os.defpath)
-                if located is None:
-                    raise LocalWorkerError("Local worker is unavailable.")
-                executable = Path(located).absolute()
-        else:
-            executable = executable.absolute()
-        if not executable.is_file() or not os.access(executable, os.X_OK):
-            raise LocalWorkerError("Local worker is unavailable.")
-        return (str(executable), *parts[1:])
 
     def _resolve_network_sandbox(self) -> tuple[str, ...]:
         if not self._enforce_network_sandbox:
@@ -401,6 +519,79 @@ class LocalModelManager:
         if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
             raise LocalWorkerError("Local worker is unavailable.")
 
+    def _prepare_worker_pycache_prefix(self, lease: _WorkerProcessLease) -> Path:
+        """Create one empty owner-only bytecode cache for the next spawn."""
+
+        root_descriptor = -1
+        prefix_descriptor = -1
+        name: str | None = None
+        try:
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            root_descriptor = os.open(self._worker_home, directory_flags)
+            root_metadata = os.fstat(root_descriptor)
+            root_identity = _owned_directory_identity(root_metadata)
+            _require_owned_directory_identity(root_metadata, root_identity)
+            _require_owned_directory_identity(
+                os.stat(self._worker_home, follow_symlinks=False),
+                root_identity,
+            )
+            for _attempt in range(16):
+                candidate = f".worker-pycache-{uuid.uuid4().hex}"
+                try:
+                    os.mkdir(candidate, 0o700, dir_fd=root_descriptor)
+                except FileExistsError:
+                    continue
+                name = candidate
+                break
+            if name is None:
+                raise LocalWorkerError("Local worker is unavailable.")
+            prefix_descriptor = os.open(name, directory_flags, dir_fd=root_descriptor)
+            prefix_metadata = os.fstat(prefix_descriptor)
+            prefix_identity = _owned_directory_identity(prefix_metadata)
+            _require_owned_directory_identity(prefix_metadata, prefix_identity)
+            _require_owned_directory_identity(
+                os.stat(name, dir_fd=root_descriptor, follow_symlinks=False),
+                prefix_identity,
+            )
+            if list(os.scandir(prefix_descriptor)):
+                raise LocalWorkerError("Local worker is unavailable.")
+            prefix = self._worker_home / name
+            lease.pycache_root_fd = root_descriptor
+            lease.pycache_prefix_fd = prefix_descriptor
+            lease.pycache_prefix_name = name
+            lease.pycache_root_identity = root_identity
+            lease.pycache_prefix_identity = prefix_identity
+            lease.pycache_root = self._worker_home
+            lease.pycache_prefix = prefix
+            return prefix
+        except OSError:
+            raise LocalWorkerError("Local worker is unavailable.") from None
+        finally:
+            if lease.pycache_root_fd < 0:
+                if prefix_descriptor >= 0:
+                    try:
+                        created = os.fstat(prefix_descriptor)
+                        current = os.stat(
+                            name,
+                            dir_fd=root_descriptor,
+                            follow_symlinks=False,
+                        )
+                        if (created.st_dev, created.st_ino) == (
+                            current.st_dev,
+                            current.st_ino,
+                        ):
+                            os.rmdir(name, dir_fd=root_descriptor)
+                    except (OSError, TypeError):
+                        pass
+                    os.close(prefix_descriptor)
+                if root_descriptor >= 0:
+                    os.close(root_descriptor)
+
     async def stop(self) -> None:
         """Prevent work, signal all callers, and reap the active process group."""
         if self._stopped:
@@ -415,7 +606,10 @@ class LocalModelManager:
         if active_process is not None:
             await self._terminate_process(active_process)
             if self._cleanup_poisoned:
-                await self._finish_cleanup_recovery(active_process)
+                try:
+                    await self._finish_cleanup_recovery(active_process)
+                except LocalWorkerError:
+                    pass
         if states:
             try:
                 await asyncio.wait_for(
@@ -424,6 +618,16 @@ class LocalModelManager:
                 )
             except TimeoutError:
                 pass
+        retained = self._retained_worker_process_lease
+        if retained is not None and self._active_process is None:
+            if not self._finalize_lease_or_retain(retained):
+                retained.finalize_without_removal()
+                self._retained_worker_process_lease = None
+                self._worker_process_lock_fd = None
+                self._clear_process_boundary_poison()
+                logger.warning(
+                    "Local worker stopped category=retained_empty_pycache_artifact"
+                )
         self._stopped = True
         self._stopping = False
 
@@ -436,16 +640,22 @@ class LocalModelManager:
         on_liveness: LivenessCallback | None = None,
     ) -> Any:
         """Run one role in a fresh process and return only after group cleanup."""
+        if not self._allow_unisolated_test_worker:
+            raise LocalWorkerError("Local worker runtime attestation is required.")
         return await self._run_command(
             role,
             payload,
             self._command_for(ModelRole(role)),
             on_progress,
             on_liveness=on_liveness,
+            manifest=None,
         )
 
     async def count_summary_tokens(self, payload: dict[str, Any]) -> int:
         """Count one validated reference document with the locked summary tokenizer."""
+
+        if not self._allow_unisolated_test_worker:
+            raise LocalWorkerError("Local worker runtime attestation is required.")
 
         result = await self._run_command(
             ModelRole.SUMMARY,
@@ -453,6 +663,61 @@ class LocalModelManager:
             "count_summary_tokens",
             None,
             on_liveness=None,
+            manifest=None,
+        )
+        if (
+            type(result) is not dict
+            or set(result) != {"token_count"}
+            or type(result["token_count"]) is not int
+            or result["token_count"] <= 0
+        ):
+            raise LocalWorkerError("Local worker returned an invalid token count.")
+        return result["token_count"]
+
+    def _require_current_runtime(self, manifest: LocalAIManifest) -> None:
+        command = self._worker_command
+        project = self._worker_project_dir
+        if command is None or project is None:
+            raise LocalWorkerError("Local worker runtime identity is unavailable.")
+        observed = resolve_worker_runtime_identity(command, project)
+        require_manifest_runtime_identity(manifest, observed)
+
+    async def run_attested(
+        self,
+        manifest: LocalAIManifest,
+        role: ModelRole,
+        payload: dict[str, Any],
+        on_progress: ProgressCallback | None = None,
+        *,
+        on_liveness: LivenessCallback | None = None,
+    ) -> Any:
+        """Run one role only while the current worker matches the manifest."""
+
+        self._require_current_runtime(manifest)
+        return await self._run_command(
+            role,
+            payload,
+            self._command_for(ModelRole(role)),
+            on_progress,
+            on_liveness=on_liveness,
+            manifest=manifest,
+        )
+
+    async def count_summary_tokens_attested(
+        self,
+        manifest: LocalAIManifest,
+        payload: dict[str, Any],
+    ) -> int:
+        """Count summary tokens only while the current worker matches the manifest."""
+
+        self._require_current_runtime(manifest)
+        result = await self._run_command(
+            ModelRole.SUMMARY,
+            payload,
+            "count_summary_tokens",
+            None,
+            on_liveness=None,
+            manifest=manifest,
         )
         if (
             type(result) is not dict
@@ -471,10 +736,11 @@ class LocalModelManager:
         on_progress: ProgressCallback | None,
         *,
         on_liveness: LivenessCallback | None,
+        manifest: LocalAIManifest | None,
     ) -> Any:
         role = ModelRole(role)
         job_id = self._job_id(payload)
-        state = self._register_job(job_id)
+        state = self._register_job(job_id, manifest=manifest)
         try:
             if _GLOBAL_PROCESS_BOUNDARY_POISONED:
                 raise LocalWorkerError("Local worker is unavailable.")
@@ -515,10 +781,15 @@ class LocalModelManager:
             self._running_events.pop(job_id, None)
             self._done_events.pop(job_id, None)
 
-    def _register_job(self, job_id: str) -> _RunState:
+    def _register_job(
+        self,
+        job_id: str,
+        *,
+        manifest: LocalAIManifest | None,
+    ) -> _RunState:
         if job_id in self._jobs:
             raise LocalWorkerError("Local worker job is already registered.")
-        state = _RunState(job_id=job_id)
+        state = _RunState(job_id=job_id, manifest=manifest)
         self._jobs[job_id] = state
         self._running_events[job_id] = state.running_event
         self._done_events[job_id] = state.done_event
@@ -544,7 +815,11 @@ class LocalModelManager:
             request = self._build_request(role, payload, state.job_id, command)
             self._active_job_id = state.job_id
             self._active_role = role
-            process = await self._spawn_worker_cancellation_safe()
+            self._prepare_worker_pycache_prefix(lease)
+            environment = self._child_environment(lease)
+            if state.manifest is not None:
+                self._require_current_runtime(state.manifest)
+            process = await self._spawn_worker_cancellation_safe(environment)
             self._record_process_start(process)
             state.running_event.set()
             self._raise_if_cancelled(state)
@@ -608,9 +883,8 @@ class LocalModelManager:
             finally:
                 if cleanup_error is None:
                     self._clear_active_process_state(cleanup_process)
-                    self._clear_process_boundary_poison()
-                    self._worker_process_lock_fd = None
-                    lease.release()
+                    if not self._finalize_lease_or_retain(lease):
+                        cleanup_error = LocalWorkerError("Local worker is unavailable.")
                 else:
                     self._retain_failed_cleanup(cleanup_process, lease)
             if cleanup_error is not None:
@@ -696,6 +970,23 @@ class LocalModelManager:
         self._cleanup_poisoned = False
         _GLOBAL_PROCESS_BOUNDARY_POISONED = False
 
+    def _finalize_lease_or_retain(self, lease: _WorkerProcessLease) -> bool:
+        """Release one proven cache lease or retain it as the poisoned boundary."""
+
+        retained = self._retained_worker_process_lease
+        if retained is not None and retained is not lease:
+            raise LocalWorkerError("Local worker is unavailable.")
+        try:
+            lease.release()
+        except LocalWorkerError:
+            self._retained_worker_process_lease = lease
+            self._poison_process_boundary()
+            return False
+        self._retained_worker_process_lease = None
+        self._worker_process_lock_fd = None
+        self._clear_process_boundary_poison()
+        return True
+
     def _retain_failed_cleanup(
         self,
         process: asyncio.subprocess.Process | None,
@@ -704,10 +995,13 @@ class LocalModelManager:
         """Keep exclusivity until a failed-cleanup process group is confirmed gone."""
         if process is None or not self._process_group_exists(process.pid):
             self._clear_active_process_state(process)
-            self._clear_process_boundary_poison()
-            self._worker_process_lock_fd = None
-            lease.release()
+            self._finalize_lease_or_retain(lease)
             return
+        if (
+            self._retained_worker_process_lease is not None
+            and self._retained_worker_process_lease is not lease
+        ):
+            raise LocalWorkerError("Local worker is unavailable.")
         self._poison_process_boundary()
         self._retained_worker_process_lease = lease
         recovery_task = asyncio.create_task(
@@ -722,7 +1016,10 @@ class LocalModelManager:
         """Release retained ownership only after the orphan group exits."""
         while self._process_group_exists(process.pid):
             await asyncio.sleep(_INTERPROCESS_LOCK_POLL_SECONDS)
-        await self._finish_cleanup_recovery(process)
+        try:
+            await self._finish_cleanup_recovery(process)
+        except LocalWorkerError:
+            logger.warning("Local worker failed category=cleanup_identity_failure")
 
     async def _finish_cleanup_recovery(
         self,
@@ -741,11 +1038,9 @@ class LocalModelManager:
         lease = self._retained_worker_process_lease
         if lease is None:
             return
-        self._retained_worker_process_lease = None
         self._clear_active_process_state(process)
-        self._clear_process_boundary_poison()
-        self._worker_process_lock_fd = None
-        lease.release()
+        if not self._finalize_lease_or_retain(lease):
+            raise LocalWorkerError("Local worker is unavailable.")
 
     async def _acquire_role_process_lock(self, state: _RunState) -> asyncio.Lock:
         if _GLOBAL_PROCESS_BOUNDARY_POISONED:
@@ -901,7 +1196,46 @@ class LocalModelManager:
         except ValidationError:
             raise LocalWorkerError("Local worker request was rejected.") from None
 
-    def _child_environment(self) -> dict[str, str]:
+    def _child_environment(self, lease: _WorkerProcessLease) -> dict[str, str]:
+        pycache_prefix = lease.pycache_prefix
+        name = lease.pycache_prefix_name
+        root_identity = lease.pycache_root_identity
+        prefix_identity = lease.pycache_prefix_identity
+        if (
+            pycache_prefix is None
+            or name is None
+            or root_identity is None
+            or prefix_identity is None
+            or lease.pycache_root_fd < 0
+            or lease.pycache_prefix_fd < 0
+        ):
+            raise LocalWorkerError("Local worker is unavailable.")
+        try:
+            _require_owned_directory_identity(
+                os.fstat(lease.pycache_root_fd), root_identity
+            )
+            _require_owned_directory_identity(
+                os.stat(self._worker_home, follow_symlinks=False), root_identity
+            )
+            _require_owned_directory_identity(
+                os.fstat(lease.pycache_prefix_fd), prefix_identity
+            )
+            _require_owned_directory_identity(
+                os.stat(
+                    name,
+                    dir_fd=lease.pycache_root_fd,
+                    follow_symlinks=False,
+                ),
+                prefix_identity,
+            )
+            _require_owned_directory_identity(
+                os.stat(pycache_prefix, follow_symlinks=False), prefix_identity
+            )
+            is_empty = not list(os.scandir(lease.pycache_prefix_fd))
+        except OSError:
+            raise LocalWorkerError("Local worker is unavailable.") from None
+        if pycache_prefix.parent != self._worker_home or not is_empty:
+            raise LocalWorkerError("Local worker is unavailable.")
         environment = {
             "PATH": os.defpath,
             "HOME": str(self._worker_home),
@@ -909,6 +1243,9 @@ class LocalModelManager:
             "TRANSFORMERS_OFFLINE": "1",
             "HF_HUB_DISABLE_TELEMETRY": "1",
             "PYTHONUNBUFFERED": "1",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONSAFEPATH": "1",
+            "PYTHONPYCACHEPREFIX": str(pycache_prefix),
         }
         if self._enforce_network_sandbox:
             lock_fd = self._worker_process_lock_fd
@@ -938,7 +1275,10 @@ class LocalModelManager:
             environment["LOCAL_AI_PROCESS_LOCK_INODE"] = str(descriptor_metadata.st_ino)
         return environment
 
-    async def _spawn_worker(self) -> asyncio.subprocess.Process:
+    async def _spawn_worker(
+        self,
+        environment: dict[str, str],
+    ) -> asyncio.subprocess.Process:
         if self._worker_command is None:
             raise LocalWorkerError("Local worker is unavailable.")
         lock_fd = self._worker_process_lock_fd
@@ -951,7 +1291,7 @@ class LocalModelManager:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
-                env=self._child_environment(),
+                env=environment,
                 cwd=self._worker_home,
                 start_new_session=True,
                 preexec_fn=_disable_core_dumps,
@@ -961,8 +1301,11 @@ class LocalModelManager:
         except (OSError, ValueError):
             raise LocalWorkerError("Local worker is unavailable.") from None
 
-    async def _spawn_worker_cancellation_safe(self) -> asyncio.subprocess.Process:
-        spawn_task = asyncio.create_task(self._spawn_worker())
+    async def _spawn_worker_cancellation_safe(
+        self,
+        environment: dict[str, str],
+    ) -> asyncio.subprocess.Process:
+        spawn_task = asyncio.create_task(self._spawn_worker(environment))
         try:
             return await asyncio.shield(spawn_task)
         except asyncio.CancelledError:

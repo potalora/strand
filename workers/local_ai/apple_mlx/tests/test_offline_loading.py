@@ -65,10 +65,15 @@ def synthetic_pack(tmp_path: Path) -> tuple[dict[str, object], Path]:
             }
         )
     manifest: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "pack_revision": "test-pack",
         "platform": "apple_silicon",
-        "runtime": {"name": "mlx-vlm", "version": "0.5.0"},
+        "runtime": {
+            "name": "mlx-vlm",
+            "version": "0.5.0",
+            "worker_identity_scheme": "local-ai-worker-bundle.v1",
+            "worker_bundle_sha256": "b" * 64,
+        },
         "validation_suite_version": "test-v1",
         "artifacts": artifacts,
     }
@@ -307,6 +312,52 @@ def test_load_role_requires_exact_manifest_schema_and_expected_identity(
         )
 
 
+@pytest.mark.parametrize(
+    ("schema_version", "runtime_update"),
+    [
+        (1, {}),
+        (2, {"worker_identity_scheme": None}),
+        (2, {"worker_identity_scheme": "wrong-scheme"}),
+        (2, {"worker_bundle_sha256": None}),
+        (2, {"worker_bundle_sha256": "A" * 64}),
+        (2, {"worker_bundle_sha256": "a" * 63}),
+        (2, {"unexpected": "value"}),
+    ],
+)
+def test_worker_manifest_requires_exact_schema_v2_runtime_identity(
+    synthetic_pack: tuple[dict[str, object], Path],
+    schema_version: int,
+    runtime_update: dict[str, object],
+) -> None:
+    from local_ai_mlx_worker.common import build_manifest_identity
+
+    manifest, _model_dir = synthetic_pack
+    candidate = deepcopy(manifest)
+    candidate["schema_version"] = schema_version
+    runtime = candidate["runtime"]
+    assert isinstance(runtime, dict)
+    for key, value in runtime_update.items():
+        if value is None:
+            runtime.pop(key, None)
+        else:
+            runtime[key] = value
+
+    with pytest.raises(ValueError, match=r"(?:incompatible|structure|digest)"):
+        build_manifest_identity(candidate, "ocr")
+
+
+def test_worker_manifest_identity_binds_runtime_worker_identity(
+    synthetic_pack: tuple[dict[str, object], Path],
+) -> None:
+    from local_ai_mlx_worker.common import build_manifest_identity
+
+    manifest, _model_dir = synthetic_pack
+    identity = build_manifest_identity(manifest, "summary")
+
+    assert identity["schema_version"] == 2
+    assert identity["runtime"] == manifest["runtime"]
+
+
 def test_summary_processor_preflight_skips_weights_but_hashes_tokenizer_assets(
     synthetic_pack: tuple[dict[str, object], Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -408,8 +459,8 @@ def test_manifest_file_rejects_duplicate_json_keys(
     serialized = json.dumps(manifest)
     manifest_path.write_text(
         serialized.replace(
-            '"schema_version": 1',
-            '"schema_version": 1, "schema_version": 1',
+            '"schema_version": 2',
+            '"schema_version": 2, "schema_version": 2',
             1,
         ),
         encoding="utf-8",

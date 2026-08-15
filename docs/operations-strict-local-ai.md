@@ -3,13 +3,17 @@
 ## Release status
 
 The strict-local path is implemented as an optional, fail-closed processing
-mode. The native Apple M4 16 GB profile is shipped and validated. The
-repository includes the exact
-[`apple-m4-16gb-v1` lock](../backend/app/model_manifests/apple-m4-16gb-v1.lock.json),
-its [release evidence](../backend/app/model_manifests/apple-m4-16gb-v1.release.json),
-and the content-free
-[fidelity](../backend/artifacts/local-ai-fidelity.json) and
-[benchmark](../backend/artifacts/local-ai-benchmark.json) reports.
+mode. This Track D state prepares the Apple M4 16 GB v2 candidate through
+[`catalog-v2.json`](../backend/app/model_manifests/catalog-v2.json) and
+[`apple-m4-16gb-v2.lock.json`](../backend/app/model_manifests/apple-m4-16gb-v2.lock.json).
+It does not contain or claim a verified v2 release. The
+`apple-m4-16gb-v2.release.json` file is generated only after the separately
+authorized model-backed benchmark, fidelity, promotion, and post-promotion
+verification gates pass. It is not present or verified in this Track D state.
+
+The v1 catalog, lock, and release evidence remain immutable diagnostic history.
+They are not defaults for new strict-local jobs and must not be relabelled as
+v2 evidence.
 
 `LOCAL_AI_ENABLED=false` remains the default so model installation and local
 processing are opt-in. After an operator enables the feature, the UI reports
@@ -18,7 +22,7 @@ runtime-validation receipt matches the same manifest.
 
 ## Supported machine
 
-The first release profile is native Apple Silicon macOS with 16 GB of unified
+The candidate profile is native Apple Silicon macOS with 16 GB of unified
 memory. Sixteen GB is both the minimum and the recommended baseline for this
 profile. The setup check also requires:
 
@@ -62,7 +66,7 @@ back once to Gemini, which then receives the original document.
 
 ## Model roles
 
-The shipped Apple lock pins these immutable repository revisions:
+The v2 candidate lock pins these immutable repository revisions:
 
 | Role | Locked model | Revision | Quantization |
 | --- | --- | --- | --- |
@@ -76,9 +80,30 @@ does not ingest documents. It receives only the already validated
 fact-and-evidence projection used for the final summary.
 
 The lock lists every allowed file, byte size, SHA-256 digest, license record,
-runtime version, and fixture-suite version. The release evidence binds that
-lock to the exact benchmark and fidelity report bytes. It also records the
-fidelity corpus identity and the thresholds used for promotion.
+runtime version, and fixture-suite version. After promotion, release evidence
+binds that lock to the exact benchmark and fidelity report bytes. It also
+records the fidelity corpus identity and promotion thresholds.
+
+### Worker runtime identity
+
+Schema-v2 manifests bind the model pack to a portable worker identity using
+the `local-ai-worker-bundle.v1` scheme. The digest covers only these inputs:
+
+- the scheme name;
+- the fixed console entry point
+  `local-ai-mlx-worker=local_ai_mlx_worker.__main__:main`;
+- `pyproject.toml`;
+- `uv.lock`; and
+- the effective `local_ai_mlx_worker` Python source tree, including every
+  regular `.py` file that can be imported from that package.
+
+The resolver also validates the worker command, launcher, virtual-environment
+layout, CPython compatibility, import precedence, and startup customization
+surface. Those topology checks fail closed but are not hashed, so absolute
+installation paths and supported Python patch releases do not change the
+portable digest. The digest does not attest the operating-system owner or root
+of trust. File ownership, host integrity, process isolation, and administrator
+control remain outside this boundary.
 
 ## Install and manage the pack
 
@@ -88,29 +113,30 @@ Install the isolated runtime without downloading models:
 just local-ai-runtime-install
 ```
 
-Download, verify, and atomically activate the shipped pack:
+The pre-promotion command binds the v2 lock to the retained artifact tree and
+runs the offline synthetic runtime fixture against those bytes. It does not
+download, relabel, activate, or require release evidence:
 
 ```bash
-just local-ai-pack-download
+just local-ai-candidate-verify
 ```
 
-Re-run the offline runtime and fixture verification:
+Its deterministic contract is covered by tests, but the command itself was not
+run in Track D. It must not be substituted with the normal lifecycle check.
 
-```bash
-just local-ai-pack-verify
-```
-
-Run the three-cold-run, content-free memory benchmark:
+Run the three-cold-run, content-free memory benchmark only as part of the
+separately authorized release gates:
 
 ```bash
 just local-ai-benchmark
 ```
 
-Run the real fidelity gate against the active, receipt-validated pack:
+Run the fidelity gate against the same v2-bound retained artifact tree with
+private fixtures removed from the environment:
 
 ```bash
 cd backend
-uv run python scripts/run_local_ai_fidelity.py \
+env -u REAL_MEDICAL_FIXTURES_DIR uv run python scripts/run_local_ai_fidelity.py \
   --output artifacts/local-ai-fidelity.json
 ```
 
@@ -118,11 +144,21 @@ The command renders the committed synthetic PDF and TIFF fixtures, runs
 OvisOCR2, NuExtract3, and Qwen3.5-9B in that order, and writes an owner-only
 JSON report containing aggregate metrics only. It exits nonzero if any release
 threshold fails. The runner checks the committed corpus SHA-256 before loading
-the models. Private-corpus metrics are gated separately, so they cannot offset
-a failure in the committed synthetic suite. The normal test suite uses a fake
-worker and does not load the models.
+the models. The checked-in release report must contain no private run or
+private metrics. The normal test suite uses a fake worker and does not load the
+models.
 
-After both gates pass, regenerate the release evidence:
+To run the same fidelity gate through pytest:
+
+```bash
+cd backend
+LOCAL_AI_ENABLED=true uv run pytest \
+  tests/test_local_ai_fidelity.py \
+  -m "local_model and fidelity" -v -rs
+```
+
+After the benchmark and synthetic fidelity gates pass, generate the v2 release
+evidence:
 
 ```bash
 just local-ai-release-promote
@@ -132,30 +168,76 @@ Promotion fails unless both reports match the exact manifest and meet their
 current hard gates. The promoted fidelity report must cover all six committed
 synthetic documents and no private documents. Readiness revalidates both report
 hashes, the fidelity corpus identity, document count, and recorded thresholds.
-Older benchmark-only release evidence is not accepted.
+Older benchmark-only release evidence is not accepted. This Track D state did
+not run these separately authorized gates or generate the v2 release file.
 
-To run the same gate through pytest:
+Promotion does not change the retained v1 activation metadata. If v1 is still
+active, normal v2 installation fails closed. Do not remove or rewrite that
+state as part of candidate verification. A separately reviewed and authorized
+operator procedure must retire the v1 activation before the normal v2 install
+can run. Track D did not define or run that mutation.
+
+After that prerequisite is complete and promotion has written
+`apple-m4-16gb-v2.release.json`, the normal install may download, verify, and
+atomically activate the configured pack:
+
+```bash
+just local-ai-pack-download
+```
+
+`local-ai-pack-download` is post-promotion because normal installation requires
+the v2 release file. It is not a candidate-preparation command.
+
+Re-run the normal offline runtime and fixture verification after installation:
+
+```bash
+just local-ai-pack-verify
+```
+
+`local-ai-pack-verify` is the post-promotion command contract and requires
+release evidence. It fails before the v2 release file exists.
+
+### v1-to-v2 deployment preflight
+
+Before applying the v2 database guard or changing the release default, an
+operator must prove that no validated strict-local job is queued or processing.
+This is an operational command contract, not permission to query a production
+database during development:
 
 ```bash
 cd backend
-LOCAL_AI_ENABLED=true uv run pytest \
-  tests/test_local_ai_fidelity.py \
-  -m "local_model and fidelity" -v -rs
+uv run python - <<'PY'
+import asyncio
+
+from sqlalchemy import func, select
+
+from app.database import async_session_factory
+from app.models.local_ai import LocalAIJob
+
+
+async def main() -> None:
+    async with async_session_factory() as session:
+        active = (await session.execute(
+            select(func.count()).select_from(LocalAIJob).where(
+                LocalAIJob.processing_mode == "validated_strict_local",
+                LocalAIJob.status.in_(("queued", "processing")),
+            )
+        )).scalar_one()
+    if active:
+        raise SystemExit(
+            "refusing v2 deployment: active strict-local jobs exist"
+        )
+
+
+asyncio.run(main())
+PY
+cd ..
 ```
 
-An optional private corpus must stay outside the repository and include an
-explicit `local-ai-corpus-v1.json` golden sidecar. Run it as an additional
-operator-only check and write its report to an ignored path:
-
-```bash
-REAL_MEDICAL_FIXTURES_DIR=/owner/private/path \
-  uv run python scripts/run_local_ai_fidelity.py \
-  --output artifacts/local-ai-fidelity.private.json
-```
-
-The private metrics are gated separately, so they cannot rescue a failed
-synthetic run. The report still contains no OCR text, facts, evidence excerpts,
-or summary output, but it is not the checked-in promotion artifact.
+If the count is nonzero, stop. Let those jobs finish or fail them under the v1
+behavior before deployment. Do not rewrite, relabel, or promote their captured
+manifests. This preflight was not run in Track D and remains an operational
+deployment gate.
 
 ## Run browser tests with local-only enforcement
 
@@ -211,8 +293,8 @@ The defaults assume the backend process starts from `backend/`:
 LOCAL_AI_ENABLED=false
 LOCAL_AI_MODEL_DIR=./data/local-ai/models
 LOCAL_AI_SCRATCH_DIR=./data/local-ai/scratch
-LOCAL_AI_MANIFEST_PATH=./app/model_manifests/apple-m4-16gb-v1.lock.json
-LOCAL_AI_RELEASE_EVIDENCE_PATH=./app/model_manifests/apple-m4-16gb-v1.release.json
+LOCAL_AI_MANIFEST_PATH=./app/model_manifests/apple-m4-16gb-v2.lock.json
+LOCAL_AI_RELEASE_EVIDENCE_PATH=./app/model_manifests/apple-m4-16gb-v2.release.json
 LOCAL_AI_BENCHMARK_PATH=./artifacts/local-ai-benchmark.json
 LOCAL_AI_FIDELITY_PATH=./artifacts/local-ai-fidelity.json
 LOCAL_AI_WORKER_COMMAND=../workers/local_ai/apple_mlx/.venv/bin/local-ai-mlx-worker
@@ -272,8 +354,9 @@ confirms that a worker-side socket receives an operating-system permission
 error. It also starts competing backend processes and confirms that their
 workers cannot overlap. A separate crash test leaves the first worker blocked,
 kills its backend, and confirms that the watchdog terminates the orphan before
-the next backend acquires the lease. The shipped release passed offline role
-loading with the exact locked artifacts on the target Mac.
+the next backend acquires the lease. The historical v1 release passed offline
+role loading with its exact locked artifacts on the target Mac. That result is
+not v2 release evidence.
 
 The current macOS boundary uses `/usr/bin/sandbox-exec`, which Apple has
 deprecated. Strict-local startup fails closed if that system tool is missing or
@@ -301,6 +384,20 @@ content. Interrupted lifecycle work is reconciled on startup. A validated
 active pack remains usable after a failed maintenance operation, but new
 strict-local jobs are blocked while maintenance is active.
 
+Schema-v1 strict-local snapshots cannot run under the v2 worker contract. A
+queued or processing legacy ingestion job makes one non-retryable transition
+to `failed` with the bounded code `runtime_identity_required`; its paired
+upload is terminalized in the same transaction. A legacy summary job makes the
+same job-only transition. The stored v1 manifest remains unchanged.
+
+For schema-v2 work, a missing or changed worker bundle is rejected before
+strict-local admission and checked again immediately before every worker
+spawn. Responses and logs use the same content-free error boundary; they do
+not include paths, source names, manifest bytes, or digests. Operators must
+repair the supported worker runtime, revalidate the exact candidate or
+promoted pack as appropriate, and submit a new job. Do not retry or rewrite a
+job whose captured runtime identity no longer matches.
+
 ## Backup and restore
 
 Back up the Postgres database and encrypted upload directory as described in
@@ -318,13 +415,13 @@ startup sweeper remove abandoned job directories.
 
 ## Validation evidence and policy
 
-The shipped M4 16 GB profile passed the committed six-document synthetic
+The historical v1 M4 16 GB profile passed the committed six-document synthetic
 fidelity suite. All six rate metrics were `1.0`: output-schema validity,
 critical numeric exactness, critical precision, critical recall, summary fact
 recall, and summary typed-field recall. Accepted facts without evidence,
 forbidden extraction facts, and unsupported summary facts were all zero.
 
-The content-free benchmark ran each model role cold three times on a 16 GB
+Its content-free benchmark ran each model role cold three times on a 16 GB
 Apple M4 machine. Peak MLX allocations were approximately:
 
 | Role | Peak MLX allocation |
@@ -333,12 +430,12 @@ Apple M4 machine. Peak MLX allocations were approximately:
 | Clinical extraction | 4.73 GB |
 | Final summary | 7.10 GB |
 
-The benchmark recorded one live model at a time, no memory-pressure
+That benchmark recorded one live model at a time, no memory-pressure
 termination, and no sustained swap thrashing. Its final MLX active-memory
 ratio was `3.7e-9`.
 
-Future pack revisions can be called validated only when all of these pass
-against their exact release lock:
+The v2 candidate can be called validated only after it passes all of these
+checks against its exact release lock:
 
 - every file hash, size, type, license record, and revision matches;
 - all three roles load with repository code disabled and no network;

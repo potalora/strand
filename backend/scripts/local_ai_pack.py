@@ -51,14 +51,11 @@ def _write(stream: TextIO, message: str) -> None:
 
 
 def _write_candidate_only_message(stream: TextIO) -> None:
-    """Explain why a catalog-only checkout cannot install a strict-local pack."""
+    """Explain why the release-required lifecycle remains unavailable."""
 
     _write(
         stream,
-        (
-            "ERROR: no validated locked local model pack is shipped; "
-            "the candidate catalog cannot be installed."
-        ),
+        "ERROR: validated local model release evidence is unavailable.",
     )
 
 

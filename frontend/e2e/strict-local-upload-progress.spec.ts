@@ -56,6 +56,7 @@ test("stamps strict-local mode and shows fail-closed model progress", async ({
         : null;
       return json({
         upload_id: "upload-1",
+        filename: "record.pdf",
         status: "pending_extraction",
         file_type: "pdf",
       });
@@ -186,6 +187,7 @@ test("blocks every upload until privacy settings load and makes failure retryabl
       uploadRequests += 1;
       return json({
         upload_id: "upload-after-retry",
+        filename: "blocked.pdf",
         status: "pending_extraction",
         file_type: "pdf",
       });
@@ -340,6 +342,7 @@ test("serializes delayed extraction polls and never applies an older response la
     ) {
       return json({
         upload_id: "serialized-poll",
+        filename: "serialized.pdf",
         status: "pending_extraction",
         file_type: "pdf",
       });

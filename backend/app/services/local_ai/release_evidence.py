@@ -259,6 +259,10 @@ def load_release_evidence(
         or report_manifest.get("sha256") != manifest_digest
         or report_manifest.get("runtime_name") != manifest.runtime["name"]
         or report_manifest.get("runtime_version") != manifest.runtime["version"]
+        or report_manifest.get("worker_identity_scheme")
+        != manifest.runtime["worker_identity_scheme"]
+        or report_manifest.get("worker_bundle_sha256")
+        != manifest.runtime["worker_bundle_sha256"]
         or fidelity.manifest_sha256 != manifest_digest
         or fidelity_identity.get("fixture_suite_version")
         != fidelity.fixture_suite_version

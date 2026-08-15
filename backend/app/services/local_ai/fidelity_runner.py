@@ -18,8 +18,8 @@ from typing import Any, Protocol
 from PIL import Image, ImageDraw, ImageFont
 
 from app.services.local_ai.artifact_store import (
-    ArtifactStore,
     manifest_sha256 as hash_manifest,
+    resolve_retained_candidate_pack,
 )
 from app.services.local_ai.errors import LocalValidationError
 from app.services.local_ai.extraction_schema import (
@@ -42,7 +42,6 @@ from app.services.local_ai.grounded_summary import (
 from app.services.local_ai.manifest import (
     LocalAIManifest,
     ManifestArtifact,
-    load_manifest,
 )
 from app.services.local_ai.model_manager import LocalModelManager
 from app.services.local_ai.rasterizer import iter_rasterized_pages
@@ -109,8 +108,9 @@ class FidelityManager(Protocol):
 
     async def stop(self) -> None: ...
 
-    async def run(
+    async def run_attested(
         self,
+        manifest: LocalAIManifest,
         role: ModelRole,
         payload: dict[str, Any],
     ) -> Any: ...
@@ -1209,7 +1209,8 @@ async def run_fidelity_suite(
                 try:
                     for page in rasterized:
                         role = ModelRole.OCR
-                        value = await selected_manager.run(
+                        value = await selected_manager.run_attested(
+                            manifest,
                             role,
                             {
                                 **_transport(
@@ -1235,7 +1236,8 @@ async def run_fidelity_suite(
                     rasterized.close()
 
                 role = ModelRole.EXTRACTION
-                value = await selected_manager.run(
+                value = await selected_manager.run_attested(
+                    manifest,
                     role,
                     {
                         **_transport(
@@ -1278,7 +1280,8 @@ async def run_fidelity_suite(
         summary_job_name = f"fidelity-{run_id}-summary"
         with ScratchJob(root / "jobs", summary_job_name) as scratch:
             role = ModelRole.SUMMARY
-            summary_value = await selected_manager.run(
+            summary_value = await selected_manager.run_attested(
+                manifest,
                 role,
                 {
                     **summary_input.model_dump(mode="json"),
@@ -1373,27 +1376,18 @@ def resolve_installed_fidelity_pack(
     manifest_path: Path | str,
     model_root: Path | str,
 ) -> tuple[LocalAIManifest, Path, Path]:
-    """Resolve one runtime-validated active pack matching the shipped lock."""
+    """Resolve a v2 lock over one hash-verified retained artifact tree."""
 
-    locked_path = Path(manifest_path).absolute()
-    locked = load_manifest(locked_path)
-    store = ArtifactStore(Path(model_root))
     try:
-        active = store.active_manifest()
+        candidate = resolve_retained_candidate_pack(
+            manifest_path=manifest_path,
+            model_root=model_root,
+        )
     except (OSError, LocalValidationError):
         raise LocalValidationError(
             "Validated local fidelity model pack is unavailable."
         ) from None
-    if (
-        active is None
-        or active.pack_revision != locked.pack_revision
-        or hash_manifest(active) != hash_manifest(locked)
-    ):
-        raise LocalValidationError(
-            "Validated local fidelity model pack is unavailable."
-        )
-    pack_path = store.packs_dir / active.pack_revision
-    return active, locked_path, pack_path
+    return candidate.manifest, candidate.manifest_path, candidate.pack_path
 
 
 async def run_installed_fidelity_suite(
@@ -1404,22 +1398,34 @@ async def run_installed_fidelity_suite(
     scratch_root: Path | str,
     private_fixtures_dir: Path | str | None = None,
 ) -> FidelityRunReport:
-    """Run the exact active, receipt-validated pack with optional private goldens."""
+    """Run the v2 candidate over exact retained bytes with optional private goldens."""
 
-    manifest, locked_path, pack_path = resolve_installed_fidelity_pack(
-        manifest_path=manifest_path,
-        model_root=model_root,
-    )
+    try:
+        candidate = resolve_retained_candidate_pack(
+            manifest_path=manifest_path,
+            model_root=model_root,
+        )
+    except (OSError, LocalValidationError):
+        raise LocalValidationError(
+            "Validated local fidelity model pack is unavailable."
+        ) from None
     private_corpus = (
         load_private_fidelity_corpus(private_fixtures_dir)
         if private_fixtures_dir is not None
         else None
     )
-    return await run_fidelity_suite(
-        manifest=manifest,
-        manifest_path=locked_path,
-        model_dir=pack_path,
+    report = await run_fidelity_suite(
+        manifest=candidate.manifest,
+        manifest_path=candidate.manifest_path,
+        model_dir=candidate.pack_path,
         corpus=load_fidelity_corpus(corpus_path),
         private_corpus=private_corpus,
         scratch_root=scratch_root,
     )
+    try:
+        candidate.revalidate()
+    except LocalValidationError:
+        raise LocalValidationError(
+            "Validated local fidelity model pack is unavailable."
+        ) from None
+    return report

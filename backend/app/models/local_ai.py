@@ -31,7 +31,11 @@ from app.models.local_ai_ddl import (
     LOCAL_AI_JOB_DATABASE_GUARDS,
 )
 from app.services.local_ai.errors import LocalValidationError
-from app.services.local_ai.manifest import canonicalize_manifest_snapshot
+from app.services.local_ai.manifest import (
+    LegacyManifestDiagnostic,
+    canonicalize_manifest_snapshot,
+    parse_manifest,
+)
 from app.services.local_ai.types import ProcessingMode
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -45,6 +49,16 @@ _IMMUTABLE_JOB_FIELDS = (
     "manifest_sha256",
 )
 _IMMUTABLE_EVIDENCE_FIELDS = ("user_id", "upload_id")
+_LEGACY_FAILURE_TRANSITION_FIELDS = frozenset(
+    {"status", "stage", "progress", "failure", "completed_at"}
+)
+LEGACY_RUNTIME_IDENTITY_FAILURE = {
+    "stage": "failed",
+    "code": "runtime_identity_required",
+    "retryable": False,
+    "checkpoint_preserved": False,
+    "cloud_fallback_attempted": False,
+}
 
 
 class LocalAIJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -155,6 +169,29 @@ class LocalAIJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         ):
             raise LocalValidationError("Stored local AI job manifest is invalid")
         return snapshot
+
+    def legacy_manifest_diagnostic(self) -> LegacyManifestDiagnostic | None:
+        """Recognize one unchanged canonical v1 row for fail-closed transition only."""
+
+        try:
+            diagnostic = parse_manifest(
+                self.manifest_snapshot,
+                allow_legacy_diagnostic=True,
+            )
+        except LocalValidationError:
+            return None
+        if not isinstance(diagnostic, LegacyManifestDiagnostic):
+            return None
+        if (
+            diagnostic.canonical_snapshot != self.manifest_snapshot
+            or not isinstance(self.manifest_sha256, str)
+            or not hmac.compare_digest(
+                diagnostic.canonical_sha256,
+                self.manifest_sha256,
+            )
+        ):
+            return None
+        return diagnostic
 
     __table_args__ = (
         CheckConstraint(
@@ -329,6 +366,33 @@ def _reject_persisted_job_identity_changes(
     state = inspect(target)
     if any(state.attrs[field].history.has_changes() for field in _IMMUTABLE_JOB_FIELDS):
         raise LocalValidationError("Local AI job identity is immutable")
+    if target.legacy_manifest_diagnostic() is not None:
+        changed = {
+            attribute.key
+            for attribute in state.attrs
+            if attribute.history.has_changes()
+        }
+        status_history = state.attrs.status.history
+        stage_history = state.attrs.stage.history
+        completed_history = state.attrs.completed_at.history
+        if (
+            changed != _LEGACY_FAILURE_TRANSITION_FIELDS
+            or tuple(status_history.added) != ("failed",)
+            or len(status_history.deleted) != 1
+            or status_history.deleted[0] not in {"queued", "processing"}
+            or tuple(stage_history.added) != ("failed",)
+            or not stage_history.deleted
+            or stage_history.deleted[0] == "failed"
+            or len(completed_history.added) != 1
+            or completed_history.added[0] is None
+            or tuple(completed_history.deleted) not in {(), (None,)}
+            or target.status != "failed"
+            or target.stage != "failed"
+            or target.progress != {"stage": "failed"}
+            or target.failure != LEGACY_RUNTIME_IDENTITY_FAILURE
+        ):
+            raise LocalValidationError("Legacy local AI job transition is invalid")
+        return
     target.revalidate_manifest_snapshot()
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,43 @@ from app.services.local_ai.extraction_schema import (
     ClinicalDocumentExtraction,
 )
 from app.services.local_ai.extraction_validator import validate_clinical_extraction
+
+
+def _grounding_cases() -> dict[str, object]:
+    root = Path(__file__).resolve().parents[2]
+    return json.loads(
+        (
+            root / "workers/local_ai/apple_mlx/tests/fixtures/"
+            "strict_local_extraction_grounding_cases.json"
+        ).read_text(encoding="utf-8")
+    )
+
+
+def test_strict_local_grounding_case_matrix_is_versioned_and_nonempty() -> None:
+    cases = _grounding_cases()
+    assert cases["version"] == 1
+    assert {case["id"] for case in cases["procedure_cases"]} == {
+        "authorization_validity_date_is_not_performance",
+        "authorization_with_status_post_is_performance",
+        "authorization_with_underwent_subject_is_performance",
+        "authorization_with_performed_subject_is_performance",
+        "authorization_with_subject_completed_is_performance",
+        "other_procedure_performed_cannot_support_subject",
+        "other_procedure_status_post_cannot_support_subject",
+        "later_same_procedure_performance_cannot_support_selected_authorization",
+        "bare_appendectomy_name_is_not_performance",
+        "bare_biopsy_name_is_not_performance",
+        "ordinary_clinical_date_remains_compatible",
+    }
+    assert {case["id"] for case in cases["medication_cases"]} == {
+        "other_medication_blocker_cannot_reject_subject",
+        "other_medication_active_cue_cannot_promote_subject",
+        "own_dosing_continuation_supports_subject",
+        "repeated_subject_fails_closed",
+        "other_medication_active_after_newline_cannot_promote_subject",
+        "other_medication_active_after_slash_cannot_promote_subject",
+        "own_active_support_survives_other_medication_blocker",
+    }
 
 
 def _medication(**overrides: object) -> dict[str, object]:
@@ -582,21 +620,23 @@ def test_billed_procedure_line_item_supports_mentioned_not_performed() -> None:
     assert result.procedures[0].assertion == AssertionState.MENTIONED_NOT_PERFORMED
 
 
-def test_billed_context_does_not_forbid_dated_present_procedure() -> None:
+def test_billed_context_allows_dated_present_procedure_with_performance_evidence() -> (
+    None
+):
     raw = {
         "procedures": [
             {
                 "name": "Colonoscopy",
                 "assertion": "present",
                 "date": "2024-03-01",
-                "verbatim": "Colonoscopy on 2024-03-01",
+                "verbatim": "Colonoscopy performed on 2024-03-01",
                 "page_number": 1,
-                "evidence_excerpt": "Billed Colonoscopy on 2024-03-01",
+                "evidence_excerpt": "Billed Colonoscopy performed on 2024-03-01",
             }
         ]
     }
 
-    result = _validate(raw, page="Billed Colonoscopy on 2024-03-01")
+    result = _validate(raw, page="Billed Colonoscopy performed on 2024-03-01")
 
     assert result.procedures[0].assertion == AssertionState.PRESENT
 
@@ -636,6 +676,41 @@ def test_billed_present_procedure_without_support_still_fails_closed() -> None:
 
     with pytest.raises(LocalValidationError, match=r"procedures\[0\].*assertion"):
         _validate(raw, page="Authorization for Colonoscopy")
+
+
+@pytest.mark.parametrize(
+    "case",
+    _grounding_cases()["procedure_cases"],
+    ids=lambda case: str(case["id"]),
+)
+def test_administrative_procedure_grounding_matches_shared_matrix(
+    case: dict[str, object],
+) -> None:
+    context = str(case["context"])
+    raw = {
+        "procedures": [
+            {
+                "name": str(case["name"]),
+                "assertion": "present",
+                "date": str(case["date"]),
+                "verbatim": str(case.get("verbatim", context)),
+                "page_number": 1,
+                "evidence_excerpt": context,
+            }
+        ]
+    }
+    if case["backend_present_valid"]:
+        assert (
+            _validate(raw, page=str(case["page"])).procedures[0].assertion
+            == AssertionState.PRESENT
+        )
+    else:
+        expected_error = str(case.get("backend_error", "performance"))
+        with pytest.raises(
+            LocalValidationError,
+            match=rf"procedures\[0\].*{expected_error}",
+        ):
+            _validate(raw, page=str(case["page"]))
 
 
 def test_evidence_ids_are_stable_and_change_with_relevant_inputs() -> None:
@@ -1137,8 +1212,8 @@ def test_medication_lifecycle_signal_after_comma_in_own_verbatim_is_supported() 
     ]
 
 
-def test_medication_lifecycle_blocker_inside_verbatim_still_rejects() -> None:
-    """A blocker word inside the fact's own evidence still defeats promotion."""
+def test_medication_lifecycle_blocker_outside_subject_source_cannot_reject() -> None:
+    """A non-continuation blocker cannot scan beyond the subject-local source."""
     line = "escitalopram 20 mg tablet, consider taking daily"
     fact = _medication(
         fact_id="med-blocker",
@@ -1153,7 +1228,7 @@ def test_medication_lifecycle_blocker_inside_verbatim_still_rejects() -> None:
     )
     with pytest.raises(
         LocalValidationError,
-        match=r"medications\[0\].status.*contradicts source evidence",
+        match=r"medications\[0\].status.*lacks source support",
     ):
         _validate({"medications": [fact]}, page=line)
 
@@ -1177,6 +1252,47 @@ def test_medication_lifecycle_signal_outside_fact_verbatim_still_rejected() -> N
         match=r"medications\[0\].status.*lacks source support",
     ):
         _validate({"medications": [fact]}, page=excerpt)
+
+
+@pytest.mark.parametrize(
+    "case",
+    _grounding_cases()["medication_cases"],
+    ids=lambda case: str(case["id"]),
+)
+def test_medication_lifecycle_scope_matches_shared_matrix(
+    case: dict[str, object],
+) -> None:
+    context = str(case["context"])
+    fact = _medication(
+        name=str(case["name"]),
+        frequency=case["frequency"],
+        status=str(case["candidate_status"]),
+        verbatim=context,
+        evidence_excerpt=context,
+    )
+    for field_name, source_token in (
+        ("dose_value", "500"),
+        ("dose_unit", "mg"),
+        ("route", "oral"),
+    ):
+        if source_token not in context.casefold():
+            fact[field_name] = None
+    if case["id"] == "other_medication_active_after_slash_cannot_promote_subject":
+        fact.update(dose_value=None, dose_unit=None, route=None)
+    if case["id"] == "repeated_subject_fails_closed":
+        fact.update(
+            verbatim="Metformin active daily",
+        )
+    if case["backend_valid"]:
+        assert _validate({"medications": [fact]}, page=context).medications[
+            0
+        ].status.value == str(case["candidate_status"])
+    else:
+        with pytest.raises(
+            LocalValidationError,
+            match=r"medications\[0\].status.*lacks source support",
+        ):
+            _validate({"medications": [fact]}, page=context)
 
 
 @pytest.mark.parametrize(
@@ -2058,20 +2174,24 @@ def test_duplicate_clinical_facts_on_the_same_evidence_span_are_rejected() -> No
         )
 
 
+def test_semantic_qualifiers_bind_to_the_exact_verbatim_occurrence() -> None:
+    page = "Possible diabetes. Diabetes confirmed"
+    fact = {
+        "name": "diabetes",
+        "assertion": "present",
+        "verbatim": "Diabetes confirmed",
+        "page_number": 1,
+        "evidence_excerpt": page,
+    }
+
+    validated = _validate({"conditions": [fact]}, page=page)
+
+    assert len(validated.conditions) == 1
+
+
 @pytest.mark.parametrize(
     ("category", "fact", "page"),
     [
-        (
-            "conditions",
-            {
-                "name": "diabetes",
-                "assertion": "present",
-                "verbatim": "Diabetes confirmed",
-                "page_number": 1,
-                "evidence_excerpt": "Possible diabetes. Diabetes confirmed",
-            },
-            "Possible diabetes. Diabetes confirmed",
-        ),
         (
             "medications",
             _medication(
@@ -2099,14 +2219,16 @@ def test_duplicate_clinical_facts_on_the_same_evidence_span_are_rejected() -> No
         ),
     ],
 )
-def test_semantic_qualifiers_bind_to_the_exact_verbatim_occurrence(
+def test_repeated_lifecycle_subjects_fail_closed_without_source_support(
     category: str,
     fact: dict[str, object],
     page: str,
 ) -> None:
-    validated = _validate({category: [fact]}, page=page)
-
-    assert len(getattr(validated, category)) == 1
+    with pytest.raises(
+        LocalValidationError,
+        match=rf"{category}\[0\]\.status.*lifecycle state lacks source support",
+    ):
+        _validate({category: [fact]}, page=page)
 
 
 @pytest.mark.parametrize(
