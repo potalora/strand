@@ -276,23 +276,117 @@ _NUMERIC_VALUE_RE = re.compile(
 )
 _QUALIFIER_CONTINUATION_WORDS = frozenset(
     {
-        "active", "administered", "as", "at", "bedtime", "bid", "bpm", "cm", "completed",
-        "continued", "current", "daily", "day", "days", "dl", "every", "g", "given", "hour",
-        "hours", "im", "in", "inhaled", "intramuscular", "intravenous", "iu", "iv", "kg", "l",
-        "mcg", "meq", "mg", "min", "ml", "mm", "mmhg", "mmol", "mol", "month", "monthly",
-        "months", "ng", "needed", "nightly", "once", "oral", "pg", "po", "performed", "prn", "qid",
-        "received", "subcutaneous", "tid", "times", "topical", "twice", "ug", "unit", "units",
+        "active",
+        "administered",
+        "as",
+        "at",
+        "bedtime",
+        "bid",
+        "bpm",
+        "cm",
+        "completed",
+        "continued",
+        "current",
+        "daily",
+        "day",
+        "days",
+        "dl",
+        "every",
+        "g",
+        "given",
+        "hour",
+        "hours",
+        "im",
+        "in",
+        "inhaled",
+        "intramuscular",
+        "intravenous",
+        "iu",
+        "iv",
+        "kg",
+        "l",
+        "mcg",
+        "meq",
+        "mg",
+        "min",
+        "ml",
+        "mm",
+        "mmhg",
+        "mmol",
+        "mol",
+        "month",
+        "monthly",
+        "months",
+        "ng",
+        "needed",
+        "nightly",
+        "once",
+        "oral",
+        "pg",
+        "po",
+        "performed",
+        "prn",
+        "qid",
+        "received",
+        "subcutaneous",
+        "tid",
+        "times",
+        "topical",
+        "twice",
+        "ug",
+        "unit",
+        "units",
         "week",
-        "weekly", "weeks", "µg", "μg",
+        "weekly",
+        "weeks",
+        "µg",
+        "μg",
     }
 )
 _LIFECYCLE_CONTINUATION_WORDS = _QUALIFIER_CONTINUATION_WORDS | frozenset(
     {
-        "apply", "applies", "applying", "by", "capsule", "capsules", "directed", "doses", "drop",
-        "drops", "each", "ear", "ears", "eye", "eyes", "give", "injected", "instill", "instilled",
-        "instills", "instructed", "mouth", "nose", "of", "one", "pill", "pills", "puff", "puffs",
-        "take", "takes", "taking", "tablet", "tablets", "the", "then", "total", "under", "use",
-        "uses", "using", "with",
+        "apply",
+        "applies",
+        "applying",
+        "by",
+        "capsule",
+        "capsules",
+        "directed",
+        "doses",
+        "drop",
+        "drops",
+        "each",
+        "ear",
+        "ears",
+        "eye",
+        "eyes",
+        "give",
+        "injected",
+        "instill",
+        "instilled",
+        "instills",
+        "instructed",
+        "mouth",
+        "nose",
+        "of",
+        "one",
+        "pill",
+        "pills",
+        "puff",
+        "puffs",
+        "take",
+        "takes",
+        "taking",
+        "tablet",
+        "tablets",
+        "the",
+        "then",
+        "total",
+        "under",
+        "use",
+        "uses",
+        "using",
+        "with",
     }
 )
 
@@ -869,14 +963,15 @@ def _has_subject_bound_performance(context: str, subject: str) -> bool:
         rf"\b(?:underwent|performed|status\s+post|s\s*[/.-]\s*p)\s+"
         rf"(?:(?:a|an|the)\s+)?{bounded_subject}"
     )
-    after_subject = (
-        rf"{bounded_subject}\s+(?:was\s+)?(?:performed|completed|done)\b"
+    after_subject = rf"{bounded_subject}\s+(?:was\s+)?(?:performed|completed|done)\b"
+    return (
+        re.search(
+            rf"(?:{before_subject}|{after_subject})",
+            context,
+            re.IGNORECASE,
+        )
+        is not None
     )
-    return re.search(
-        rf"(?:{before_subject}|{after_subject})",
-        context,
-        re.IGNORECASE,
-    ) is not None
 
 
 def _procedure_requires_explicit_performance(
@@ -944,19 +1039,16 @@ def _semantic_boundaries(source: str) -> list[tuple[int, int]]:
                 re.IGNORECASE,
             ):
                 continue
-            line_words = [
-                word.casefold()
-                for word in re.findall(r"[^\W\d_]+", line, re.UNICODE)
-            ]
+            line_words = [word.casefold() for word in re.findall(r"[^\W\d_]+", line, re.UNICODE)]
             if (
                 token in frequency_led_continuations
                 and line_words
                 and all(word in frequency_led_continuations for word in line_words)
             ):
                 continue
-            if (
-                token.isdigit() or token in continuation_words
-            ) and _is_qualifier_only_continuation(line):
+            if (token.isdigit() or token in continuation_words) and _is_qualifier_only_continuation(
+                line
+            ):
                 continue
         boundaries.append((match.start(), match.end()))
     for match in re.finditer(r"/", source):
@@ -983,10 +1075,7 @@ def _semantic_boundaries(source: str) -> list[tuple[int, int]]:
 def _is_qualifier_only_continuation(line: str) -> bool:
     """Return whether a wrapped line contains qualifiers but no named subject."""
     without_numbers = _NUMERIC_VALUE_RE.sub(" ", line)
-    words = [
-        word.casefold()
-        for word in re.findall(r"[^\W\d_]+", without_numbers, re.UNICODE)
-    ]
+    words = [word.casefold() for word in re.findall(r"[^\W\d_]+", without_numbers, re.UNICODE)]
     return bool(words) and all(word in _QUALIFIER_CONTINUATION_WORDS for word in words)
 
 
@@ -998,8 +1087,7 @@ def _procedure_subject_source(fact: Mapping[str, object], subject: str) -> str:
         return ""
     verbatim_chunks = re.split(r"(\s+)", verbatim.strip())
     verbatim_pattern = "".join(
-        r"\s+" if chunk.isspace() else re.escape(chunk)
-        for chunk in verbatim_chunks
+        r"\s+" if chunk.isspace() else re.escape(chunk) for chunk in verbatim_chunks
     )
     verbatim_matches = list(re.finditer(verbatim_pattern, excerpt, re.IGNORECASE))
     if len(verbatim_matches) != 1:
@@ -1019,12 +1107,8 @@ def _procedure_subject_source(fact: Mapping[str, object], subject: str) -> str:
         return ""
     subject_match = subject_matches[0]
     clause_boundaries = _semantic_boundaries(clause)
-    subject_preceding = [
-        end for _, end in clause_boundaries if end <= subject_match.start()
-    ]
-    subject_following = [
-        start for start, _ in clause_boundaries if start >= subject_match.end()
-    ]
+    subject_preceding = [end for _, end in clause_boundaries if end <= subject_match.start()]
+    subject_following = [start for start, _ in clause_boundaries if start >= subject_match.end()]
     subject_start = max(subject_preceding) if subject_preceding else 0
     subject_end = min(subject_following) if subject_following else len(clause)
     return clause[subject_start:subject_end]
@@ -1033,10 +1117,7 @@ def _procedure_subject_source(fact: Mapping[str, object], subject: str) -> str:
 def _is_lifecycle_continuation(clause: str) -> bool:
     """Return whether a clause after the subject reads as its dosing tail."""
     without_numbers = _NUMERIC_VALUE_RE.sub(" ", clause)
-    words = [
-        word.casefold()
-        for word in re.findall(r"[^\W\d_]+", without_numbers, re.UNICODE)
-    ]
+    words = [word.casefold() for word in re.findall(r"[^\W\d_]+", without_numbers, re.UNICODE)]
     return bool(words) and all(word in _LIFECYCLE_CONTINUATION_WORDS for word in words)
 
 
@@ -1687,8 +1768,7 @@ def run_extraction(
             raise failure
         else:
             if all(
-                not _is_fragment(page) or page.get(_FRAGMENT_FINAL_KEY) is True
-                for page in batch
+                not _is_fragment(page) or page.get(_FRAGMENT_FINAL_KEY) is True for page in batch
             ):
                 publish_batch_progress(len(batch))
             resolved_batches.append((batch, result))

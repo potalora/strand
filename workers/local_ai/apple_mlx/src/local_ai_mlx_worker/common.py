@@ -74,9 +74,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "artifacts",
     }
 )
-_RUNTIME_KEYS = frozenset(
-    {"name", "version", "worker_identity_scheme", "worker_bundle_sha256"}
-)
+_RUNTIME_KEYS = frozenset({"name", "version", "worker_identity_scheme", "worker_bundle_sha256"})
 _ARTIFACT_KEYS = frozenset(
     {
         "role",
@@ -423,10 +421,7 @@ def _validated_manifest(
     ):
         raise ArtifactUnavailableError("Locked manifest is incompatible.")
     worker_bundle_sha256 = runtime.get("worker_bundle_sha256")
-    if (
-        not isinstance(worker_bundle_sha256, str)
-        or _SHA256.fullmatch(worker_bundle_sha256) is None
-    ):
+    if not isinstance(worker_bundle_sha256, str) or _SHA256.fullmatch(worker_bundle_sha256) is None:
         raise ArtifactUnavailableError("Locked manifest runtime digest is invalid.")
     validation_suite_version = _manifest_string(
         raw,

@@ -1857,7 +1857,7 @@ async def generate_grounded_local_summary(
                     "manifest_path": str(locked_manifest_path),
                     "model_dir": str(model_dir),
                     "manifest_identity": manifest_identity,
-                }
+                },
             )
             summary_limit = min(
                 artifact.decode_limits["max_output_tokens"],

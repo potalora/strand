@@ -309,7 +309,9 @@ async def test_strict_admission_rejects_worker_drift_before_pack_evidence_or_sna
     monkeypatch.setattr(
         snapshot_module,
         "load_release_evidence",
-        lambda *_args, **_kwargs: pytest.fail("release evidence loaded before identity"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "release evidence loaded before identity"
+        ),
     )
 
     with pytest.raises(LocalPolicyError, match="unavailable"):

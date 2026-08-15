@@ -54,7 +54,11 @@ def _fake_setup_repository(
         "#!/bin/sh\n"
         "set -eu\n"
         'test -d "$PYTHONPYCACHEPREFIX"\n'
-        "mode=$(stat -f '%Lp' \"$PYTHONPYCACHEPREFIX\")\n"
+        "if mode=$(stat -c '%a' \"$PYTHONPYCACHEPREFIX\" 2>/dev/null); then\n"
+        "  :\n"
+        "else\n"
+        "  mode=$(stat -f '%Lp' \"$PYTHONPYCACHEPREFIX\")\n"
+        "fi\n"
         'printf \'python %s\\n\' "$*" >> "$FAKE_COMMAND_LOG"\n'
         "printf 'python-env %s|%s|%s|%s|%s|%s\\n' "
         '"${PYTHONPATH-unset}" "${PYTHONHOME-unset}" '

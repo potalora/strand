@@ -1517,26 +1517,28 @@ async def test_timeout_reaps_worker_and_returns_safe_taxonomy(
 
 
 @pytest.mark.asyncio
-async def test_forward_progress_extends_idle_timeout_but_not_hard_deadline(
+async def test_forward_progress_extends_idle_timeout_when_total_work_exceeds_idle(
     fake_worker_command: list[str], worker_home: Path
 ) -> None:
     manager = LocalModelManager(
         fake_worker_command,
         worker_home=worker_home,
-        timeout_seconds=0.25,
-        hard_timeout_seconds=1.0,
+        timeout_seconds=1.0,
+        hard_timeout_seconds=5.0,
     )
     await manager.start()
 
+    started_at = time.monotonic()
     result = await manager.run(
         ModelRole.EXTRACTION,
         {
             "progress_steps": 3,
-            "progress_delay_ms": 150,
+            "progress_delay_ms": 600,
         },
     )
 
     assert result["entities"] == []
+    assert time.monotonic() - started_at > 1.0
     assert manager.active_pid is None
     await manager.stop()
 
@@ -2182,34 +2184,44 @@ async def test_hard_timeout_includes_async_progress_callback(
 ) -> None:
     callback_started = asyncio.Event()
 
-    async def blocked_callback(_progress: dict[str, object]) -> None:
+    async def blocked_callback(progress: dict[str, object]) -> None:
+        if progress["current"] == 0:
+            return
         callback_started.set()
         await asyncio.Event().wait()
 
     manager = LocalModelManager(
         fake_worker_command,
         worker_home=worker_home,
-        timeout_seconds=0.3,
-        hard_timeout_seconds=0.5,
+        timeout_seconds=3.0,
+        hard_timeout_seconds=3.0,
     )
     await manager.start()
 
-    with pytest.raises(LocalWorkerTimeout, match="timed out"):
-        await asyncio.wait_for(
-            manager.run(
-                ModelRole.EXTRACTION,
-                {
-                    "progress_steps": 2,
-                    "progress_delay_ms": 20,
-                },
-                blocked_callback,
-            ),
-            timeout=1,
+    started_at = time.monotonic()
+    run_task = asyncio.create_task(
+        manager.run(
+            ModelRole.EXTRACTION,
+            {
+                "progress_steps": 2,
+                "progress_delay_ms": 2000,
+            },
+            blocked_callback,
         )
+    )
+    try:
+        await asyncio.wait_for(callback_started.wait(), timeout=5)
+        with pytest.raises(LocalWorkerTimeout, match="timed out"):
+            await asyncio.wait_for(run_task, timeout=5)
 
-    assert callback_started.is_set()
-    assert manager.active_pid is None
-    await manager.stop()
+        elapsed = time.monotonic() - started_at
+        assert 2.5 <= elapsed < 4.5
+        assert manager.active_pid is None
+    finally:
+        await manager.stop()
+        if not run_task.done():
+            run_task.cancel()
+        await asyncio.gather(run_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

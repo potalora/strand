@@ -27,8 +27,7 @@ def _grounding_cases() -> dict[str, object]:
     root = Path(__file__).resolve().parents[4]
     return json.loads(
         (
-            root
-            / "workers/local_ai/apple_mlx/tests/fixtures/"
+            root / "workers/local_ai/apple_mlx/tests/fixtures/"
             "strict_local_extraction_grounding_cases.json"
         ).read_text(encoding="utf-8")
     )
@@ -1010,9 +1009,7 @@ def test_extraction_batches_long_documents_without_reloading_the_model(
 def test_image_retry_over_batch_cap_splits_before_second_generation(tmp_path: Path) -> None:
     from local_ai_mlx_worker.nuextract3 import run_extraction
 
-    markdown = ("left marker " + ("A" * 1_350)) + "\n\n" + (
-        "right marker " + ("B" * 1_350)
-    )
+    markdown = ("left marker " + ("A" * 1_350)) + "\n\n" + ("right marker " + ("B" * 1_350))
     image = _png(tmp_path, "page-1.png")
     calls: list[tuple[str, list[str], int]] = []
 
@@ -1271,9 +1268,7 @@ def test_chat_template_input_overflow_splits_before_stream_generation(
 
     from local_ai_mlx_worker.nuextract3 import _EXTRACTION_BATCH_INPUT_CAP, run_extraction
 
-    markdown = ("first bounded section " * 30) + "\n\n" + (
-        "second bounded section " * 30
-    )
+    markdown = ("first bounded section " * 30) + "\n\n" + ("second bounded section " * 30)
     stream_calls: list[str] = []
     budget_events: list[dict[str, int]] = []
 
@@ -2373,9 +2368,7 @@ def test_grounding_downgrades_billed_procedure_line_items_to_mentioned_not_perfo
 
     grounded = _ground_explicit_assertions(value)
 
-    assert grounded["procedures"][0]["assertion"] == (
-        "mentioned_not_performed"
-    )  # type: ignore[index]
+    assert grounded["procedures"][0]["assertion"] == ("mentioned_not_performed")  # type: ignore[index]
 
 
 def test_grounding_keeps_billed_procedure_present_when_performance_is_documented() -> None:
@@ -2402,9 +2395,7 @@ def test_grounding_keeps_billed_procedure_present_when_performance_is_documented
     grounded = _ground_explicit_assertions(value)
 
     assert grounded["procedures"][0]["assertion"] == "present"  # type: ignore[index]
-    assert grounded["procedures"][1]["assertion"] == (
-        "mentioned_not_performed"
-    )  # type: ignore[index]
+    assert grounded["procedures"][1]["assertion"] == ("mentioned_not_performed")  # type: ignore[index]
 
 
 @pytest.mark.parametrize(
@@ -2595,9 +2586,7 @@ def test_grounding_downgrades_undated_procedure_on_billing_form_page() -> None:
 
     grounded = _ground_explicit_assertions(value, pages)
 
-    assert grounded["procedures"][0]["assertion"] == (
-        "mentioned_not_performed"
-    )  # type: ignore[index]
+    assert grounded["procedures"][0]["assertion"] == ("mentioned_not_performed")  # type: ignore[index]
 
 
 def test_grounding_ignores_billing_signature_on_other_pages() -> None:
