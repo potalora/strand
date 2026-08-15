@@ -17,6 +17,10 @@ from app.services.local_ai.manifest import canonicalize_manifest_snapshot
 from tests.conftest import auth_headers, create_test_patient
 
 
+def _no_legacy_manifest_diagnostic() -> None:
+    return None
+
+
 @pytest.mark.asyncio
 async def test_duplicate_wakeups_run_one_summary_job(
     monkeypatch: pytest.MonkeyPatch,
@@ -195,6 +199,7 @@ async def test_shutdown_requeue_processes_every_job_across_bounded_batches() -> 
             progress={"stage": "summary"},
             failure=None,
             completed_at=None,
+            legacy_manifest_diagnostic=_no_legacy_manifest_diagnostic,
         )
         for _ in range(1001)
     ]
@@ -256,6 +261,7 @@ async def test_startup_requeue_processes_every_job_across_bounded_batches() -> N
             progress={"stage": "summary"},
             failure=None,
             completed_at=None,
+            legacy_manifest_diagnostic=_no_legacy_manifest_diagnostic,
         )
         for _ in range(1001)
     ]
