@@ -15,7 +15,7 @@ test.describe("Console-error gate", () => {
     await page.goto("/login");
     // The login form renders; if the gate had tripped on benign noise this test
     // would have failed in teardown.
-    await expect(page.locator("#email")).toBeVisible();
+    await expect(page.locator("#loginIdentifier")).toBeVisible();
     await expect(page.locator("#password")).toBeVisible();
   });
 
