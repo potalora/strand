@@ -26,6 +26,7 @@ async def test_register_user(client: AsyncClient):
     )
     assert response.status_code == 201
     data = response.json()
+    assert data["login_identifier"] == "test@example.com"
     assert data["email"] == "test@example.com"
     assert data["display_name"] == "Test User"
     assert data["is_active"] is True
@@ -104,6 +105,7 @@ async def test_get_me_authenticated(client: AsyncClient):
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 200
+    assert response.json()["login_identifier"] == "me@example.com"
     assert response.json()["email"] == "me@example.com"
 
 

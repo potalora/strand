@@ -1,14 +1,29 @@
 import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
-import { testEmail, TEST_PASSWORD } from "./helpers/test-data";
+import {
+  testIdentifier,
+  uniqueIdentifier,
+  TEST_PASSWORD,
+} from "./helpers/test-data";
 
 test.describe("Register page", () => {
   test("successful registration redirects to login", async ({ page }) => {
-    const uniqueEmail = `e2e-register-${Date.now()}@test.com`;
+    const loginIdentifier = uniqueIdentifier("register");
 
     await page.goto("/register");
     await page.locator("#displayName").fill("Test User");
-    await page.locator("#email").fill(uniqueEmail);
+    const accountName = page.getByLabel("Account name");
+    await expect(accountName).toHaveAttribute("type", "text");
+    await expect(accountName).toHaveAttribute("autocomplete", "username");
+    await expect(accountName).toHaveAttribute("autocapitalize", "none");
+    await expect(accountName).toHaveAttribute("spellcheck", "false");
+    await expect(
+      page.getByText(/do not need an email address/i)
+    ).toBeVisible();
+    await expect(
+      page.getByText(/visually similar Unicode text may still differ/i)
+    ).toBeVisible();
+    await page.locator("#loginIdentifier").fill(loginIdentifier);
     await page.locator("#password").fill(TEST_PASSWORD);
     await page.locator('button[type="submit"]').click();
 
@@ -16,27 +31,30 @@ test.describe("Register page", () => {
     expect(page.url()).toContain("/login");
   });
 
-  test("duplicate email shows error", async ({ page }) => {
-    const email = `e2e-register-dup-${Date.now()}@test.com`;
+  test("duplicate account name shows error", async ({ page }) => {
+    const loginIdentifier = uniqueIdentifier("register duplicate");
 
     // Pre-register via API
     const api = new ApiClient();
-    await api.register(email, TEST_PASSWORD);
+    await api.register(loginIdentifier, TEST_PASSWORD);
 
-    // Try same email in browser
+    // Try the same account name in the browser.
     await page.goto("/register");
-    await page.locator("#email").fill(email);
+    await page.locator("#loginIdentifier").fill(loginIdentifier);
     await page.locator("#password").fill(TEST_PASSWORD);
     await page.locator('button[type="submit"]').click();
 
     // Error div should appear
-    const errorDiv = page.locator("div").filter({ hasText: /already|exists|registered|error/i }).first();
+    const errorDiv = page
+      .locator("div")
+      .filter({ hasText: /unavailable|already|exists|registered|error/i })
+      .first();
     await expect(errorDiv).toBeVisible({ timeout: 10_000 });
   });
 
   test("short password rejected", async ({ page }) => {
     await page.goto("/register");
-    await page.locator("#email").fill(testEmail("register"));
+    await page.locator("#loginIdentifier").fill(testIdentifier("register short"));
     await page.locator("#password").fill("Ab1!");
     await page.locator('button[type="submit"]').click();
 
@@ -44,7 +62,7 @@ test.describe("Register page", () => {
     expect(page.url()).toContain("/register");
   });
 
-  test("empty email prevents submit", async ({ page }) => {
+  test("empty account name prevents submit", async ({ page }) => {
     await page.goto("/register");
     await page.locator("#password").fill(TEST_PASSWORD);
     await page.locator('button[type="submit"]').click();
@@ -54,11 +72,11 @@ test.describe("Register page", () => {
   });
 
   test("loading state shows during submit", async ({ page }) => {
-    const uniqueEmail = `e2e-register-loading-${Date.now()}@test.com`;
+    const loginIdentifier = uniqueIdentifier("register loading");
 
     await page.goto("/register");
     await page.locator("#displayName").fill("Loading Test");
-    await page.locator("#email").fill(uniqueEmail);
+    await page.locator("#loginIdentifier").fill(loginIdentifier);
     await page.locator("#password").fill(TEST_PASSWORD);
     await page.locator('button[type="submit"]').click();
 

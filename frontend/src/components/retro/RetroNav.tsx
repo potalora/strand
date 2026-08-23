@@ -42,7 +42,7 @@ function initialsFrom(user: UserResponse | null): string {
     const parts = name.split(/\s+/);
     return ((parts[0]?.[0] ?? "") + (parts[1]?.[0] ?? "")).toUpperCase() || name.slice(0, 2).toUpperCase();
   }
-  return user.email.slice(0, 2).toUpperCase();
+  return (Array.from(user.login_identifier)[0] ?? "·").toUpperCase();
 }
 
 export function RetroNav() {
@@ -58,7 +58,7 @@ export function RetroNav() {
   );
 
   // Shared store: fetched once, cached, retried on a transient 401 (so the
-  // avatar initials never silently fall back to the email/placeholder).
+  // avatar initials never silently fall back to the account-name placeholder).
   useEffect(() => {
     void fetchUser();
   }, [fetchUser]);

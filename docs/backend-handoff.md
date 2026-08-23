@@ -8,6 +8,47 @@ This document defines the complete API contract between the AI-Enabled Clinical 
 
 All authenticated endpoints require a `Bearer` token in the `Authorization` header. The frontend stores JWT tokens in localStorage via Zustand and attaches them automatically through the `ApiClient` class (`src/lib/api.ts`).
 
+### Account login identifier
+
+New clients send `login_identifier`, the private value used to sign in. No email
+address is required. The deprecated `email` field is still accepted in register
+and login requests and returned in user responses as an alias for
+`login_identifier`. It does not mean that the value is an email address. If a
+request supplies both fields, they must match under the rule below or the API
+returns the generic 422 response.
+
+Strand trims the value for storage. Lookup and uniqueness use exactly:
+
+```python
+value.strip().lower()
+```
+
+This is not Unicode `casefold()` or Unicode canonical-equivalence matching.
+For example:
+
+- ` Alice ` and `alice` both produce `alice` and identify the same account.
+- `Straße` produces `straße`, while `STRASSE` produces `strasse`; they remain
+  distinct.
+- Precomposed `Å` (`U+00C5`) produces `å` (`U+00E5`). Decomposed `A` plus a
+  combining ring (`U+0041 U+030A`) produces `a` plus a combining ring
+  (`U+0061 U+030A`), so the two forms remain distinct.
+
+The identifier is private. `users.login_identifier` contains app-layer
+AES-256-GCM ciphertext. `users.login_identifier_hmac` contains the unique,
+indexed keyed HMAC-SHA256 blind index used for exact lookup; it is not a
+plaintext identifier.
+
+Auth validation and credential failures return these complete generic bodies:
+
+| Condition | Response |
+|-----------|----------|
+| Invalid payload, invalid identifier or password shape, or conflicting aliases | HTTP 422 `{"detail":"Invalid authentication request."}` |
+| Duplicate or concurrently claimed identifier | HTTP 409 `{"detail":"Account identifier is unavailable."}` |
+| Unknown identifier, wrong password, or disabled account | HTTP 401 `{"detail":"Invalid account identifier or password."}` |
+
+An active temporary lockout keeps its existing 401 response instead of the
+generic invalid-credentials body.
+
 ### POST `/auth/register`
 
 Create a new user account.
@@ -15,9 +56,18 @@ Create a new user account.
 **Request:**
 ```json
 {
-  "email": "user@example.com",
-  "password": "securepassword",
-  "display_name": "Optional Name"
+  "login_identifier": "pedro",
+  "password": "SecurePass123!",
+  "display_name": "Pedro"
+}
+```
+
+Deprecated request spelling:
+
+```json
+{
+  "email": "existing@example.com",
+  "password": "SecurePass123!"
 }
 ```
 
@@ -25,13 +75,15 @@ Create a new user account.
 ```json
 {
   "id": "uuid",
-  "email": "user@example.com",
-  "display_name": "Optional Name",
-  "is_active": true
+  "login_identifier": "pedro",
+  "email": "pedro",
+  "display_name": "Pedro",
+  "is_active": true,
+  "created_at": "timestamp"
 }
 ```
 
-**Errors:** `400` (validation), `409` (email already exists)
+The deprecated `email` response alias repeats `login_identifier`.
 
 ### POST `/auth/login`
 
@@ -40,10 +92,13 @@ Authenticate and receive JWT tokens.
 **Request:**
 ```json
 {
-  "email": "user@example.com",
-  "password": "securepassword"
+  "login_identifier": "pedro",
+  "password": "SecurePass123!"
 }
 ```
+
+The deprecated `email` request spelling shown under registration is also
+accepted for login.
 
 **Response (200):**
 ```json
@@ -53,8 +108,6 @@ Authenticate and receive JWT tokens.
   "token_type": "bearer"
 }
 ```
-
-**Errors:** `401` (invalid credentials)
 
 ### POST `/auth/refresh`
 
@@ -92,11 +145,15 @@ Get the authenticated user's profile. Used by the Admin > SYS tab.
 ```json
 {
   "id": "uuid",
-  "email": "user@example.com",
-  "display_name": "Optional Name",
-  "is_active": true
+  "login_identifier": "pedro",
+  "email": "pedro",
+  "display_name": "Pedro",
+  "is_active": true,
+  "created_at": "timestamp"
 }
 ```
+
+The response has the same fields as registration.
 
 ---
 
@@ -1462,9 +1519,9 @@ The frontend reads `response.json().detail` for error display. **Never expose st
 | 401 | Authentication required or invalid token |
 | 403 | Forbidden (accessing another user's data) |
 | 404 | Resource not found |
-| 409 | Conflict (duplicate email) |
+| 409 | Conflict (duplicate account login identifier) |
 | 413 | File too large |
-| 422 | Unprocessable entity |
+| 422 | Unprocessable entity; auth payload errors use the exact generic body above |
 | 500 | Internal server error |
 
 ---

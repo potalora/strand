@@ -50,6 +50,8 @@ type DedupResolution = {
 };
 
 type AuthenticatedUser = {
+  login_identifier: string;
+  /** @deprecated Compatibility alias; equal to login_identifier. */
   email: string;
 };
 
@@ -77,13 +79,13 @@ const LOCAL_ONLY = process.env.E2E_LOCAL_ONLY === "1";
 export class ApiClient {
   private token: string = "";
 
-  async register(email: string, password: string): Promise<void> {
+  async register(loginIdentifier: string, password: string): Promise<void> {
     const res = await this._withRateLimitRetry(() =>
       fetch(`${API_BASE}/auth/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          email,
+          login_identifier: loginIdentifier,
           password,
           display_name: "E2E Test User",
         }),
@@ -95,12 +97,12 @@ export class ApiClient {
     }
   }
 
-  async login(email: string, password: string): Promise<void> {
+  async login(loginIdentifier: string, password: string): Promise<void> {
     const res = await this._withRateLimitRetry(() =>
       fetch(`${API_BASE}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ login_identifier: loginIdentifier, password }),
       })
     );
     if (!res.ok) {

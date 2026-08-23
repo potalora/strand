@@ -352,7 +352,7 @@ async def test_pending_extraction_excludes_other_users(
 
     other_user = User(
         id=uuid4(),
-        email="other_pending_encrypted",
+        login_identifier="other_pending_encrypted",
         password_hash="$2b$12$fakefakefakefakefakefuaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         is_active=True,
     )
@@ -395,8 +395,14 @@ async def test_batch_upload_skips_invalid_files(
             "/api/v1/upload/unstructured-batch",
             files=[
                 ("files", ("first-invalid.txt", io.BytesIO(txt_invalid), "text/plain")),
-                ("files", ("later-valid.rtf", io.BytesIO(rtf_valid), "application/rtf")),
-                ("files", ("final-valid.pdf", io.BytesIO(pdf_valid), "application/pdf")),
+                (
+                    "files",
+                    ("later-valid.rtf", io.BytesIO(rtf_valid), "application/rtf"),
+                ),
+                (
+                    "files",
+                    ("final-valid.pdf", io.BytesIO(pdf_valid), "application/pdf"),
+                ),
             ],
             headers=headers,
             data={"processing_mode": "cloud_assisted"},
@@ -481,7 +487,11 @@ async def test_batch_rejection_cap_does_not_block_later_valid_file(
     invalid_files.append(
         (
             "files",
-            ("accepted-after-cap.rtf", io.BytesIO(rb"{\rtf1 valid}"), "application/rtf"),
+            (
+                "accepted-after-cap.rtf",
+                io.BytesIO(rb"{\rtf1 valid}"),
+                "application/rtf",
+            ),
         )
     )
 
@@ -1260,7 +1270,7 @@ async def test_trigger_extraction_rejects_other_users_files(
 
     other_user = User(
         id=uuid4(),
-        email="trigger_other_user_encrypted",
+        login_identifier="trigger_other_user_encrypted",
         password_hash="$2b$12$fakefakefakefakefakefuaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         is_active=True,
     )

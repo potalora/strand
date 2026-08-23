@@ -14,6 +14,8 @@ export interface TokenResponse {
 
 export interface UserResponse {
   id: string;
+  login_identifier: string;
+  /** @deprecated Compatibility alias; this value is not necessarily an email. */
   email: string;
   display_name: string | null;
   is_active: boolean;
@@ -21,13 +23,13 @@ export interface UserResponse {
 }
 
 export interface RegisterRequest {
-  email: string;
+  login_identifier: string;
   password: string;
   display_name?: string;
 }
 
 export interface LoginRequest {
-  email: string;
+  login_identifier: string;
   password: string;
 }
 

@@ -1,8 +1,8 @@
 import { test, expect } from "@playwright/test";
 import { ApiClient } from "./helpers/api-client";
-import { uniqueEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";
+import { uniqueIdentifier, TEST_PASSWORD, PATHS } from "./helpers/test-data";
 
-const email = uniqueEmail("setup");
+const loginIdentifier = uniqueIdentifier("setup");
 const SUCCESSFUL_UPLOAD_STATUSES = [
   "awaiting_confirmation",
   "completed",
@@ -14,13 +14,14 @@ test.describe("E2E Setup", () => {
   const api = new ApiClient();
 
   test.beforeAll(async () => {
-    await api.register(email, TEST_PASSWORD);
-    await api.login(email, TEST_PASSWORD);
+    await api.register(loginIdentifier, TEST_PASSWORD);
+    await api.login(loginIdentifier, TEST_PASSWORD);
   });
 
   test("test account is authenticated", async () => {
     const me = await api.getMe();
-    expect(me.email).toBeTruthy();
+    expect(me.login_identifier).toBe(loginIdentifier);
+    expect(me.email).toBe(me.login_identifier);
   });
 
   test("local-only profile persists validated strict-local routing", async () => {

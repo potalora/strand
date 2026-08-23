@@ -5,6 +5,7 @@ must carry the encrypted name/MRN/DOB so ``scrub_phi`` can strip the patient's
 own identifiers before text reaches Gemini. Regression target — historically
 ``name_encrypted`` stayed NULL and the patient name leaked to the LLM.
 """
+
 from __future__ import annotations
 
 import uuid
@@ -80,7 +81,7 @@ async def _make_user(db_session) -> uuid.UUID:
     """Create a persisted User so patient FK constraints are satisfied."""
     user = User(
         id=uuid.uuid4(),
-        email=f"demo-{uuid.uuid4().hex[:8]}@example.com",
+        login_identifier=f"demo-{uuid.uuid4().hex[:8]}@example.com",
         password_hash="x",
     )
     db_session.add(user)

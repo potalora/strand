@@ -19,7 +19,7 @@ async def test_user_pref_overrides_extraction_engine(db_session, monkeypatch):
     from app.services.ai.llm import config as cfg
 
     monkeypatch.setattr(cfg.settings, "extraction_engine", "hybrid")
-    user = User(email="ee-pref@example.com", password_hash="x")
+    user = User(login_identifier="ee-pref@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     db_session.add(UserLLMPreferences(user_id=user.id, extraction_engine="local"))
@@ -34,7 +34,7 @@ async def test_no_pref_falls_back_to_settings_engine(db_session, monkeypatch):
     from app.services.ai.llm import config as cfg
 
     monkeypatch.setattr(cfg.settings, "extraction_engine", "gemini")
-    user = User(email="ee-nopref@example.com", password_hash="x")
+    user = User(login_identifier="ee-nopref@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     await db_session.commit()

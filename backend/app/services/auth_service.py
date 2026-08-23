@@ -18,7 +18,7 @@ from app.middleware.auth import (
 from app.middleware.encryption import blind_index
 from app.models.token_blacklist import RevokedToken
 from app.models.user import User
-from app.schemas.auth import TokenResponse
+from app.schemas.auth import TokenResponse, normalize_login_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,22 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds
 
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_DURATION_MINUTES = 15
+_LOGIN_IDENTIFIER_HMAC_CONSTRAINT = "ix_users_login_identifier_hmac"
+
+
+def _is_login_identifier_unique_violation(error: IntegrityError) -> bool:
+    current: BaseException | None = error.orig
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if (
+            getattr(current, "sqlstate", None) == "23505"
+            and getattr(current, "constraint_name", None)
+            == _LOGIN_IDENTIFIER_HMAC_CONSTRAINT
+        ):
+            return True
+        current = current.__cause__
+    return False
 
 
 def hash_password(password: str) -> str:
@@ -40,41 +56,51 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 async def register_user(
     db: AsyncSession,
-    email: str,
+    login_identifier: str,
     password: str,
     display_name: str | None = None,
 ) -> User:
     """Register a new user."""
-    # ``email`` is encrypted at rest and not directly queryable; look up the
-    # deterministic blind index instead.
-    email_hmac = blind_index(email)
-    existing = await db.execute(select(User).where(User.email_hmac == email_hmac))
+    login_identifier = normalize_login_identifier(login_identifier)
+    identifier_hmac = blind_index(login_identifier)
+    existing = await db.execute(
+        select(User).where(User.login_identifier_hmac == identifier_hmac)
+    )
     if existing.scalar_one_or_none():
-        raise ValueError("Email already registered")
+        raise ValueError("Account identifier is unavailable.")
 
     user = User(
-        email=email,
-        email_hmac=email_hmac,
+        login_identifier=login_identifier,
+        login_identifier_hmac=identifier_hmac,
         password_hash=hash_password(password),
         display_name=display_name,
     )
     db.add(user)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if _is_login_identifier_unique_violation(exc):
+            raise ValueError("Account identifier is unavailable.") from None
+        raise
     await db.refresh(user)
     return user
 
 
 async def authenticate_user(
     db: AsyncSession,
-    email: str,
+    login_identifier: str,
     password: str,
 ) -> TokenResponse:
     """Authenticate a user and return JWT tokens."""
-    result = await db.execute(select(User).where(User.email_hmac == blind_index(email)))
+    login_identifier = normalize_login_identifier(login_identifier)
+    result = await db.execute(
+        select(User).where(User.login_identifier_hmac == blind_index(login_identifier))
+    )
     user = result.scalar_one_or_none()
 
     if not user:
-        raise ValueError("Invalid email or password")
+        raise ValueError("Invalid account identifier or password")
 
     now = datetime.now(timezone.utc)
 
@@ -96,9 +122,13 @@ async def authenticate_user(
         user.last_failed_login_at = now
         if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
             user.locked_until = now + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
-            logger.warning("Account locked for user %s after %d failed attempts", user.id, user.failed_login_attempts)
+            logger.warning(
+                "Account locked for user %s after %d failed attempts",
+                user.id,
+                user.failed_login_attempts,
+            )
         await db.commit()
-        raise ValueError("Invalid email or password")
+        raise ValueError("Invalid account identifier or password")
 
     if not user.is_active:
         raise ValueError("Account is disabled")
@@ -214,7 +244,11 @@ async def refresh_tokens(
     # Rotate: revoke the presented refresh token, then mint a fresh pair.
     if old_jti:
         exp = payload.get("exp")
-        expires_at = datetime.fromtimestamp(exp, tz=timezone.utc) if exp else datetime.now(timezone.utc)
+        expires_at = (
+            datetime.fromtimestamp(exp, tz=timezone.utc)
+            if exp
+            else datetime.now(timezone.utc)
+        )
         db.add(
             RevokedToken(
                 jti=old_jti,
@@ -255,9 +289,7 @@ async def purge_expired_revoked_tokens(db: AsyncSession) -> int:
     no such trigger, so a DELETE here is allowed. Returns the rows removed.
     """
     result = await db.execute(
-        delete(RevokedToken).where(
-            RevokedToken.expires_at < datetime.now(timezone.utc)
-        )
+        delete(RevokedToken).where(RevokedToken.expires_at < datetime.now(timezone.utc))
     )
     await db.commit()
     return result.rowcount or 0

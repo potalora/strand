@@ -14,7 +14,7 @@ from app.models.user import User
 @pytest.mark.asyncio
 async def test_provider_config_roundtrip_encrypted_key(db_session):
     """An API key is stored as ciphertext and round-trips via decrypt_field."""
-    user = User(email="llm-models-a@example.com", password_hash="x")
+    user = User(login_identifier="llm-models-a@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     row = LLMProviderConfig(
@@ -43,7 +43,7 @@ async def test_provider_config_roundtrip_encrypted_key(db_session):
 @pytest.mark.asyncio
 async def test_preferences_one_row_per_user(db_session):
     """Preferences persist routing overrides; unset operations stay None."""
-    user = User(email="llm-models-b@example.com", password_hash="x")
+    user = User(login_identifier="llm-models-b@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     pref = UserLLMPreferences(
@@ -68,7 +68,7 @@ async def test_preferences_one_row_per_user(db_session):
 @pytest.mark.asyncio
 async def test_new_processing_rows_default_prompt_only(db_session) -> None:
     """Fresh policy-bearing rows cannot opt into cloud processing by omission."""
-    user = User(email="llm-models-defaults@example.com", password_hash="x")
+    user = User(login_identifier="llm-models-defaults@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     patient = Patient(user_id=user.id)

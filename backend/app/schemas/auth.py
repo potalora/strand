@@ -2,13 +2,45 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from typing import Any, Self
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 
-class RegisterRequest(BaseModel):
-    email: EmailStr
+def normalize_login_identifier(value: str) -> str:
+    trimmed = value.strip()
+    if not 1 <= len(trimmed) <= 255 or not trimmed.isprintable():
+        raise ValueError("invalid login identifier")
+    return trimmed
+
+
+class _LoginIdentifierRequest(BaseModel):
+    login_identifier: str = Field(
+        validation_alias=AliasChoices("login_identifier", "email")
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_matching_aliases(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        if "login_identifier" in value and "email" in value:
+            canonical = value["login_identifier"]
+            legacy = value["email"]
+            if not isinstance(canonical, str) or not isinstance(legacy, str):
+                raise ValueError("invalid login identifier aliases")
+            if canonical.strip().lower() != legacy.strip().lower():
+                raise ValueError("invalid login identifier aliases")
+        return value
+
+    @field_validator("login_identifier")
+    @classmethod
+    def validate_login_identifier(cls, value: str) -> str:
+        return normalize_login_identifier(value)
+
+
+class RegisterRequest(_LoginIdentifierRequest):
     password: str = Field(..., min_length=8, max_length=128)
     display_name: str | None = None
 
@@ -27,8 +59,7 @@ class RegisterRequest(BaseModel):
         return v
 
 
-class LoginRequest(BaseModel):
-    email: EmailStr
+class LoginRequest(_LoginIdentifierRequest):
     password: str
 
 
@@ -50,9 +81,19 @@ class LogoutRequest(BaseModel):
 
 class UserResponse(BaseModel):
     id: UUID
-    email: str
+    login_identifier: str
+    email: str = Field(deprecated=True)
     display_name: str | None
     is_active: bool
     created_at: datetime
 
-    model_config = {"from_attributes": True}
+    @classmethod
+    def from_user(cls, user: Any) -> Self:
+        return cls(
+            id=user.id,
+            login_identifier=user.login_identifier,
+            email=user.login_identifier,
+            display_name=user.display_name,
+            is_active=user.is_active,
+            created_at=user.created_at,
+        )

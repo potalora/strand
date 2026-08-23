@@ -95,6 +95,7 @@ test("loads ingestion evidence only for an AI-extracted record", async ({
     if (url.pathname === "/api/v1/auth/me") {
       return json({
         id: "user-1",
+        login_identifier: "pedro@example.com",
         email: "pedro@example.com",
         display_name: "Pedro",
         is_active: true,
@@ -131,6 +132,7 @@ test("does not request extraction evidence for a structured record", async ({
     const body = url.pathname === "/api/v1/auth/me"
       ? {
           id: "user-1",
+          login_identifier: "pedro@example.com",
           email: "pedro@example.com",
           display_name: "Pedro",
           is_active: true,

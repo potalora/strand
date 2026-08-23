@@ -5,12 +5,12 @@ import type { Page } from "@playwright/test";
  */
 export async function browserLogin(
   page: Page,
-  email: string,
+  loginIdentifier: string,
   password: string
 ): Promise<void> {
   for (let attempt = 0; attempt < 8; attempt++) {
     await page.goto("/login");
-    await page.locator("#email").fill(email);
+    await page.locator("#loginIdentifier").fill(loginIdentifier);
     await page.locator("#password").fill(password);
 
     // Listen for potential rate-limit response

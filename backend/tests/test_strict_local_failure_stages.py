@@ -38,7 +38,7 @@ async def _strict_job(
     upload_snapshot: dict[str, object] | None = None,
     job_snapshot: dict[str, object] | None = None,
 ) -> tuple[UploadedFile, LocalAIJob]:
-    user = User(email=f"strict-stage-{label}@example.com", password_hash="x")
+    user = User(login_identifier=f"strict-stage-{label}@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())

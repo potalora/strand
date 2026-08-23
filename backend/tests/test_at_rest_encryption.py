@@ -1,10 +1,10 @@
-"""At-rest encryption (W7 / CRYPTO-01) + email blind index (W17) tests.
+"""At-rest encryption (W7 / CRYPTO-01) + login blind index (W17) tests.
 
 Verifies that clinical PHI columns (``health_records.fhir_resource``,
 ``uploaded_files.extracted_text`` & extraction JSON, AI-summary prompts/response,
-``users.email``) are encrypted at rest via the AES-256-GCM ``EncryptedJSON`` /
+``users.login_identifier``) are encrypted at rest via the AES-256-GCM ``EncryptedJSON`` /
 ``EncryptedText`` SQLAlchemy ``TypeDecorator``s, while remaining transparent to
-the ORM (read back identical), and that email lookups go through a deterministic
+the ORM (read back identical), and that login lookups go through a deterministic
 HMAC blind index so login still works without a queryable plaintext column.
 """
 
@@ -35,8 +35,12 @@ EVIDENCE_SOURCE_MARKER = "EvidenceSourceCanary-NC61J"
 TYPED_SUMMARY_MARKER = "TypedSummaryCanary-BD95W"
 
 
-async def _make_user(db_session, email: str = "enc-user@example.com"):
-    return await register_user(db_session, email=email, password="SecurePass123!")
+async def _make_user(db_session, login_identifier: str = "enc-user@example.com"):
+    return await register_user(
+        db_session,
+        login_identifier=login_identifier,
+        password="SecurePass123!",
+    )
 
 
 def _local_ai_manifest() -> dict:
@@ -175,7 +179,12 @@ async def test_extracted_text_and_entities_encrypted(db_session):
     assert reloaded.extraction_sections == {"history": PHI_MARKER}
     assert reloaded.document_metadata == {"author": PHI_MARKER}
 
-    for col in ("extracted_text", "extraction_entities", "extraction_sections", "document_metadata"):
+    for col in (
+        "extracted_text",
+        "extraction_entities",
+        "extraction_sections",
+        "document_metadata",
+    ):
         raw = (
             await db_session.execute(
                 text(f"SELECT {col} FROM uploaded_files WHERE id = :id"), {"id": uf.id}
@@ -329,52 +338,67 @@ async def test_local_ai_checkpoints_and_evidence_are_encrypted(db_session):
 
 
 # ---------------------------------------------------------------------------
-# (3) Login / get-by-email works through the blind index, not a plaintext col.
+# (3) Login works through the blind index, not a plaintext column.
 # ---------------------------------------------------------------------------
 async def test_login_through_blind_index(db_session):
-    email = "blind-login@example.com"
-    await register_user(db_session, email=email, password="SecurePass123!")
+    login_identifier = "blind-login@example.com"
+    await register_user(
+        db_session,
+        login_identifier=login_identifier,
+        password="SecurePass123!",
+    )
 
-    tokens = await authenticate_user(db_session, email=email, password="SecurePass123!")
+    tokens = await authenticate_user(
+        db_session,
+        login_identifier=login_identifier,
+        password="SecurePass123!",
+    )
     assert tokens.access_token
     assert tokens.refresh_token
 
-    # The encrypted email column must not be queryable as plaintext, while the
+    # The encrypted identifier column must not be queryable as plaintext, while the
     # blind-index column resolves the row.
     by_hmac = (
         await db_session.execute(
-            text("SELECT email FROM users WHERE email_hmac = :h"),
-            {"h": blind_index(email)},
+            text("SELECT login_identifier FROM users WHERE login_identifier_hmac = :h"),
+            {"h": blind_index(login_identifier)},
         )
     ).first()
     assert by_hmac is not None
-    raw_email = bytes(by_hmac[0])
-    assert email.encode() not in raw_email  # ciphertext, not plaintext
+    raw_identifier = bytes(by_hmac[0])
+    assert login_identifier.encode() not in raw_identifier
 
 
-async def test_email_stored_as_ciphertext_and_decrypts(db_session):
-    email = "enc-email@example.com"
-    user = await register_user(db_session, email=email, password="SecurePass123!")
+async def test_login_identifier_stored_as_ciphertext_and_decrypts(db_session):
+    login_identifier = "encrypted private account name"
+    user = await register_user(
+        db_session,
+        login_identifier=login_identifier,
+        password="SecurePass123!",
+    )
     # ORM read decrypts transparently.
     reloaded = await db_session.get(type(user), user.id)
-    assert reloaded.email == email
+    assert reloaded.login_identifier == login_identifier
     raw = (
         await db_session.execute(
-            text("SELECT email FROM users WHERE id = :id"), {"id": user.id}
+            text("SELECT login_identifier FROM users WHERE id = :id"),
+            {"id": user.id},
         )
     ).scalar_one()
-    assert email.encode() not in bytes(raw)
+    assert login_identifier.encode() not in bytes(raw)
 
 
 # ---------------------------------------------------------------------------
-# (4) Blind index: deterministic, normalized, collision-free across emails.
+# (4) Blind index: deterministic, normalized, collision-free across identifiers.
 # ---------------------------------------------------------------------------
 def test_blind_index_deterministic_and_distinct():
     a = blind_index("Person.A@Example.com")
     b = blind_index("person.b@example.com")
     assert a != b
-    # Same email (case + surrounding whitespace normalized) -> same index.
-    assert blind_index("Person.A@Example.com") == blind_index("  person.a@example.com  ")
+    # Same identifier (case + surrounding whitespace normalized) -> same index.
+    assert blind_index("Person.A@Example.com") == blind_index(
+        "  person.a@example.com  "
+    )
     # Hex digest of HMAC-SHA256 -> 64 hex chars.
     assert len(a) == 64
     int(a, 16)  # parses as hex

@@ -26,7 +26,7 @@ async def test_user_row_overrides_env(db_session, monkeypatch):
 
     monkeypatch.setattr(cfg.settings, "llm_provider", "gemini")
     monkeypatch.setattr(cfg.settings, "openai_api_key", "env-openai")
-    user = User(email="llm-resolver-z@example.com", password_hash="x")
+    user = User(login_identifier="llm-resolver-z@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     db_session.add(
@@ -57,7 +57,7 @@ async def test_user_row_overrides_env(db_session, monkeypatch):
 @pytest.mark.asyncio
 async def test_no_user_config_equals_settings(db_session):
     """A user with no saved config resolves identically to from_settings()."""
-    user = User(email="llm-resolver-y@example.com", password_hash="x")
+    user = User(login_identifier="llm-resolver-y@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     await db_session.commit()

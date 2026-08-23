@@ -66,6 +66,7 @@ test("strict summary 202 registers a durable background card and clears loading"
       return route.fulfill(
         json({
           id: "user-1",
+          login_identifier: "pedro@example.com",
           email: "pedro@example.com",
           display_name: "Pedro",
           is_active: true,

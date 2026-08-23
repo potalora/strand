@@ -116,6 +116,7 @@ test("stamps strict-local mode and shows fail-closed model progress", async ({
     if (url.pathname === "/api/v1/auth/me") {
       return json({
         id: "user-1",
+        login_identifier: "pedro@example.com",
         email: "pedro@example.com",
         display_name: "Pedro",
         is_active: true,
@@ -195,6 +196,7 @@ test("blocks every upload until privacy settings load and makes failure retryabl
     if (url.pathname === "/api/v1/auth/me") {
       return json({
         id: "user-1",
+        login_identifier: "pedro@example.com",
         email: "pedro@example.com",
         display_name: "Pedro",
         is_active: true,
@@ -272,6 +274,7 @@ for (const mode of ["custom_local", "prompt_only"] as const) {
       if (url.pathname === "/api/v1/auth/me") {
         return json({
           id: "user-1",
+          login_identifier: "pedro@example.com",
           email: "pedro@example.com",
           display_name: "Pedro",
           is_active: true,
@@ -389,6 +392,7 @@ test("serializes delayed extraction polls and never applies an older response la
     if (url.pathname === "/api/v1/auth/me") {
       return json({
         id: "user-1",
+        login_identifier: "pedro@example.com",
         email: "pedro@example.com",
         display_name: "Pedro",
         is_active: true,
@@ -483,6 +487,7 @@ test("renders strict-local failure provenance in upload history", async ({
     if (url.pathname === "/api/v1/auth/me") {
       return json({
         id: "user-1",
+        login_identifier: "pedro@example.com",
         email: "pedro@example.com",
         display_name: "Pedro",
         is_active: true,
@@ -572,6 +577,7 @@ test("renders immutable model identities for a completed strict-local upload", a
     if (url.pathname === "/api/v1/auth/me") {
       return json({
         id: "user-1",
+        login_identifier: "pedro@example.com",
         email: "pedro@example.com",
         display_name: "Pedro",
         is_active: true,
@@ -652,6 +658,7 @@ test("renders strict-local failure stage and provenance in Admin extractions", a
     if (url.pathname === "/api/v1/auth/me") {
       return json({
         id: "user-1",
+        login_identifier: "pedro@example.com",
         email: "pedro@example.com",
         display_name: "Pedro",
         is_active: true,
