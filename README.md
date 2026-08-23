@@ -43,7 +43,9 @@ docker compose up -d        # or: just up
 
 Then open http://localhost:3000 (the API is at http://localhost:8000). For live AI features, add a provider key (Gemini, OpenAI, Anthropic, or OpenRouter) or point at a local Ollama or LM Studio model. Set this up at Admin → System → AI providers, or see [AI providers](#ai-providers). Prompt-only needs no key.
 
-Everything binds to `127.0.0.1`, so nothing is reachable from outside your machine. On-device clinical extraction is off by default to keep the image small; rebuild with `--build-arg CLINICAL_NLP=true` to turn it on. The validated MLX pack is native-macOS only and is not available inside Docker Desktop. To upgrade, bump `APP_VERSION` in `.env` and run `docker compose pull && docker compose up -d`.
+Everything binds to `127.0.0.1`, so nothing is reachable from outside your machine. This quickstart uses `APP_ENV=local` and must not be exposed beyond localhost. Serving Strand on a network requires a separately configured TLS reverse proxy and production settings. That setup is outside this quickstart.
+
+On-device clinical extraction is off by default to keep the image small; rebuild with `--build-arg CLINICAL_NLP=true` to turn it on. The validated MLX pack is native-macOS only and is not available inside Docker Desktop. To upgrade, bump `APP_VERSION` in `.env` and run `docker compose pull && docker compose up -d`.
 
 ## What it does
 
