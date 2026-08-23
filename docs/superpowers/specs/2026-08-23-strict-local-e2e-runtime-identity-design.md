@@ -219,7 +219,8 @@ replaced, or deleted.
 The command and profile reject symlinked parents or roots. They resolve the
 worktree, evidence parent, approved parents, and candidate roots through the
 filesystem and require exact real-path containment. Existing parents must be
-directories owned by the current OS user. Each task-created root must be a
+directories owned by the current OS user and must not be group- or
+world-writable; their modes are never changed. Each task-created root must be a
 non-symlink directory owned by the current user with mode `0700`. At creation,
 the command captures its real path, device, inode, owner, type, and mode. Before
 any `rm -rf`, it repeats those checks and refuses deletion unless the identity
@@ -240,15 +241,19 @@ path. Command preflight and cleanup operate only on the exact runtime root they
 created. Inherited `UPLOAD_DIR` and `TEMP_EXTRACT_DIR` cannot redirect the
 backend.
 
-Playwright's `outputDir` is `<output-root>/artifacts`. This is separate from the
-runtime root so runtime cleanup cannot delete a retained failure trace. It also
-prevents Playwright from clearing the parent `frontend/test-results` directory,
-where the original Phase 1 traces and JSON results remain untouched. The full
-suite writes its list and JSON report inside the same unique output root, using
-paths derived from that run's token. The command proves those files were absent
-before the run, and the acceptance parser consumes the exact captured paths;
-fixed or stale report names are not accepted. New execution outputs stay
-ignored and uncommitted until the root captures or discards them.
+Playwright's `outputDir` is `<output-root>/artifacts`. On every config
+evaluation, the profile creates or revalidates that path as an exact
+non-symlink `0700` child owned by the current user and captures its filesystem
+identity before handing its real path to Playwright. This child is separate
+from the runtime root, so runtime cleanup cannot delete a retained failure
+trace. It also prevents Playwright from clearing the parent
+`frontend/test-results` directory, where the original Phase 1 traces and JSON
+results remain untouched. The full suite writes its list and JSON report inside
+the same unique output root, using paths derived from that run's token. The
+command proves those files were absent before the run, and the acceptance
+parser consumes the exact captured paths; fixed or stale report names are not
+accepted. New execution outputs stay ignored and uncommitted until the root
+captures or discards them.
 
 The public browser-test command follows the same real-path and identity
 boundary. It creates both absolute task roots, passes them as
@@ -332,6 +337,8 @@ deployment evidence was produced.
   it and still holds the corresponding ownership flag.
 - Recursive cleanup is allowed only after real-path and captured filesystem
   identity revalidation of the exact task-created root.
+- The Playwright-cleared `artifacts` directory is itself an exact validated
+  child of the owned output root, never the Phase-1 evidence parent.
 - Ignored artifacts are included in bounded before/after scope evidence.
 - Existing content-free errors, owner scoping, encryption at rest, immutable
   artifacts, migration/create-all parity, and runtime-attestation semantics
