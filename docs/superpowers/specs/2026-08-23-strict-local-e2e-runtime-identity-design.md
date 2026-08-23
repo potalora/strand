@@ -216,8 +216,15 @@ The negative browser test reads the effective `UPLOAD_DIR` from the profile and
 verifies it is inside `E2E_RUNTIME_ROOT`; it does not guess a repository data
 path. Command preflight and cleanup operate only on the exact runtime root they
 created. Inherited `UPLOAD_DIR` and `TEMP_EXTRACT_DIR` cannot redirect the
-backend. The original diagnostic traces and results are outside these new
-per-run roots and remain untouched.
+backend.
+
+Playwright's `outputDir` is also per run, under
+`frontend/test-results/executions/<runtime-token>`. This is separate from the
+runtime root so runtime cleanup cannot delete a retained failure trace. It also
+prevents Playwright from clearing the parent `frontend/test-results` directory,
+where the original Phase 1 traces and JSON results remain untouched. New
+execution outputs stay ignored and uncommitted until the root captures or
+discards them.
 
 ## Local-only profile contract
 
@@ -230,6 +237,7 @@ The profile fixes these values inside `if (localOnly)`:
 - offline Hugging Face and Transformers flags
 - an empty real-attested-pack execution gate
 - the task-owned upload, temp, scratch, model, and sentinel project paths
+- a task-owned Playwright output directory that cannot clear Phase 1 evidence
 
 The v1 manifest/release paths remain only for negative admission coverage. The
 backend socket denial, macOS Next.js sandbox, closed browser proxy, loopback-only
@@ -348,7 +356,7 @@ Implementation uses strict TDD.
    loopback database commands.
 8. Recreate the focused backend database before the final integration gate.
 9. Run focused populated-upload Playwright tests with a new per-command runtime
-   root.
+   root and per-run Playwright output directory.
 10. Enumerate the updated suite and record the exact total, then run the complete
     local-only suite with one worker and retained-on-failure traces.
 
