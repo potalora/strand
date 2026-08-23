@@ -197,8 +197,10 @@ any spawn or runtime-identity use. Cloud-assisted structured parsing does not
 use the worker.
 
 A manager-level startup test proves the sentinel/project pair reaches the
-started state without a child PID. A static profile test ties that behavior to
-the Playwright environment and keeps the legacy-v1 negative contract explicit.
+started state without a child PID. A profile-level Playwright regression asserts
+the sentinel, project containment, and empty real-pack gate, then reaches the
+backend health endpoint. A static profile test ties those behaviors to the
+configured environment and keeps the legacy-v1 negative contract explicit.
 
 ## Isolated runtime state
 
