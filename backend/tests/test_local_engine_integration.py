@@ -5,6 +5,7 @@ real medspaCy/scispaCy models (no Gemini), proving the pipeline wiring:
 section detection → local NER → ConText → parsed_doc + document_metadata.
 Model-gated: skips when scispaCy/medspaCy are not installed.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -39,7 +40,11 @@ _NOTE = (
 async def test_local_engine_helper_end_to_end(db_session: AsyncSession):
     from app.api.upload import _run_local_extraction_engine
 
-    user = User(id=uuid4(), login_identifier=f"wsa_{uuid4().hex[:8]}@example.com", password_hash="x")
+    user = User(
+        id=uuid4(),
+        login_identifier=f"wsa_{uuid4().hex[:8]}@example.com",
+        password_hash="x",
+    )
     db_session.add(user)
     await db_session.commit()
     user_id = user.id

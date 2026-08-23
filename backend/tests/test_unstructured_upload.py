@@ -395,8 +395,14 @@ async def test_batch_upload_skips_invalid_files(
             "/api/v1/upload/unstructured-batch",
             files=[
                 ("files", ("first-invalid.txt", io.BytesIO(txt_invalid), "text/plain")),
-                ("files", ("later-valid.rtf", io.BytesIO(rtf_valid), "application/rtf")),
-                ("files", ("final-valid.pdf", io.BytesIO(pdf_valid), "application/pdf")),
+                (
+                    "files",
+                    ("later-valid.rtf", io.BytesIO(rtf_valid), "application/rtf"),
+                ),
+                (
+                    "files",
+                    ("final-valid.pdf", io.BytesIO(pdf_valid), "application/pdf"),
+                ),
             ],
             headers=headers,
             data={"processing_mode": "cloud_assisted"},
@@ -481,7 +487,11 @@ async def test_batch_rejection_cap_does_not_block_later_valid_file(
     invalid_files.append(
         (
             "files",
-            ("accepted-after-cap.rtf", io.BytesIO(rb"{\rtf1 valid}"), "application/rtf"),
+            (
+                "accepted-after-cap.rtf",
+                io.BytesIO(rb"{\rtf1 valid}"),
+                "application/rtf",
+            ),
         )
     )
 

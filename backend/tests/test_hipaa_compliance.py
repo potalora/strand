@@ -1,4 +1,5 @@
 """HIPAA Compliance Tests — verifying all audit findings are remediated."""
+
 from __future__ import annotations
 
 import json
@@ -44,11 +45,15 @@ async def test_refresh_token_revoked_after_use(client: AsyncClient):
     old_refresh = login.json()["refresh_token"]
 
     # First refresh should succeed
-    resp = await client.post("/api/v1/auth/refresh", json={"refresh_token": old_refresh})
+    resp = await client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": old_refresh}
+    )
     assert resp.status_code == 200
 
     # Second use of same refresh token should fail (revoked)
-    resp = await client.post("/api/v1/auth/refresh", json={"refresh_token": old_refresh})
+    resp = await client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": old_refresh}
+    )
     assert resp.status_code == 401
 
 
@@ -110,6 +115,7 @@ async def test_login_rate_limiting(client: AsyncClient):
 async def test_account_lockout_after_failed_attempts(client: AsyncClient):
     """Account should lock after 5 failed login attempts."""
     from app.middleware.rate_limit import login_limiter
+
     login_limiter._requests.clear()
 
     await client.post(
@@ -301,6 +307,7 @@ async def test_login_audit_has_no_identifier_details(client: AsyncClient, db_ses
 def test_phi_scrubber_removes_fax():
     """PHI scrubber should remove fax numbers."""
     from app.services.ai.phi_scrubber import scrub_phi
+
     text = "Contact fax: 555-123-4567 for records"
     scrubbed, report = scrub_phi(text)
     assert "555-123-4567" not in scrubbed
@@ -310,6 +317,7 @@ def test_phi_scrubber_removes_fax():
 def test_phi_scrubber_removes_vin():
     """PHI scrubber should remove vehicle identification numbers."""
     from app.services.ai.phi_scrubber import scrub_phi
+
     text = "Vehicle ID: 1HGBH41JXMN109186"
     scrubbed, report = scrub_phi(text)
     assert "1HGBH41JXMN109186" not in scrubbed
@@ -318,6 +326,7 @@ def test_phi_scrubber_removes_vin():
 def test_phi_scrubber_removes_device_id():
     """PHI scrubber should remove device identifiers."""
     from app.services.ai.phi_scrubber import scrub_phi
+
     text = "Device serial: ABC123-DEF456"
     scrubbed, report = scrub_phi(text)
     assert "ABC123-DEF456" not in scrubbed
@@ -326,6 +335,7 @@ def test_phi_scrubber_removes_device_id():
 def test_phi_scrubber_removes_health_plan_number():
     """PHI scrubber should remove health plan numbers."""
     from app.services.ai.phi_scrubber import scrub_phi
+
     text = "Member number: HPN12345"
     scrubbed, report = scrub_phi(text)
     assert "HPN12345" not in scrubbed
@@ -334,6 +344,7 @@ def test_phi_scrubber_removes_health_plan_number():
 def test_phi_scrubber_word_boundary_short_names():
     """Short name parts (<=3 chars) should use word boundaries to avoid false positives."""
     from app.services.ai.phi_scrubber import scrub_phi
+
     text = "The patient named Li has diabetes."
     scrubbed, report = scrub_phi(text, patient_names=["Li"])
     assert "[PATIENT]" in scrubbed
@@ -349,6 +360,7 @@ def test_phi_scrubber_generalizes_slash_dates():
     DOB/collection dates must not leak the day or month.
     (enable_ner=False isolates the regex layer.)"""
     from app.services.ai.phi_scrubber import scrub_phi
+
     text = "DOB: 07/31/1996  Collected: 02/16/2026  Reported: 2/3/2026"
     scrubbed, report = scrub_phi(text, enable_ner=False)
     assert "07/31/1996" not in scrubbed
@@ -364,12 +376,9 @@ def test_phi_scrubber_redacts_account_and_accession_numbers():
     """Account and lab-accession numbers (e.g. 'Account No: 235410324',
     'Lab Accession: 87414853') are identifiers and must be redacted."""
     from app.services.ai.phi_scrubber import scrub_phi
+
     # Plain, markdown-bold (as OCR sometimes emits), and shorthand variants.
-    text = (
-        "Account No: 235410324\n"
-        "**Lab Accession:** 87414853\n"
-        "Acct #998877"
-    )
+    text = "Account No: 235410324\n**Lab Accession:** 87414853\nAcct #998877"
     scrubbed, _ = scrub_phi(text, enable_ner=False)
     assert "235410324" not in scrubbed
     assert "87414853" not in scrubbed
@@ -380,6 +389,7 @@ def test_phi_scrubber_redacts_account_and_accession_numbers():
 def test_phi_scrubber_preserves_clinical_numbers():
     """De-identification must not destroy lab values, ranges, or percentages."""
     from app.services.ai.phi_scrubber import scrub_phi
+
     text = "Anti-CdtB Ab 1.24; reference 0.00 - 1.55; 96% - 100% PPV; IBS-D"
     scrubbed, _ = scrub_phi(text, enable_ner=False)
     assert "1.24" in scrubbed
@@ -392,6 +402,7 @@ def test_phi_scrubber_redacts_street_address():
     """Street addresses (incl. suite/unit continuation) are geographic PHI.
     (enable_ner=False isolates the regex layer.)"""
     from app.services.ai.phi_scrubber import scrub_phi
+
     text = "Address: 275 Post Rd E, Ste. 10, Unit 310; also 1234 Elm Street, Apt 5B"
     scrubbed, _ = scrub_phi(text, enable_ner=False)
     assert "275 Post Rd" not in scrubbed
@@ -402,6 +413,7 @@ def test_phi_scrubber_redacts_street_address():
 def test_phi_scrubber_street_regex_preserves_clinical_text():
     """The street-address regex must not eat dosing / vitals / lab lines."""
     from app.services.ai.phi_scrubber import scrub_phi
+
     text = "Take 2 tablets by mouth daily; 5 mg PO; BP 120/80; 3 episodes per week"
     scrubbed, _ = scrub_phi(text, enable_ner=False)
     assert "2 tablets" in scrubbed
@@ -448,6 +460,7 @@ def test_safe_file_path_preserves_extension():
 def test_magic_bytes_pdf():
     """PDF magic bytes should be validated."""
     from app.api.upload import _validate_magic_bytes
+
     assert _validate_magic_bytes(b"%PDF-1.4 ...", ".pdf") is True
     assert _validate_magic_bytes(b"not a pdf file", ".pdf") is False
 
@@ -455,6 +468,7 @@ def test_magic_bytes_pdf():
 def test_magic_bytes_rtf():
     """RTF magic bytes should be validated."""
     from app.api.upload import _validate_magic_bytes
+
     assert _validate_magic_bytes(b"{\\rtf1 ...", ".rtf") is True
     assert _validate_magic_bytes(b"not rtf content", ".rtf") is False
 
@@ -462,6 +476,7 @@ def test_magic_bytes_rtf():
 def test_magic_bytes_tiff():
     """TIFF magic bytes should be validated (both LE and BE)."""
     from app.api.upload import _validate_magic_bytes
+
     assert _validate_magic_bytes(b"\x49\x49\x2a\x00", ".tif") is True  # LE
     assert _validate_magic_bytes(b"\x4d\x4d\x00\x2a", ".tiff") is True  # BE
     assert _validate_magic_bytes(b"not a tiff", ".tif") is False

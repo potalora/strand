@@ -336,7 +336,9 @@ class TestRunUploadDedup:
         from app.models.uploaded_file import UploadedFile
         from app.models.user import User
 
-        user = User(login_identifier="strict-repeat-dedup@example.com", password_hash="x")
+        user = User(
+            login_identifier="strict-repeat-dedup@example.com", password_hash="x"
+        )
         db_session.add(user)
         await db_session.flush()
         patient = Patient(user_id=user.id)
@@ -674,9 +676,7 @@ class TestRunUploadDedup:
             processing_started_at=None,
             processing_completed_at=None,
         )
-        rows.all.return_value = [
-            (upload, patient_id)
-        ]
+        rows.all.return_value = [(upload, patient_id)]
         mock_db.execute.return_value = rows
 
         recovered = await coordinator.recover_dedup_background_specs(mock_db)

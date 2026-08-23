@@ -5,6 +5,7 @@ must carry the encrypted name/MRN/DOB so ``scrub_phi`` can strip the patient's
 own identifiers before text reaches Gemini. Regression target — historically
 ``name_encrypted`` stayed NULL and the patient name leaked to the LLM.
 """
+
 from __future__ import annotations
 
 import uuid

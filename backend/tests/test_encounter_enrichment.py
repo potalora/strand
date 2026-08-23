@@ -17,6 +17,7 @@ Covers the four legs of the encounter-detail work:
 Pure-function tests unless noted; one DB-backed integration test exercises the
 full ``parse_fhir_bundle`` wiring.
 """
+
 from __future__ import annotations
 
 import json
@@ -88,7 +89,9 @@ def _entity(entity_class: str, text: str, **attrs) -> ExtractedEntity:
 
 def _ai_encounter(**attrs) -> dict:
     text = attrs.pop("_text", "Office visit")
-    rec = entity_to_health_record_dict(_entity("encounter", text, **attrs), uuid4(), uuid4(), uuid4())
+    rec = entity_to_health_record_dict(
+        _entity("encounter", text, **attrs), uuid4(), uuid4(), uuid4()
+    )
     return rec["fhir_resource"]
 
 
@@ -107,7 +110,9 @@ class TestHumanNameToDisplay:
         assert _human_name_to_display(name) == "Dr. Jane Smith"
 
     def test_prefix_and_suffix(self):
-        name = [{"prefix": ["Dr."], "given": ["Jane"], "family": "Smith", "suffix": ["MD"]}]
+        name = [
+            {"prefix": ["Dr."], "given": ["Jane"], "family": "Smith", "suffix": ["MD"]}
+        ]
         assert _human_name_to_display(name) == "Dr. Jane Smith MD"
 
     def test_plain_string(self):
@@ -142,8 +147,20 @@ class TestBuildReferenceNameMap:
 
     def test_organization_and_location_names(self):
         entries = [
-            {"resource": {"resourceType": "Organization", "id": "o1", "name": "Mercy Hospital"}},
-            {"resource": {"resourceType": "Location", "id": "l1", "name": "Cardiology Suite"}},
+            {
+                "resource": {
+                    "resourceType": "Organization",
+                    "id": "o1",
+                    "name": "Mercy Hospital",
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "Location",
+                    "id": "l1",
+                    "name": "Cardiology Suite",
+                }
+            },
         ]
         ref_map = build_reference_name_map(entries)
         assert ref_map["Organization/o1"] == "Mercy Hospital"
@@ -154,7 +171,15 @@ class TestBuildReferenceNameMap:
         assert build_reference_name_map(entries) == {}
 
     def test_clinical_resources_ignored(self):
-        entries = [{"resource": {"resourceType": "Condition", "id": "c1", "code": {"text": "x"}}}]
+        entries = [
+            {
+                "resource": {
+                    "resourceType": "Condition",
+                    "id": "c1",
+                    "code": {"text": "x"},
+                }
+            }
+        ]
         assert build_reference_name_map(entries) == {}
 
 
@@ -182,7 +207,9 @@ class TestResolveEncounterReferences:
 
     def test_existing_display_not_overwritten(self):
         ref_map = {"Practitioner/p1": "Resolved Name"}
-        enc = _encounter(participant_ref="Practitioner/p1", participant_display="Original Name")
+        enc = _encounter(
+            participant_ref="Practitioner/p1", participant_display="Original Name"
+        )
         resolve_encounter_references(enc, ref_map)
         assert enc["participant"][0]["individual"]["display"] == "Original Name"
 
@@ -197,7 +224,10 @@ class TestResolveEncounterReferences:
         assert "display" not in enc["participant"][0]["individual"]
 
     def test_non_encounter_untouched(self):
-        obs = {"resourceType": "Observation", "performer": [{"reference": "Practitioner/p1"}]}
+        obs = {
+            "resourceType": "Observation",
+            "performer": [{"reference": "Practitioner/p1"}],
+        }
         before = json.loads(json.dumps(obs))
         resolve_encounter_references(obs, {"Practitioner/p1": "Dr. X"})
         assert obs == before
@@ -206,7 +236,9 @@ class TestResolveEncounterReferences:
 class TestMapFhirResourceWithRefMap:
     def test_provider_resolved_through_map(self):
         ref_map = {"Practitioner/p1": "Dr. Jane Smith"}
-        mapped = map_fhir_resource(_encounter(participant_ref="Practitioner/p1"), ref_map)
+        mapped = map_fhir_resource(
+            _encounter(participant_ref="Practitioner/p1"), ref_map
+        )
         assert mapped is not None
         assert (
             mapped["fhir_resource"]["participant"][0]["individual"]["display"]
@@ -239,7 +271,9 @@ async def test_parse_bundle_resolves_practitioner_name(
     )
     db_session.add(user)
     await db_session.flush()
-    patient = Patient(id=uuid4(), user_id=user.id, fhir_id="enc-ref-pat", gender="female")
+    patient = Patient(
+        id=uuid4(), user_id=user.id, fhir_id="enc-ref-pat", gender="female"
+    )
     db_session.add(patient)
     await db_session.commit()
 
@@ -252,7 +286,9 @@ async def test_parse_bundle_resolves_practitioner_name(
                 "resource": {
                     "resourceType": "Practitioner",
                     "id": "prac-1",
-                    "name": [{"given": ["Gregory"], "family": "House", "prefix": ["Dr."]}],
+                    "name": [
+                        {"given": ["Gregory"], "family": "House", "prefix": ["Dr."]}
+                    ],
                 },
             },
             {
@@ -270,7 +306,9 @@ async def test_parse_bundle_resolves_practitioner_name(
                     "status": "finished",
                     "class": {"code": "AMB"},
                     "period": {"start": "2024-05-02"},
-                    "participant": [{"individual": {"reference": "Practitioner/prac-1"}}],
+                    "participant": [
+                        {"individual": {"reference": "Practitioner/prac-1"}}
+                    ],
                     "serviceProvider": {"reference": "Organization/org-1"},
                 }
             },
@@ -330,7 +368,9 @@ def test_cda_encounter_resolves_provider_name(tmp_path: Path):
                     "status": "finished",
                     "class": {"code": "AMB"},
                     "period": {"start": "2024-04-01"},
-                    "participant": [{"individual": {"reference": "Practitioner/prac-9"}}],
+                    "participant": [
+                        {"individual": {"reference": "Practitioner/prac-9"}}
+                    ],
                     "serviceProvider": {"reference": "Organization/org-9"},
                 }
             },
@@ -389,7 +429,9 @@ class TestEpicEncounterEnrichment:
 
 class TestAIEncounterEnrichment:
     def test_facility_from_medical_center_attr(self):
-        res = _ai_encounter(visit_type="office", medical_center="Sunrise Medical Center")
+        res = _ai_encounter(
+            visit_type="office", medical_center="Sunrise Medical Center"
+        )
         assert res["serviceProvider"]["display"] == "Sunrise Medical Center"
 
     def test_facility_from_facility_attr(self):
@@ -420,7 +462,9 @@ class TestAIEncounterEnrichment:
         assert res["text"]["status"] == "additional"
 
     def test_chief_complaint_used_as_summary(self):
-        res = _ai_encounter(visit_type="office", chief_complaint="Abdominal pain x3 days")
+        res = _ai_encounter(
+            visit_type="office", chief_complaint="Abdominal pain x3 days"
+        )
         assert "Abdominal pain" in res["text"]["div"]
 
     def test_summary_escapes_xml(self):

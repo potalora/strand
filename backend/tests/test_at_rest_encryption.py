@@ -179,7 +179,12 @@ async def test_extracted_text_and_entities_encrypted(db_session):
     assert reloaded.extraction_sections == {"history": PHI_MARKER}
     assert reloaded.document_metadata == {"author": PHI_MARKER}
 
-    for col in ("extracted_text", "extraction_entities", "extraction_sections", "document_metadata"):
+    for col in (
+        "extracted_text",
+        "extraction_entities",
+        "extraction_sections",
+        "document_metadata",
+    ):
         raw = (
             await db_session.execute(
                 text(f"SELECT {col} FROM uploaded_files WHERE id = :id"), {"id": uf.id}
@@ -355,10 +360,7 @@ async def test_login_through_blind_index(db_session):
     # blind-index column resolves the row.
     by_hmac = (
         await db_session.execute(
-            text(
-                "SELECT login_identifier FROM users "
-                "WHERE login_identifier_hmac = :h"
-            ),
+            text("SELECT login_identifier FROM users WHERE login_identifier_hmac = :h"),
             {"h": blind_index(login_identifier)},
         )
     ).first()
@@ -394,7 +396,9 @@ def test_blind_index_deterministic_and_distinct():
     b = blind_index("person.b@example.com")
     assert a != b
     # Same identifier (case + surrounding whitespace normalized) -> same index.
-    assert blind_index("Person.A@Example.com") == blind_index("  person.a@example.com  ")
+    assert blind_index("Person.A@Example.com") == blind_index(
+        "  person.a@example.com  "
+    )
     # Hex digest of HMAC-SHA256 -> 64 hex chars.
     assert len(a) == 64
     int(a, 16)  # parses as hex

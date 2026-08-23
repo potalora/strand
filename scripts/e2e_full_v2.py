@@ -9,6 +9,7 @@ Validates, after the de-id / NER / summary-truncation fixes:
 Unstructured status is polled via psql (DB ground truth) so a busy event loop
 during extraction can't stall the driver on an HTTP read.
 """
+
 from __future__ import annotations
 
 import io
@@ -58,8 +59,9 @@ def log(m: str) -> None:
 
 
 def psql(sql: str) -> str:
-    r = subprocess.run(["psql", "medtimeline", "-t", "-A", "-c", sql],
-                       capture_output=True, text=True)
+    r = subprocess.run(
+        ["psql", "medtimeline", "-t", "-A", "-c", sql], capture_output=True, text=True
+    )
     return r.stdout.strip()
 
 
@@ -79,7 +81,7 @@ def zip_dir(src: Path, prefix: str, only: str | None = None) -> bytes:
             if f.is_file() and (only is None or f.suffix.lower() == only):
                 zf.write(f, arcname=f"{prefix}/{f.relative_to(src).as_posix()}")
                 n += 1
-    log(f"  zipped {n} files ({len(buf.getvalue())/1e6:.2f} MB)")
+    log(f"  zipped {n} files ({len(buf.getvalue()) / 1e6:.2f} MB)")
     return buf.getvalue()
 
 
@@ -112,13 +114,20 @@ def main() -> int:
         return d.get("total_records") or 0
 
     def poll_db(upload_id: str, label: str, cap_s: int = 600) -> dict:
-        terminal = {"completed", "completed_with_merges", "awaiting_confirmation",
-                    "failed", "duplicate_file"}
+        terminal = {
+            "completed",
+            "completed_with_merges",
+            "awaiting_confirmation",
+            "failed",
+            "duplicate_file",
+        }
         deadline = time.time() + cap_s
         seen = None
         while time.time() < deadline:
-            row = psql(f"SELECT ingestion_status||'|'||COALESCE(record_count,0) "
-                       f"FROM uploaded_files WHERE id='{upload_id}'")
+            row = psql(
+                f"SELECT ingestion_status||'|'||COALESCE(record_count,0) "
+                f"FROM uploaded_files WHERE id='{upload_id}'"
+            )
             st, _, rc = row.partition("|")
             if st != seen:
                 log(f"    [{label}] status={st} records={rc}")
@@ -130,18 +139,42 @@ def main() -> int:
 
     td = _fixtures_raw()
     steps = [
-        ("EhiExport (One Medical FHIR)", "2026-01-06", "fhir",
-         td / "EhiExport-22259" / "fhir_109989389_22259_1767722729.json"),
-        ("EHITables (UCSF Epic)", "2026-02-12", "epic",
-         td / "Requested Record" / "EHITables"),
-        ("Clinical note PDF", "2026-03-30", "unstructured",
-         td / "note_361370_387671680_81379cb7-9e94-44da-909b-dd0ee7990dbf.pdf"),
-        ("HealthSummary April XDM", "2026-04-05", "xdm",
-         td / "HealthSummary_Apr_05_2026" / "IHE_XDM"),
-        ("HealthSummary May XDM (superset)", "2026-05-29", "xdm",
-         td / "HealthSummary_May_29_2026" / "IHE_XDM"),
-        ("ibs_smart.pdf (image OCR)", "2026-05-29", "unstructured",
-         td / "ibs_smart.pdf"),
+        (
+            "EhiExport (One Medical FHIR)",
+            "2026-01-06",
+            "fhir",
+            td / "EhiExport-22259" / "fhir_109989389_22259_1767722729.json",
+        ),
+        (
+            "EHITables (UCSF Epic)",
+            "2026-02-12",
+            "epic",
+            td / "Requested Record" / "EHITables",
+        ),
+        (
+            "Clinical note PDF",
+            "2026-03-30",
+            "unstructured",
+            td / "note_361370_387671680_81379cb7-9e94-44da-909b-dd0ee7990dbf.pdf",
+        ),
+        (
+            "HealthSummary April XDM",
+            "2026-04-05",
+            "xdm",
+            td / "HealthSummary_Apr_05_2026" / "IHE_XDM",
+        ),
+        (
+            "HealthSummary May XDM (superset)",
+            "2026-05-29",
+            "xdm",
+            td / "HealthSummary_May_29_2026" / "IHE_XDM",
+        ),
+        (
+            "ibs_smart.pdf (image OCR)",
+            "2026-05-29",
+            "unstructured",
+            td / "ibs_smart.pdf",
+        ),
     ]
 
     for i, (name, created, kind, path) in enumerate(steps, 1):
@@ -151,28 +184,46 @@ def main() -> int:
         try:
             if kind == "fhir":
                 with upclient() as c:
-                    r = c.post(f"{BASE}/upload", headers=H,
-                               files={"file": (path.name, path.read_bytes(), "application/json")})
+                    r = c.post(
+                        f"{BASE}/upload",
+                        headers=H,
+                        files={
+                            "file": (path.name, path.read_bytes(), "application/json")
+                        },
+                    )
                 r.raise_for_status()
                 entry["resp"] = r.json()
             elif kind == "epic":
                 blob = zip_dir(path, "EHITables", only=".tsv")
                 with upclient() as c:
-                    r = c.post(f"{BASE}/upload/epic-export", headers=H,
-                               files={"file": ("EHITables.zip", blob, "application/zip")})
+                    r = c.post(
+                        f"{BASE}/upload/epic-export",
+                        headers=H,
+                        files={"file": ("EHITables.zip", blob, "application/zip")},
+                    )
                 r.raise_for_status()
                 entry["resp"] = r.json()
             elif kind == "xdm":
                 blob = zip_dir(path, "IHE_XDM")
                 with upclient() as c:
-                    r = c.post(f"{BASE}/upload", headers=H,
-                               files={"file": (f"{path.parent.name}.zip", blob, "application/zip")})
+                    r = c.post(
+                        f"{BASE}/upload",
+                        headers=H,
+                        files={
+                            "file": (f"{path.parent.name}.zip", blob, "application/zip")
+                        },
+                    )
                 r.raise_for_status()
                 entry["resp"] = r.json()
             else:  # unstructured
                 with upclient() as c:
-                    r = c.post(f"{BASE}/upload/unstructured", headers=H,
-                               files={"file": (path.name, path.read_bytes(), "application/pdf")})
+                    r = c.post(
+                        f"{BASE}/upload/unstructured",
+                        headers=H,
+                        files={
+                            "file": (path.name, path.read_bytes(), "application/pdf")
+                        },
+                    )
                 r.raise_for_status()
                 up = r.json()
                 entry["resp"] = up
@@ -180,7 +231,7 @@ def main() -> int:
             time.sleep(2)
             after = total()
             entry["records_after"] = after
-            log(f"  -> DB after={after} (delta={after-before})")
+            log(f"  -> DB after={after} (delta={after - before})")
         except Exception as e:  # noqa: BLE001
             entry["error"] = f"{type(e).__name__}: {e}"
             log(f"  !! ERROR {entry['error']}")
@@ -189,19 +240,32 @@ def main() -> int:
 
     # patient + demographics check
     with short() as c:
-        patient_id = c.get(f"{BASE}/dashboard/patients", headers=H).json()["items"][0]["id"]
+        patient_id = c.get(f"{BASE}/dashboard/patients", headers=H).json()["items"][0][
+            "id"
+        ]
     results["patient_id"] = patient_id
-    name_present = psql(f"SELECT (name_encrypted IS NOT NULL) FROM patients WHERE id='{patient_id}'")
+    name_present = psql(
+        f"SELECT (name_encrypted IS NOT NULL) FROM patients WHERE id='{patient_id}'"
+    )
     results["patient_name_encrypted_present"] = name_present
     results["final_total"] = total()
-    log(f"patient {patient_id} | name_encrypted_present={name_present} | total={results['final_total']}")
+    log(
+        f"patient {patient_id} | name_encrypted_present={name_present} | total={results['final_total']}"
+    )
 
     # ---- generate summary ----
     log("generating summary (full, both) ...")
     t0 = time.time()
     with httpx.Client(timeout=httpx.Timeout(900.0, connect=5.0), limits=NOKEEP) as c:
-        r = c.post(f"{BASE}/summary/generate", headers=H,
-                   json={"patient_id": patient_id, "summary_type": "full", "output_format": "both"})
+        r = c.post(
+            f"{BASE}/summary/generate",
+            headers=H,
+            json={
+                "patient_id": patient_id,
+                "summary_type": "full",
+                "output_format": "both",
+            },
+        )
         r.raise_for_status()
         summ = r.json()
     results["summary_elapsed_s"] = round(time.time() - t0, 1)
@@ -213,7 +277,8 @@ def main() -> int:
         "WITH s AS (SELECT user_prompt,response_text,length(response_text) AS rlen "
         f"FROM ai_summary_prompts WHERE user_id='{uid}' ORDER BY generated_at DESC LIMIT 1) "
         "SELECT (position('Pedro' in user_prompt)>0)||'|'||(position('Otalora' in user_prompt)>0)"
-        "||'|'||(position('Pedro' in response_text)>0)||'|'||rlen FROM s")
+        "||'|'||(position('Pedro' in response_text)>0)||'|'||rlen FROM s"
+    )
     php, poh, rhp, rlen = (leak.split("|") + ["", "", "", ""])[:4]
     results["prompt_has_pedro"] = php
     results["prompt_has_otalora"] = poh
@@ -223,9 +288,13 @@ def main() -> int:
     results["summary_nl_len"] = len(nl)
     RESULT.write_text(json.dumps(results, indent=2, default=str))
 
-    log(f"summary in {results['summary_elapsed_s']}s | record_count={results['summary_record_count']}")
+    log(
+        f"summary in {results['summary_elapsed_s']}s | record_count={results['summary_record_count']}"
+    )
     log(f"  de_id_report={json.dumps(results['summary_deid_report'])}")
-    log(f"  prompt_has_pedro={php} prompt_has_otalora={poh} resp_has_pedro={rhp} resp_len={rlen}")
+    log(
+        f"  prompt_has_pedro={php} prompt_has_otalora={poh} resp_has_pedro={rhp} resp_len={rlen}"
+    )
 
     ok_deid = php in ("f", "false") and poh in ("f", "false")
     ok_len = rlen.isdigit() and int(rlen) > 2000

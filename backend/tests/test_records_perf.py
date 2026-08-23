@@ -94,9 +94,17 @@ async def test_list_page_decrypts_only_page_rows(client, db_session, monkeypatch
     async with _fresh_session() as sess:
         spy.reset()
         resp = await list_records(
-            request=_FakeRequest(), page=1, page_size=20, record_type=None,
-            category=None, search=None, status=None, sort=None, order="desc",
-            user_id=uid, db=sess,
+            request=_FakeRequest(),
+            page=1,
+            page_size=20,
+            record_type=None,
+            category=None,
+            search=None,
+            status=None,
+            sort=None,
+            order="desc",
+            user_id=uid,
+            db=sess,
         )
 
     assert resp.total == 120
@@ -106,7 +114,9 @@ async def test_list_page_decrypts_only_page_rows(client, db_session, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_single_row_page_and_count_decrypt_minimally(client, db_session, monkeypatch):
+async def test_single_row_page_and_count_decrypt_minimally(
+    client, db_session, monkeypatch
+):
     """page_size=1 decrypts exactly 1 row — the count contributes 0 decrypts."""
     uid = await _seed(client, db_session, count=120)
     spy = _DecryptSpy(monkeypatch)
@@ -114,9 +124,17 @@ async def test_single_row_page_and_count_decrypt_minimally(client, db_session, m
     async with _fresh_session() as sess:
         spy.reset()
         resp = await list_records(
-            request=_FakeRequest(), page=1, page_size=1, record_type=None,
-            category=None, search=None, status=None, sort=None, order="desc",
-            user_id=uid, db=sess,
+            request=_FakeRequest(),
+            page=1,
+            page_size=1,
+            record_type=None,
+            category=None,
+            search=None,
+            status=None,
+            sort=None,
+            order="desc",
+            user_id=uid,
+            db=sess,
         )
 
     assert resp.total == 120
@@ -134,9 +152,17 @@ async def test_deep_page_still_page_bounded(client, db_session, monkeypatch):
     async with _fresh_session() as sess:
         spy.reset()
         resp = await list_records(
-            request=_FakeRequest(), page=5, page_size=20, record_type=None,
-            category=None, search=None, status=None, sort=None, order="desc",
-            user_id=uid, db=sess,
+            request=_FakeRequest(),
+            page=5,
+            page_size=20,
+            record_type=None,
+            category=None,
+            search=None,
+            status=None,
+            sort=None,
+            order="desc",
+            user_id=uid,
+            db=sess,
         )
 
     assert len(resp.items) == 20
@@ -210,24 +236,44 @@ async def _isolated_records(count: int = 60):
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         async with factory() as db:
-            db.add(User(id=uid, login_identifier=f"perf-{uid}@x.com", login_identifier_hmac=f"bi-{uid}",
-                        password_hash="x"))
+            db.add(
+                User(
+                    id=uid,
+                    login_identifier=f"perf-{uid}@x.com",
+                    login_identifier_hmac=f"bi-{uid}",
+                    password_hash="x",
+                )
+            )
             db.add(Patient(id=pid, user_id=uid, fhir_id=f"pp-{uid}", gender="male"))
             await db.commit()
             base = datetime(2024, 1, 1, tzinfo=timezone.utc)
             for i in range(count):
-                db.add(HealthRecord(
-                    id=uuid4(), patient_id=pid, user_id=uid, record_type="observation",
-                    fhir_resource_type="Observation", fhir_resource={"n": i},
-                    source_format="fhir_r4", effective_date=base + timedelta(days=i),
-                    status="final", code_value="x", code_display="A1c",
-                    display_text=f"r{i}"))
+                db.add(
+                    HealthRecord(
+                        id=uuid4(),
+                        patient_id=pid,
+                        user_id=uid,
+                        record_type="observation",
+                        fhir_resource_type="Observation",
+                        fhir_resource={"n": i},
+                        source_format="fhir_r4",
+                        effective_date=base + timedelta(days=i),
+                        status="final",
+                        code_value="x",
+                        code_display="A1c",
+                        display_text=f"r{i}",
+                    )
+                )
             await db.commit()
         yield factory, uid
     finally:
         async with factory() as db:
-            await db.execute(text("DELETE FROM audit_log WHERE user_id = :u"), {"u": uid})
-            await db.execute(HealthRecord.__table__.delete().where(HealthRecord.user_id == uid))
+            await db.execute(
+                text("DELETE FROM audit_log WHERE user_id = :u"), {"u": uid}
+            )
+            await db.execute(
+                HealthRecord.__table__.delete().where(HealthRecord.user_id == uid)
+            )
             await db.execute(Patient.__table__.delete().where(Patient.id == pid))
             await db.execute(User.__table__.delete().where(User.id == uid))
             await db.commit()
@@ -261,11 +307,13 @@ async def test_isfalse_ordering_index_eliminates_the_sort():
     idx = "idx_perf_eff_isfalse"
     async with _isolated_records() as (factory, uid):
         async with factory() as sess:
-            await sess.execute(text(
-                f"CREATE INDEX IF NOT EXISTS {idx} ON health_records "
-                "(user_id, effective_date DESC NULLS LAST, id) "
-                "WHERE deleted_at IS NULL AND is_duplicate IS FALSE"
-            ))
+            await sess.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS {idx} ON health_records "
+                    "(user_id, effective_date DESC NULLS LAST, id) "
+                    "WHERE deleted_at IS NULL AND is_duplicate IS FALSE"
+                )
+            )
             await sess.commit()
         try:
             plan = await _explain_ordered_fetch(factory, uid)
@@ -286,11 +334,13 @@ async def test_eqfalse_predicate_index_is_not_matched():
     idx = "idx_perf_eff_eqfalse"
     async with _isolated_records() as (factory, uid):
         async with factory() as sess:
-            await sess.execute(text(
-                f"CREATE INDEX IF NOT EXISTS {idx} ON health_records "
-                "(user_id, effective_date DESC NULLS LAST, id) "
-                "WHERE deleted_at IS NULL AND is_duplicate = false"
-            ))
+            await sess.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS {idx} ON health_records "
+                    "(user_id, effective_date DESC NULLS LAST, id) "
+                    "WHERE deleted_at IS NULL AND is_duplicate = false"
+                )
+            )
             await sess.commit()
         try:
             plan = await _explain_ordered_fetch(factory, uid)

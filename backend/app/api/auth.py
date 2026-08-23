@@ -160,10 +160,9 @@ async def logout(
             _stage_revocation(db, decode_token(credentials.credentials), user_id)
         if body is not None and body.refresh_token:
             refresh_payload = decode_token(body.refresh_token)
-            if (
-                refresh_payload.get("type") == "refresh"
-                and refresh_payload.get("sub") == str(user_id)
-            ):
+            if refresh_payload.get("type") == "refresh" and refresh_payload.get(
+                "sub"
+            ) == str(user_id):
                 _stage_revocation(db, refresh_payload, user_id)
         await db.commit()
     except Exception:
@@ -186,5 +185,7 @@ async def get_me(
     """Get current user profile."""
     user = await get_user_by_id(db, user_id)
     if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+        )
     return UserResponse.from_user(user)
