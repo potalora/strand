@@ -239,6 +239,7 @@ async function setup(
     if (url.includes("/auth/me")) {
       return json({
         id: "11111111-2222-3333-4444-555555555555",
+        login_identifier: "pedro@example.com",
         email: "pedro@example.com",
         display_name: "Pedro",
         is_active: true,

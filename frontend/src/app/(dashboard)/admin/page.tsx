@@ -82,6 +82,7 @@ import type {
 } from "@/types/local-ai";
 import { useBackgroundProcessingStore } from "@/stores/useBackgroundProcessingStore";
 import { fmtDay, yearOf } from "@/lib/format-date";
+import { maskLoginIdentifier } from "@/lib/login-identifier";
 
 const fmtTimestampDate = (s: string | null | undefined) => {
   if (!s) return "—";
@@ -2019,14 +2020,6 @@ function MergeRow({
    SYSTEM TAB
    ========================================== */
 
-function maskEmail(email: string | undefined | null): string {
-  if (!email) return "—";
-  const [local, domain] = email.split("@");
-  if (!domain) return email;
-  const head = local.slice(0, 1);
-  return `${head}${"•".repeat(Math.max(3, local.length - 1))}@${domain}`;
-}
-
 function SystemTab() {
   // Account identity comes from the shared user store (fetched once, retried on
   // a transient 401) so the name never blanks. The overview gates this pane's
@@ -2108,7 +2101,9 @@ function SystemTab() {
     : userStatus === "loaded"
       ? "Not set"
       : <FieldSkeleton width={108} />;
-  const emailNode: ReactNode = user ? maskEmail(user.email) : <FieldSkeleton width={150} />;
+  const loginIdentifierNode: ReactNode = user
+    ? maskLoginIdentifier(user.login_identifier)
+    : <FieldSkeleton width={150} />;
 
   const isDark = mounted && resolvedTheme === "dark";
 
@@ -2134,7 +2129,7 @@ function SystemTab() {
           </h3>
           <div className="s12">
             <Field l="Name" v={nameNode} />
-            <Field l="Email" v={emailNode} />
+            <Field l="Account name" v={loginIdentifierNode} />
             <Field l="Record owner" v="You" />
             {/* TODO(backend): created_at not on /auth/me yet */}
             <Field l="Member since" v="—" />

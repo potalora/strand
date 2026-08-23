@@ -1,9 +1,9 @@
 import { test, expect } from "./fixtures/console-gate";
 import { browserLogin } from "./helpers/browser-login";
 import { ApiClient } from "./helpers/api-client";
-import { testEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";
+import { testIdentifier, TEST_PASSWORD } from "./helpers/test-data";
 
-const email = testEmail("admin-system");
+const loginIdentifier = testIdentifier("admin-system");
 
 /**
  * Repaired for the consolidated Admin → System tab (Settings folded in). Tabs use
@@ -15,24 +15,24 @@ const email = testEmail("admin-system");
 test.describe("Admin — System tab", () => {
   test.beforeAll(async () => {
     const api = new ApiClient();
-    await api.register(email, TEST_PASSWORD);
-    await api.login(email, TEST_PASSWORD);
-    await api.uploadStructured(PATHS.fhirBundle, "sample_fhir_bundle.json");
+    await api.register(loginIdentifier, TEST_PASSWORD);
+    await api.login(loginIdentifier, TEST_PASSWORD);
   });
 
   test("account info renders", async ({ page }) => {
-    await browserLogin(page, email, TEST_PASSWORD);
+    await browserLogin(page, loginIdentifier, TEST_PASSWORD);
     await page.goto("/admin?tab=sys");
 
     await expect(page.getByRole("heading", { name: "Account" })).toBeVisible({
       timeout: 10_000,
     });
     await expect(page.getByText("E2E Test User")).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText(/@test\.com/)).toBeVisible();
+    await expect(page.getByText("Account name", { exact: true })).toBeVisible();
+    await expect(page.getByText("e2•••", { exact: true })).toBeVisible();
   });
 
   test("this-record statistics render", async ({ page }) => {
-    await browserLogin(page, email, TEST_PASSWORD);
+    await browserLogin(page, loginIdentifier, TEST_PASSWORD);
     await page.goto("/admin?tab=sys");
 
     await expect(page.getByRole("heading", { name: "This record" })).toBeVisible({
@@ -48,7 +48,7 @@ test.describe("Admin — System tab", () => {
   test("preferences section renders (folded in from /settings)", async ({
     page,
   }) => {
-    await browserLogin(page, email, TEST_PASSWORD);
+    await browserLogin(page, loginIdentifier, TEST_PASSWORD);
     await page.goto("/admin?tab=sys");
 
     await expect(
@@ -59,7 +59,7 @@ test.describe("Admin — System tab", () => {
   });
 
   test("export and sign-out controls render", async ({ page }) => {
-    await browserLogin(page, email, TEST_PASSWORD);
+    await browserLogin(page, loginIdentifier, TEST_PASSWORD);
     await page.goto("/admin?tab=sys");
 
     await expect(
@@ -71,7 +71,7 @@ test.describe("Admin — System tab", () => {
   });
 
   test("sign out from System redirects to /login", async ({ page }) => {
-    await browserLogin(page, email, TEST_PASSWORD);
+    await browserLogin(page, loginIdentifier, TEST_PASSWORD);
     await page.goto("/admin?tab=sys");
 
     const signOut = page.locator("main").getByRole("button", { name: "Sign out" });

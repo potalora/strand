@@ -1,6 +1,6 @@
 const API_BASE = "http://localhost:8000/api/v1";
 
-const TEST_EMAIL = "test-renderer@test.com";
+const TEST_LOGIN_IDENTIFIER = "test renderer";
 const TEST_PASSWORD = "TestPass123!";
 const TEST_DISPLAY_NAME = "Test Renderer";
 
@@ -16,7 +16,7 @@ export async function getTestAuth(): Promise<AuthContext> {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: TEST_EMAIL,
+        login_identifier: TEST_LOGIN_IDENTIFIER,
         password: TEST_PASSWORD,
         display_name: TEST_DISPLAY_NAME,
       }),
@@ -33,7 +33,10 @@ export async function getTestAuth(): Promise<AuthContext> {
   const loginRes = await fetch(`${API_BASE}/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email: TEST_EMAIL, password: TEST_PASSWORD }),
+    body: JSON.stringify({
+      login_identifier: TEST_LOGIN_IDENTIFIER,
+      password: TEST_PASSWORD,
+    }),
   });
 
   if (!loginRes.ok) {

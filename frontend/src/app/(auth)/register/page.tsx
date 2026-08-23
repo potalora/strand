@@ -153,7 +153,7 @@ const authStyles = `
 
 export default function RegisterPage() {
   const router = useRouter();
-  const [email, setEmail] = useState("");
+  const [loginIdentifier, setLoginIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -167,7 +167,7 @@ export default function RegisterPage() {
 
     try {
       await api.post<UserResponse>("/auth/register", {
-        email,
+        login_identifier: loginIdentifier,
         password,
         display_name: displayName || undefined,
       });
@@ -223,19 +223,26 @@ export default function RegisterPage() {
           </div>
 
           <div className="auth-field">
-            <label htmlFor="email" className="field-l">
-              Email
+            <label htmlFor="loginIdentifier" className="field-l">
+              Account name
             </label>
             <input
-              id="email"
+              id="loginIdentifier"
               className="auth-input"
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
+              type="text"
+              value={loginIdentifier}
+              onChange={(event) => setLoginIdentifier(event.target.value)}
               required
-              autoComplete="email"
-              placeholder="you@example.com"
+              autoComplete="username"
+              autoCapitalize="none"
+              spellCheck={false}
             />
+            <p className="auth-hint dim">
+              Used only to sign in to this Strand instance. It does not need to be an email address.
+            </p>
+            <p className="auth-hint dim">
+              Leading and trailing spaces are ignored. Capitalization of A–Z does not matter; visually similar Unicode text can still be different.
+            </p>
           </div>
 
           <div className="auth-field">

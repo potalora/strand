@@ -1,19 +1,39 @@
 import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
-import { testEmail, TEST_PASSWORD } from "./helpers/test-data";
+import { testEmail, testIdentifier, TEST_PASSWORD } from "./helpers/test-data";
 
-const EMAIL = testEmail("login");
+const LOGIN_IDENTIFIER = testIdentifier("login");
+const LEGACY_EMAIL = testEmail("login-legacy");
 
 test.describe("Login page", () => {
   const api = new ApiClient();
 
   test.beforeAll(async () => {
-    await api.register(EMAIL, TEST_PASSWORD);
+    await api.register(LOGIN_IDENTIFIER, TEST_PASSWORD);
+    await api.register(LEGACY_EMAIL, TEST_PASSWORD);
   });
 
-  test("successful login redirects to dashboard", async ({ page }) => {
+  test("account-name login redirects to dashboard", async ({ page }) => {
     await page.goto("/login");
-    await page.locator("#email").fill(EMAIL);
+    const accountName = page.getByLabel("Account name or existing email");
+    await expect(accountName).toHaveAttribute("type", "text");
+    await expect(accountName).toHaveAttribute("autocomplete", "username");
+    await expect(accountName).toHaveAttribute("autocapitalize", "none");
+    await expect(accountName).toHaveAttribute("spellcheck", "false");
+    await expect(
+      page.getByText(/visually similar Unicode text can still be different/i)
+    ).toBeVisible();
+    await page.locator("#loginIdentifier").fill(LOGIN_IDENTIFIER);
+    await page.locator("#password").fill(TEST_PASSWORD);
+    await page.locator('button[type="submit"]').click();
+    await page.waitForURL(/\/$/, { timeout: 30_000 });
+  });
+
+  test("existing email-shaped account login redirects to dashboard", async ({
+    page,
+  }) => {
+    await page.goto("/login");
+    await page.locator("#loginIdentifier").fill(LEGACY_EMAIL);
     await page.locator("#password").fill(TEST_PASSWORD);
     await page.locator('button[type="submit"]').click();
     await page.waitForURL(/\/$/, { timeout: 30_000 });
@@ -21,7 +41,7 @@ test.describe("Login page", () => {
 
   test("wrong password shows error", async ({ page }) => {
     await page.goto("/login");
-    await page.locator("#email").fill(EMAIL);
+    await page.locator("#loginIdentifier").fill(LOGIN_IDENTIFIER);
     await page.locator("#password").fill("WrongPass1!");
     await page.locator('button[type="submit"]').click();
 
@@ -34,9 +54,11 @@ test.describe("Login page", () => {
     expect(borderColor).toBeTruthy();
   });
 
-  test("nonexistent email shows error", async ({ page }) => {
+  test("nonexistent account name shows error", async ({ page }) => {
     await page.goto("/login");
-    await page.locator("#email").fill(`nonexistent-${Date.now()}@test.com`);
+    await page
+      .locator("#loginIdentifier")
+      .fill(`nonexistent account ${Date.now()}`);
     await page.locator("#password").fill(TEST_PASSWORD);
     await page.locator('button[type="submit"]').click();
 
@@ -44,7 +66,7 @@ test.describe("Login page", () => {
     await expect(errorDiv).toBeVisible({ timeout: 10_000 });
   });
 
-  test("empty email prevents submit", async ({ page }) => {
+  test("empty account name prevents submit", async ({ page }) => {
     await page.goto("/login");
     await page.locator("#password").fill(TEST_PASSWORD);
     await page.locator('button[type="submit"]').click();
@@ -53,7 +75,7 @@ test.describe("Login page", () => {
 
   test("empty password prevents submit", async ({ page }) => {
     await page.goto("/login");
-    await page.locator("#email").fill(EMAIL);
+    await page.locator("#loginIdentifier").fill(LOGIN_IDENTIFIER);
     await page.locator('button[type="submit"]').click();
     expect(page.url()).toContain("/login");
   });
@@ -67,7 +89,7 @@ test.describe("Login page", () => {
 
   test("loading state shows during submit", async ({ page }) => {
     await page.goto("/login");
-    await page.locator("#email").fill(EMAIL);
+    await page.locator("#loginIdentifier").fill(LOGIN_IDENTIFIER);
     await page.locator("#password").fill(TEST_PASSWORD);
 
     const submitBtn = page.locator('button[type="submit"]');

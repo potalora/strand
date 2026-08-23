@@ -46,12 +46,20 @@ export function testEmail(specName: string): string {
   return `e2e-${specName}@test.com`;
 }
 
+export function testIdentifier(specName: string): string {
+  return `e2e ${specName}`;
+}
+
 // Per-run-unique counter so uploads aren't treated as idempotent re-uploads of a
 // prior run's identical content (the backend now skips duplicate file_hash / stable-id
 // re-ingestion — see Phase 2a/1). Use for specs that must genuinely ingest each run.
 let _uniqueCounter = 0;
 export function uniqueEmail(specName: string): string {
   return `e2e-${specName}-${Date.now()}-${_uniqueCounter++}@test.com`;
+}
+
+export function uniqueIdentifier(specName: string): string {
+  return `e2e ${specName} ${Date.now()} ${_uniqueCounter++}`;
 }
 
 export const TEST_PASSWORD = "E2eTest1!";

@@ -305,6 +305,7 @@ async function mockBackend(page: Page, state: MockState): Promise<void> {
       return route.fulfill(
         json({
           id: "user-1",
+          login_identifier: "pedro@example.com",
           email: "pedro@example.com",
           display_name: "Pedro",
           is_active: true,

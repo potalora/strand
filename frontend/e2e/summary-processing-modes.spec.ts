@@ -91,6 +91,7 @@ async function mockBackend(
     if (url.pathname === "/api/v1/auth/me") {
       return json({
         id: "user-1",
+        login_identifier: "pedro@example.com",
         email: "pedro@example.com",
         display_name: "Pedro",
         is_active: true,
