@@ -2187,7 +2187,7 @@ function SystemTab() {
             type="button"
             className="btn ghost sm"
             onClick={() => setTheme(isDark ? "light" : "dark")}
-            aria-label="Toggle theme"
+            aria-label={isDark ? "Switch to light" : "Switch to dark"}
           >
             {isDark ? <Sun size={15} /> : <Moon size={15} />}
             Switch to {isDark ? "light" : "dark"}

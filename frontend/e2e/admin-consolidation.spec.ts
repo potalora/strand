@@ -215,8 +215,9 @@ test.describe("Admin consolidation (#4/#5/#6)", () => {
     const preferences = page
       .getByRole("heading", { name: "Preferences" })
       .locator("..");
-    const themeToggle = preferences.getByRole("button", {
-      name: "Toggle theme",
+    const switchToLight = preferences.getByRole("button", {
+      name: "Switch to light",
+      exact: true,
     });
 
     await expect(page.locator("html")).toHaveClass(/\bdark\b/);
@@ -224,13 +225,18 @@ test.describe("Admin consolidation (#4/#5/#6)", () => {
     await expect
       .soft(preferences.getByText("Dark theme", { exact: true }))
       .toBeVisible();
-    await expect.soft(themeToggle).toContainText("Switch to light");
+    await expect(switchToLight).toBeVisible();
 
-    await themeToggle.click();
+    await switchToLight.click();
 
     await expect(page.locator("html")).toHaveClass(/\blight\b/);
     expect(await page.evaluate(() => localStorage.getItem("theme"))).toBe("light");
     await expect(preferences.getByText("Light theme", { exact: true })).toBeVisible();
-    await expect(themeToggle).toContainText("Switch to dark");
+    await expect(
+      preferences.getByRole("button", {
+        name: "Switch to dark",
+        exact: true,
+      })
+    ).toBeVisible();
   });
 });
