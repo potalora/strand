@@ -228,6 +228,13 @@ where the original Phase 1 traces and JSON results remain untouched. New
 execution outputs stay ignored and uncommitted until the root captures or
 discards them.
 
+The public browser-test command follows the same ownership boundary. It creates
+an absolute runtime root under `frontend/test-results/runtime`, passes it as
+`E2E_RUNTIME_ROOT`, and removes only that exact child after a prefix check. It
+uses explicit loopback PostgreSQL host and port arguments, records whether it
+created the named test database, and drops the database only when that flag is
+set. An existing database makes the command fail instead of being deleted.
+
 ## Local-only profile contract
 
 The profile fixes these values inside `if (localOnly)`:
@@ -236,6 +243,8 @@ The profile fixes these values inside `if (localOnly)`:
 - a synthetic test-only 64-hex-character `DATABASE_ENCRYPTION_KEY`
 - empty `REAL_MEDICAL_FIXTURES_DIR`
 - empty provider credentials, provider project fields, and telemetry inputs
+- `LLM_PROVIDER=gemini` with every operation-specific provider override empty,
+  so inherited Ollama or LM Studio routing cannot reach a live loopback model
 - offline Hugging Face and Transformers flags
 - an empty real-attested-pack execution gate
 - the task-owned upload, temp, scratch, model, and sentinel project paths
@@ -264,6 +273,8 @@ deployment evidence was produced.
   reading their paths.
 - No provider credential or shell encryption key is inherited, stored, or
   logged.
+- No provider routing is inherited. The credential-free loopback providers are
+  not selected by the local-only profile.
 - Provider construction and non-loopback connections fail the positive proof.
 - Existing content-free errors, owner scoping, encryption at rest, immutable
   artifacts, migration/create-all parity, and runtime-attestation semantics
@@ -386,7 +397,7 @@ Private structured-fixture family:
 Private unstructured-fixture family:
 
 - `Extraction progress tracking › extraction progress counts are accurate for batch upload`
-- `Extraction progress tracking › unstructured upload goes to extraction pipeline`
+- `Mixed content upload classification › unstructured upload goes to extraction pipeline`
 - `Unstructured Upload › upload single RTF via API`
 - `Unstructured Upload › upload batch RTFs via UI`
 - `Unstructured Upload › upload PDF via API`
@@ -395,9 +406,9 @@ Private unstructured-fixture family:
 
 Real-pack summary execution cases:
 
-- `Summaries › generate produces a result`
-- `Summaries › history entry reopens a saved summary without regenerating`
-- `Summaries › generation reports the selected privacy boundary`
+- `Summaries page › generate produces a result`
+- `Summaries page › history entry reopens a saved summary without regenerating`
+- `Summaries page › generation reports the selected privacy boundary`
 
 The final report includes the exact enumerated, passed, skipped, failed, and
 not-run counts. It also confirms no provider, external network, model, download,
