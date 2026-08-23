@@ -1,6 +1,7 @@
 """HIPAA Compliance Tests — verifying all audit findings are remediated."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -252,23 +253,30 @@ def test_config_accepts_default_secret_in_development():
 
 
 # ===========================================================================
-# H5: No plaintext email in audit log
+# H5: No plaintext login identifier in audit log
 # ===========================================================================
 
 
 @pytest.mark.asyncio
-async def test_login_audit_does_not_log_email(client: AsyncClient, db_session):
-    """Login audit event should only log email domain, not full email."""
+async def test_login_audit_has_no_identifier_details(client: AsyncClient, db_session):
+    """Login audit events contain no identifier-derived content."""
     from sqlalchemy import select
     from app.models.audit import AuditLog
 
+    login_identifier = "auditcheck@test.com"
     await client.post(
         "/api/v1/auth/register",
-        json={"email": "auditcheck@test.com", "password": "SecurePass123!"},
+        json={
+            "login_identifier": login_identifier,
+            "password": "SecurePass123!",
+        },
     )
     await client.post(
         "/api/v1/auth/login",
-        json={"email": "auditcheck@test.com", "password": "SecurePass123!"},
+        json={
+            "login_identifier": login_identifier,
+            "password": "SecurePass123!",
+        },
     )
 
     result = await db_session.execute(
@@ -276,11 +284,13 @@ async def test_login_audit_does_not_log_email(client: AsyncClient, db_session):
     )
     logs = result.scalars().all()
 
-    for log in logs:
-        if log.details:
-            assert "auditcheck@test.com" not in str(log.details)
-            if "email_domain" in log.details:
-                assert log.details["email_domain"] == "test.com"
+    assert logs
+    assert all(log.details is None for log in logs)
+    serialized = json.dumps(
+        [{"action": log.action, "details": log.details} for log in logs]
+    )
+    assert login_identifier not in serialized
+    assert "test.com" not in serialized
 
 
 # ===========================================================================

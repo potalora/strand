@@ -18,7 +18,7 @@ from app.middleware.auth import (
 from app.middleware.encryption import blind_index
 from app.models.token_blacklist import RevokedToken
 from app.models.user import User
-from app.schemas.auth import TokenResponse
+from app.schemas.auth import TokenResponse, normalize_login_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -40,41 +40,51 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 async def register_user(
     db: AsyncSession,
-    email: str,
+    login_identifier: str,
     password: str,
     display_name: str | None = None,
 ) -> User:
     """Register a new user."""
-    # ``email`` is encrypted at rest and not directly queryable; look up the
-    # deterministic blind index instead.
-    email_hmac = blind_index(email)
-    existing = await db.execute(select(User).where(User.email_hmac == email_hmac))
+    login_identifier = normalize_login_identifier(login_identifier)
+    identifier_hmac = blind_index(login_identifier)
+    existing = await db.execute(
+        select(User).where(User.login_identifier_hmac == identifier_hmac)
+    )
     if existing.scalar_one_or_none():
-        raise ValueError("Email already registered")
+        raise ValueError("Account identifier is unavailable.")
 
     user = User(
-        email=email,
-        email_hmac=email_hmac,
+        login_identifier=login_identifier,
+        login_identifier_hmac=identifier_hmac,
         password_hash=hash_password(password),
         display_name=display_name,
     )
     db.add(user)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise ValueError("Account identifier is unavailable.") from None
     await db.refresh(user)
     return user
 
 
 async def authenticate_user(
     db: AsyncSession,
-    email: str,
+    login_identifier: str,
     password: str,
 ) -> TokenResponse:
     """Authenticate a user and return JWT tokens."""
-    result = await db.execute(select(User).where(User.email_hmac == blind_index(email)))
+    login_identifier = normalize_login_identifier(login_identifier)
+    result = await db.execute(
+        select(User).where(
+            User.login_identifier_hmac == blind_index(login_identifier)
+        )
+    )
     user = result.scalar_one_or_none()
 
     if not user:
-        raise ValueError("Invalid email or password")
+        raise ValueError("Invalid account identifier or password")
 
     now = datetime.now(timezone.utc)
 
@@ -98,7 +108,7 @@ async def authenticate_user(
             user.locked_until = now + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
             logger.warning("Account locked for user %s after %d failed attempts", user.id, user.failed_login_attempts)
         await db.commit()
-        raise ValueError("Invalid email or password")
+        raise ValueError("Invalid account identifier or password")
 
     if not user.is_active:
         raise ValueError("Account is disabled")

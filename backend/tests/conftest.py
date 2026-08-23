@@ -315,12 +315,16 @@ async def auth_headers(
     """Register a user, log in, return (headers_dict, user_id_str)."""
     reg = await client.post(
         "/api/v1/auth/register",
-        json={"email": email, "password": "SecurePass123!", "display_name": "Test"},
+        json={
+            "login_identifier": email,
+            "password": "SecurePass123!",
+            "display_name": "Test",
+        },
     )
     user_id = reg.json()["id"]
     login = await client.post(
         "/api/v1/auth/login",
-        json={"email": email, "password": "SecurePass123!"},
+        json={"login_identifier": email, "password": "SecurePass123!"},
     )
     token = login.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}, user_id

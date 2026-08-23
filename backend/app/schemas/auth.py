@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from typing import Any, Self
 from uuid import UUID
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
@@ -80,9 +81,19 @@ class LogoutRequest(BaseModel):
 
 class UserResponse(BaseModel):
     id: UUID
-    email: str
+    login_identifier: str
+    email: str = Field(deprecated=True)
     display_name: str | None
     is_active: bool
     created_at: datetime
 
-    model_config = {"from_attributes": True}
+    @classmethod
+    def from_user(cls, user: Any) -> Self:
+        return cls(
+            id=user.id,
+            login_identifier=user.login_identifier,
+            email=user.login_identifier,
+            display_name=user.display_name,
+            is_active=user.is_active,
+            created_at=user.created_at,
+        )

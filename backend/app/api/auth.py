@@ -70,7 +70,7 @@ async def register(
         resource_id=user.id,
         ip_address=client_ip,
     )
-    return UserResponse.model_validate(user)
+    return UserResponse.from_user(user)
 
 
 @router.post("/login", response_model=TokenResponse, name="auth_login")
@@ -92,7 +92,7 @@ async def login(
     except ValueError as e:
         detail = str(e)
         if "locked" not in detail.lower():
-            detail = "Invalid account identifier or password"
+            detail = "Invalid account identifier or password."
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=detail,
@@ -187,4 +187,4 @@ async def get_me(
     user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    return UserResponse.model_validate(user)
+    return UserResponse.from_user(user)
