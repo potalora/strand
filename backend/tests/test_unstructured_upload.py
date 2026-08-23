@@ -352,7 +352,7 @@ async def test_pending_extraction_excludes_other_users(
 
     other_user = User(
         id=uuid4(),
-        email="other_pending_encrypted",
+        login_identifier="other_pending_encrypted",
         password_hash="$2b$12$fakefakefakefakefakefuaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         is_active=True,
     )
@@ -1260,7 +1260,7 @@ async def test_trigger_extraction_rejects_other_users_files(
 
     other_user = User(
         id=uuid4(),
-        email="trigger_other_user_encrypted",
+        login_identifier="trigger_other_user_encrypted",
         password_hash="$2b$12$fakefakefakefakefakefuaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         is_active=True,
     )

@@ -128,7 +128,7 @@ def _record_for(
 async def test_local_job_locks_mode_and_manifest_when_preferences_change(
     db_session,
 ) -> None:
-    user = User(email="local-job-models@example.com", password_hash="x")
+    user = User(login_identifier="local-job-models@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     upload = _upload_for(user)
@@ -187,8 +187,8 @@ def test_local_job_requires_kind_matched_target() -> None:
 async def test_local_job_rejects_kind_and_owner_mismatches(
     db_session, case: str
 ) -> None:
-    user_a = User(email=f"{case}-a@example.com", password_hash="x")
-    user_b = User(email=f"{case}-b@example.com", password_hash="x")
+    user_a = User(login_identifier=f"{case}-a@example.com", password_hash="x")
+    user_b = User(login_identifier=f"{case}-b@example.com", password_hash="x")
     db_session.add_all([user_a, user_b])
     await db_session.flush()
     upload_a = _upload_for(user_a)
@@ -238,8 +238,8 @@ async def test_local_job_rejects_kind_and_owner_mismatches(
 
 
 async def test_evidence_rejects_user_upload_mismatch(db_session) -> None:
-    user_a = User(email="evidence-upload-a@example.com", password_hash="x")
-    user_b = User(email="evidence-upload-b@example.com", password_hash="x")
+    user_a = User(login_identifier="evidence-upload-a@example.com", password_hash="x")
+    user_b = User(login_identifier="evidence-upload-b@example.com", password_hash="x")
     db_session.add_all([user_a, user_b])
     await db_session.flush()
     upload_b = _upload_for(user_b)
@@ -266,8 +266,12 @@ async def test_evidence_rejects_health_record_scope_mismatch(
     db_session,
     case: str,
 ) -> None:
-    user_a = User(email=f"evidence-record-{case}-a@example.com", password_hash="x")
-    user_b = User(email=f"evidence-record-{case}-b@example.com", password_hash="x")
+    user_a = User(
+        login_identifier=f"evidence-record-{case}-a@example.com", password_hash="x"
+    )
+    user_b = User(
+        login_identifier=f"evidence-record-{case}-b@example.com", password_hash="x"
+    )
     db_session.add_all([user_a, user_b])
     await db_session.flush()
     upload_a = _upload_for(user_a)
@@ -303,7 +307,9 @@ async def test_evidence_rejects_health_record_scope_mismatch(
 async def test_deleting_health_record_preserves_evidence_with_null_record_link(
     db_session,
 ) -> None:
-    user = User(email="evidence-delete-record@example.com", password_hash="x")
+    user = User(
+        login_identifier="evidence-delete-record@example.com", password_hash="x"
+    )
     db_session.add(user)
     await db_session.flush()
     upload = _upload_for(user)
@@ -417,7 +423,9 @@ def test_local_job_canonicalizes_copies_and_hashes_manifest() -> None:
 
 
 async def _persist_local_job(db_session) -> LocalAIJob:
-    user = User(email=f"immutable-job-{uuid.uuid4()}@example.com", password_hash="x")
+    user = User(
+        login_identifier=f"immutable-job-{uuid.uuid4()}@example.com", password_hash="x"
+    )
     db_session.add(user)
     await db_session.flush()
     upload = _upload_for(user)
@@ -487,8 +495,8 @@ async def test_database_rejects_raw_local_job_target_reassignment(
     db_session,
     case: str,
 ) -> None:
-    user_a = User(email=f"job-move-{case}-a@example.com", password_hash="x")
-    user_b = User(email=f"job-move-{case}-b@example.com", password_hash="x")
+    user_a = User(login_identifier=f"job-move-{case}-a@example.com", password_hash="x")
+    user_b = User(login_identifier=f"job-move-{case}-b@example.com", password_hash="x")
     db_session.add_all([user_a, user_b])
     await db_session.flush()
     upload_a = _upload_for(user_a)
@@ -575,7 +583,9 @@ async def test_database_rejects_raw_local_job_identity_mutation(
 
 
 async def test_persisted_evidence_scope_is_immutable_in_orm(db_session) -> None:
-    user = User(email="evidence-immutable-orm@example.com", password_hash="x")
+    user = User(
+        login_identifier="evidence-immutable-orm@example.com", password_hash="x"
+    )
     db_session.add(user)
     await db_session.flush()
     upload = _upload_for(user)
@@ -601,8 +611,8 @@ async def test_persisted_evidence_scope_is_immutable_in_orm(db_session) -> None:
 
 
 async def test_database_rejects_raw_evidence_scope_reassignment(db_session) -> None:
-    user_a = User(email="evidence-move-a@example.com", password_hash="x")
-    user_b = User(email="evidence-move-b@example.com", password_hash="x")
+    user_a = User(login_identifier="evidence-move-a@example.com", password_hash="x")
+    user_b = User(login_identifier="evidence-move-b@example.com", password_hash="x")
     db_session.add_all([user_a, user_b])
     await db_session.flush()
     upload_a = _upload_for(user_a)
@@ -737,7 +747,7 @@ async def test_fresh_database_accepts_only_exact_attested_v2_runtime(
 
 
 async def test_fresh_database_rejects_legacy_raw_job_insert(db_session) -> None:
-    user = User(email="fresh-v1-rejected@example.com", password_hash="x")
+    user = User(login_identifier="fresh-v1-rejected@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     upload = _upload_for(user)
@@ -767,7 +777,7 @@ async def test_database_rejects_invalid_raw_local_job_insert(
     db_session,
     case: str,
 ) -> None:
-    user = User(email=f"raw-job-{case}@example.com", password_hash="x")
+    user = User(login_identifier=f"raw-job-{case}@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     upload = _upload_for(user)
@@ -795,7 +805,9 @@ async def test_database_rejects_second_raw_ingestion_job_for_one_upload(
     db_session,
 ) -> None:
     """A raw SQL insert cannot create a competing strict-local ingestion job."""
-    user = User(email="duplicate-raw-local-job@example.com", password_hash="x")
+    user = User(
+        login_identifier="duplicate-raw-local-job@example.com", password_hash="x"
+    )
     db_session.add(user)
     await db_session.flush()
     upload = _upload_for(user)
@@ -840,7 +852,9 @@ async def test_database_rejects_float_manifest_integer_fields(
     field: str,
     numeric_value: float,
 ) -> None:
-    user = User(email=f"raw-job-float-{field}@example.com", password_hash="x")
+    user = User(
+        login_identifier=f"raw-job-float-{field}@example.com", password_hash="x"
+    )
     db_session.add(user)
     await db_session.flush()
     upload = _upload_for(user)
@@ -882,7 +896,9 @@ async def test_database_rejects_noncanonical_exponent_manifest_integer_fields(
     old_token: str,
     exponent_token: str,
 ) -> None:
-    user = User(email=f"raw-job-exponent-{field}@example.com", password_hash="x")
+    user = User(
+        login_identifier=f"raw-job-exponent-{field}@example.com", password_hash="x"
+    )
     db_session.add(user)
     await db_session.flush()
     upload = _upload_for(user)
@@ -910,7 +926,7 @@ async def test_database_rejects_noncanonical_exponent_manifest_integer_fields(
 
 
 async def test_database_accepts_canonical_raw_local_job_insert(db_session) -> None:
-    user = User(email="raw-job-canonical@example.com", password_hash="x")
+    user = User(login_identifier="raw-job-canonical@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     upload = _upload_for(user)

@@ -233,7 +233,7 @@ async def test_parse_bundle_resolves_practitioner_name(
     resource ends up storing the provider name on the encounter."""
     user = User(
         id=uuid4(),
-        email="enc_ref_resolution",
+        login_identifier="enc_ref_resolution",
         password_hash="$2b$12$fakefakefakefakefakefuaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         is_active=True,
     )

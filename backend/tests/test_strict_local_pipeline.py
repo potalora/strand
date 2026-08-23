@@ -1849,7 +1849,7 @@ def test_empty_extraction_fixture_is_json_serializable() -> None:
 async def test_database_checkpoint_store_replaces_stale_page_atomically(
     db_session,
 ) -> None:
-    user = User(email="pipeline-checkpoint@example.com", password_hash="x")
+    user = User(login_identifier="pipeline-checkpoint@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
@@ -1928,7 +1928,7 @@ async def test_strict_autoconfirm_uses_closed_validated_fhir_mapper(
 ) -> None:
     from app.api.upload import _autoconfirm_and_finish
 
-    user = User(email="strict-mapper@example.com", password_hash="x")
+    user = User(login_identifier="strict-mapper@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     upload = UploadedFile(
@@ -1998,7 +1998,7 @@ async def test_strict_autoconfirm_preserves_grounded_fact_date(
 ) -> None:
     from app.api.upload import _autoconfirm_and_finish
 
-    user = User(email="strict-date@example.com", password_hash="x")
+    user = User(login_identifier="strict-date@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     upload = UploadedFile(
@@ -2062,7 +2062,7 @@ async def test_deferred_strict_autoconfirm_rolls_back_records_and_status_togethe
 ) -> None:
     from app.api.upload import _autoconfirm_and_finish
 
-    user = User(email="strict-atomic@example.com", password_hash="x")
+    user = User(login_identifier="strict-atomic@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     upload = UploadedFile(
@@ -2129,7 +2129,7 @@ async def test_deferred_strict_autoconfirm_rolls_back_records_and_status_togethe
 async def test_strict_runner_does_not_revive_cancelled_job(db_session) -> None:
     from app.api.upload import _run_strict_local_ingestion_for_upload
 
-    user = User(email="strict-no-revive@example.com", password_hash="x")
+    user = User(login_identifier="strict-no-revive@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
@@ -2182,7 +2182,7 @@ async def test_strict_failure_terminalizes_upload_and_job_together(
 ) -> None:
     from app.api.upload import _run_strict_local_ingestion_for_upload
 
-    user = User(email="strict-paired-failure@example.com", password_hash="x")
+    user = User(login_identifier="strict-paired-failure@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
@@ -2248,7 +2248,7 @@ async def test_unstructured_worker_branches_before_cloud_configuration(
 ) -> None:
     from app.api.upload import _process_unstructured
 
-    user = User(email="strict-branch@example.com", password_hash="x")
+    user = User(login_identifier="strict-branch@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
@@ -2295,7 +2295,9 @@ async def test_strict_runner_rejects_job_with_a_different_upload_snapshot(
     """The worker must not choose a newer mismatched job for this upload."""
     from app.api.upload import _run_strict_local_ingestion_for_upload
 
-    user = User(email="strict-job-snapshot-mismatch@example.com", password_hash="x")
+    user = User(
+        login_identifier="strict-job-snapshot-mismatch@example.com", password_hash="x"
+    )
     db_session.add(user)
     await db_session.flush()
     upload_manifest, _ = canonicalize_manifest_snapshot(_manifest_payload())
@@ -2345,7 +2347,7 @@ async def test_strict_worker_cancellation_becomes_cancelled_not_failed(
 ) -> None:
     from app.api.upload import _process_unstructured
 
-    user = User(email="strict-cancel@example.com", password_hash="x")
+    user = User(login_identifier="strict-cancel@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())

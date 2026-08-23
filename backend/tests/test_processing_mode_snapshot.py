@@ -537,7 +537,7 @@ async def test_persisted_upload_processing_snapshot_is_immutable(
     changed_value: object,
 ) -> None:
     user = User(
-        email=f"immutable-upload-{field}@example.com",
+        login_identifier=f"immutable-upload-{field}@example.com",
         password_hash="test",
     )
     db_session.add(user)
@@ -564,7 +564,7 @@ async def test_database_rejects_raw_upload_processing_snapshot_mutation(
     db_session: AsyncSession,
 ) -> None:
     user = User(
-        email="raw-immutable-upload@example.com",
+        login_identifier="raw-immutable-upload@example.com",
         password_hash="test",
     )
     db_session.add(user)
@@ -1328,7 +1328,7 @@ async def test_runtime_custom_local_config_fails_closed_for_remote_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Runtime config loading must reject a persisted custom-local remote route."""
-    user = User(email="runtime-custom-local@example.com", password_hash="x")
+    user = User(login_identifier="runtime-custom-local@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     from app.models.llm_settings import UserLLMPreferences

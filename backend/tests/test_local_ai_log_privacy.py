@@ -77,7 +77,7 @@ async def test_strict_local_failure_never_logs_or_persists_exception_phi(
         "warfarin 7.5 mg nightly",
         "summary-canary-BRAVO-771",
     )
-    user = User(email="strict-log-privacy@example.com", password_hash="x")
+    user = User(login_identifier="strict-log-privacy@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
@@ -148,7 +148,7 @@ async def test_strict_local_summary_recovery_never_logs_exception_message(
     from app.services.ai.summarizer import resume_grounded_local_summary_jobs
 
     canary = "summary-worker-secret-canary-FOXTROT-884"
-    user = User(email="strict-summary-log@example.com", password_hash="x")
+    user = User(login_identifier="strict-summary-log@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     patient = Patient(user_id=user.id)

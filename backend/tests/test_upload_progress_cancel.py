@@ -95,7 +95,7 @@ async def test_extraction_progress_ids_still_user_scoped(
     headers, user_id = await auth_headers(client)
     other = User(
         id=uuid4(),
-        email="prog_other_enc",
+        login_identifier="prog_other_enc",
         password_hash="$2b$12$fakefakefakefakefakefuaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         is_active=True,
     )
@@ -330,7 +330,7 @@ async def test_strict_cancel_check_reloads_flags_from_database(
     from app.models.user import User
 
     user = User(
-        email=f"strict-cancel-{uuid4().hex}@example.com",
+        login_identifier=f"strict-cancel-{uuid4().hex}@example.com",
         password_hash="x",
     )
     db_session.add(user)
@@ -385,7 +385,7 @@ async def test_strict_progress_uses_isolated_transaction_when_runner_session_is_
     from app.models.user import User
 
     user = User(
-        email=f"strict-progress-isolated-{uuid4().hex}@example.com",
+        login_identifier=f"strict-progress-isolated-{uuid4().hex}@example.com",
         password_hash="x",
     )
     db_session.add(user)
@@ -459,7 +459,7 @@ async def test_strict_progress_fails_closed_after_cancel_without_partial_write(
     from app.services.local_ai.errors import LocalPolicyError
 
     user = User(
-        email=f"strict-progress-cancel-{uuid4().hex}@example.com",
+        login_identifier=f"strict-progress-cancel-{uuid4().hex}@example.com",
         password_hash="x",
     )
     db_session.add(user)
@@ -525,7 +525,7 @@ async def test_completion_lock_linearizes_before_late_cancel(
     from app.schemas.upload import CancelExtractionRequest
 
     user = User(
-        email=f"terminal-lock-{uuid4().hex}@example.com",
+        login_identifier=f"terminal-lock-{uuid4().hex}@example.com",
         password_hash="x",
     )
     db_session.add(user)
@@ -597,7 +597,7 @@ async def test_cancel_skips_unknown_and_other_users(
     headers, user_id = await auth_headers(client)
     other = User(
         id=uuid4(),
-        email="cancel_other_enc",
+        login_identifier="cancel_other_enc",
         password_hash="$2b$12$fakefakefakefakefakefuaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         is_active=True,
     )
@@ -782,7 +782,7 @@ async def test_worker_aborts_when_cancel_requested(db_session: AsyncSession):
 
     user = User(
         id=uuid4(),
-        email="worker_cancel_enc",
+        login_identifier="worker_cancel_enc",
         password_hash="$2b$12$fakefakefakefakefakefuaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         is_active=True,
     )
@@ -829,7 +829,7 @@ async def test_strict_worker_early_cancel_terminalizes_upload_and_job(
 
     user = User(
         id=uuid4(),
-        email=f"strict-worker-cancel-{uuid4().hex}@example.com",
+        login_identifier=f"strict-worker-cancel-{uuid4().hex}@example.com",
         password_hash="x",
         is_active=True,
     )
@@ -986,7 +986,7 @@ async def test_worker_writes_section_progress(db_session: AsyncSession):
 
     user = User(
         id=uuid4(),
-        email="worker_progress_enc",
+        login_identifier="worker_progress_enc",
         password_hash="$2b$12$fakefakefakefakefakefuaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         is_active=True,
     )

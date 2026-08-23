@@ -101,7 +101,7 @@ async def test_auto_confirm_attaches_document_provider(db_session: AsyncSession)
 
     user = User(
         id=uuid4(),
-        email="prov_wiring_enc",
+        login_identifier="prov_wiring_enc",
         password_hash="$2b$12$fakefakefakefakefakefuaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         is_active=True,
     )

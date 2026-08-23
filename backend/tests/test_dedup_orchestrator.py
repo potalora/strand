@@ -336,7 +336,7 @@ class TestRunUploadDedup:
         from app.models.uploaded_file import UploadedFile
         from app.models.user import User
 
-        user = User(email="strict-repeat-dedup@example.com", password_hash="x")
+        user = User(login_identifier="strict-repeat-dedup@example.com", password_hash="x")
         db_session.add(user)
         await db_session.flush()
         patient = Patient(user_id=user.id)

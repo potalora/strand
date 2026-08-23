@@ -210,7 +210,7 @@ async def _isolated_records(count: int = 60):
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         async with factory() as db:
-            db.add(User(id=uid, email=f"perf-{uid}@x.com", email_hmac=f"bi-{uid}",
+            db.add(User(id=uid, login_identifier=f"perf-{uid}@x.com", login_identifier_hmac=f"bi-{uid}",
                         password_hash="x"))
             db.add(Patient(id=pid, user_id=uid, fhir_id=f"pp-{uid}", gender="male"))
             await db.commit()

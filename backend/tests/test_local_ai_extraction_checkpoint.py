@@ -109,7 +109,7 @@ async def test_database_store_commits_encrypted_exact_extraction_checkpoint(
 ) -> None:
     from app.models.local_ai import LocalAIExtractionCheckpoint
 
-    user = User(email="extraction-checkpoint@example.com", password_hash="x")
+    user = User(login_identifier="extraction-checkpoint@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     snapshot, manifest_digest = canonicalize_manifest_snapshot(_manifest_payload())
@@ -199,7 +199,7 @@ async def test_downstream_rollback_preserves_checkpoint_and_retry_skips_extracti
     db_session,
     tmp_path: Path,
 ) -> None:
-    user = User(email="checkpoint-retry@example.com", password_hash="x")
+    user = User(login_identifier="checkpoint-retry@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())
@@ -283,7 +283,7 @@ async def test_validation_failure_preserves_raw_checkpoint_and_retry_skips_manag
     db_session,
     tmp_path: Path,
 ) -> None:
-    user = User(email="raw-checkpoint-retry@example.com", password_hash="x")
+    user = User(login_identifier="raw-checkpoint-retry@example.com", password_hash="x")
     db_session.add(user)
     await db_session.flush()
     snapshot, _digest = canonicalize_manifest_snapshot(_manifest_payload())

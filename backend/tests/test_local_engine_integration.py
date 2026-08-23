@@ -39,7 +39,7 @@ _NOTE = (
 async def test_local_engine_helper_end_to_end(db_session: AsyncSession):
     from app.api.upload import _run_local_extraction_engine
 
-    user = User(id=uuid4(), email=f"wsa_{uuid4().hex[:8]}@example.com", password_hash="x")
+    user = User(id=uuid4(), login_identifier=f"wsa_{uuid4().hex[:8]}@example.com", password_hash="x")
     db_session.add(user)
     await db_session.commit()
     user_id = user.id
