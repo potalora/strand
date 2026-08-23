@@ -91,8 +91,10 @@ fixture setup, and real model execution.
 `cloud_assisted` or `validated_strict_local`. `prompt_only` is a summary mode,
 not an ingestion mode. Selecting `cloud_assisted` does not authorize a provider
 call. The allowed inputs use deterministic FHIR/CDA parsers; backend tests run
-the complete downstream dedup flow and fail if provider construction occurs;
-provider credentials are empty; and local-only socket guards deny non-loopback
+the complete downstream dedup flow and fail if provider construction occurs.
+The instrumentation retains only a zero/nonzero call count; it never stores
+provider arguments, keyword arguments, `LLMConfig`, prompts, or credentials.
+Provider credentials are empty, and local-only socket guards deny non-loopback
 connections.
 
 This is a narrow fixture override. Unstructured uploads, strict admission tests,
@@ -193,20 +195,38 @@ The local-only profile therefore uses:
 so command normalization succeeds, but it is not an installed local-AI worker,
 an attested runtime, a fake success seam, or evidence that a pack can run. The
 legacy-v1 manifest guarantees strict upload and summary admission reject before
-any spawn or runtime-identity use. Cloud-assisted structured parsing does not
-use the worker.
+any production/model worker spawn or runtime-identity use. Cloud-assisted
+structured parsing does not use the worker.
 
 A manager-level startup test proves the sentinel/project pair reaches the
-started state without a child PID. A profile-level Playwright regression asserts
-the sentinel, project containment, and empty real-pack gate, then reaches the
-backend health endpoint. A static profile test ties those behaviors to the
-configured environment and keeps the legacy-v1 negative contract explicit.
+started state without a child PID. It deliberately uses the test module's
+unisolated `LocalModelManager` subclass with explicit worker-home and project
+paths, so it neither reads nor mutates `settings.local_ai_model_dir`. A
+profile-level Playwright regression separately exercises production application
+startup, asserts the sentinel, project containment, and empty real-pack gate,
+then reaches the backend health endpoint. A static profile test pins those
+behaviors and all four legacy-v1 manifest/release/benchmark/fidelity paths.
 
 ## Isolated runtime state
 
 Each local-only Playwright command supplies a newly created absolute
-`E2E_RUNTIME_ROOT` owned by that command. The profile validates that it is
-absolute, creates only these children, and overwrites inherited settings:
+`E2E_RUNTIME_ROOT` and `E2E_OUTPUT_ROOT` owned by that invocation. Their approved
+parents are `frontend/test-results/runtime` and
+`frontend/test-results/executions`. The existing
+`frontend/test-results` Phase-1 evidence parent is never recursively chmodded,
+replaced, or deleted.
+
+The command and profile reject symlinked parents or roots. They resolve the
+worktree, evidence parent, approved parents, and candidate roots through the
+filesystem and require exact real-path containment. Existing parents must be
+directories owned by the current OS user. Each task-created root must be a
+non-symlink directory owned by the current user with mode `0700`. At creation,
+the command captures its real path, device, inode, owner, type, and mode. Before
+any `rm -rf`, it repeats those checks and refuses deletion unless the identity
+and exact-child relationship are unchanged.
+
+The profile validates both supplied roots before it creates only these runtime
+children and overwrites inherited settings:
 
 - `UPLOAD_DIR=<runtime-root>/uploads`
 - `TEMP_EXTRACT_DIR=<runtime-root>/temp-extract`
@@ -220,20 +240,48 @@ path. Command preflight and cleanup operate only on the exact runtime root they
 created. Inherited `UPLOAD_DIR` and `TEMP_EXTRACT_DIR` cannot redirect the
 backend.
 
-Playwright's `outputDir` is also per run, under
-`frontend/test-results/executions/<runtime-token>`. This is separate from the
+Playwright's `outputDir` is `<output-root>/artifacts`. This is separate from the
 runtime root so runtime cleanup cannot delete a retained failure trace. It also
 prevents Playwright from clearing the parent `frontend/test-results` directory,
-where the original Phase 1 traces and JSON results remain untouched. New
-execution outputs stay ignored and uncommitted until the root captures or
-discards them.
+where the original Phase 1 traces and JSON results remain untouched. The full
+suite writes its list and JSON report inside the same unique output root, using
+paths derived from that run's token. The command proves those files were absent
+before the run, and the acceptance parser consumes the exact captured paths;
+fixed or stale report names are not accepted. New execution outputs stay
+ignored and uncommitted until the root captures or discards them.
 
-The public browser-test command follows the same ownership boundary. It creates
-an absolute runtime root under `frontend/test-results/runtime`, passes it as
-`E2E_RUNTIME_ROOT`, and removes only that exact child after a prefix check. It
-uses explicit loopback PostgreSQL host and port arguments, records whether it
-created the named test database, and drops the database only when that flag is
-set. An existing database makes the command fail instead of being deleted.
+The public browser-test command follows the same real-path and identity
+boundary. It creates both absolute task roots, passes them as
+`E2E_RUNTIME_ROOT` and `E2E_OUTPUT_ROOT`, and removes only roots whose captured
+identity still matches. It uses explicit loopback PostgreSQL host and port
+arguments, records whether it created the named test database, and drops the
+database only when that flag is set. An existing database makes the command
+fail instead of being deleted.
+
+## Disposable database ownership
+
+Every database/test command starts with `set -euo pipefail`, uses a distinct
+task-specific database name, and calls `createdb -h 127.0.0.1 -p 5432` without a
+preflight drop. The command sets its ownership flag immediately after
+`createdb` succeeds. Its cleanup trap may call `dropdb` only while that flag is
+set. If the name already exists, the command fails without changing it. There
+is no unconditional final database cleanup list and no prose claim of ownership
+without the corresponding flag.
+
+## Ignored-artifact evidence
+
+Before behavioral work, the root captures a sorted repository-relative
+inventory of every ignored path except the explicitly named dependency trees
+`frontend/node_modules/` and `backend/.venv/`. It also records separate
+inventories for Phase-1 `test-results`, new runtime/execution/report roots,
+Python and pytest caches, Next build output, backend data, and a residual
+unclassified set. After verification, the root repeats and compares these
+inventories. New ignored paths are accepted only in the enumerated generated
+classes and task-token output roots; backend data and the residual set must not
+change. The complete Phase-1 tree outside the approved runtime/execution roots
+is hash-inventoried, while the already recorded JSON and 15-trace aggregate
+hashes remain explicit acceptance gates. Ignored status cannot hide an
+unauthorized artifact.
 
 ## Local-only profile contract
 
@@ -248,9 +296,11 @@ The profile fixes these values inside `if (localOnly)`:
 - offline Hugging Face and Transformers flags
 - an empty real-attested-pack execution gate
 - the task-owned upload, temp, scratch, model, and sentinel project paths
-- a task-owned Playwright output directory that cannot clear Phase 1 evidence
+- a separately supplied, real-path-validated task-owned Playwright output root
+  that cannot clear Phase 1 evidence
 
-The v1 manifest/release paths remain only for negative admission coverage. The
+The v1 lock, v1 release, benchmark, and fidelity paths remain pinned only for
+negative admission coverage. The
 backend socket denial, macOS Next.js sandbox, closed browser proxy, loopback-only
 database validation, and disabled service workers remain active.
 
@@ -276,6 +326,13 @@ deployment evidence was produced.
 - No provider routing is inherited. The credential-free loopback providers are
   not selected by the local-only profile.
 - Provider construction and non-loopback connections fail the positive proof.
+- Provider-call instrumentation stores only a count or fixed non-sensitive
+  operation label, never configuration or request arguments.
+- A database is dropped only by the same invocation that successfully created
+  it and still holds the corresponding ownership flag.
+- Recursive cleanup is allowed only after real-path and captured filesystem
+  identity revalidation of the exact task-created root.
+- Ignored artifacts are included in bounded before/after scope evidence.
 - Existing content-free errors, owner scoping, encryption at rest, immutable
   artifacts, migration/create-all parity, and runtime-attestation semantics
   remain intact.
@@ -348,7 +405,8 @@ Implementation uses strict TDD.
 
 1. Add static profile and manager-startup tests. Observe the profile test fail
    against the stale fake-worker/runtime-root contract, then add the minimal
-   startup-safe sentinel profile.
+   startup-safe sentinel profile. Pin the v1 lock, release, benchmark, and
+   fidelity paths and the real-path-safe runtime/output contract.
 2. Add upload and summary endpoint characterization regressions for the exact
    legacy-v1 rejection and request-scoped absence of database/storage side
    effects. These should pass before the harness repair; a failure means the
@@ -365,9 +423,10 @@ Implementation uses strict TDD.
 6. Split summary UI coverage from the three real-pack execution cases and add
    the exact endpoint negative regression.
 7. Run focused backend runtime-attestation, startup, upload, summary, profile,
-   and migration/create-all parity tests with `APP_ENV=test` and explicit
-   loopback database commands.
-8. Recreate the focused backend database before the final integration gate.
+   and migration/create-all parity tests with `APP_ENV=test`, strict shell mode,
+   explicit loopback database commands, and per-invocation database ownership.
+8. Create a distinct focused backend database immediately before the final
+   integration gate and drop it only from that invocation's cleanup trap.
 9. Run focused populated-upload Playwright tests with a new per-command runtime
    root and per-run Playwright output directory.
 10. Enumerate the updated suite and record the exact total, then run the complete
@@ -411,8 +470,11 @@ Real-pack summary execution cases:
 - `Summaries page › generation reports the selected privacy boundary`
 
 The final report includes the exact enumerated, passed, skipped, failed, and
-not-run counts. It also confirms no provider, external network, model, download,
-pack, release, promotion, or deployment call occurred.
+not-run counts. It also confirms no production/model worker spawn and no
+provider, external network, model, download, pack, release, benchmark,
+fidelity, promotion, or deployment call occurred. The bounded
+runtime-identity tests may legitimately invoke a subprocess or console script;
+that is not described as a model-worker spawn.
 
 Any unrelated baseline must be identified by exact test name, before/after
 status, and reproduction on the unchanged baseline. Generated traces, JSON
