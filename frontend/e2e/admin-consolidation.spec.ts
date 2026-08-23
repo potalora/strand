@@ -203,4 +203,40 @@ test.describe("Admin consolidation (#4/#5/#6)", () => {
     await expect(page.getByRole("heading", { name: "Account" })).toBeVisible();
     await expect(page.getByRole("tab", { name: "System" })).toBeVisible();
   });
+
+  test("(g) Appearance follows system dark mode on first load and toggles immediately", async ({
+    page,
+  }) => {
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.addInitScript(() => localStorage.removeItem("theme"));
+    await mockBackend(page);
+    await page.goto("/admin?tab=sys");
+
+    const preferences = page
+      .getByRole("heading", { name: "Preferences" })
+      .locator("..");
+    const switchToLight = preferences.getByRole("button", {
+      name: "Switch to light",
+      exact: true,
+    });
+
+    await expect(page.locator("html")).toHaveClass(/\bdark\b/);
+    expect(await page.evaluate(() => localStorage.getItem("theme"))).toBeNull();
+    await expect
+      .soft(preferences.getByText("Dark theme", { exact: true }))
+      .toBeVisible();
+    await expect(switchToLight).toBeVisible();
+
+    await switchToLight.click();
+
+    await expect(page.locator("html")).toHaveClass(/\blight\b/);
+    expect(await page.evaluate(() => localStorage.getItem("theme"))).toBe("light");
+    await expect(preferences.getByText("Light theme", { exact: true })).toBeVisible();
+    await expect(
+      preferences.getByRole("button", {
+        name: "Switch to dark",
+        exact: true,
+      })
+    ).toBeVisible();
+  });
 });

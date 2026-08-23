@@ -2039,7 +2039,7 @@ function SystemTab() {
   const [exporting, setExporting] = useState(false);
   const [mounted, setMounted] = useState(false);
   const { clearTokens } = useAuthStore();
-  const { theme, setTheme } = useTheme();
+  const { resolvedTheme, setTheme } = useTheme();
   const { skipDeleteConfirm, setSkipDeleteConfirm } = usePreferencesStore();
 
   useEffect(() => setMounted(true), []);
@@ -2110,7 +2110,7 @@ function SystemTab() {
       : <FieldSkeleton width={108} />;
   const emailNode: ReactNode = user ? maskEmail(user.email) : <FieldSkeleton width={150} />;
 
-  const isDark = mounted && theme === "dark";
+  const isDark = mounted && resolvedTheme === "dark";
 
   const span =
     overview?.date_range_start && overview?.date_range_end
@@ -2187,7 +2187,7 @@ function SystemTab() {
             type="button"
             className="btn ghost sm"
             onClick={() => setTheme(isDark ? "light" : "dark")}
-            aria-label="Toggle theme"
+            aria-label={isDark ? "Switch to light" : "Switch to dark"}
           >
             {isDark ? <Sun size={15} /> : <Moon size={15} />}
             Switch to {isDark ? "light" : "dark"}
