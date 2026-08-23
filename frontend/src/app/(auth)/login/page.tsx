@@ -224,7 +224,13 @@ export default function LoginPage() {
               spellCheck={false}
             />
             <p className="auth-hint dim">
-              Leading and trailing spaces are ignored. Capitalization of A–Z does not matter; visually similar Unicode text can still be different.
+              This value is only for signing in to this Strand instance. You do
+              not need an email address, and Strand does not send emails for
+              sign-in.
+            </p>
+            <p className="auth-hint dim">
+              Leading and trailing spaces are ignored. A–Z capitalization does
+              not matter. Visually similar Unicode text may still differ.
             </p>
           </div>
 

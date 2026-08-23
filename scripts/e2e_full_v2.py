@@ -85,17 +85,26 @@ def zip_dir(src: Path, prefix: str, only: str | None = None) -> bytes:
 
 def main() -> int:
     stamp = int(time.time())
-    email = f"e2e-v2-{stamp}@example.com"
+    login_identifier = f"e2e-v2-{stamp}"
     pw = "E2eVerify!2026"
-    with short() as c:
-        c.post(f"{BASE}/auth/register", json={"email": email, "password": pw,
-                                              "display_name": "E2E V2"}).raise_for_status()
-        token = c.post(f"{BASE}/auth/login", json={"email": email, "password": pw}).json()["access_token"]
+    with short() as client:
+        registration = client.post(
+            f"{BASE}/auth/register",
+            json={
+                "login_identifier": login_identifier,
+                "password": pw,
+                "display_name": "E2E V2",
+            },
+        )
+        registration.raise_for_status()
+        uid = registration.json()["id"]
+        token = client.post(
+            f"{BASE}/auth/login",
+            json={"login_identifier": login_identifier, "password": pw},
+        ).json()["access_token"]
     H = {"Authorization": f"Bearer {token}"}
-    results["email"] = email
-    log(f"fresh user {email}")
-
-    uid = psql(f"SELECT id FROM users WHERE email='{email}'")
+    results["login_identifier"] = login_identifier
+    log(f"fresh user {login_identifier}")
 
     def total() -> int:
         with short() as c:
@@ -144,25 +153,29 @@ def main() -> int:
                 with upclient() as c:
                     r = c.post(f"{BASE}/upload", headers=H,
                                files={"file": (path.name, path.read_bytes(), "application/json")})
-                r.raise_for_status(); entry["resp"] = r.json()
+                r.raise_for_status()
+                entry["resp"] = r.json()
             elif kind == "epic":
                 blob = zip_dir(path, "EHITables", only=".tsv")
                 with upclient() as c:
                     r = c.post(f"{BASE}/upload/epic-export", headers=H,
                                files={"file": ("EHITables.zip", blob, "application/zip")})
-                r.raise_for_status(); entry["resp"] = r.json()
+                r.raise_for_status()
+                entry["resp"] = r.json()
             elif kind == "xdm":
                 blob = zip_dir(path, "IHE_XDM")
                 with upclient() as c:
                     r = c.post(f"{BASE}/upload", headers=H,
                                files={"file": (f"{path.parent.name}.zip", blob, "application/zip")})
-                r.raise_for_status(); entry["resp"] = r.json()
+                r.raise_for_status()
+                entry["resp"] = r.json()
             else:  # unstructured
                 with upclient() as c:
                     r = c.post(f"{BASE}/upload/unstructured", headers=H,
                                files={"file": (path.name, path.read_bytes(), "application/pdf")})
                 r.raise_for_status()
-                up = r.json(); entry["resp"] = up
+                up = r.json()
+                entry["resp"] = up
                 entry["extraction"] = poll_db(up["upload_id"], path.name)
             time.sleep(2)
             after = total()

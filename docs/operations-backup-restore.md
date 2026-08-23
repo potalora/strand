@@ -11,7 +11,8 @@ PHI in this app is encrypted at rest with AES-256-GCM under `DATABASE_ENCRYPTION
 - `health_records.fhir_resource` (the clinical JSONB)
 - `uploaded_files.extracted_text` and the JSONB extraction columns
 - `ai_summary_prompts` prompts and responses
-- `users.email` (with `users.email_hmac` as a blind index for lookups)
+- `users.login_identifier` (with `users.login_identifier_hmac` as the unique
+  blind index for lookups)
 - `patients` demographic identifiers (name, MRN, DOB, contact)
 - stored per-user LLM API keys
 
@@ -92,6 +93,21 @@ Check the volume name with `docker volume ls` if `test_autonomous_ai_web_records
 - Keep more than one generation. A single rolling backup gives you no recovery point if the latest run captured corruption.
 - Test a restore periodically. A backup you have never restored is a guess, not a backup.
 
+## Account-identifier downgrade and rollback
+
+Make a database backup before upgrading through the migration that renames the
+account identifier columns. A downgrade first decrypts every
+`users.login_identifier` in process with the existing
+`DATABASE_ENCRYPTION_KEY` and checks it against the legacy email-validation
+contract. Plaintext stays in process: the downgrade does not log it, write it
+back to the database, or rewrite the stored ciphertext or blind index.
+
+If the key is missing or wrong, decryption fails, or any identifier is not a
+legacy-compatible email address, the downgrade stops before any schema
+mutation. After any non-email identifier has been created, restore the
+pre-migration database backup to return to the legacy schema. The database also
+returns to that backup's point in time.
+
 ## Restore procedure
 
 The same `DATABASE_ENCRYPTION_KEY` that encrypted the data must be in place before the app reads anything. Restore the database and files first, put the key back, then start the app.
@@ -150,7 +166,9 @@ Notes:
 
 Confirm the data both loaded and decrypts. A row count alone does not prove the key is right, because ciphertext counts the same with the wrong key.
 
-1. **Start the app and sign in.** A failed login here usually means `users.email` is not decrypting, which points at a wrong or missing `DATABASE_ENCRYPTION_KEY`.
+1. **Start the app and sign in.** A failed sign-in may mean
+   `users.login_identifier` cannot be decrypted. Check that the restored
+   instance has the original `DATABASE_ENCRYPTION_KEY` before changing data.
 2. **Open a record.** If the timeline and a record detail render real clinical content (not blanks or an error), the clinical JSONB is decrypting under the current key.
 3. **Spot-check counts** against what you expect:
 

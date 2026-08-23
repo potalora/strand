@@ -212,13 +212,17 @@ erDiagram
 ```
 
 `health_records` is the core table: every clinical fact, stored as an encrypted
-FHIR R4 payload. Patient identifiers, account email, uploaded source files,
-extracted text and entities, prompts, summaries, strict-local checkpoints, and
-evidence are encrypted at rest with app-layer AES-256-GCM. Some operational and
-search metadata remains plaintext by design. UUID primary keys are used
-throughout. Nothing is hard-deleted: `deleted_at` marks a row gone, and deleting
-an upload cascades that soft-delete to the records it produced. Full schema
-lives in the Alembic migrations.
+FHIR R4 payload. Patient identifiers, private account login identifiers,
+uploaded source files, extracted text and entities, prompts, summaries,
+strict-local checkpoints, and evidence are encrypted at rest with app-layer
+AES-256-GCM. Some operational and search metadata remains plaintext by design.
+UUID primary keys are used throughout. Nothing is hard-deleted: `deleted_at`
+marks a row gone, and deleting an upload cascades that soft-delete to the
+records it produced. Full schema lives in the Alembic migrations.
+
+Signing in does not require an email address. A private login identifier can
+look like an email, but Strand does not send email or provide email-based
+recovery.
 
 ## Configuration
 
@@ -283,12 +287,12 @@ Full contract: [`docs/backend-handoff.md`](docs/backend-handoff.md) (base URL `/
 | Password complexity | UUID upload filenames | CORS hardening |
 
 **What's encrypted at rest.** App-layer AES-256-GCM covers patient identifiers,
-account email, clinical FHIR payloads, uploaded source files, extracted
-text/entities, prompts, summaries, strict-local checkpoints, and evidence.
-Operational fields needed for indexing, filtering, audit, and job control are
-not all encrypted. Full-disk encryption (FileVault, LUKS, or BitLocker) is
-still recommended because plaintext exists in process memory and temporary
-owner-only scratch while a document is processed.
+private account login identifiers, clinical FHIR payloads, uploaded source
+files, extracted text/entities, prompts, summaries, strict-local checkpoints,
+and evidence. Operational fields needed for indexing, filtering, audit, and job
+control are not all encrypted. Full-disk encryption (FileVault, LUKS, or
+BitLocker) is still recommended because plaintext exists in process memory and
+temporary owner-only scratch while a document is processed.
 
 These are HIPAA-informed security controls, not a certification. HIPAA compliance is an organizational state — risk analysis, business associate agreements, a trained workforce, audited policies — not a property of code, and a single-user, self-hosted instance is not a covered entity in the first place. The controls here describe the safeguards in the code, not a certification of compliance, and the operator is responsible for any compliance obligations that attach to their use.
 
