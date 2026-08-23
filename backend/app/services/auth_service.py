@@ -26,6 +26,22 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds
 
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_DURATION_MINUTES = 15
+_LOGIN_IDENTIFIER_HMAC_CONSTRAINT = "ix_users_login_identifier_hmac"
+
+
+def _is_login_identifier_unique_violation(error: IntegrityError) -> bool:
+    current: BaseException | None = error.orig
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if (
+            getattr(current, "sqlstate", None) == "23505"
+            and getattr(current, "constraint_name", None)
+            == _LOGIN_IDENTIFIER_HMAC_CONSTRAINT
+        ):
+            return True
+        current = current.__cause__
+    return False
 
 
 def hash_password(password: str) -> str:
@@ -62,9 +78,11 @@ async def register_user(
     db.add(user)
     try:
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
-        raise ValueError("Account identifier is unavailable.") from None
+        if _is_login_identifier_unique_violation(exc):
+            raise ValueError("Account identifier is unavailable.") from None
+        raise
     await db.refresh(user)
     return user
 
@@ -77,9 +95,7 @@ async def authenticate_user(
     """Authenticate a user and return JWT tokens."""
     login_identifier = normalize_login_identifier(login_identifier)
     result = await db.execute(
-        select(User).where(
-            User.login_identifier_hmac == blind_index(login_identifier)
-        )
+        select(User).where(User.login_identifier_hmac == blind_index(login_identifier))
     )
     user = result.scalar_one_or_none()
 
@@ -106,7 +122,11 @@ async def authenticate_user(
         user.last_failed_login_at = now
         if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
             user.locked_until = now + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
-            logger.warning("Account locked for user %s after %d failed attempts", user.id, user.failed_login_attempts)
+            logger.warning(
+                "Account locked for user %s after %d failed attempts",
+                user.id,
+                user.failed_login_attempts,
+            )
         await db.commit()
         raise ValueError("Invalid account identifier or password")
 
@@ -224,7 +244,11 @@ async def refresh_tokens(
     # Rotate: revoke the presented refresh token, then mint a fresh pair.
     if old_jti:
         exp = payload.get("exp")
-        expires_at = datetime.fromtimestamp(exp, tz=timezone.utc) if exp else datetime.now(timezone.utc)
+        expires_at = (
+            datetime.fromtimestamp(exp, tz=timezone.utc)
+            if exp
+            else datetime.now(timezone.utc)
+        )
         db.add(
             RevokedToken(
                 jti=old_jti,
@@ -265,9 +289,7 @@ async def purge_expired_revoked_tokens(db: AsyncSession) -> int:
     no such trigger, so a DELETE here is allowed. Returns the rows removed.
     """
     result = await db.execute(
-        delete(RevokedToken).where(
-            RevokedToken.expires_at < datetime.now(timezone.utc)
-        )
+        delete(RevokedToken).where(RevokedToken.expires_at < datetime.now(timezone.utc))
     )
     await db.commit()
     return result.rowcount or 0

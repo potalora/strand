@@ -7,10 +7,10 @@ const loginIdentifier = testIdentifier("admin-system");
 
 /**
  * Repaired for the consolidated Admin → System tab (Settings folded in). Tabs use
- * role="tab"; the pane now shows an Account card, a "This record" stats card, a
- * Preferences card (Appearance + Delete confirmation), data-export + Sign out,
- * and an audit log. The old "Patients/Uploads/Active" stats and the raw user-UUID
- * field no longer exist.
+ * role="tab"; the pane now shows an Account card, an empty-account "This record"
+ * zero-state statistics card, a Preferences card (Appearance + Delete
+ * confirmation), data-export + Sign out, and an audit log. The old
+ * "Patients/Uploads/Active" stats and the raw user-UUID field no longer exist.
  */
 test.describe("Admin — System tab", () => {
   test.beforeAll(async () => {
@@ -31,15 +31,17 @@ test.describe("Admin — System tab", () => {
     await expect(page.getByText("e2•••", { exact: true })).toBeVisible();
   });
 
-  test("this-record statistics render", async ({ page }) => {
+  test("empty-account statistic labels render in the zero state", async ({
+    page,
+  }) => {
     await browserLogin(page, loginIdentifier, TEST_PASSWORD);
     await page.goto("/admin?tab=sys");
 
     await expect(page.getByRole("heading", { name: "This record" })).toBeVisible({
       timeout: 10_000,
     });
-    // Scope to the field labels in the "This record" card ("Records" also names
-    // the admin tab and appears in audit-log rows).
+    // Scope these empty-account zero-state statistic labels to the "This record"
+    // card ("Records" also names the admin tab and appears in audit-log rows).
     await expect(page.locator(".field-l").filter({ hasText: /^Records$/ })).toBeVisible();
     await expect(page.locator(".field-l").filter({ hasText: /^Sources$/ })).toBeVisible();
     await expect(page.locator(".field-l").filter({ hasText: /^Span$/ })).toBeVisible();

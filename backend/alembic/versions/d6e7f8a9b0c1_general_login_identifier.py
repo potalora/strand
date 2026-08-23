@@ -7,12 +7,14 @@ Create Date: 2026-08-23
 
 from __future__ import annotations
 
+import hmac
+
 import sqlalchemy as sa
 from alembic import op
 from cryptography.exceptions import InvalidTag
 from pydantic import EmailStr, TypeAdapter, ValidationError
 
-from app.middleware.encryption import decrypt_field
+from app.middleware.encryption import blind_index, decrypt_field
 
 # revision identifiers, used by Alembic.
 revision = "d6e7f8a9b0c1"
@@ -37,13 +39,15 @@ def upgrade() -> None:
 def _assert_legacy_email_compatible() -> None:
     connection = op.get_bind()
     connection.execute(sa.text("LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE"))
-    ciphertext_values = connection.execute(
-        sa.text("SELECT login_identifier FROM users")
-    ).scalars()
+    encrypted_identifiers = connection.execute(
+        sa.text("SELECT login_identifier, login_identifier_hmac FROM users")
+    )
     try:
-        for ciphertext in ciphertext_values:
+        for ciphertext, stored_hmac in encrypted_identifiers:
             plaintext = decrypt_field(bytes(ciphertext))
-            _EMAIL_ADAPTER.validate_python(plaintext)
+            legacy_email = str(_EMAIL_ADAPTER.validate_python(plaintext))
+            if not hmac.compare_digest(blind_index(legacy_email), stored_hmac):
+                raise RuntimeError(DOWNGRADE_BLOCKED)
     except (InvalidTag, RuntimeError, ValueError, ValidationError):
         raise RuntimeError(DOWNGRADE_BLOCKED) from None
 

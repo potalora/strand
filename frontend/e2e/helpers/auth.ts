@@ -23,7 +23,10 @@ export async function getTestAuth(): Promise<AuthContext> {
     });
     if (regRes.ok) {
       const data = await regRes.json();
-      return { accessToken: data.access_token, refreshToken: data.refresh_token };
+      return {
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token,
+      };
     }
   } catch {
     // Registration may fail if account already exists — that's fine
@@ -44,7 +47,10 @@ export async function getTestAuth(): Promise<AuthContext> {
   }
 
   const data = await loginRes.json();
-  return { accessToken: data.access_token, refreshToken: data.refresh_token };
+  return {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+  };
 }
 
 export function authHeaders(token: string): Record<string, string> {

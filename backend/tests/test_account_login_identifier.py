@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
+from asyncpg.exceptions import UniqueViolationError
 from httpx import AsyncClient
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -20,9 +21,12 @@ from app.schemas.auth import LoginRequest, RegisterRequest, UserResponse
 
 
 def test_identifier_normalization_is_exact_lower_not_unicode_caseless() -> None:
-    assert RegisterRequest.model_validate(
-        {"login_identifier": "  Alice  ", "password": "SecurePass123!"}
-    ).login_identifier == "Alice"
+    assert (
+        RegisterRequest.model_validate(
+            {"login_identifier": "  Alice  ", "password": "SecurePass123!"}
+        ).login_identifier
+        == "Alice"
+    )
     assert blind_index("Alice") == blind_index("alice")
     assert blind_index("Straße") != blind_index("STRASSE")
     assert blind_index("Å") != blind_index("A\u030a")
@@ -94,12 +98,16 @@ def _assert_content_free_response(
     assert set(response_json) == {"detail"}
     serialized = response_content.decode("utf-8")
     for sentinel in sentinels:
-        assert sentinel not in serialized
-        assert sentinel.strip().lower() not in serialized
-        assert blind_index(sentinel) not in serialized
-        assert sentinel not in captured_logs
+        for sensitive_value in (
+            sentinel,
+            sentinel.strip().lower(),
+            blind_index(sentinel),
+        ):
+            assert sensitive_value not in serialized
+            assert sensitive_value not in captured_logs
     for framework_key in ("input", "ctx", "loc"):
         assert framework_key not in serialized
+        assert framework_key not in captured_logs
     assert json.loads(serialized) == {"detail": "Invalid authentication request."}
 
 
@@ -136,9 +144,9 @@ async def test_register_422_is_complete_and_content_free(
 ) -> None:
     response = await client.post("/api/v1/auth/register", json=payload)
     assert response.status_code == 422
-    sentinels = [
-        value for value in payload.values() if isinstance(value, str)
-    ] + ["identifier-sentinel-type"]
+    sentinels = [value for value in payload.values() if isinstance(value, str)] + [
+        "identifier-sentinel-type"
+    ]
     _assert_content_free_response(
         response.content, response.json(), sentinels, caplog.text
     )
@@ -173,9 +181,10 @@ async def test_login_422_is_complete_and_content_free(
 ) -> None:
     response = await client.post("/api/v1/auth/login", json=payload)
     assert response.status_code == 422
-    sentinels = [
-        value for value in payload.values() if isinstance(value, str)
-    ] + ["login-identifier-sentinel-type", "login-password-sentinel-type"]
+    sentinels = [value for value in payload.values() if isinstance(value, str)] + [
+        "login-identifier-sentinel-type",
+        "login-password-sentinel-type",
+    ]
     _assert_content_free_response(
         response.content, response.json(), sentinels, caplog.text
     )
@@ -188,8 +197,7 @@ async def test_login_malformed_json_422_is_complete_and_content_free(
     identifier_sentinel = "login-identifier-sentinel-malformed-json"
     password_sentinel = "login-password-sentinel-malformed-json"
     malformed_json = (
-        f'{{"login_identifier":"{identifier_sentinel}",'
-        f'"password":"{password_sentinel}"'
+        f'{{"login_identifier":"{identifier_sentinel}","password":"{password_sentinel}"'
     )
 
     response = await client.post(
@@ -338,9 +346,7 @@ async def test_active_lockout_response_remains_unchanged(client: AsyncClient) ->
             json={"login_identifier": identifier, "password": "WrongPass123!"},
         )
         assert failed.status_code == 401
-        assert failed.json() == {
-            "detail": "Invalid account identifier or password."
-        }
+        assert failed.json() == {"detail": "Invalid account identifier or password."}
 
     login_limiter._requests.clear()
     locked = await client.post(
@@ -386,8 +392,21 @@ async def test_expired_lockout_resets_before_next_failure(
     assert reloaded.locked_until is None
 
 
+def _wrapped_unique_violation(constraint_name: str) -> IntegrityError:
+    driver_error = UniqueViolationError.new(
+        {
+            "C": "23505",
+            "M": "synthetic unique violation",
+            "n": constraint_name,
+        }
+    )
+    dbapi_error = RuntimeError("synthetic asyncpg adapter error")
+    dbapi_error.__cause__ = driver_error
+    return IntegrityError("synthetic insert", {}, dbapi_error)
+
+
 @pytest.mark.asyncio
-async def test_commit_time_duplicate_is_generic_and_rolls_back(
+async def test_commit_time_identifier_duplicate_is_generic_and_rolls_back(
     client: AsyncClient,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -395,11 +414,7 @@ async def test_commit_time_duplicate_is_generic_and_rolls_back(
     original_rollback = db_session.rollback
     rollback = AsyncMock(wraps=original_rollback)
     commit = AsyncMock(
-        side_effect=IntegrityError(
-            "synthetic unique constraint race",
-            {},
-            RuntimeError("synthetic unique violation"),
-        )
+        side_effect=_wrapped_unique_violation("ix_users_login_identifier_hmac")
     )
     monkeypatch.setattr(db_session, "commit", commit)
     monkeypatch.setattr(db_session, "rollback", rollback)
@@ -415,6 +430,35 @@ async def test_commit_time_duplicate_is_generic_and_rolls_back(
     assert response.status_code == 409
     assert response.json() == {"detail": "Account identifier is unavailable."}
     assert "concurrent account sentinel" not in response.text
+    rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_time_unrelated_integrity_error_is_reraised_after_rollback(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_rollback = db_session.rollback
+    rollback = AsyncMock(wraps=original_rollback)
+    integrity_error = _wrapped_unique_violation("unrelated_constraint")
+    monkeypatch.setattr(
+        db_session,
+        "commit",
+        AsyncMock(side_effect=integrity_error),
+    )
+    monkeypatch.setattr(db_session, "rollback", rollback)
+
+    with pytest.raises(IntegrityError) as exc_info:
+        await client.post(
+            "/api/v1/auth/register",
+            json={
+                "login_identifier": "unrelated integrity sentinel",
+                "password": "SecurePass123!",
+            },
+        )
+
+    assert exc_info.value is integrity_error
     rollback.assert_awaited_once()
 
 
@@ -461,8 +505,14 @@ async def test_successful_login_audit_details_are_none(
     ).status_code == 200
 
     login_logs = (
-        await db_session.execute(select(AuditLog).where(AuditLog.action == "user.login"))
-    ).scalars().all()
+        (
+            await db_session.execute(
+                select(AuditLog).where(AuditLog.action == "user.login")
+            )
+        )
+        .scalars()
+        .all()
+    )
     assert login_logs
     assert all(log.details is None for log in login_logs)
     assert identifier not in json.dumps(

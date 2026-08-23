@@ -20,6 +20,7 @@ from alembic.operations import Operations
 from cryptography.exceptions import InvalidTag
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from pydantic import EmailStr, TypeAdapter
 from sqlalchemy import event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
@@ -47,6 +48,8 @@ _MIGRATION_DATABASE = "medtimeline_issue67_migrations_ci"
 _TEST_ENCRYPTION_KEY = "19" * 32
 _WRONG_ENCRYPTION_KEY = "91" * 32
 _LEGACY_IDENTIFIER = "legacy-migration@example.com"
+_DECOMPOSED_LEGACY_IDENTIFIER = "u\u0308ser@example.com"
+_NORMALIZED_LEGACY_IDENTIFIER = "üser@example.com"
 _NON_EMAIL_IDENTIFIER = "synthetic account name sentinel"
 _PASSWORD = "SecurePass123!"
 _USER_ID = uuid.UUID("00000000-0000-0000-0000-000000006701")
@@ -55,32 +58,36 @@ DOWNGRADE_BLOCKED = (
     "Downgrade blocked: account identifiers are not compatible with the legacy schema."
 )
 _DOWNGRADE_LOCK = "LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE"
+_EMAIL_ADAPTER = TypeAdapter(EmailStr)
 
 
 class FakeScalarResult:
-    def __init__(self, values: list[bytes]) -> None:
-        self._values = values
+    def __init__(self, rows: list[tuple[bytes, str]]) -> None:
+        self._rows = rows
 
     def __iter__(self) -> Iterator[bytes]:
-        return iter(self._values)
+        return iter(row[0] for row in self._rows)
 
 
 class FakeResult:
-    def __init__(self, values: list[bytes]) -> None:
-        self._values = values
+    def __init__(self, rows: list[tuple[bytes, str]]) -> None:
+        self._rows = rows
+
+    def __iter__(self) -> Iterator[tuple[bytes, str]]:
+        return iter(self._rows)
 
     def scalars(self) -> FakeScalarResult:
-        return FakeScalarResult(self._values)
+        return FakeScalarResult(self._rows)
 
 
 class FakeConnection:
-    def __init__(self, values: list[bytes], events: list[str]) -> None:
-        self._values = values
+    def __init__(self, rows: list[tuple[bytes, str]], events: list[str]) -> None:
+        self._rows = rows
         self._events = events
 
     def execute(self, statement: object) -> FakeResult:
         self._events.append(str(statement))
-        return FakeResult(self._values)
+        return FakeResult(self._rows)
 
 
 @pytest.fixture
@@ -121,11 +128,11 @@ def _require_migration(module: ModuleType | None) -> ModuleType:
 def _patch_fake_operations(
     migration: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
-    values: list[bytes],
+    rows: list[tuple[bytes, str]],
 ) -> tuple[list[str], list[tuple[str, tuple[object, ...], dict[str, object]]]]:
     connection_events: list[str] = []
     ddl_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
-    connection = FakeConnection(values, connection_events)
+    connection = FakeConnection(rows, connection_events)
     monkeypatch.setattr(migration.op, "get_bind", lambda: connection)
     monkeypatch.setattr(
         migration.op,
@@ -199,7 +206,7 @@ def test_downgrade_preflight_failure_is_content_free_and_precedes_ddl(
     connection_events, ddl_calls = _patch_fake_operations(
         migration,
         monkeypatch,
-        [encrypt_field(sentinel)],
+        [(encrypt_field(sentinel), blind_index(sentinel))],
     )
 
     with pytest.raises(RuntimeError) as exc_info:
@@ -209,7 +216,7 @@ def test_downgrade_preflight_failure_is_content_free_and_precedes_ddl(
     assert ddl_calls == []
     assert connection_events == [
         _DOWNGRADE_LOCK,
-        "SELECT login_identifier FROM users",
+        "SELECT login_identifier, login_identifier_hmac FROM users",
     ]
     assert all("UPDATE" not in statement.upper() for statement in connection_events)
     assert sentinel not in str(exc_info.value)
@@ -234,7 +241,7 @@ def test_downgrade_key_or_decryption_failure_is_content_free_and_precedes_ddl(
     connection_events, ddl_calls = _patch_fake_operations(
         migration,
         monkeypatch,
-        [b"synthetic-ciphertext"],
+        [(b"synthetic-ciphertext", "synthetic-hmac")],
     )
     failure_text = str(failure)
 
@@ -250,7 +257,7 @@ def test_downgrade_key_or_decryption_failure_is_content_free_and_precedes_ddl(
     assert ddl_calls == []
     assert connection_events == [
         _DOWNGRADE_LOCK,
-        "SELECT login_identifier FROM users",
+        "SELECT login_identifier, login_identifier_hmac FROM users",
     ]
     assert all("UPDATE" not in statement.upper() for statement in connection_events)
     assert failure_text not in str(exc_info.value)
@@ -265,7 +272,7 @@ def test_downgrade_does_not_broaden_the_approved_exception_set(
     connection_events, ddl_calls = _patch_fake_operations(
         migration,
         monkeypatch,
-        [b"synthetic-ciphertext"],
+        [(b"synthetic-ciphertext", "synthetic-hmac")],
     )
 
     def raise_unexpected(_ciphertext: bytes) -> str:
@@ -279,8 +286,47 @@ def test_downgrade_does_not_broaden_the_approved_exception_set(
     assert ddl_calls == []
     assert connection_events == [
         _DOWNGRADE_LOCK,
-        "SELECT login_identifier FROM users",
+        "SELECT login_identifier, login_identifier_hmac FROM users",
     ]
+
+
+def test_downgrade_refuses_email_validator_normalization_mismatch_before_ddl(
+    migration_module: ModuleType | None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    configured_test_key: None,
+) -> None:
+    del configured_test_key
+    migration = _require_migration(migration_module)
+    normalized = str(_EMAIL_ADAPTER.validate_python(_DECOMPOSED_LEGACY_IDENTIFIER))
+    assert normalized == _NORMALIZED_LEGACY_IDENTIFIER
+    stored_hmac = blind_index(_DECOMPOSED_LEGACY_IDENTIFIER)
+    normalized_hmac = blind_index(normalized)
+    assert stored_hmac != normalized_hmac
+    connection_events, ddl_calls = _patch_fake_operations(
+        migration,
+        monkeypatch,
+        [(encrypt_field(_DECOMPOSED_LEGACY_IDENTIFIER), stored_hmac)],
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        migration.downgrade()
+
+    assert str(exc_info.value) == DOWNGRADE_BLOCKED
+    assert ddl_calls == []
+    assert connection_events == [
+        _DOWNGRADE_LOCK,
+        "SELECT login_identifier, login_identifier_hmac FROM users",
+    ]
+    assert all("UPDATE" not in statement.upper() for statement in connection_events)
+    for sensitive_value in (
+        _DECOMPOSED_LEGACY_IDENTIFIER,
+        normalized,
+        stored_hmac,
+        normalized_hmac,
+    ):
+        assert sensitive_value not in str(exc_info.value)
+        assert sensitive_value not in caplog.text
 
 
 def test_email_compatible_downgrade_runs_only_inverse_renames_in_order(
@@ -293,14 +339,14 @@ def test_email_compatible_downgrade_runs_only_inverse_renames_in_order(
     connection_events, ddl_calls = _patch_fake_operations(
         migration,
         monkeypatch,
-        [encrypt_field(_LEGACY_IDENTIFIER)],
+        [(encrypt_field(_LEGACY_IDENTIFIER), blind_index(_LEGACY_IDENTIFIER))],
     )
 
     migration.downgrade()
 
     assert connection_events == [
         _DOWNGRADE_LOCK,
-        "SELECT login_identifier FROM users",
+        "SELECT login_identifier, login_identifier_hmac FROM users",
     ]
     assert ddl_calls == [
         (
@@ -508,7 +554,7 @@ async def _run_downgrade_with_validation_barrier(
     ) -> None:
         nonlocal ddl_statement_count
         normalized = " ".join(statement.split()).upper()
-        if normalized == "SELECT LOGIN_IDENTIFIER FROM USERS":
+        if normalized == ("SELECT LOGIN_IDENTIFIER, LOGIN_IDENTIFIER_HMAC FROM USERS"):
             validation_started.set()
             if not allow_ddl.wait(timeout=15):
                 raise TimeoutError("test barrier did not release downgrade DDL")
@@ -725,7 +771,8 @@ async def test_email_only_downgrade_preserves_ciphertext_and_hmac_bytes(
         await engine.dispose()
 
     assert any(
-        " ".join(statement.split()) == "SELECT login_identifier FROM users"
+        " ".join(statement.split())
+        == "SELECT login_identifier, login_identifier_hmac FROM users"
         for statement in statements
     )
     assert all(
@@ -819,7 +866,15 @@ async def test_concurrent_identifier_update_waits_for_downgrade_ddl_after_valida
 
 @pytest.mark.parametrize(
     ("identifier", "wrong_key"),
-    ((_NON_EMAIL_IDENTIFIER, False), (_LEGACY_IDENTIFIER, True)),
+    (
+        pytest.param(_NON_EMAIL_IDENTIFIER, False, id="non-email"),
+        pytest.param(_LEGACY_IDENTIFIER, True, id="wrong-key"),
+        pytest.param(
+            _DECOMPOSED_LEGACY_IDENTIFIER,
+            False,
+            id="email-validator-normalization-mismatch",
+        ),
+    ),
 )
 async def test_refused_downgrade_preserves_canonical_schema_and_bytes_before_any_write(
     migration_module: ModuleType | None,
@@ -835,6 +890,14 @@ async def test_refused_downgrade_preserves_canonical_schema_and_bytes_before_any
         seeded_values = await _seed_legacy_user(engine, identifier)
     finally:
         await engine.dispose()
+    sensitive_values = {identifier, seeded_values[1]}
+    if identifier == _DECOMPOSED_LEGACY_IDENTIFIER:
+        sensitive_values.update(
+            {
+                _NORMALIZED_LEGACY_IDENTIFIER,
+                blind_index(_NORMALIZED_LEGACY_IDENTIFIER),
+            }
+        )
     result = _run_alembic(migration_database_url, "upgrade", "d6e7f8a9b0c1")
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -860,7 +923,8 @@ async def test_refused_downgrade_preserves_canonical_schema_and_bytes_before_any
         await engine.dispose()
 
     assert any(
-        " ".join(statement.split()) == "SELECT login_identifier FROM users"
+        " ".join(statement.split())
+        == "SELECT login_identifier, login_identifier_hmac FROM users"
         for statement in statements
     )
     assert all(
@@ -874,8 +938,9 @@ async def test_refused_downgrade_preserves_canonical_schema_and_bytes_before_any
     assert signature["identifier_indexes"] == (
         ("ix_users_login_identifier_hmac", ("login_identifier_hmac",), True),
     )
-    assert identifier not in str(exc_info.value)
-    assert identifier not in caplog.text
+    for sensitive_value in sensitive_values:
+        assert sensitive_value not in str(exc_info.value)
+        assert sensitive_value not in caplog.text
     assert str(_USER_ID) not in str(exc_info.value)
     assert str(_USER_ID) not in caplog.text
 
