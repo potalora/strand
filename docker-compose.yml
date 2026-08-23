@@ -84,9 +84,9 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:${DB_PASSWORD}@db:5432/${POSTGRES_DB:-medtimeline}
       REDIS_URL: redis://redis:6379/0
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
-      # This loopback-only profile serves plain HTTP. Network deployments must
-      # terminate TLS and override APP_ENV=production.
-      APP_ENV: ${APP_ENV:-development}
+      # This profile serves loopback HTTP and must not be exposed beyond localhost.
+      # Non-loopback deployments need a separate TLS reverse proxy and production settings.
+      APP_ENV: ${APP_ENV:-local}
       # Transport security (W19 / CRYPTO-04). Host headers TrustedHostMiddleware
       # accepts in production. Default permissive for loopback; set to the real
       # deployment hostname(s) when serving beyond localhost.

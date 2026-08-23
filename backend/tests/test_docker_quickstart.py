@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shlex
+import subprocess
+import sys
 
 from app.config import Settings
 
@@ -75,6 +78,31 @@ def _final_dockerfile_environment(source: str) -> dict[str, str]:
     return environment
 
 
+def _database_engine_echo(app_env: str) -> str:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "APP_ENV": app_env,
+            "DATABASE_URL": "postgresql+asyncpg://localhost:5432/medtimeline",
+            "JWT_SECRET_KEY": STRONG_SECRET,
+            "DATABASE_ENCRYPTION_KEY": VALID_KEY,
+        }
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from app.database import engine; print(engine.echo)",
+        ],
+        cwd=REPOSITORY_ROOT / "backend",
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
 def test_docker_env_example_uses_nonproduction_mode_for_loopback_http() -> None:
     example = (REPOSITORY_ROOT / ".env.docker.example").read_text(encoding="utf-8")
 
@@ -91,13 +119,23 @@ def test_docker_env_example_uses_nonproduction_mode_for_loopback_http() -> None:
     assert configured.is_production is False
 
 
-def test_compose_fallback_uses_nonproduction_mode_for_loopback_http() -> None:
+def test_resolved_quickstart_mode_disables_sqlalchemy_echo() -> None:
+    example = (REPOSITORY_ROOT / ".env.docker.example").read_text(encoding="utf-8")
     compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-
-    assert (
-        _yaml_mapping_value(compose, "services", "backend", "environment", "APP_ENV")
-        == "${APP_ENV:-development}"
+    example_app_env = _environment_value(example, "APP_ENV")
+    compose_expression = _yaml_mapping_value(
+        compose,
+        "services",
+        "backend",
+        "environment",
+        "APP_ENV",
     )
+    assert compose_expression.startswith("${APP_ENV:-")
+    assert compose_expression.endswith("}")
+    compose_app_env = compose_expression.removeprefix("${APP_ENV:-").removesuffix("}")
+
+    assert _database_engine_echo(compose_app_env) == "False"
+    assert example_app_env == compose_app_env == "local"
 
 
 def test_bare_backend_image_still_defaults_to_production() -> None:
