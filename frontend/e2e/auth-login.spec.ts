@@ -21,7 +21,7 @@ test.describe("Login page", () => {
     await expect(accountName).toHaveAttribute("autocapitalize", "none");
     await expect(accountName).toHaveAttribute("spellcheck", "false");
     await expect(
-      page.getByText(/visually similar Unicode text can still be different/i)
+      page.getByText(/visually similar Unicode text may still differ/i)
     ).toBeVisible();
     await page.locator("#loginIdentifier").fill(LOGIN_IDENTIFIER);
     await page.locator("#password").fill(TEST_PASSWORD);

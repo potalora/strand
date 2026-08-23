@@ -18,10 +18,10 @@ test.describe("Register page", () => {
     await expect(accountName).toHaveAttribute("autocapitalize", "none");
     await expect(accountName).toHaveAttribute("spellcheck", "false");
     await expect(
-      page.getByText(/does not need to be an email address/i)
+      page.getByText(/do not need an email address/i)
     ).toBeVisible();
     await expect(
-      page.getByText(/visually similar Unicode text can still be different/i)
+      page.getByText(/visually similar Unicode text may still differ/i)
     ).toBeVisible();
     await page.locator("#loginIdentifier").fill(loginIdentifier);
     await page.locator("#password").fill(TEST_PASSWORD);
