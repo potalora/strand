@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_authenticated_user_id
+from app.api.auth_validation import ContentFreeAuthValidationRoute
 from app.middleware.audit import log_audit_event
 from app.middleware.auth import decode_token, security
 from app.middleware.rate_limit import login_limiter, register_limiter
@@ -30,10 +31,17 @@ from app.services.auth_service import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(
+    prefix="/auth", tags=["auth"], route_class=ContentFreeAuthValidationRoute
+)
 
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    name="auth_register",
+)
 async def register(
     body: RegisterRequest,
     request: Request,
@@ -48,7 +56,9 @@ async def register(
         )
 
     try:
-        user = await register_user(db, body.email, body.password, body.display_name)
+        user = await register_user(
+            db, body.login_identifier, body.password, body.display_name
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
@@ -63,7 +73,7 @@ async def register(
     return UserResponse.model_validate(user)
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse, name="auth_login")
 async def login(
     body: LoginRequest,
     request: Request,
@@ -78,11 +88,11 @@ async def login(
         )
 
     try:
-        tokens = await authenticate_user(db, body.email, body.password)
+        tokens = await authenticate_user(db, body.login_identifier, body.password)
     except ValueError as e:
         detail = str(e)
         if "locked" not in detail.lower():
-            detail = "Invalid email or password"
+            detail = "Invalid account identifier or password"
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=detail,
@@ -93,7 +103,6 @@ async def login(
         user_id=None,
         action="user.login",
         ip_address=client_ip,
-        details={"email_domain": body.email.split("@")[1] if "@" in body.email else "unknown"},
     )
     return tokens
 
