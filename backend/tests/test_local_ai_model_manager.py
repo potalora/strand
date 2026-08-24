@@ -2356,6 +2356,31 @@ async def test_constructor_defers_command_validation_until_start(
 
 
 @pytest.mark.asyncio
+async def test_start_with_inert_executable_does_not_spawn_worker(
+    worker_home: Path,
+) -> None:
+    manager = LocalModelManager(
+        ["/usr/bin/false"],
+        worker_home=worker_home,
+        worker_project_dir=worker_home.parent / "non-worker-project",
+    )
+
+    try:
+        await manager.start()
+
+        assert manager._started is True
+        assert manager._worker_command == ("/usr/bin/false",)
+        assert manager._worker_project_dir == worker_home.parent / "non-worker-project"
+        assert manager.active_pid is None
+        assert manager.metrics.live_processes == 0
+        assert manager.metrics.pids_started == []
+        assert manager.metrics.roles_started == []
+        assert list(worker_home.glob(".worker-pycache-*")) == []
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
 async def test_start_resolves_executable_to_absolute_path(
     fake_worker_command: list[str], worker_home: Path
 ) -> None:

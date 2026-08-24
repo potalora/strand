@@ -89,10 +89,7 @@ test.describe("Mixed content upload classification", () => {
     await api.register(email, TEST_PASSWORD);
     await api.login(email, TEST_PASSWORD);
 
-    const result = await api.uploadStructured(
-      PATHS.fhirBundle,
-      "sample_fhir_bundle.json"
-    );
+    const result = await api.uploadTrackedSyntheticFhirCloudAssisted();
     expect(result.upload_id).toBeTruthy();
 
     const status = await api.pollUploadStatus(result.upload_id, 60_000);

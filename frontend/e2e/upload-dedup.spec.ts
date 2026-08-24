@@ -19,10 +19,7 @@ test.describe.serial("Cross-upload dedup detection", () => {
   });
 
   test("first upload creates baseline records", async () => {
-    const result = await api.uploadStructured(
-      PATHS.fhirBundle,
-      "sample_fhir_bundle.json"
-    );
+    const result = await api.uploadTrackedSyntheticFhirCloudAssisted();
     upload1Id = result.upload_id;
     expect(upload1Id).toBeTruthy();
 
@@ -38,10 +35,7 @@ test.describe.serial("Cross-upload dedup detection", () => {
     // records (each resource matches an existing one by source id + content hash), so it
     // no longer creates duplicates to dedup. This asserts the new, correct behavior —
     // genuine cross-source dedup is covered by the "Cross-format dedup" describe below.
-    const result = await api.uploadStructured(
-      PATHS.fhirBundle,
-      "sample_fhir_bundle.json"
-    );
+    const result = await api.uploadTrackedSyntheticFhirCloudAssisted();
     upload2Id = result.upload_id;
     expect(upload2Id).toBeTruthy();
 
@@ -126,10 +120,7 @@ test.describe("Cross-format dedup", () => {
     expect(cda.records_inserted).toBeGreaterThan(0);
 
     // Then upload FHIR bundle (uses synthetic fixture — small, fast)
-    const fhir = await api.uploadStructured(
-      PATHS.fhirBundle,
-      "sample_fhir_bundle.json"
-    );
+    const fhir = await api.uploadTrackedSyntheticFhirCloudAssisted();
     expect(fhir.upload_id).toBeTruthy();
     expect(fhir.records_inserted).toBeGreaterThan(0);
 

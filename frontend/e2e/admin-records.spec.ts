@@ -1,7 +1,7 @@
 import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { browserLogin } from "./helpers/browser-login";
-import { testEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";
+import { testEmail, TEST_PASSWORD } from "./helpers/test-data";
 
 const EMAIL = testEmail("admin-records");
 
@@ -17,10 +17,7 @@ test.describe.serial("Admin — Records tab", () => {
   test.beforeAll(async () => {
     await api.register(EMAIL, TEST_PASSWORD);
     await api.login(EMAIL, TEST_PASSWORD);
-    const result = await api.uploadStructured(
-      PATHS.fhirBundle,
-      "sample_fhir_bundle.json"
-    );
+    const result = await api.uploadTrackedSyntheticFhirCloudAssisted();
     await api.pollUploadStatus(result.upload_id, 60_000);
   });
 

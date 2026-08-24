@@ -1,7 +1,4 @@
 import { test, expect } from "./fixtures/console-gate";
-import * as fs from "fs";
-import * as path from "path";
-import * as os from "os";
 import { ApiClient } from "./helpers/api-client";
 import { browserLogin } from "./helpers/browser-login";
 import { uniqueEmail, TEST_PASSWORD } from "./helpers/test-data";
@@ -97,18 +94,10 @@ test.describe("Large-dataset pagination integrity (Admin → Records)", () => {
     await api.register(email, TEST_PASSWORD);
     await api.login(email, TEST_PASSWORD);
 
-    // Seed via a temp bundle file.
-    const bundlePath = path.join(
-      os.tmpdir(),
-      `e2e-pagination-${Date.now()}.json`
+    const up = await api.uploadGeneratedPaginationFhirCloudAssisted(
+      JSON.stringify(buildBundle())
     );
-    fs.writeFileSync(bundlePath, JSON.stringify(buildBundle()));
-    try {
-      const up = await api.uploadStructured(bundlePath, "pagination-seed.json");
-      await api.pollUploadStatus(up.upload_id, 90_000);
-    } finally {
-      if (fs.existsSync(bundlePath)) fs.unlinkSync(bundlePath);
-    }
+    await api.pollUploadStatus(up.upload_id, 90_000);
 
     // Ground-truth total from the API.
     const meta = await api.getRecords({ page: 1, page_size: 1 });

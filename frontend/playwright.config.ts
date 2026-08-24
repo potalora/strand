@@ -34,11 +34,53 @@ function loadEnvFile(envFile: string, allowlist?: ReadonlySet<string>): void {
   }
 }
 
+type DirectoryIdentity = {
+  realPath: string;
+  dev: number;
+  ino: number;
+  uid: number;
+  mode: number;
+};
+
+function ownedDirectoryIdentity(
+  rawPath: string,
+  label: string,
+  taskCreated: boolean
+): DirectoryIdentity {
+  if (!path.isAbsolute(rawPath)) {
+    throw new Error(`${label} must be absolute.`);
+  }
+  const lexicalPath = path.resolve(rawPath);
+  const linkStats = fs.lstatSync(lexicalPath);
+  if (linkStats.isSymbolicLink() || !linkStats.isDirectory()) {
+    throw new Error(`${label} must be a non-symlink directory.`);
+  }
+  const realPath = fs.realpathSync.native(lexicalPath);
+  const stats = fs.statSync(realPath);
+  if (!stats.isDirectory() || typeof process.getuid !== "function") {
+    throw new Error(`${label} must be an owned directory.`);
+  }
+  const mode = stats.mode & 0o777;
+  const unsafeExistingMode = !taskCreated && (mode & 0o022) !== 0;
+  if (
+    stats.uid !== process.getuid() ||
+    (taskCreated && mode !== 0o700) ||
+    unsafeExistingMode
+  ) {
+    throw new Error(`${label} has unsafe ownership or mode.`);
+  }
+  return {
+    realPath,
+    dev: stats.dev,
+    ino: stats.ino,
+    uid: stats.uid,
+    mode,
+  };
+}
+
+let localOnlyOutputDir: string | undefined;
+
 if (localOnly) {
-  loadEnvFile(
-    path.resolve(repoRoot, ".env.test.local"),
-    new Set(["REAL_MEDICAL_FIXTURES_DIR"])
-  );
   const e2eDatabaseUrl = process.env.E2E_DATABASE_URL;
   if (!e2eDatabaseUrl) {
     throw new Error(
@@ -55,15 +97,102 @@ if (localOnly) {
     configuredDevelopmentDatabase,
     localOnlyProfileReentry
   );
+  const configuredRuntimeRoot = process.env.E2E_RUNTIME_ROOT;
+  const configuredOutputRoot = process.env.E2E_OUTPUT_ROOT;
+  if (!configuredRuntimeRoot || !configuredOutputRoot) {
+    throw new Error("E2E runtime and output roots are required.");
+  }
+  const repoIdentity = ownedDirectoryIdentity(repoRoot, "repository root", false);
+  if (repoIdentity.realPath !== repoRoot) {
+    throw new Error("Repository root must not traverse a symlink.");
+  }
+  const evidenceIdentity = ownedDirectoryIdentity(
+    path.resolve(__dirname, "test-results"),
+    "Playwright evidence parent",
+    false
+  );
+  if (
+    path.dirname(evidenceIdentity.realPath) !==
+    path.join(repoIdentity.realPath, "frontend")
+  ) {
+    throw new Error("Playwright evidence parent escaped the worktree.");
+  }
+  const runtimeParentIdentity = ownedDirectoryIdentity(
+    path.join(evidenceIdentity.realPath, "runtime"),
+    "runtime parent",
+    false
+  );
+  const outputParentIdentity = ownedDirectoryIdentity(
+    path.join(evidenceIdentity.realPath, "executions"),
+    "execution parent",
+    false
+  );
+  if (
+    path.dirname(runtimeParentIdentity.realPath) !== evidenceIdentity.realPath ||
+    path.dirname(outputParentIdentity.realPath) !== evidenceIdentity.realPath
+  ) {
+    throw new Error("E2E root parent escaped the evidence directory.");
+  }
+  const rootIdentity = ownedDirectoryIdentity(
+    configuredRuntimeRoot,
+    "E2E_RUNTIME_ROOT",
+    true
+  );
+  const outputIdentity = ownedDirectoryIdentity(
+    configuredOutputRoot,
+    "E2E_OUTPUT_ROOT",
+    true
+  );
+  if (path.dirname(rootIdentity.realPath) !== runtimeParentIdentity.realPath) {
+    throw new Error("E2E_RUNTIME_ROOT is not an exact runtime-parent child.");
+  }
+  if (path.dirname(outputIdentity.realPath) !== outputParentIdentity.realPath) {
+    throw new Error("E2E_OUTPUT_ROOT is not an exact execution-parent child.");
+  }
+  if (
+    rootIdentity.dev === outputIdentity.dev &&
+    rootIdentity.ino === outputIdentity.ino
+  ) {
+    throw new Error("E2E runtime and output roots must be distinct.");
+  }
+  const runtimePaths = {
+    uploads: path.join(rootIdentity.realPath, "uploads"),
+    tempExtract: path.join(rootIdentity.realPath, "temp-extract"),
+    scratch: path.join(rootIdentity.realPath, "scratch"),
+    models: path.join(rootIdentity.realPath, "models"),
+    nonWorkerProject: path.join(rootIdentity.realPath, "non-worker-project"),
+  };
+  for (const directory of Object.values(runtimePaths)) {
+    if (!fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
+    const childIdentity = ownedDirectoryIdentity(directory, "runtime child", true);
+    if (path.dirname(childIdentity.realPath) !== rootIdentity.realPath) {
+      throw new Error("Runtime child escaped E2E_RUNTIME_ROOT.");
+    }
+  }
+  const outputArtifacts = path.join(outputIdentity.realPath, "artifacts");
+  if (!fs.existsSync(outputArtifacts)) {
+    fs.mkdirSync(outputArtifacts, { mode: 0o700 });
+  }
+  const outputArtifactsIdentity = ownedDirectoryIdentity(
+    outputArtifacts,
+    "Playwright output directory",
+    true
+  );
+  if (path.dirname(outputArtifactsIdentity.realPath) !== outputIdentity.realPath) {
+    throw new Error("Playwright output directory escaped E2E_OUTPUT_ROOT.");
+  }
+  localOnlyOutputDir = outputArtifactsIdentity.realPath;
   Object.assign(process.env, {
     [LOCAL_ONLY_PROFILE_INITIALIZED]: "1",
     APP_ENV: "test",
+    DATABASE_ENCRYPTION_KEY: "00".repeat(32),
+    REAL_MEDICAL_FIXTURES_DIR: "",
+    E2E_ATTESTED_STRICT_PACK: "",
     LOCAL_AI_ENABLED: "true",
-    LOCAL_AI_MODEL_DIR: path.resolve(repoRoot, "backend/data/local-ai/models"),
-    LOCAL_AI_SCRATCH_DIR: path.resolve(
-      repoRoot,
-      "backend/data/local-ai/e2e-scratch"
-    ),
+    UPLOAD_DIR: runtimePaths.uploads,
+    TEMP_EXTRACT_DIR: runtimePaths.tempExtract,
+    LOCAL_AI_MODEL_DIR: runtimePaths.models,
+    LOCAL_AI_SCRATCH_DIR: runtimePaths.scratch,
     LOCAL_AI_MANIFEST_PATH: path.resolve(
       repoRoot,
       "backend/app/model_manifests/apple-m4-16gb-v1.lock.json"
@@ -80,10 +209,10 @@ if (localOnly) {
       repoRoot,
       "backend/artifacts/local-ai-fidelity.json"
     ),
-    LOCAL_AI_WORKER_COMMAND: `${path.resolve(
-      repoRoot,
-      "backend/.venv/bin/python"
-    )} ${path.resolve(repoRoot, "backend/tests/e2e_local_ai_worker.py")}`,
+    // This sentinel only lets lifespan startup normalize a command. Legacy-v1
+    // admission rejects before runtime identity validation or process spawn.
+    LOCAL_AI_WORKER_COMMAND: "/usr/bin/false",
+    LOCAL_AI_WORKER_PROJECT_DIR: runtimePaths.nonWorkerProject,
     EXTRACTION_ENGINE: "local",
     GEMINI_API_KEY: "",
     GOOGLE_API_KEY: "",
@@ -93,6 +222,11 @@ if (localOnly) {
     VERTEX_PROJECT: "",
     GOOGLE_CLOUD_PROJECT: "",
     GOOGLE_APPLICATION_CREDENTIALS: "",
+    LLM_PROVIDER: "gemini",
+    LLM_SUMMARY_PROVIDER: "",
+    LLM_SECTION_PROVIDER: "",
+    LLM_DEDUP_PROVIDER: "",
+    LLM_EXTRACTION_PROVIDER: "",
     HF_HUB_OFFLINE: "1",
     TRANSFORMERS_OFFLINE: "1",
     HF_HUB_DISABLE_TELEMETRY: "1",
@@ -117,6 +251,7 @@ if (localOnly) {
 
 export default defineConfig({
   testDir: "./e2e",
+  outputDir: localOnlyOutputDir,
   timeout: 120_000,
   // External runs share the backend login limiter across three parallel workers,
   // so a UI login can transiently 429 under burst load.
