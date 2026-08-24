@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { ApiClient } from "./helpers/api-client";
-import { uniqueIdentifier, TEST_PASSWORD, PATHS } from "./helpers/test-data";
+import { uniqueIdentifier, TEST_PASSWORD } from "./helpers/test-data";
 
 const loginIdentifier = uniqueIdentifier("setup");
 const SUCCESSFUL_UPLOAD_STATUSES = [
@@ -31,7 +31,7 @@ test.describe("E2E Setup", () => {
   });
 
   test("fixture data can be uploaded and ingested", async () => {
-    const result = await api.uploadStructured(PATHS.fhirBundle, "sample_fhir_bundle.json");
+    const result = await api.uploadTrackedSyntheticFhirCloudAssisted();
     expect(result.upload_id).toBeTruthy();
     const status = await api.pollUploadStatus(result.upload_id, 60_000);
     expect(SUCCESSFUL_UPLOAD_STATUSES).toContain(

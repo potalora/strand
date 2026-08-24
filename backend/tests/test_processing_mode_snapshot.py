@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import os
 import re
+import stat
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,13 +14,16 @@ from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.models.ai_summary import AISummaryPrompt
 from app.models.local_ai import LocalAIJob
 from app.models.llm_settings import LLMProviderConfig
+from app.models.patient import Patient
+from app.models.record import HealthRecord
 from app.models.uploaded_file import UploadedFile
 from app.models.user import User
 from app.schemas.llm_settings import RoutingUpdate
@@ -47,7 +53,7 @@ from app.services.local_ai.runtime_identity import (
 from app.services.ai.llm.config import load_llm_config
 from tests.test_local_ai_runtime_identity import build_worker_project
 from app.utils.file_utils import encrypt_stream
-from tests.conftest import auth_headers
+from tests.conftest import auth_headers, create_test_patient
 
 
 def _load_prompt_only_default_migration() -> ModuleType:
@@ -123,6 +129,69 @@ def _manifest() -> LocalAIManifest:
             for index, role in enumerate(ModelRole, start=1)
         ),
     )
+
+
+def _configure_legacy_v1_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> list[Path]:
+    import app.services.local_ai.processing_snapshot as snapshot_module
+
+    legacy_manifest = replace(
+        _manifest(),
+        schema_version=1,
+        pack_revision="apple-m4-16gb-v1",
+        runtime={"name": "mlx-vlm", "version": "0.5.0"},
+    )
+    manifest_path = tmp_path / "legacy-manifest.json"
+    manifest_path.write_text(
+        json.dumps(asdict(legacy_manifest), sort_keys=True),
+        encoding="utf-8",
+    )
+    release_calls: list[Path] = []
+    monkeypatch.setattr(snapshot_module.settings, "local_ai_enabled", True)
+    monkeypatch.setattr(
+        snapshot_module.settings,
+        "local_ai_manifest_path",
+        str(manifest_path),
+    )
+    monkeypatch.setattr(
+        snapshot_module,
+        "load_release_evidence",
+        lambda path, **_kwargs: release_calls.append(Path(path)),
+    )
+    return release_calls
+
+
+async def _owned_ingestion_counts(
+    db_session: AsyncSession,
+    user_id: UUID,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for model in (UploadedFile, LocalAIJob, HealthRecord, Patient):
+        counts[model.__tablename__] = (
+            await db_session.execute(
+                select(func.count()).select_from(model).where(model.user_id == user_id)
+            )
+        ).scalar_one()
+    return counts
+
+
+def _content_free_storage_snapshot(root: Path) -> dict[str, object]:
+    if not root.exists():
+        return {"root_exists": False, "entries": []}
+    entries: list[dict[str, object]] = []
+    for candidate in sorted(root.rglob("*")):
+        metadata = os.lstat(candidate)
+        entry: dict[str, object] = {
+            "path": candidate.relative_to(root).as_posix(),
+            "type": stat.S_IFMT(metadata.st_mode),
+            "size": metadata.st_size,
+        }
+        if stat.S_ISREG(metadata.st_mode):
+            entry["sha256"] = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        entries.append(entry)
+    return {"root_exists": True, "entries": entries}
 
 
 def _enable_strict_pack(
@@ -1082,6 +1151,123 @@ async def test_structured_upload_rejects_unsupported_processing_mode_before_inge
     assert response.json()["detail"] == (
         f"{mode} is not available for document ingestion."
     )
+
+
+@pytest.mark.asyncio
+async def test_structured_upload_rejects_legacy_strict_runtime_without_request_side_effects(
+    client,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import app.services.ingestion.coordinator as coordinator
+    from app.config import settings
+
+    headers, user_id_text = await auth_headers(
+        client,
+        email="legacy-strict-no-side-effects@example.com",
+    )
+    user_id = UUID(user_id_text)
+    release_calls = _configure_legacy_v1_admission(monkeypatch, tmp_path)
+    upload_root = tmp_path / "uploads"
+    monkeypatch.setattr(settings, "upload_dir", str(upload_root))
+
+    async def _unexpected_ingestion(**_kwargs: object) -> dict[str, object]:
+        pytest.fail("legacy strict rejection reached ingestion")
+
+    monkeypatch.setattr(coordinator, "ingest_file", _unexpected_ingestion)
+    before_counts = await _owned_ingestion_counts(db_session, user_id)
+    before_storage = _content_free_storage_snapshot(upload_root)
+
+    response = await client.post(
+        "/api/v1/upload",
+        headers=headers,
+        data={"processing_mode": "validated_strict_local"},
+        files={
+            "file": (
+                "bundle.json",
+                b'{"resourceType":"Bundle","entry":[]}',
+                "application/fhir+json",
+            )
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Strict-local worker runtime identity is required."
+    }
+    assert await _owned_ingestion_counts(db_session, user_id) == before_counts
+    assert _content_free_storage_snapshot(upload_root) == before_storage
+    assert release_calls == []
+
+
+@pytest.mark.asyncio
+async def test_summary_endpoint_rejects_legacy_strict_runtime_before_prompt_or_job(
+    client,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import app.api.summary as summary_api
+
+    headers, user_id_text = await auth_headers(
+        client,
+        email="legacy-strict-summary@example.com",
+    )
+    user_id = UUID(user_id_text)
+    patient = await create_test_patient(db_session, user_id)
+    release_calls = _configure_legacy_v1_admission(monkeypatch, tmp_path)
+    enqueue_calls: list[UUID] = []
+
+    monkeypatch.setattr(
+        summary_api.local_summary_runner,
+        "enqueue",
+        lambda job_id: enqueue_calls.append(job_id),
+    )
+
+    async def _unexpected_generate(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("legacy strict summary reached provider generation")
+
+    monkeypatch.setattr(
+        "app.services.ai.summarizer.generate_summary",
+        _unexpected_generate,
+    )
+
+    async def _summary_counts() -> tuple[int, int]:
+        prompts = (
+            await db_session.execute(
+                select(func.count())
+                .select_from(AISummaryPrompt)
+                .where(AISummaryPrompt.user_id == user_id)
+            )
+        ).scalar_one()
+        jobs = (
+            await db_session.execute(
+                select(func.count())
+                .select_from(LocalAIJob)
+                .where(LocalAIJob.user_id == user_id)
+            )
+        ).scalar_one()
+        return prompts, jobs
+
+    before = await _summary_counts()
+    response = await client.post(
+        "/api/v1/summary/generate",
+        headers=headers,
+        json={
+            "patient_id": str(patient.id),
+            "summary_type": "full",
+            "processing_mode": "validated_strict_local",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Strict-local worker runtime identity is required."
+    }
+    assert await _summary_counts() == before
+    assert enqueue_calls == []
+    assert release_calls == []
 
 
 @pytest.mark.asyncio

@@ -1,11 +1,14 @@
 import { test, expect, type Page } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
 import { browserLogin } from "./helpers/browser-login";
-import { PATHS, uniqueEmail, TEST_PASSWORD } from "./helpers/test-data";
+import { uniqueEmail, TEST_PASSWORD } from "./helpers/test-data";
 
 const email = uniqueEmail("summaries");
-const modelExecutionConfigured =
-  process.env.E2E_LOCAL_ONLY === "1" || Boolean(process.env.GEMINI_API_KEY);
+const localOnly = process.env.E2E_LOCAL_ONLY === "1";
+const realModelExecutionConfigured =
+  localOnly && process.env.E2E_ATTESTED_STRICT_PACK === "1";
+const modelExecutionSkipReason =
+  "No E2E model execution profile is configured";
 const SUCCESSFUL_UPLOAD_STATUSES = [
   "awaiting_confirmation",
   "completed",
@@ -140,7 +143,7 @@ test.describe("Summaries page", () => {
   test.beforeAll(async () => {
     await api.register(email, TEST_PASSWORD);
     await api.login(email, TEST_PASSWORD);
-    const result = await api.uploadStructured(PATHS.fhirBundle, "sample_fhir_bundle.json");
+    const result = await api.uploadTrackedSyntheticFhirCloudAssisted();
     const status = await api.pollUploadStatus(result.upload_id, 60_000);
     expect(SUCCESSFUL_UPLOAD_STATUSES).toContain(
       status.ingestion_status ?? status.status
@@ -232,18 +235,54 @@ test.describe("Summaries page", () => {
     await expect(json).toHaveAttribute("aria-pressed", "false");
   });
 
-  test("generate button is present and enabled with a patient", async ({ page }) => {
+  test("primary summary action reflects execution availability with a patient", async ({
+    page,
+  }) => {
     await browserLogin(page, email, TEST_PASSWORD);
     await page.goto("/summaries");
 
-    const generateBtn = page.getByRole("button", { name: "Generate summary" });
-    await expect(generateBtn).toBeVisible({ timeout: 10_000 });
-    // The page auto-selects the first patient, so the button is enabled.
-    await expect(generateBtn).toBeEnabled();
+    const recordSubject = page.getByLabel("Record subject");
+    await expect(recordSubject).toHaveValue(/.+/);
+    const processingMode = (await api.getLlmSettings()).routing.processing_mode;
+
+    if (localOnly && process.env.E2E_ATTESTED_STRICT_PACK !== "1") {
+      expect(processingMode).toBe("validated_strict_local");
+
+      const generateBtn = page.getByRole("button", {
+        name: "Generate summary",
+      });
+      await expect(generateBtn).toBeVisible({ timeout: 10_000 });
+      const strictOption = page.locator(
+        'option[value="validated_strict_local"]'
+      );
+      await expect(strictOption).toHaveText(
+        "Validated strict local (pack not ready)"
+      );
+      await expect(strictOption).toBeDisabled();
+      await expect(generateBtn).toBeDisabled();
+      return;
+    }
+
+    if (localOnly) {
+      expect(processingMode).toBe("validated_strict_local");
+      const generateBtn = page.getByRole("button", {
+        name: "Generate summary",
+      });
+      await expect(generateBtn).toBeVisible({ timeout: 10_000 });
+      await expect(generateBtn).toBeEnabled();
+      return;
+    }
+
+    expect(processingMode).toBe("prompt_only");
+    const buildPromptBtn = page.getByRole("button", {
+      name: "Build prompt",
+    });
+    await expect(buildPromptBtn).toBeVisible({ timeout: 10_000 });
+    await expect(buildPromptBtn).toBeEnabled();
   });
 
   test("generate produces a result", async ({ page }) => {
-    test.skip(!modelExecutionConfigured, "No E2E model execution profile is configured");
+    test.skip(!realModelExecutionConfigured, modelExecutionSkipReason);
     test.setTimeout(120_000);
 
     await browserLogin(page, email, TEST_PASSWORD);
@@ -271,7 +310,7 @@ test.describe("Summaries page", () => {
   test("history entry reopens a saved summary without regenerating", async ({
     page,
   }) => {
-    test.skip(!modelExecutionConfigured, "No E2E model execution profile is configured");
+    test.skip(!realModelExecutionConfigured, modelExecutionSkipReason);
     test.setTimeout(120_000);
 
     await browserLogin(page, email, TEST_PASSWORD);
@@ -316,7 +355,7 @@ test.describe("Summaries page", () => {
   });
 
   test("generation reports the selected privacy boundary", async ({ page }) => {
-    test.skip(!modelExecutionConfigured, "No E2E model execution profile is configured");
+    test.skip(!realModelExecutionConfigured, modelExecutionSkipReason);
     test.setTimeout(120_000);
 
     await browserLogin(page, email, TEST_PASSWORD);

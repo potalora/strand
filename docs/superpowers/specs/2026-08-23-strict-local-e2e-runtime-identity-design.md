@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-23
 
-**Status:** Revised design; implementation plan awaiting root approval
+**Status:** Approved design; uncommitted implementation verified and awaiting
+root publication review
 
 **Baseline:** `origin/main` at
 `32075826694e1a24bfb36699fb14374b7916b29a`
@@ -83,9 +84,12 @@ fixture setup, and real model execution.
 - Add exact negative strict-local upload and summary admission regressions.
 - Keep all OS, socket, and browser network-denial guards active.
 - Gate the three summary tests that execute a model on a real attested worker and
-  pack. The current legacy-v1 profile does not qualify, so those cases skip with
-  a pack-required reason. The seven non-execution summary UI cases continue to
-  run.
+  pack. Only a local-only profile with `E2E_ATTESTED_STRICT_PACK=1` qualifies;
+  every other profile skips with `No E2E model execution profile is configured`.
+  External credentials alone do not configure stored cloud-assisted execution.
+  The seven non-execution summary UI cases continue to run and reflect the
+  primary action available in each profile after proving a record subject is
+  selected.
 
 `cloud_assisted` is the correct explicit fixture mode because ingestion admits
 `cloud_assisted` or `validated_strict_local`. `prompt_only` is a summary mode,
@@ -163,8 +167,15 @@ a model:
 - `category dropdown appears for By category type`
 - `date range inputs appear for Date range type`
 - `output format options work`
-- `generate button is present and enabled with a patient`
+- `primary summary action reflects execution availability with a patient`
 - `AI disclaimer always visible`
+
+The primary-action case has three truthful profile branches. Ordinary no-pack
+local-only keeps stored `validated_strict_local`, exposes the exact disabled
+`Validated strict local (pack not ready)` option, and shows a disabled Generate
+summary button. Attested-pack local-only keeps stored `validated_strict_local`
+and shows an enabled Generate summary button. Outside local-only, stored
+`prompt_only` shows an enabled Build prompt button.
 
 These three cases require actual model execution and skip in the current
 legacy-v1 local-only profile:
@@ -218,13 +229,16 @@ replaced, or deleted.
 
 The command and profile reject symlinked parents or roots. They resolve the
 worktree, evidence parent, approved parents, and candidate roots through the
-filesystem and require exact real-path containment. Existing parents must be
+filesystem and require exact real-path containment. The public command creates
+the evidence parent with mode `0700` only when it is absent, then validates it
+before creating either approved child parent. Existing parents must be
 directories owned by the current OS user and must not be group- or
-world-writable; their modes are never changed. Each task-created root must be a
-non-symlink directory owned by the current user with mode `0700`. At creation,
-the command captures its real path, device, inode, owner, type, and mode. Before
-any `rm -rf`, it repeats those checks and refuses deletion unless the identity
-and exact-child relationship are unchanged.
+world-writable; their modes are never changed. Shared parents are never removed.
+Each task-created root must be a non-symlink directory owned by the current user
+with mode `0700`. Immediately after creating each root, the command captures its
+real path, device, inode, owner, type, and mode. Before any `rm -rf`, it repeats
+those checks and refuses deletion unless the identity and exact-child
+relationship are unchanged.
 
 The profile validates both supplied roots before it creates only these runtime
 children and overwrites inherited settings:
@@ -258,20 +272,30 @@ captures or discards them.
 The public browser-test command follows the same real-path and identity
 boundary. It creates both absolute task roots, passes them as
 `E2E_RUNTIME_ROOT` and `E2E_OUTPUT_ROOT`, and removes only roots whose captured
-identity still matches. It uses explicit loopback PostgreSQL host and port
-arguments, records whether it created the named test database, and drops the
-database only when that flag is set. An existing database makes the command
-fail instead of being deleted.
+identity still matches. It derives a lowercase database name from a validated
+24-character random token and uses explicit loopback PostgreSQL host and port
+arguments. After creation, it records the database OID and owner. Cleanup
+re-queries that identity and issues its single `dropdb` only when the creation
+flag and identity both match. An absent database is already clean. Query failure
+or identity mismatch retains the database and fails cleanup.
 
 ## Disposable database ownership
 
 Every database/test command starts with `set -euo pipefail`, uses a distinct
 task-specific database name, and calls `createdb -h 127.0.0.1 -p 5432` without a
 preflight drop. The command sets its ownership flag immediately after
-`createdb` succeeds. Its cleanup trap may call `dropdb` only while that flag is
-set. If the name already exists, the command fails without changing it. There
-is no unconditional final database cleanup list and no prose claim of ownership
-without the corresponding flag.
+`createdb` succeeds. The public documentation command also captures
+`oid:datdba` through fixed SQL sent to `psql` on standard input and re-queries it
+before cleanup. Its random name and OID/owner comparison detect ordinary
+collisions and replacement, but they are not absolute protection from a
+malicious PostgreSQL cluster administrator. A database that is absent needs no
+cleanup; query failure or identity mismatch retains it. There is no
+unconditional final database cleanup list and no prose claim of ownership
+without the corresponding flag and, for the public command, matching identity.
+The final residue audit fails if any exact task-owned fixed database name
+remains. It reports the public example's `medtimeline_e2e_` prefix separately
+and read-only; a prefix match is not ownership or deletion authority. The
+task-owned audit directory remains available through root review.
 
 ## Ignored-artifact evidence
 
@@ -279,11 +303,12 @@ Before behavioral work, the root captures a sorted repository-relative
 inventory of every ignored path except the explicitly named dependency trees
 `frontend/node_modules/` and `backend/.venv/`. It also records separate
 inventories for Phase-1 `test-results`, new runtime/execution/report roots,
-Python and pytest caches, Next build output, backend data, and a residual
-unclassified set. After verification, the root repeats and compares these
-inventories. New ignored paths are accepted only in the enumerated generated
-classes and task-token output roots; backend data and the residual set must not
-change. The complete Phase-1 tree outside the approved runtime/execution roots
+Python and pytest caches, Ruff caches, the exact TypeScript incremental cache,
+Next build output, backend data, and a residual unclassified set. After
+verification, the root repeats and compares these inventories. New ignored
+paths are accepted only in the enumerated generated classes and task-token
+output roots; backend data and the residual set must not change. The complete
+Phase-1 tree outside the approved runtime/execution roots
 is hash-inventoried, while the already recorded JSON and 15-trace aggregate
 hashes remain explicit acceptance gates. Ignored status cannot hide an
 unauthorized artifact.
@@ -333,8 +358,8 @@ deployment evidence was produced.
 - Provider construction and non-loopback connections fail the positive proof.
 - Provider-call instrumentation stores only a count or fixed non-sensitive
   operation label, never configuration or request arguments.
-- A database is dropped only by the same invocation that successfully created
-  it and still holds the corresponding ownership flag.
+- The public command drops a database only while its invocation-local creation
+  flag is set and a fresh OID/owner query matches the captured identity.
 - Recursive cleanup is allowed only after real-path and captured filesystem
   identity revalidation of the exact task-created root.
 - The Playwright-cleared `artifacts` directory is itself an exact validated
@@ -353,11 +378,19 @@ deployment evidence was produced.
   ingestion total, or account-prefixed storage file fails the regression.
 - A strict summary rejection that creates an `AISummaryPrompt` or `LocalAIJob`
   fails the regression.
+- Summary primary-action acceptance first requires the Record subject selector
+  to have a value. Ordinary no-pack local-only keeps stored
+  `validated_strict_local`; the exact `Validated strict local (pack not ready)`
+  option and Generate summary button are both disabled. Attested-pack local-only
+  keeps stored `validated_strict_local` and enables Generate summary. Outside
+  local-only, stored `prompt_only` enables Build prompt.
 - The provider-free backend proof runs real background dedup, drains it without
   cancellation, checks terminal upload status, and fails on any provider call.
 - Missing private fixtures and the three real-pack summary cases are the only
   legitimate skips.
 - Full-suite acceptance requires zero failures and zero not-run tests.
+- Public-command cleanup emits one generic warning if it retains state. It
+  preserves an earlier nonzero status; otherwise it returns cleanup status.
 
 ## Exact behavioral file allowlist
 

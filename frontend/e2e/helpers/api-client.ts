@@ -1,7 +1,18 @@
 import * as fs from "fs";
+import * as path from "node:path";
 import { isTerminalStatus } from "../../src/lib/extraction-progress";
 
 const API_BASE = "http://localhost:8000/api/v1";
+const TRACKED_SYNTHETIC_FHIR = path.resolve(
+  __dirname,
+  "..",
+  "..",
+  "..",
+  "backend",
+  "tests",
+  "fixtures",
+  "sample_fhir_bundle.json"
+);
 
 type ApiRecord = {
   id: string;
@@ -50,9 +61,23 @@ type DedupResolution = {
 };
 
 type AuthenticatedUser = {
+  id: string;
   login_identifier: string;
   /** @deprecated Compatibility alias; equal to login_identifier. */
   email: string;
+};
+
+type PatientsResponse = {
+  items: { id: string }[];
+  total: number;
+};
+
+type DashboardOverviewSnapshot = {
+  total_records: number;
+  total_patients: number;
+  total_uploads: number;
+  records_by_type: Record<string, number>;
+  recent_records: { id: string }[];
 };
 
 type DedupCandidatesResponse = {
@@ -161,6 +186,73 @@ export class ApiClient {
       );
     }
     return res.json();
+  }
+
+  private async uploadStructuredBytes(
+    bytes: Uint8Array,
+    filename: string,
+    processingMode?: "cloud_assisted"
+  ): Promise<{ upload_id: string; status: string; records_inserted: number }> {
+    const formData = new FormData();
+    formData.append(
+      "file",
+      new Blob([new Uint8Array(bytes)], { type: "application/fhir+json" }),
+      filename
+    );
+    if (processingMode) formData.append("processing_mode", processingMode);
+    const res = await fetch(`${API_BASE}/upload`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.token}` },
+      body: formData,
+    });
+    if (!res.ok) {
+      throw new Error(
+        `Structured fixture upload failed: ${res.status} ${await res.text()}`
+      );
+    }
+    return res.json();
+  }
+
+  async uploadTrackedSyntheticFhirCloudAssisted(): Promise<{
+    upload_id: string;
+    status: string;
+    records_inserted: number;
+  }> {
+    return this.uploadStructuredBytes(
+      fs.readFileSync(TRACKED_SYNTHETIC_FHIR),
+      "sample_fhir_bundle.json",
+      "cloud_assisted"
+    );
+  }
+
+  async uploadGeneratedPaginationFhirCloudAssisted(
+    bundleJson: string
+  ): Promise<{ upload_id: string; status: string; records_inserted: number }> {
+    return this.uploadStructuredBytes(
+      new TextEncoder().encode(bundleJson),
+      "pagination-seed.json",
+      "cloud_assisted"
+    );
+  }
+
+  async attemptTrackedSyntheticFhirUsingStoredPreference(): Promise<{
+    status: number;
+    body: unknown;
+  }> {
+    const formData = new FormData();
+    formData.append(
+      "file",
+      new Blob([fs.readFileSync(TRACKED_SYNTHETIC_FHIR)], {
+        type: "application/fhir+json",
+      }),
+      "sample_fhir_bundle.json"
+    );
+    const res = await fetch(`${API_BASE}/upload`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.token}` },
+      body: formData,
+    });
+    return { status: res.status, body: await res.json() };
   }
 
   async uploadStructured(
@@ -307,6 +399,18 @@ export class ApiClient {
     );
   }
 
+  async getLocalAIJobs(): Promise<LocalAIJobStatus[]> {
+    const res = await fetch(`${API_BASE}/local-ai/jobs?active_only=false`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `List local AI jobs failed: ${res.status} ${await res.text()}`
+      );
+    }
+    return res.json();
+  }
+
   async getUploadHistory(): Promise<UploadHistoryResponse> {
     const res = await fetch(`${API_BASE}/upload/history`, {
       headers: this.headers(),
@@ -428,7 +532,19 @@ export class ApiClient {
     return res.json();
   }
 
-  async getDashboardOverview(): Promise<EmptyApiResponse> {
+  async getPatients(): Promise<PatientsResponse> {
+    const res = await fetch(`${API_BASE}/dashboard/patients`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `Get patients failed: ${res.status} ${await res.text()}`
+      );
+    }
+    return res.json();
+  }
+
+  async getDashboardOverview(): Promise<DashboardOverviewSnapshot> {
     const res = await fetch(`${API_BASE}/dashboard/overview`, {
       headers: this.headers(),
     });

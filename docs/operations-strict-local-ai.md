@@ -241,16 +241,207 @@ deployment gate.
 
 ## Run browser tests with local-only enforcement
 
-Create a dedicated PostgreSQL database once, then run the complete Playwright
-directory through the local-only profile:
+From the repository root, run the complete Playwright directory through the
+local-only profile:
 
 ```bash
-createdb medtimeline_e2e_local
+set -euo pipefail
+task_repo_root="$(pwd -P)"
+task_evidence_parent="$task_repo_root/frontend/test-results"
+task_runtime_parent="$task_evidence_parent/runtime"
+task_output_parent="$task_evidence_parent/executions"
+task_runtime_root=""
+task_output_root=""
+task_runtime_parent_identity=""
+task_output_parent_identity=""
+task_runtime_root_identity=""
+task_output_root_identity=""
+task_run_token=""
+task_e2e_database=""
+task_e2e_database_identity=""
+task_created_e2e_database=0
+validate_owned_parent() {
+  task_parent="$1"
+  test -d "$task_parent" && test ! -L "$task_parent"
+  test "$(cd -P -- "$task_parent" && pwd -P)" = "$task_parent"
+  test "$(stat -f '%u' "$task_parent")" -eq "$(id -u)"
+  task_parent_mode="$(stat -f '%Lp' "$task_parent")"
+  case "$task_parent_mode" in
+    ""|*[!0-7]*) return 1 ;;
+  esac
+  test "$((8#$task_parent_mode & 022))" -eq 0
+}
+validate_owned_root() {
+  task_root="$1"
+  task_parent="$2"
+  test -d "$task_root" && test ! -L "$task_root"
+  test "$(stat -f '%u' "$task_root")" -eq "$(id -u)"
+  test "$(stat -f '%Lp' "$task_root")" = 700
+  task_root_real="$(cd -P -- "$task_root" && pwd -P)"
+  test "$task_root_real" = "$task_root"
+  test "$(dirname -- "$task_root_real")" = "$task_parent"
+}
+query_task_database_identity() {
+  psql -X -qAt -v ON_ERROR_STOP=1 \
+    -v task_database="$task_e2e_database" \
+    -h 127.0.0.1 -p 5432 -d postgres <<'SQL'
+SELECT oid::text || ':' || datdba::text
+FROM pg_database
+WHERE datname = :'task_database';
+SQL
+}
+safe_remove_owned_directory() {
+  task_remove_root="$1"
+  task_remove_parent="$2"
+  task_expected_parent_identity="$3"
+  task_expected_root_identity="$4"
+  test -n "$task_remove_root" && test -n "$task_remove_parent" || return 1
+  test -n "$task_expected_parent_identity" && \
+    test -n "$task_expected_root_identity" || return 1
+  test -d "$task_remove_parent" && test ! -L "$task_remove_parent" || return 1
+  test "$(stat -f '%d:%i:%u:%HT:%Lp' "$task_remove_parent")" = \
+    "$task_expected_parent_identity" || return 1
+  task_remove_parent_real="$(cd -P -- "$task_remove_parent" && pwd -P)" || return 1
+  test "$task_remove_parent_real" = "$task_remove_parent" || return 1
+  test -d "$task_remove_root" && test ! -L "$task_remove_root" || return 1
+  test "$(stat -f '%d:%i:%u:%HT:%Lp' "$task_remove_root")" = \
+    "$task_expected_root_identity" || return 1
+  task_remove_root_real="$(cd -P -- "$task_remove_root" && pwd -P)" || return 1
+  test "$task_remove_root_real" = "$task_remove_root" || return 1
+  test "$(dirname -- "$task_remove_root_real")" = \
+    "$task_remove_parent_real" || return 1
+  rm -rf -- "$task_remove_root" >/dev/null 2>&1
+}
+cleanup_local_e2e_docs() {
+  task_original_status=$?
+  trap - EXIT INT TERM
+  task_cleanup_status=0
+  if [ "$task_created_e2e_database" -eq 1 ]; then
+    task_current_e2e_database_identity=""
+    if task_current_e2e_database_identity="$(query_task_database_identity 2>/dev/null)"; then
+      if [ -z "$task_current_e2e_database_identity" ]; then
+        :
+      elif [ -n "$task_e2e_database_identity" ] && \
+        [ "$task_current_e2e_database_identity" = "$task_e2e_database_identity" ]; then
+        if ! dropdb -h 127.0.0.1 -p 5432 "$task_e2e_database" \
+          >/dev/null 2>&1; then
+          task_cleanup_status=1
+        fi
+      else
+        task_cleanup_status=1
+      fi
+    else
+      task_cleanup_status=1
+    fi
+  fi
+  if [ -n "$task_runtime_root" ]; then
+    if ! safe_remove_owned_directory \
+      "$task_runtime_root" "$task_runtime_parent" \
+      "$task_runtime_parent_identity" "$task_runtime_root_identity" \
+      2>/dev/null; then
+      task_cleanup_status=1
+    fi
+  fi
+  if [ -n "$task_output_root" ]; then
+    if ! safe_remove_owned_directory \
+      "$task_output_root" "$task_output_parent" \
+      "$task_output_parent_identity" "$task_output_root_identity" \
+      2>/dev/null; then
+      task_cleanup_status=1
+    fi
+  fi
+  if [ "$task_cleanup_status" -ne 0 ]; then
+    printf '%s\n' \
+      'local-only browser cleanup could not remove all task-owned state' >&2
+  fi
+  if [ "$task_original_status" -ne 0 ]; then
+    exit "$task_original_status"
+  fi
+  exit "$task_cleanup_status"
+}
+trap cleanup_local_e2e_docs EXIT
+test -d "$task_repo_root/frontend" && test ! -L "$task_repo_root/frontend"
+test "$(cd -P -- "$task_repo_root/frontend" && pwd -P)" = \
+  "$task_repo_root/frontend"
+if [ ! -e "$task_evidence_parent" ] && [ ! -L "$task_evidence_parent" ]; then
+  mkdir -m 700 -- "$task_evidence_parent"
+fi
+validate_owned_parent "$task_evidence_parent"
+if [ ! -e "$task_runtime_parent" ] && [ ! -L "$task_runtime_parent" ]; then
+  mkdir -m 700 -- "$task_runtime_parent"
+fi
+validate_owned_parent "$task_runtime_parent"
+task_runtime_parent_identity="$(stat -f '%d:%i:%u:%HT:%Lp' "$task_runtime_parent")"
+if [ ! -e "$task_output_parent" ] && [ ! -L "$task_output_parent" ]; then
+  mkdir -m 700 -- "$task_output_parent"
+fi
+validate_owned_parent "$task_output_parent"
+task_output_parent_identity="$(stat -f '%d:%i:%u:%HT:%Lp' "$task_output_parent")"
+umask 077
+task_runtime_root="$(mktemp -d "$task_runtime_parent/docs.XXXXXXXXXXXXXXXXXXXXXXXX")"
+validate_owned_root "$task_runtime_root" "$task_runtime_parent"
+task_runtime_root_identity="$(stat -f '%d:%i:%u:%HT:%Lp' "$task_runtime_root")"
+task_output_root="$(mktemp -d "$task_output_parent/docs.XXXXXXXXXXXXXXXXXXXXXXXX")"
+validate_owned_root "$task_output_root" "$task_output_parent"
+task_output_root_identity="$(stat -f '%d:%i:%u:%HT:%Lp' "$task_output_root")"
+task_run_token="${task_runtime_root##*.}"
+test "${#task_run_token}" -eq 24
+case "$task_run_token" in
+  ""|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*) exit 1 ;;
+esac
+task_run_token="$(printf '%s' "$task_run_token" | tr '[:upper:]' '[:lower:]')"
+task_e2e_database="medtimeline_e2e_$task_run_token"
+test "${#task_e2e_database}" -le 63
+case "$task_e2e_database" in
+  medtimeline_e2e_*) ;;
+  *) exit 1 ;;
+esac
+case "$task_e2e_database" in
+  ""|*[!a-z0-9_]*) exit 1 ;;
+esac
+createdb -h 127.0.0.1 -p 5432 "$task_e2e_database"
+task_created_e2e_database=1
+task_e2e_database_identity="$(query_task_database_identity)"
+task_e2e_database_oid="${task_e2e_database_identity%%:*}"
+task_e2e_database_owner="${task_e2e_database_identity#*:}"
+case "$task_e2e_database_oid" in
+  ""|*[!0-9]*) exit 1 ;;
+esac
+case "$task_e2e_database_owner" in
+  ""|*[!0-9]*) exit 1 ;;
+esac
 cd frontend
-E2E_LOCAL_ONLY=1 \
-E2E_DATABASE_URL=postgresql+asyncpg://localhost:5432/medtimeline_e2e_local \
-  npx playwright test --workers=1
+env -u DATABASE_ENCRYPTION_KEY -u UPLOAD_DIR -u TEMP_EXTRACT_DIR \
+  APP_ENV=test REAL_MEDICAL_FIXTURES_DIR= E2E_ATTESTED_STRICT_PACK= \
+  GEMINI_API_KEY= GOOGLE_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY= \
+  ANTHROPIC_API_KEY= VERTEX_PROJECT= GOOGLE_CLOUD_PROJECT= \
+  GOOGLE_APPLICATION_CREDENTIALS= \
+  LLM_PROVIDER=gemini LLM_SUMMARY_PROVIDER= LLM_SECTION_PROVIDER= \
+  LLM_DEDUP_PROVIDER= LLM_EXTRACTION_PROVIDER= \
+  E2E_LOCAL_ONLY=1 \
+  E2E_RUNTIME_ROOT="$task_runtime_root" \
+  E2E_OUTPUT_ROOT="$task_output_root" \
+  E2E_DATABASE_URL="postgresql+asyncpg://127.0.0.1:5432/$task_e2e_database" \
+  ./node_modules/.bin/playwright test --workers=1
 ```
+
+When `frontend/test-results` is absent, the command creates it with mode `0700`.
+Before creating either task root, it validates that directory and the `runtime`
+and `executions` parents. It does not change permissions on or remove those
+shared parents. The command records each task root's filesystem identity
+immediately after creation.
+
+Each run uses a validated 24-character random token. The lowercase token becomes
+part of the database name. After `createdb` succeeds, the command records the
+database OID and owner. Before dropping the database, cleanup queries that
+identity again and requires a match. An absent database needs no cleanup. A
+query failure or identity mismatch retains it and makes cleanup fail. The random
+name and OID/owner check detect ordinary collisions and replacement.
+This is not absolute protection.
+A malicious PostgreSQL cluster administrator can still manipulate the database.
+
+If cleanup retains state, it writes one generic warning. An earlier command
+failure remains the exit status; otherwise, the command returns cleanup status.
 
 The profile accepts only a `postgresql+asyncpg` URL whose host is loopback and
 whose database name contains a `test` or `e2e` segment. It rejects the same URL
@@ -263,15 +454,34 @@ Every Chromium context uses a closed proxy with loopback bypass, and service
 workers are disabled. Cloud credentials are cleared and Hugging Face offline
 flags remain set.
 
-These controls cover database traffic, the backend, browser requests, and the
-already sandboxed model worker. The local-only profile fails closed before
-starting Next.js when its OS network profile is unavailable. The server binds
-to `127.0.0.1` and does not proxy raw uploads; the browser sends them to the
-backend. The real upload, encryption, job, polling, summary, grounded
-extraction, and persistence paths still run. The E2E worker returns
-deterministic validator-compatible output so the browser suite does not
-repeatedly load the model pack. Use the fidelity gate above for real-model
-quality checks.
+This profile proves network confinement for the test database, backend, Next.js
+server, and browser.
+It does not prove that an attested strict-local model pack is installed.
+The legacy v1 manifest remains only for bounded negative
+admission tests. `/usr/bin/false` is a startup sentinel. Application lifespan
+uses it to validate a one-token executable. It is not a worker, and the suite
+never spawns it.
+
+The local-only profile fails closed before starting Next.js when its OS network
+profile is unavailable. The server binds to `127.0.0.1` and does not proxy raw
+uploads; the browser sends them to the backend. Tests that need populated
+records use an explicit `cloud_assisted` request for the tracked synthetic FHIR
+fixture or generated pagination FHIR. Backend tests also cover the repository's
+synthetic CDA parser. The tracked FHIR, identical re-upload, and synthetic CDA
+sequences run background dedup to terminal state and fail if
+provider construction occurs.
+Provider credentials are empty. All local-only network
+guards stay active. The account's default preference remains
+`validated_strict_local`.
+
+Strict upload and summary regressions check the exact legacy-v1 rejection before
+request side effects. Seven summary UI cases do not execute a model and still
+run. The three summary model-execution cases require a real attested worker and
+pack, so this profile skips them. A boolean test gate is not release evidence.
+
+Use the release and fidelity gates above when you need evidence for a real
+strict-local pack. A browser run is not release, benchmark, fidelity,
+pack-verification, promotion, or deployment evidence.
 
 Remove model artifacts:
 

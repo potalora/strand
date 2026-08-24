@@ -1,6 +1,6 @@
 import { test, expect } from "./fixtures/console-gate";
 import { ApiClient } from "./helpers/api-client";
-import { testEmail, TEST_PASSWORD, PATHS } from "./helpers/test-data";
+import { testEmail, TEST_PASSWORD } from "./helpers/test-data";
 
 const API_BASE = "http://localhost:8000/api/v1";
 const email = testEmail("record-renderers");
@@ -35,7 +35,7 @@ test.describe("Type-specific Renderers", () => {
   test.beforeAll(async () => {
     await api.register(email, TEST_PASSWORD);
     await api.login(email, TEST_PASSWORD);
-    const result = await api.uploadStructured(PATHS.fhirBundle, "sample_fhir_bundle.json");
+    const result = await api.uploadTrackedSyntheticFhirCloudAssisted();
     await api.pollUploadStatus(result.upload_id, 60_000);
 
     // Fetch all records grouped by type (page_size=100 covers the full FHIR bundle)

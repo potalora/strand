@@ -30,12 +30,38 @@ async function setupBrowserUser(
   return email;
 }
 
+async function useCloudAssistedForTrackedSyntheticFhir(
+  page: import("@playwright/test").Page
+): Promise<void> {
+  await page.route("**/api/v1/settings/llm", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    const body = (await response.json()) as {
+      routing?: Record<string, unknown>;
+    };
+    await route.fulfill({
+      response,
+      json: {
+        ...body,
+        routing: {
+          ...body.routing,
+          processing_mode: "cloud_assisted",
+        },
+      },
+    });
+  });
+}
+
 test.describe("Structured file uploads", () => {
   test("upload FHIR JSON bundle via dropzone", async ({ page }) => {
     test.setTimeout(120_000);
 
     const api = new ApiClient();
     await setupBrowserUser(page, api);
+    await useCloudAssistedForTrackedSyntheticFhir(page);
 
     await page.goto("/upload");
     await page.waitForSelector("text=Drop files or a folder");
@@ -66,6 +92,9 @@ test.describe("Structured file uploads", () => {
     expect(fhirUpload).toBeDefined();
     if (!fhirUpload) throw new Error("FHIR upload missing from history");
     expect(fhirUpload.record_count).toBeGreaterThan(0);
+    expect((await api.getLlmSettings()).routing.processing_mode).toBe(
+      "validated_strict_local"
+    );
   });
 
   test("upload XDM/CDA ZIP package", async ({ page }) => {
