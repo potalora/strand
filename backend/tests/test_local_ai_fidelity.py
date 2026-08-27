@@ -11,6 +11,8 @@ from typing import Any
 
 import pytest
 
+from tests.conftest import private_fixture_root
+
 FIXTURE_PATH = (
     Path(__file__).parent
     / "fidelity"
@@ -1348,13 +1350,16 @@ async def test_real_local_model_fidelity_report_passes_all_hard_gates(
         write_fidelity_report,
     )
 
-    private_value = os.environ.get("REAL_MEDICAL_FIXTURES_DIR")
+    private_fixture_data = private_fixture_root()
+    private_fixture_raw = (
+        private_fixture_data / "raw" if private_fixture_data is not None else None
+    )
     report = await run_installed_fidelity_suite(
         corpus_path=FIXTURE_PATH,
         manifest_path=Path(settings.local_ai_manifest_path),
         model_root=Path(settings.local_ai_model_dir),
         scratch_root=Path(settings.local_ai_scratch_dir) / "fidelity",
-        private_fixtures_dir=Path(private_value) if private_value else None,
+        private_fixtures_dir=private_fixture_raw,
     )
     output_value = os.environ.get("LOCAL_AI_FIDELITY_REPORT")
     output = (

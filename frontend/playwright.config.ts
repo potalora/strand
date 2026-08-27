@@ -187,6 +187,7 @@ if (localOnly) {
     APP_ENV: "test",
     DATABASE_ENCRYPTION_KEY: "00".repeat(32),
     REAL_MEDICAL_FIXTURES_DIR: "",
+    MEDTIMELINE_LEGACY_DEV_FIXTURES_DIR: "",
     E2E_ATTESTED_STRICT_PACK: "",
     LOCAL_AI_ENABLED: "true",
     UPLOAD_DIR: runtimePaths.uploads,

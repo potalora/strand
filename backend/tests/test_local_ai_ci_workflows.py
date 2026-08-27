@@ -23,6 +23,7 @@ def test_local_only_playwright_profile_is_network_denial_not_attested_worker() -
     assert 'APP_ENV: "test"' in local_profile
     assert 'DATABASE_ENCRYPTION_KEY: "00".repeat(32)' in local_profile
     assert 'REAL_MEDICAL_FIXTURES_DIR: ""' in local_profile
+    assert 'MEDTIMELINE_LEGACY_DEV_FIXTURES_DIR: ""' in local_profile
     assert 'E2E_ATTESTED_STRICT_PACK: ""' in local_profile
     assert 'LOCAL_AI_WORKER_COMMAND: "/usr/bin/false"' in local_profile
     assert "LOCAL_AI_WORKER_PROJECT_DIR: runtimePaths.nonWorkerProject" in local_profile

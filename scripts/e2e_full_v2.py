@@ -30,25 +30,28 @@ results: dict = {"steps": [], "started_at": datetime.now(timezone.utc).isoformat
 
 
 def _fixtures_raw() -> Path:
-    """Resolve the off-repo real-medical-fixtures ``raw/`` dir.
+    """Resolve the legacy developer corpus's off-repo ``raw/`` directory.
 
-    Reads ``REAL_MEDICAL_FIXTURES_DIR`` (falling back to repo-root
-    ``.env.test.local``). Real PHI never lives in the repo, so there is no
-    in-repo fallback.
+    This standalone development driver predates signed fixturectl releases. It
+    deliberately uses ``MEDTIMELINE_LEGACY_DEV_FIXTURES_DIR`` instead of the
+    protected runtime variable, which is reserved for guarded receipt discovery.
+    The value may also come from repo-root ``.env.test.local``. Real PHI never
+    lives in the repo, so there is no in-repo fallback.
     """
     import os
 
-    root = os.environ.get("REAL_MEDICAL_FIXTURES_DIR")
+    variable = "MEDTIMELINE_LEGACY_DEV_FIXTURES_DIR"
+    root = os.environ.get(variable)
     if not root:
         envf = ROOT / ".env.test.local"
         if envf.exists():
             for ln in envf.read_text().splitlines():
-                if ln.strip().startswith("REAL_MEDICAL_FIXTURES_DIR="):
+                if ln.strip().startswith(f"{variable}="):
                     root = ln.split("=", 1)[1].strip()
                     break
     if not root:
         raise SystemExit(
-            "REAL_MEDICAL_FIXTURES_DIR not set and no .env.test.local found; "
+            f"{variable} not set and no matching .env.test.local entry found; "
             "real medical fixtures live off-repo (~/Private/medical-test-fixtures)."
         )
     return Path(root).expanduser() / "raw"

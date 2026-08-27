@@ -15,8 +15,8 @@ from striprtf.striprtf import rtf_to_text
 
 from tests.conftest import private_fixture_root
 
-# Real Epic RTF corpus lives off-repo (gitignored), under
-# <REAL_MEDICAL_FIXTURES_DIR>/raw/Requested Record/Rich Text/. No in-repo fallback.
+# The shared guard resolves the fixturectl release data directory. The Epic RTF
+# corpus lives under its signed raw/Requested Record/Rich Text/ subtree.
 _FIXROOT = private_fixture_root()
 RTF_DIR = (_FIXROOT / "raw" / "Requested Record" / "Rich Text") if _FIXROOT else None
 
@@ -37,7 +37,7 @@ def _models_available() -> bool:
 async def test_local_extraction_on_real_rtf_notes():
     notes = _real_notes()
     if not notes:
-        pytest.skip("real RTF notes absent (set REAL_MEDICAL_FIXTURES_DIR)")
+        pytest.skip("guarded fixturectl release has no real RTF notes")
     if not _models_available():
         pytest.skip("scispaCy/medspaCy not installed (.[clinical-nlp])")
 
@@ -65,5 +65,9 @@ async def test_local_extraction_on_real_rtf_notes():
         classes.update(e.entity_class for e in result.entities)
 
     assert notes_with_entities >= 1, "local extraction found nothing in real notes"
-    assert total >= 5, f"expected several entities across {len(sample)} real notes, got {total}"
-    assert classes & {"medication", "condition"}, f"no clinical classes extracted: {classes}"
+    assert total >= 5, (
+        f"expected several entities across {len(sample)} real notes, got {total}"
+    )
+    assert classes & {"medication", "condition"}, (
+        f"no clinical classes extracted: {classes}"
+    )

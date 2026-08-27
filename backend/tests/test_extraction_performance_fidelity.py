@@ -8,8 +8,8 @@ from app.config import settings
 from app.services.extraction import text_extractor
 from tests.conftest import private_fixture_root
 
-# Real-data fixtures resolve via REAL_MEDICAL_FIXTURES_DIR (gitignored, off-repo);
-# originals live under <root>/raw/. No in-repo fallback — skip cleanly if absent.
+# The shared guard resolves the fixturectl release data directory; originals
+# live under its signed raw/ subtree. No in-repo fallback exists.
 _FIXROOT = private_fixture_root()
 _RAW = (_FIXROOT / "raw") if _FIXROOT else None
 _NOTE = next(iter(_RAW.glob("note_*.pdf")), None) if _RAW else None

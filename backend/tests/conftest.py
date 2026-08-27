@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from tests.private_fixture_release import private_fixture_root  # noqa: F401
 
 from app.config import settings
 from app.main import app as fastapi_app
@@ -31,28 +32,13 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 # ---------------------------------------------------------------------------
 # Private real-data fixtures (gitignored; never committed to any repo).
 # ---------------------------------------------------------------------------
-# Load machine-local test env so REAL_MEDICAL_FIXTURES_DIR is available to the
-# fidelity/extraction tests. ``.env.test.local`` sits at the repo root next to
-# ``.env`` and is gitignored. Loaded here (not in app.config) because it is
-# test-only plumbing, and conftest is imported before any test module.
+# Load machine-local test env so the three protected fixture-release values are
+# available to guarded fidelity/extraction tests. ``.env.test.local`` sits at
+# the repo root next to ``.env`` and is gitignored. Loaded here (not in
+# app.config) because it is test-only plumbing, and conftest is imported before
+# any test module.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(_REPO_ROOT / ".env.test.local", override=False)
-
-
-def private_fixture_root() -> Path | None:
-    """Return the real-medical-fixtures root, or ``None``.
-
-    Reads ``REAL_MEDICAL_FIXTURES_DIR`` (expanding ``~``). Returns ``None`` when
-    the var is unset or the directory is missing, so callers can compute a clean
-    module-level skip. There is intentionally NO fallback to in-repo paths —
-    real PHI never lives in the repository. Original exports live under
-    ``<root>/raw/``.
-    """
-    root = os.environ.get("REAL_MEDICAL_FIXTURES_DIR")
-    if not root:
-        return None
-    path = Path(root).expanduser()
-    return path if path.exists() else None
 
 
 # Ordinary test runs must not inherit cloud credentials merely because a

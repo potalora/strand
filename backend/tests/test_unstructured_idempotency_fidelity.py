@@ -30,15 +30,15 @@ from tests.conftest import (
 pytestmark = pytest.mark.private_cloud_fidelity
 
 # ---------------------------------------------------------------------------
-# Locate real note PDF via REAL_MEDICAL_FIXTURES_DIR (gitignored, off-repo).
-# Originals live under <root>/raw/. No in-repo fallback.
+# Resolve the receipt-guarded fixturectl release data directory. Originals live
+# under its signed raw/ subtree. There is no in-repo fallback.
 # ---------------------------------------------------------------------------
 _FIXROOT = private_fixture_root()
 _RAW = (_FIXROOT / "raw") if _FIXROOT else None
 _NOTE = next(iter(_RAW.glob("note_*.pdf")), None) if _RAW else None
 
 _SKIP_REASON = (
-    "REAL_MEDICAL_FIXTURES_DIR with a real note PDF (raw/note_*.pdf) and "
+    "a guarded fixturectl release with raw/note_*.pdf and "
     "GEMINI_API_KEY are all required"
 )
 _SHOULD_SKIP = _NOTE is None or not settings.gemini_api_key

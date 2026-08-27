@@ -136,3 +136,57 @@ Production signing-key creation remains a separate human gate. Only the public
 key belongs in source control. Real fixture scanning, signing, transfer, test
 execution, backup restore, and release retention require their own explicit
 operator approvals.
+
+## MedTimeline test discovery
+
+Ordinary backend tests expose no private fixture path. Tests that call
+`private_fixture_root()` receive `None` and skip when
+`REAL_MEDICAL_FIXTURES_DIR` is unset. Setting it is an explicit request, so an
+invalid requested release raises `PrivateFixtureReleaseError` instead of
+silently skipping or substituting synthetic data.
+
+The dedicated test runtime receives three values from runtime configuration, not
+from Git or Chezmoi:
+
+- `REAL_MEDICAL_FIXTURES_APPROVED_ROOT` names the one read-only fixture root
+  visible inside that runtime.
+- `REAL_MEDICAL_FIXTURES_DIR` names the exact `current` link below the selected
+  dataset child.
+- `REAL_MEDICAL_FIXTURES_TARGET_ID` pins the receipt to the approved receiver.
+
+The resolver accepts only `<approved-root>/<expected-dataset>/current`, a stable
+relative symlink of the form `releases/<manifest-sha256>`, mode-`0600` canonical
+receipt, manifest, and signature files, matching receipt/manifest dataset,
+target, and aggregate identities, the manifest digest named by the release, and
+an owner-only directory chain. It returns the immutable release's `data/`
+directory. Existing guarded fidelity consumers find originals under the signed
+`data/raw/` subtree without learning the receiver or staging layout. The local
+AI golden sidecar `local-ai-corpus-v1.json` and every source it names must also
+be manifest-listed below `data/raw/`; putting the sidecar beside `data/` would
+violate the fixturectl top-level policy and is not supported.
+
+`REAL_MEDICAL_FIXTURES_DIR` is reserved for this receipt-guarded release
+selection contract. Legacy standalone/UI development E2E consumers use the
+separate `MEDTIMELINE_LEGACY_DEV_FIXTURES_DIR` variable for an unsigned off-repo
+corpus and never accept the protected variable. The strict-local Playwright
+profile clears both variables. Do not use the legacy variable for release or
+fidelity acceptance.
+
+This application check is a selection guard, not a replacement for receiver-side
+Minisign and payload verification. The target promotes only a fully verified
+immutable release. The MedTimeline test runtime must mount exactly that approved
+root read-only and run under its dedicated test identity. Pedro and Danielle
+Hermes, both Hindsight instances, ordinary developer shells, and default test
+profiles receive neither the mount nor these environment values.
+
+The resolver binds every validated directory to its device/inode and repeats the
+complete data-to-approved-root link check immediately before returning, but its
+public result is a normal `Path`, not an open descriptor capability. Therefore
+identity after the resolver returns depends on the runtime invariants above: the
+receiver-owned release is exposed through a read-only bind into a
+read-only-root-filesystem container. A writable same-UID release tree would
+reintroduce a path-after-check race and is outside this contract.
+
+Transport and discovery never start a MedTimeline test. A fidelity run remains
+a separate explicit owner action, and any cloud-marked private-fidelity test
+still requires its independent command-line consent gates.

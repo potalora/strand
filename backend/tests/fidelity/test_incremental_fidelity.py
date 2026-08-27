@@ -30,6 +30,7 @@ every ingest. The downstream content-dedup pipeline (not exercised by
 _ingest_xdm alone) would catch them later. Hence we MEASURE and bound, never
 assert a perfect zero-insert no-op.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -43,8 +44,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from tests.conftest import auth_headers, create_test_patient, private_fixture_root
 
-# Real IHE-XDM extracts resolve via REAL_MEDICAL_FIXTURES_DIR (gitignored,
-# off-repo); originals live under <root>/raw/. No in-repo fallback.
+# The shared guard resolves the fixturectl release data directory; IHE-XDM
+# originals live under its signed raw/ subtree. No in-repo fallback exists.
 # NOTE: the previous MAY_DIR pointed at REPO_ROOT (missing the test_data
 # segment), so it silently skipped on every run — now both extracts resolve
 # consistently under raw/.
@@ -57,11 +58,11 @@ pytestmark = pytest.mark.fidelity
 
 skip_if_no_may = pytest.mark.skipif(
     not (MAY_DIR and (MAY_DIR / "METADATA.XML").exists()),
-    reason="REAL_MEDICAL_FIXTURES_DIR unset or MAY XDM extract (raw/HealthSummary_May_29_2026) missing",
+    reason="guarded fixturectl release absent or MAY XDM extract missing",
 )
 skip_if_no_apr = pytest.mark.skipif(
     not (APR_DIR and (APR_DIR / "METADATA.XML").exists()),
-    reason="REAL_MEDICAL_FIXTURES_DIR unset or APRIL XDM extract (raw/HealthSummary_Apr_05_2026) missing",
+    reason="guarded fixturectl release absent or APRIL XDM extract missing",
 )
 
 

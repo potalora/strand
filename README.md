@@ -260,7 +260,14 @@ uv run pytest tests/fidelity/    # real-data fidelity (skips without fixtures)
 uv run pytest -m "local_model or hardware"  # release machine only
 ```
 
-The fast suite runs against `strand_test` (auto-derived from `DATABASE_URL`). Fidelity tests need real-data fixtures and skip when they're absent; point `REAL_MEDICAL_FIXTURES_DIR` at a local corpus to run them.
+The fast suite runs against `strand_test` (auto-derived from `DATABASE_URL`).
+Guarded fidelity tests skip when private fixtures are absent. To opt in, provide
+the three fixturectl release values documented in
+[`tools/fixturectl/README.md`](tools/fixturectl/README.md); the protected
+`REAL_MEDICAL_FIXTURES_DIR` value is the dataset's exact `current` link, not a
+raw corpus directory. Older standalone/UI development E2E drivers instead use
+`MEDTIMELINE_LEGACY_DEV_FIXTURES_DIR` for their deliberately unsigned off-repo
+corpus. That legacy variable is never accepted by guarded backend tests.
 
 ## API
 

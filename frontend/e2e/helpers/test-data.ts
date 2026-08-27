@@ -3,15 +3,18 @@ import * as path from "path";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 
-// Real medical fixtures live OUTSIDE the repo (gitignored, off-repo) and are
-// resolved via REAL_MEDICAL_FIXTURES_DIR; originals are under <root>/raw/.
-// playwright.config.ts loads .env.test.local so this var is present here. When
-// it is unset, TEST_DATA_DIR points at a path that does not exist, so
-// hasTestData() returns false and the data-dependent specs skip cleanly —
-// there is intentionally no in-repo fallback (real PHI never lives in the repo).
+// These legacy developer E2E specs predate signed fixturectl releases. Their
+// off-repo corpus uses MEDTIMELINE_LEGACY_DEV_FIXTURES_DIR and originals under
+// <root>/raw/. The protected fixture-release variable is reserved for the
+// backend's receipt-guarded resolver and must never be read here.
+// playwright.config.ts loads .env.test.local for external-AI E2E runs. When the
+// legacy variable is unset, TEST_DATA_DIR points at a path that does not exist,
+// so data-dependent specs skip cleanly; real PHI has no in-repo fallback.
 function privateFixtureRaw(): string {
-  const root = process.env.REAL_MEDICAL_FIXTURES_DIR;
-  if (!root) return path.join(__dirname, "__REAL_MEDICAL_FIXTURES_DIR_unset__");
+  const root = process.env.MEDTIMELINE_LEGACY_DEV_FIXTURES_DIR;
+  if (!root) {
+    return path.join(__dirname, "__MEDTIMELINE_LEGACY_DEV_FIXTURES_DIR_unset__");
+  }
   const expanded = root.replace(/^~(?=$|\/)/, process.env.HOME ?? "");
   return path.join(expanded, "raw");
 }
