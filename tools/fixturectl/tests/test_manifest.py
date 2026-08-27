@@ -7,10 +7,13 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
+import traceback
 import unittest
 from unittest import mock
 
@@ -529,6 +532,382 @@ class ManifestTests(unittest.TestCase):
                 )
         self.assertFalse(output.exists())
         self.assertEqual(stderr.getvalue(), "fixturectl: validation failed\n")
+
+
+class SignatureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        base = Path(self.directory.name)
+        self.root = make_synthetic_dataset(base)
+        manifest = fixturectl.build_manifest(synthetic_policy(), self.root, FIXED_TIME)
+        self.manifest = base / "manifest.json"
+        self.manifest.write_bytes(fixturectl.canonical_json(manifest))
+        self.manifest.chmod(0o600)
+        self.secret_key = base / "test-only-signing.key"
+        self.secret_key.write_text("synthetic-test-key-material\n", encoding="utf-8")
+        self.secret_key.chmod(0o600)
+        self.public_key = base / "test-only-signing.pub"
+        self.public_key.write_text("synthetic-test-public-key\n", encoding="utf-8")
+        self.public_key.chmod(0o644)
+        self.signature = base / "manifest.minisig"
+
+    def _successful_sign(
+        self, args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        self.assertNotIn("synthetic-test-key-material", " ".join(args))
+        signature_fd = int(args[args.index("-x") + 1].rsplit("/", 1)[1])
+        os.ftruncate(signature_fd, 0)
+        os.lseek(signature_fd, 0, os.SEEK_SET)
+        os.write(signature_fd, b"synthetic detached signature\n")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def test_sign_manifest_uses_safe_argv_and_private_key(self) -> None:
+        with mock.patch.object(
+            fixturectl.subprocess,
+            "run",
+            side_effect=self._successful_sign,
+        ) as run:
+            fixturectl.sign_manifest(self.manifest, self.secret_key, self.signature)
+
+        args, kwargs = run.call_args
+        command = args[0]
+        self.assertEqual(command[:3], ["minisign", "-S", "-s"])
+        self.assertTrue(
+            all(command[index].startswith("/dev/fd/") for index in (3, 5, 7))
+        )
+        self.assertNotIn(str(self.secret_key), command)
+        self.assertNotIn(str(self.manifest), command)
+        self.assertNotIn(str(self.signature), command)
+        self.assertEqual(
+            set(kwargs["pass_fds"]),
+            {int(item.rsplit("/", 1)[1]) for item in command[3::2]},
+        )
+        self.assertEqual(kwargs["timeout"], 60)
+        self.assertIsNone(kwargs["stdin"])
+        self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stderr"], subprocess.PIPE)
+        self.assertTrue(kwargs["text"])
+        self.assertEqual(stat.S_IMODE(self.signature.stat().st_mode), 0o600)
+
+    def test_verify_signature_uses_only_public_key_file(self) -> None:
+        self.signature.write_text("synthetic detached signature\n", encoding="utf-8")
+        self.signature.chmod(0o600)
+        with mock.patch.object(fixturectl.subprocess, "run") as run:
+            verified = fixturectl.verify_signature(
+                self.manifest,
+                self.signature,
+                self.public_key,
+            )
+
+        args, kwargs = run.call_args
+        command = args[0]
+        self.assertEqual(command[:4], ["minisign", "-V", "-q", "-p"])
+        self.assertTrue(
+            all(command[index].startswith("/dev/fd/") for index in (4, 6, 8))
+        )
+        self.assertEqual(
+            set(kwargs["pass_fds"]),
+            {int(item.rsplit("/", 1)[1]) for item in command[4::2]},
+        )
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stderr"], subprocess.PIPE)
+        self.assertEqual(verified.manifest.dataset, "synthetic")
+        self.assertEqual(
+            verified.sha256,
+            fixturectl.hashlib.sha256(verified.canonical_bytes).hexdigest(),
+        )
+
+    def test_invalid_signature_wrong_key_and_absent_signature_fail_closed(self) -> None:
+        self.signature.write_text("synthetic detached signature\n", encoding="utf-8")
+        self.signature.chmod(0o600)
+        for failure in (
+            subprocess.CalledProcessError(1, ["minisign"]),
+            subprocess.CalledProcessError(1, ["minisign"], stderr="wrong key"),
+        ):
+            with self.subTest(failure=failure):
+                with mock.patch.object(
+                    fixturectl.subprocess,
+                    "run",
+                    side_effect=failure,
+                ):
+                    with self.assertRaisesRegex(
+                        fixturectl.FixtureSignatureError,
+                        "signature verification failed",
+                    ):
+                        fixturectl.verify_signature(
+                            self.manifest,
+                            self.signature,
+                            self.public_key,
+                        )
+
+        self.signature.unlink()
+        with self.assertRaisesRegex(
+            fixturectl.FixtureSignatureError,
+            "signature file",
+        ):
+            fixturectl.verify_signature(
+                self.manifest,
+                self.signature,
+                self.public_key,
+            )
+
+    def test_signing_rejects_insecure_key_and_timeout_without_leaking(self) -> None:
+        self.secret_key.chmod(0o640)
+        with self.assertRaisesRegex(
+            fixturectl.FixtureSignatureError,
+            "secret key mode",
+        ):
+            fixturectl.sign_manifest(self.manifest, self.secret_key, self.signature)
+        self.secret_key.chmod(0o600)
+
+        def partial_timeout(args: list[str], **kwargs: object) -> None:
+            signature_fd = int(args[args.index("-x") + 1].rsplit("/", 1)[1])
+            os.write(signature_fd, b"partial signature")
+            raise subprocess.TimeoutExpired(
+                ["minisign"],
+                60,
+                output="synthetic-test-key-material",
+                stderr="synthetic-passphrase",
+            )
+
+        with mock.patch.object(
+            fixturectl.subprocess,
+            "run",
+            side_effect=partial_timeout,
+        ):
+            with self.assertRaises(fixturectl.FixtureSignatureError) as raised:
+                fixturectl.sign_manifest(
+                    self.manifest,
+                    self.secret_key,
+                    self.signature,
+                )
+        rendered = str(raised.exception)
+        self.assertNotIn("synthetic-test-key-material", rendered)
+        self.assertNotIn("synthetic-passphrase", rendered)
+        self.assertEqual(rendered, "signing command timed out")
+        formatted = "".join(
+            traceback.format_exception(
+                type(raised.exception),
+                raised.exception,
+                raised.exception.__traceback__,
+            )
+        )
+        self.assertNotIn("synthetic-test-key-material", formatted)
+        self.assertNotIn("synthetic-passphrase", formatted)
+        context = raised.exception.__context__
+        if context is not None:
+            self.assertIsNone(getattr(context, "output", None))
+            self.assertIsNone(getattr(context, "stderr", None))
+        self.assertFalse(self.signature.exists())
+        self.assertEqual(
+            list(self.signature.parent.glob(".fixturectl-signature-*.tmp")), []
+        )
+
+    def test_signature_output_races_empty_and_oversize_fail_cleanly(self) -> None:
+        protected = Path(self.directory.name) / "protected.txt"
+        protected.write_text("unchanged\n", encoding="utf-8")
+        protected.chmod(0o600)
+
+        def precreate_symlink(
+            args: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            self.signature.symlink_to(protected)
+            return self._successful_sign(args, **kwargs)
+
+        with mock.patch.object(
+            fixturectl.subprocess,
+            "run",
+            side_effect=precreate_symlink,
+        ):
+            with self.assertRaisesRegex(
+                fixturectl.FixtureSignatureError,
+                "installation failed",
+            ):
+                fixturectl.sign_manifest(
+                    self.manifest,
+                    self.secret_key,
+                    self.signature,
+                )
+        self.assertEqual(protected.read_text(encoding="utf-8"), "unchanged\n")
+        self.signature.unlink()
+        self.assertEqual(
+            list(self.signature.parent.glob(".fixturectl-signature-*.tmp")), []
+        )
+
+    def test_signature_temp_setup_failure_is_cleaned(self) -> None:
+        with mock.patch.object(
+            fixturectl.os,
+            "fchmod",
+            side_effect=OSError("synthetic setup failure"),
+        ):
+            with self.assertRaises(fixturectl.FixtureSignatureError):
+                fixturectl.sign_manifest(
+                    self.manifest,
+                    self.secret_key,
+                    self.signature,
+                )
+        self.assertFalse(self.signature.exists())
+        self.assertEqual(
+            list(self.signature.parent.glob(".fixturectl-signature-*.tmp")), []
+        )
+
+        with mock.patch.object(
+            fixturectl.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(["minisign"], 0),
+        ):
+            with self.assertRaisesRegex(fixturectl.FixtureSignatureError, "changed"):
+                fixturectl.sign_manifest(
+                    self.manifest,
+                    self.secret_key,
+                    self.signature,
+                )
+        self.assertFalse(self.signature.exists())
+
+        def oversized_signature(
+            args: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            signature_fd = int(args[args.index("-x") + 1].rsplit("/", 1)[1])
+            os.write(signature_fd, b"x" * (fixturectl._MAX_SIGNATURE_BYTES + 1))
+            return subprocess.CompletedProcess(args, 0)
+
+        with mock.patch.object(
+            fixturectl.subprocess,
+            "run",
+            side_effect=oversized_signature,
+        ):
+            with self.assertRaisesRegex(fixturectl.FixtureSignatureError, "changed"):
+                fixturectl.sign_manifest(
+                    self.manifest,
+                    self.secret_key,
+                    self.signature,
+                )
+        self.assertFalse(self.signature.exists())
+        self.assertEqual(
+            list(self.signature.parent.glob(".fixturectl-signature-*.tmp")), []
+        )
+
+    def test_sign_and_verify_reject_path_swaps_without_installing_output(self) -> None:
+        replacement_manifest = self.manifest.with_name("replacement-manifest.json")
+        replacement_manifest.write_text("{}\n", encoding="utf-8")
+        replacement_manifest.chmod(0o600)
+
+        def swap_during_sign(
+            args: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            replacement_manifest.replace(self.manifest)
+            return self._successful_sign(args, **kwargs)
+
+        with mock.patch.object(
+            fixturectl.subprocess,
+            "run",
+            side_effect=swap_during_sign,
+        ):
+            with self.assertRaisesRegex(
+                fixturectl.FixtureSignatureError,
+                "manifest changed",
+            ):
+                fixturectl.sign_manifest(
+                    self.manifest,
+                    self.secret_key,
+                    self.signature,
+                )
+        self.assertFalse(self.signature.exists())
+
+        self.manifest.write_bytes(
+            fixturectl.canonical_json(
+                fixturectl.build_manifest(synthetic_policy(), self.root, FIXED_TIME)
+            )
+        )
+        self.manifest.chmod(0o600)
+        self.signature.write_text("synthetic detached signature\n", encoding="utf-8")
+        self.signature.chmod(0o600)
+        replacement_public_key = self.public_key.with_name("replacement.pub")
+        replacement_public_key.write_text("replacement public key\n", encoding="utf-8")
+        replacement_public_key.chmod(0o644)
+
+        def swap_during_verify(
+            args: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            replacement_public_key.replace(self.public_key)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(
+            fixturectl.subprocess,
+            "run",
+            side_effect=swap_during_verify,
+        ):
+            with self.assertRaisesRegex(
+                fixturectl.FixtureSignatureError,
+                "public key changed",
+            ):
+                fixturectl.verify_signature(
+                    self.manifest,
+                    self.signature,
+                    self.public_key,
+                )
+
+
+class ManifestRaceAndMinisignIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = make_synthetic_dataset(Path(self.directory.name))
+
+    @unittest.skipUnless(shutil.which("minisign"), "Minisign is not installed")
+    def test_temporary_key_round_trip_and_tamper_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = make_synthetic_dataset(base)
+            manifest_path = base / "manifest.json"
+            manifest_path.write_bytes(
+                fixturectl.canonical_json(
+                    fixturectl.build_manifest(synthetic_policy(), root, FIXED_TIME)
+                )
+            )
+            manifest_path.chmod(0o600)
+            secret_key = base / "test-only.key"
+            public_key = base / "test-only.pub"
+            signature = base / "manifest.minisig"
+            subprocess.run(
+                [
+                    "minisign",
+                    "-G",
+                    "-W",
+                    "-s",
+                    str(secret_key),
+                    "-p",
+                    str(public_key),
+                ],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            secret_key.chmod(0o600)
+            public_key.chmod(0o644)
+
+            fixturectl.sign_manifest(manifest_path, secret_key, signature)
+            fixturectl.verify_signature(manifest_path, signature, public_key)
+
+            changed_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            changed_manifest["created_at"] = "2026-08-27T00:00:01Z"
+            manifest_path.write_bytes(
+                (
+                    json.dumps(
+                        changed_manifest,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+            manifest_path.chmod(0o600)
+            with self.assertRaises(fixturectl.FixtureSignatureError):
+                fixturectl.verify_signature(manifest_path, signature, public_key)
 
     def test_cli_containment_uses_the_scanned_root_identity(self) -> None:
         output = self.root / "raw/manifest.json"

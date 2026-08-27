@@ -15,7 +15,9 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import stat
+import subprocess
 import sys
 from typing import Any, NoReturn
 import unicodedata
@@ -42,6 +44,9 @@ _MANIFEST_FIELDS = frozenset(
 _FILE_FIELDS = frozenset({"path", "size", "mode", "sha256"})
 _READ_SIZE = 1024 * 1024
 _MAX_MANIFEST_BYTES = 32 * 1024 * 1024
+_MAX_SIGNATURE_BYTES = 64 * 1024
+_MAX_KEY_BYTES = 1024 * 1024
+_PUBLIC_KEY_MODES = frozenset({0o400, 0o440, 0o444, 0o600, 0o640, 0o644})
 
 
 class FixturePolicyError(ValueError):
@@ -50,6 +55,10 @@ class FixturePolicyError(ValueError):
 
 class FixtureManifestError(ValueError):
     """A manifest is malformed or does not match the local dataset."""
+
+
+class FixtureSignatureError(ValueError):
+    """A signature operation violated the fixture signing contract."""
 
 
 @dataclass(frozen=True)
@@ -84,6 +93,13 @@ class Manifest:
     file_count: int
     total_bytes: int
     files: tuple[ManifestFile, ...]
+
+
+@dataclass(frozen=True)
+class VerifiedManifest:
+    manifest: Manifest
+    canonical_bytes: bytes
+    sha256: str
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -589,47 +605,141 @@ def manifest_from_mapping(value: object) -> Manifest:
     )
 
 
-def load_manifest(path: Path) -> Manifest:
-    """Load a strict manifest without disclosing its path on failure."""
-
+def _open_checked_regular(
+    path: Path,
+    *,
+    error_type: type[FixtureManifestError] | type[FixtureSignatureError],
+    label: str,
+    allowed_modes: frozenset[int] | None,
+    max_bytes: int,
+) -> tuple[int, os.stat_result]:
     try:
         metadata = path.lstat()
         if not stat.S_ISREG(metadata.st_mode):
-            raise FixtureManifestError("manifest must be a regular file")
+            raise error_type(f"{label} must be a regular file")
         if metadata.st_uid != os.getuid():
-            raise FixtureManifestError("manifest owner is invalid")
-        if _mode_bits(metadata) != 0o600:
-            raise FixtureManifestError("manifest mode must be 0600")
+            raise error_type(f"{label} owner is invalid")
+        if allowed_modes is not None and _mode_bits(metadata) not in allowed_modes:
+            raise error_type(f"{label} mode is invalid")
         if metadata.st_nlink != 1:
-            raise FixtureManifestError("manifest hardlink is forbidden")
-        if metadata.st_size > _MAX_MANIFEST_BYTES:
-            raise FixtureManifestError("manifest size limit exceeded")
+            raise error_type(f"{label} hardlink is forbidden")
+        if metadata.st_size < 0 or metadata.st_size > max_bytes:
+            raise error_type(f"{label} size limit exceeded")
         descriptor = os.open(path, _read_flags(nonblocking=True))
         try:
             before = os.fstat(descriptor)
-            if _metadata_identity(before) != _metadata_identity(metadata):
-                raise FixtureManifestError("manifest changed during read")
-            chunks: list[bytes] = []
-            total = 0
-            while chunk := os.read(descriptor, _READ_SIZE):
-                total += len(chunk)
-                if total > _MAX_MANIFEST_BYTES:
-                    raise FixtureManifestError("manifest size limit exceeded")
-                chunks.append(chunk)
-            after = os.fstat(descriptor)
-            if _metadata_identity(before) != _metadata_identity(after):
-                raise FixtureManifestError("manifest changed during read")
-        finally:
+        except BaseException:
             os.close(descriptor)
+            raise
+        if _metadata_identity(before) != _metadata_identity(metadata):
+            os.close(descriptor)
+            raise error_type(f"{label} changed during read")
+        return descriptor, before
+    except (FixtureManifestError, FixtureSignatureError):
+        raise
+    except OSError as exc:
+        raise error_type(f"{label} file is unavailable or unsafe") from exc
+
+
+def _read_checked_descriptor(
+    descriptor: int,
+    before: os.stat_result,
+    *,
+    error_type: type[FixtureManifestError] | type[FixtureSignatureError],
+    label: str,
+    max_bytes: int,
+) -> bytes:
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, _READ_SIZE):
+            total += len(chunk)
+            if total > max_bytes:
+                raise error_type(f"{label} size limit exceeded")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _metadata_identity(before) != _metadata_identity(after):
+            raise error_type(f"{label} changed during read")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return b"".join(chunks)
+    except (FixtureManifestError, FixtureSignatureError):
+        raise
+    except OSError as exc:
+        raise error_type(f"{label} file is unavailable or unsafe") from exc
+
+
+def _read_checked_regular(
+    path: Path,
+    *,
+    error_type: type[FixtureManifestError] | type[FixtureSignatureError],
+    label: str,
+    allowed_modes: frozenset[int] | None,
+    max_bytes: int,
+) -> bytes:
+    descriptor, before = _open_checked_regular(
+        path,
+        error_type=error_type,
+        label=label,
+        allowed_modes=allowed_modes,
+        max_bytes=max_bytes,
+    )
+    try:
+        return _read_checked_descriptor(
+            descriptor,
+            before,
+            error_type=error_type,
+            label=label,
+            max_bytes=max_bytes,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _manifest_from_bytes(raw: bytes) -> Manifest:
+    try:
         value = json.loads(
-            b"".join(chunks).decode("utf-8"),
+            raw.decode("utf-8"),
             object_pairs_hook=_reject_manifest_duplicate_keys,
         )
     except FixtureManifestError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise FixtureManifestError("manifest JSON is unreadable or invalid") from exc
-    return manifest_from_mapping(value)
+    manifest = manifest_from_mapping(value)
+    if raw != canonical_json(manifest):
+        raise FixtureManifestError("manifest JSON is not canonical")
+    return manifest
+
+
+def _open_manifest(path: Path) -> tuple[int, os.stat_result, Manifest, bytes]:
+    descriptor, before = _open_checked_regular(
+        path,
+        error_type=FixtureManifestError,
+        label="manifest",
+        allowed_modes=frozenset({0o600}),
+        max_bytes=_MAX_MANIFEST_BYTES,
+    )
+    try:
+        raw = _read_checked_descriptor(
+            descriptor,
+            before,
+            error_type=FixtureManifestError,
+            label="manifest",
+            max_bytes=_MAX_MANIFEST_BYTES,
+        )
+        return descriptor, before, _manifest_from_bytes(raw), raw
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def load_manifest(path: Path) -> Manifest:
+    """Load a strict canonical manifest without disclosing its path on failure."""
+
+    descriptor, _, manifest, _ = _open_manifest(path)
+    os.close(descriptor)
+    return manifest
 
 
 def _reject_manifest_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -639,6 +749,345 @@ def _reject_manifest_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, A
             raise FixtureManifestError("duplicate key in manifest JSON")
         result[key] = value
     return result
+
+
+def _open_signature_output(path: Path) -> tuple[int, int, str, str, os.stat_result]:
+    parent = path.parent
+    parent_fd: int | None = None
+    try:
+        parent_metadata = parent.lstat()
+        if not stat.S_ISDIR(parent_metadata.st_mode):
+            raise FixtureSignatureError("signature output parent is invalid")
+        if parent_metadata.st_uid != os.getuid():
+            raise FixtureSignatureError("signature output parent owner is invalid")
+        if _mode_bits(parent_metadata) != 0o700:
+            raise FixtureSignatureError("signature output parent mode is invalid")
+        parent_fd = os.open(parent, _read_flags(directory=True))
+        anchored_parent = os.fstat(parent_fd)
+        if _metadata_identity(anchored_parent) != _metadata_identity(parent_metadata):
+            raise FixtureSignatureError("signature output parent changed")
+        if not _safe_component(path.name):
+            raise FixtureSignatureError("signature output filename is invalid")
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FixtureSignatureError("signature output already exists")
+
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        for _ in range(32):
+            temporary_name = f".fixturectl-signature-{secrets.token_hex(16)}.tmp"
+            try:
+                signature_fd = os.open(
+                    temporary_name,
+                    flags,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+            except FileExistsError:
+                continue
+            try:
+                os.fchmod(signature_fd, 0o600)
+                temporary_metadata = os.fstat(signature_fd)
+            except BaseException:
+                os.close(signature_fd)
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+                except OSError:
+                    pass
+                raise
+            return (
+                parent_fd,
+                signature_fd,
+                temporary_name,
+                path.name,
+                temporary_metadata,
+            )
+        raise FixtureSignatureError("signature temporary name allocation failed")
+    except FixtureSignatureError:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise
+    except OSError:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise FixtureSignatureError(
+            "signature output is unavailable or unsafe"
+        ) from None
+
+
+def _unlink_if_same(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if _same_file(current, expected):
+            os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def _install_signature(
+    parent_fd: int,
+    signature_fd: int,
+    temporary_name: str,
+    final_name: str,
+    temporary_metadata: os.stat_result,
+) -> None:
+    final_link_created = False
+    try:
+        generated = os.fstat(signature_fd)
+        if (
+            not _same_file(generated, temporary_metadata)
+            or not stat.S_ISREG(generated.st_mode)
+            or generated.st_uid != os.getuid()
+            or generated.st_nlink != 1
+            or generated.st_size <= 0
+            or generated.st_size > _MAX_SIGNATURE_BYTES
+        ):
+            raise FixtureSignatureError("signature file changed during creation")
+        os.fchmod(signature_fd, 0o600)
+        os.fsync(signature_fd)
+        generated = os.fstat(signature_fd)
+        if _mode_bits(generated) != 0o600:
+            raise FixtureSignatureError("signature file mode is invalid")
+        os.link(
+            temporary_name,
+            final_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        final_link_created = True
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        installed = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not _same_file(installed, generated)
+            or installed.st_nlink != 1
+            or installed.st_uid != os.getuid()
+            or _mode_bits(installed) != 0o600
+        ):
+            raise FixtureSignatureError("signature installation failed safely")
+        os.fsync(parent_fd)
+    except FixtureSignatureError:
+        if final_link_created:
+            _unlink_if_same(parent_fd, final_name, temporary_metadata)
+        raise
+    except OSError:
+        if final_link_created:
+            _unlink_if_same(parent_fd, final_name, temporary_metadata)
+        raise FixtureSignatureError("signature installation failed safely") from None
+
+
+def _require_stable_descriptor(
+    descriptor: int,
+    before: os.stat_result,
+    label: str,
+) -> None:
+    try:
+        after = os.fstat(descriptor)
+    except OSError:
+        raise FixtureSignatureError(
+            f"{label} changed during signature operation"
+        ) from None
+    if _metadata_identity(before) != _metadata_identity(after):
+        raise FixtureSignatureError(f"{label} changed during signature operation")
+
+
+def _discard_subprocess_output(exc: BaseException) -> None:
+    for attribute in ("output", "stdout", "stderr"):
+        if hasattr(exc, attribute):
+            try:
+                setattr(exc, attribute, None)
+            except (AttributeError, TypeError):
+                pass
+
+
+def _descriptor_path(descriptor: int) -> str:
+    return f"/dev/fd/{descriptor}"
+
+
+def sign_manifest(manifest: Path, secret_key: Path, signature: Path) -> None:
+    """Create a detached Minisign signature over held, validated descriptors."""
+
+    manifest_fd, manifest_before, _, _ = _open_manifest(manifest)
+    secret_key_fd: int | None = None
+    parent_fd: int | None = None
+    signature_fd: int | None = None
+    temporary_name: str | None = None
+    temporary_metadata: os.stat_result | None = None
+    installed = False
+    try:
+        secret_key_fd, secret_key_before = _open_checked_regular(
+            secret_key,
+            error_type=FixtureSignatureError,
+            label="secret key",
+            allowed_modes=frozenset({0o600}),
+            max_bytes=_MAX_KEY_BYTES,
+        )
+        (
+            parent_fd,
+            signature_fd,
+            temporary_name,
+            final_name,
+            temporary_metadata,
+        ) = _open_signature_output(signature)
+        pass_fds = (manifest_fd, secret_key_fd, signature_fd)
+        try:
+            subprocess.run(
+                [
+                    "minisign",
+                    "-S",
+                    "-s",
+                    _descriptor_path(secret_key_fd),
+                    "-m",
+                    _descriptor_path(manifest_fd),
+                    "-x",
+                    _descriptor_path(signature_fd),
+                ],
+                check=True,
+                timeout=60,
+                stdin=None,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                pass_fds=pass_fds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            _discard_subprocess_output(exc)
+            raise FixtureSignatureError("signing command timed out") from None
+        except subprocess.CalledProcessError as exc:
+            _discard_subprocess_output(exc)
+            raise FixtureSignatureError("manifest signing failed") from None
+        except OSError:
+            raise FixtureSignatureError("Minisign is unavailable") from None
+
+        _require_stable_descriptor(manifest_fd, manifest_before, "manifest")
+        _require_stable_descriptor(secret_key_fd, secret_key_before, "secret key")
+        _install_signature(
+            parent_fd,
+            signature_fd,
+            temporary_name,
+            final_name,
+            temporary_metadata,
+        )
+        installed = True
+    finally:
+        if (
+            not installed
+            and parent_fd is not None
+            and temporary_name is not None
+            and temporary_metadata is not None
+        ):
+            _unlink_if_same(parent_fd, temporary_name, temporary_metadata)
+        if signature_fd is not None:
+            os.close(signature_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        if secret_key_fd is not None:
+            os.close(secret_key_fd)
+        os.close(manifest_fd)
+
+
+def verify_signature(
+    manifest: Path,
+    signature: Path,
+    public_key: Path,
+) -> VerifiedManifest:
+    """Verify held bytes and return the exact verified manifest snapshot."""
+
+    manifest_fd, manifest_before, parsed_manifest, manifest_bytes = _open_manifest(
+        manifest
+    )
+    signature_fd: int | None = None
+    public_key_fd: int | None = None
+    try:
+        signature_fd, signature_before = _open_checked_regular(
+            signature,
+            error_type=FixtureSignatureError,
+            label="signature file",
+            allowed_modes=frozenset({0o600}),
+            max_bytes=_MAX_SIGNATURE_BYTES,
+        )
+        signature_bytes = _read_checked_descriptor(
+            signature_fd,
+            signature_before,
+            error_type=FixtureSignatureError,
+            label="signature file",
+            max_bytes=_MAX_SIGNATURE_BYTES,
+        )
+        if not signature_bytes:
+            raise FixtureSignatureError("signature file is empty")
+        public_key_fd, public_key_before = _open_checked_regular(
+            public_key,
+            error_type=FixtureSignatureError,
+            label="public key",
+            allowed_modes=_PUBLIC_KEY_MODES,
+            max_bytes=_MAX_KEY_BYTES,
+        )
+        public_key_bytes = _read_checked_descriptor(
+            public_key_fd,
+            public_key_before,
+            error_type=FixtureSignatureError,
+            label="public key",
+            max_bytes=_MAX_KEY_BYTES,
+        )
+        if not public_key_bytes:
+            raise FixtureSignatureError("public key is empty")
+        pass_fds = (manifest_fd, signature_fd, public_key_fd)
+        try:
+            subprocess.run(
+                [
+                    "minisign",
+                    "-V",
+                    "-q",
+                    "-p",
+                    _descriptor_path(public_key_fd),
+                    "-m",
+                    _descriptor_path(manifest_fd),
+                    "-x",
+                    _descriptor_path(signature_fd),
+                ],
+                check=True,
+                timeout=60,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                pass_fds=pass_fds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            _discard_subprocess_output(exc)
+            raise FixtureSignatureError("signature verification timed out") from None
+        except subprocess.CalledProcessError as exc:
+            _discard_subprocess_output(exc)
+            raise FixtureSignatureError("signature verification failed") from None
+        except OSError:
+            raise FixtureSignatureError("Minisign is unavailable") from None
+
+        _require_stable_descriptor(manifest_fd, manifest_before, "manifest")
+        _require_stable_descriptor(signature_fd, signature_before, "signature file")
+        _require_stable_descriptor(public_key_fd, public_key_before, "public key")
+        return VerifiedManifest(
+            manifest=parsed_manifest,
+            canonical_bytes=manifest_bytes,
+            sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        )
+    finally:
+        if public_key_fd is not None:
+            os.close(public_key_fd)
+        if signature_fd is not None:
+            os.close(signature_fd)
+        os.close(manifest_fd)
 
 
 def verify_manifest(manifest: Manifest, policy: DatasetPolicy, root: Path) -> None:
@@ -807,7 +1256,7 @@ def main(argv: list[str] | None = None) -> int:
                 os.close(root_fd)
         else:
             verify_manifest(load_manifest(args.manifest), dataset_policy, args.root)
-    except (FixturePolicyError, FixtureManifestError, OSError):
+    except (FixturePolicyError, FixtureManifestError, FixtureSignatureError, OSError):
         _die("validation failed")
     return 0
 
