@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "datasets": {
+    "medtimeline": {
+      "allowed_top_level": ["raw"],
+      "max_files": 10000,
+      "max_total_bytes": 268435456,
+      "destination": "/srv/private-fixtures/medtimeline"
+    },
+    "medtimeline-fidelity-v2": {
+      "allowed_top_level": ["Run-v5-71a2f50"],
+      "max_files": 20000,
+      "max_total_bytes": 3221225472,
+      "destination": "/srv/private-fixtures/medtimeline-fidelity-v2"
+    }
+  }
+}
