@@ -8,8 +8,11 @@ contains a source-root path or file contents.
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -19,6 +22,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import threading
 from typing import Any, NoReturn
 import unicodedata
 
@@ -47,6 +51,10 @@ _MAX_MANIFEST_BYTES = 32 * 1024 * 1024
 _MAX_SIGNATURE_BYTES = 64 * 1024
 _MAX_KEY_BYTES = 1024 * 1024
 _PUBLIC_KEY_MODES = frozenset({0o400, 0o440, 0o444, 0o600, 0o640, 0o644})
+_PROMOTION_THREAD_LOCKS_GUARD = threading.Lock()
+_PROMOTION_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 0x00000004
 
 
 class FixturePolicyError(ValueError):
@@ -59,6 +67,10 @@ class FixtureManifestError(ValueError):
 
 class FixtureSignatureError(ValueError):
     """A signature operation violated the fixture signing contract."""
+
+
+class FixtureTransferError(ValueError):
+    """A transfer or release operation violated the fixture safety contract."""
 
 
 @dataclass(frozen=True)
@@ -100,6 +112,50 @@ class VerifiedManifest:
     manifest: Manifest
     canonical_bytes: bytes
     sha256: str
+    signature_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class TransferPlan:
+    dataset: str
+    source: Path
+    destination: str
+    manifest_sha256: str
+    files_from: Path
+    file_count: int
+    total_bytes: int
+
+
+@dataclass(frozen=True)
+class Receipt:
+    schema_version: int
+    dataset: str
+    manifest_sha256: str
+    file_count: int
+    total_bytes: int
+    verified_at: str
+    target_id: str
+    status: str
+
+
+@dataclass(frozen=True)
+class StagingLayout:
+    dataset_root: Path
+    staging: Path
+    transfer_id: str
+    root_fd: int
+    incoming_fd: int
+    staging_fd: int
+    data_fd: int
+
+    def close(self) -> None:
+        for descriptor in (
+            self.data_fd,
+            self.staging_fd,
+            self.incoming_fd,
+            self.root_fd,
+        ):
+            os.close(descriptor)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -233,6 +289,18 @@ def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
+    )
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return identity/security fields stable across child-directory changes."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_uid,
+        _mode_bits(metadata),
     )
 
 
@@ -608,7 +676,11 @@ def manifest_from_mapping(value: object) -> Manifest:
 def _open_checked_regular(
     path: Path,
     *,
-    error_type: type[FixtureManifestError] | type[FixtureSignatureError],
+    error_type: (
+        type[FixtureManifestError]
+        | type[FixtureSignatureError]
+        | type[FixtureTransferError]
+    ),
     label: str,
     allowed_modes: frozenset[int] | None,
     max_bytes: int,
@@ -635,7 +707,7 @@ def _open_checked_regular(
             os.close(descriptor)
             raise error_type(f"{label} changed during read")
         return descriptor, before
-    except (FixtureManifestError, FixtureSignatureError):
+    except (FixtureManifestError, FixtureSignatureError, FixtureTransferError):
         raise
     except OSError as exc:
         raise error_type(f"{label} file is unavailable or unsafe") from exc
@@ -645,7 +717,11 @@ def _read_checked_descriptor(
     descriptor: int,
     before: os.stat_result,
     *,
-    error_type: type[FixtureManifestError] | type[FixtureSignatureError],
+    error_type: (
+        type[FixtureManifestError]
+        | type[FixtureSignatureError]
+        | type[FixtureTransferError]
+    ),
     label: str,
     max_bytes: int,
 ) -> bytes:
@@ -663,7 +739,7 @@ def _read_checked_descriptor(
             raise error_type(f"{label} changed during read")
         os.lseek(descriptor, 0, os.SEEK_SET)
         return b"".join(chunks)
-    except (FixtureManifestError, FixtureSignatureError):
+    except (FixtureManifestError, FixtureSignatureError, FixtureTransferError):
         raise
     except OSError as exc:
         raise error_type(f"{label} file is unavailable or unsafe") from exc
@@ -672,7 +748,11 @@ def _read_checked_descriptor(
 def _read_checked_regular(
     path: Path,
     *,
-    error_type: type[FixtureManifestError] | type[FixtureSignatureError],
+    error_type: (
+        type[FixtureManifestError]
+        | type[FixtureSignatureError]
+        | type[FixtureTransferError]
+    ),
     label: str,
     allowed_modes: frozenset[int] | None,
     max_bytes: int,
@@ -1081,6 +1161,7 @@ def verify_signature(
             manifest=parsed_manifest,
             canonical_bytes=manifest_bytes,
             sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+            signature_sha256=hashlib.sha256(signature_bytes).hexdigest(),
         )
     finally:
         if public_key_fd is not None:
@@ -1090,12 +1171,23 @@ def verify_signature(
         os.close(manifest_fd)
 
 
-def verify_manifest(manifest: Manifest, policy: DatasetPolicy, root: Path) -> None:
+def verify_manifest(
+    manifest: Manifest,
+    policy: DatasetPolicy,
+    root: Path,
+    *,
+    _anchored_root_fd: int | None = None,
+) -> None:
     """Fail unless a fresh scan exactly matches the supplied manifest."""
 
     if manifest.dataset != policy.dataset_id:
         raise FixtureManifestError("manifest mismatch")
-    current = build_manifest(policy, root, datetime.now(UTC))
+    current = _build_manifest(
+        policy,
+        root,
+        datetime.now(UTC),
+        anchored_root_fd=_anchored_root_fd,
+    )
     if (
         manifest.schema_version != current.schema_version
         or manifest.hash_algorithm != current.hash_algorithm
@@ -1208,6 +1300,1027 @@ def _write_private(
         os.close(parent_fd)
 
 
+def _validate_verified_manifest(verified: VerifiedManifest) -> None:
+    canonical = canonical_json(verified.manifest)
+    if canonical != verified.canonical_bytes:
+        raise FixtureTransferError("verified manifest bytes are inconsistent")
+    if hashlib.sha256(canonical).hexdigest() != verified.sha256:
+        raise FixtureTransferError("verified manifest digest is inconsistent")
+
+
+def _open_private_directory(path: Path, label: str) -> tuple[int, os.stat_result]:
+    descriptor: int | None = None
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise FixtureTransferError(f"{label} must be a real directory")
+        if metadata.st_uid != os.getuid():
+            raise FixtureTransferError(f"{label} owner is invalid")
+        if _mode_bits(metadata) != 0o700:
+            raise FixtureTransferError(f"{label} mode is invalid")
+        descriptor = os.open(path, _read_flags(directory=True))
+        anchored = os.fstat(descriptor)
+        if _directory_identity(anchored) != _directory_identity(metadata):
+            os.close(descriptor)
+            descriptor = None
+            raise FixtureTransferError(f"{label} changed during validation")
+        return descriptor, anchored
+    except FixtureTransferError:
+        raise
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise FixtureTransferError(f"{label} is unavailable or unsafe") from None
+
+
+def _open_private_child_directory(
+    parent_fd: int,
+    name: str,
+    label: str,
+) -> tuple[int, os.stat_result]:
+    if not _safe_component(name):
+        raise FixtureTransferError(f"{label} name is invalid")
+    descriptor: int | None = None
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise FixtureTransferError(f"{label} must be a real directory")
+        if metadata.st_uid != os.getuid():
+            raise FixtureTransferError(f"{label} owner is invalid")
+        if _mode_bits(metadata) != 0o700:
+            raise FixtureTransferError(f"{label} mode is invalid")
+        descriptor = os.open(
+            name,
+            _read_flags(directory=True),
+            dir_fd=parent_fd,
+        )
+        anchored = os.fstat(descriptor)
+        if _directory_identity(anchored) != _directory_identity(metadata):
+            os.close(descriptor)
+            descriptor = None
+            raise FixtureTransferError(f"{label} changed during validation")
+        return descriptor, anchored
+    except FixtureTransferError:
+        raise
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise FixtureTransferError(f"{label} is unavailable or unsafe") from None
+
+
+def _require_linked_directory(
+    descriptor: int,
+    parent_fd: int,
+    name: str,
+    label: str,
+) -> None:
+    try:
+        anchored = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        raise FixtureTransferError(f"{label} changed") from None
+    if _directory_identity(anchored) != _directory_identity(linked):
+        raise FixtureTransferError(f"{label} changed")
+
+
+def _open_held_transfer_file_at(
+    parent_fd: int,
+    name: str,
+    *,
+    label: str,
+    max_bytes: int,
+) -> tuple[int, os.stat_result, bytes]:
+    if not _safe_component(name):
+        raise FixtureTransferError(f"{label} filename is invalid")
+    descriptor: int | None = None
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise FixtureTransferError(f"{label} must be a regular file")
+        if metadata.st_uid != os.getuid():
+            raise FixtureTransferError(f"{label} owner is invalid")
+        if _mode_bits(metadata) != 0o600:
+            raise FixtureTransferError(f"{label} mode is invalid")
+        if metadata.st_nlink != 1:
+            raise FixtureTransferError(f"{label} hardlink is forbidden")
+        if metadata.st_size < 0 or metadata.st_size > max_bytes:
+            raise FixtureTransferError(f"{label} size limit exceeded")
+        descriptor = os.open(
+            name,
+            _read_flags(nonblocking=True),
+            dir_fd=parent_fd,
+        )
+        before = os.fstat(descriptor)
+        if _metadata_identity(before) != _metadata_identity(metadata):
+            raise FixtureTransferError(f"{label} changed during read")
+        body = _read_checked_descriptor(
+            descriptor,
+            before,
+            error_type=FixtureTransferError,
+            label=label,
+            max_bytes=max_bytes,
+        )
+        return descriptor, before, body
+    except FixtureTransferError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise FixtureTransferError(f"{label} file is unavailable or unsafe") from None
+
+
+def _require_linked_regular(
+    descriptor: int,
+    before: os.stat_result,
+    parent_fd: int,
+    name: str,
+    label: str,
+) -> None:
+    try:
+        held = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        raise FixtureTransferError(f"{label} changed") from None
+    if _metadata_identity(held) != _metadata_identity(before) or _metadata_identity(
+        linked
+    ) != _metadata_identity(before):
+        raise FixtureTransferError(f"{label} changed")
+
+
+def _require_configured_directory(
+    path: Path,
+    descriptor: int,
+    label: str,
+) -> None:
+    try:
+        configured = path.lstat()
+        anchored = os.fstat(descriptor)
+    except OSError:
+        raise FixtureTransferError(f"{label} changed") from None
+    if _directory_identity(configured) != _directory_identity(anchored):
+        raise FixtureTransferError(f"{label} changed")
+
+
+def _write_private_at(parent_fd: int, name: str, body: bytes, label: str) -> None:
+    if not _safe_component(name):
+        raise FixtureTransferError(f"{label} filename is invalid")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    created: os.stat_result | None = None
+    complete = False
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        created = os.fstat(descriptor)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or _mode_bits(metadata) != 0o600
+        ):
+            raise FixtureTransferError(f"{label} creation failed safely")
+        os.fsync(parent_fd)
+        complete = True
+    except FileExistsError:
+        raise FixtureTransferError(f"{label} already exists") from None
+    except FixtureTransferError:
+        raise
+    except OSError:
+        raise FixtureTransferError(f"{label} could not be written safely") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created is not None and not complete:
+            _unlink_if_same(parent_fd, name, created)
+
+
+def _rename_noreplace(
+    source_fd: int,
+    source_name: str,
+    destination_fd: int,
+    destination_name: str,
+) -> None:
+    """Atomically rename a directory without replacing an existing destination."""
+
+    if not _safe_component(source_name) or not _safe_component(destination_name):
+        raise FixtureTransferError("release rename component is invalid")
+    libc = ctypes.CDLL(None, use_errno=True)
+    function: Any
+    flags: int
+    if sys.platform.startswith("linux"):
+        try:
+            function = libc.renameat2
+        except AttributeError:
+            raise FixtureTransferError(
+                "atomic no-clobber rename is unavailable"
+            ) from None
+        flags = _RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        try:
+            function = libc.renameatx_np
+        except AttributeError:
+            raise FixtureTransferError(
+                "atomic no-clobber rename is unavailable"
+            ) from None
+        flags = _RENAME_EXCL
+    else:
+        raise FixtureTransferError("atomic no-clobber rename is unavailable")
+
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    result = function(
+        source_fd,
+        os.fsencode(source_name),
+        destination_fd,
+        os.fsencode(destination_name),
+        flags,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FixtureTransferError("release already exists")
+    if error_number in {errno.ENOSYS, errno.ENOTSUP}:
+        raise FixtureTransferError("atomic no-clobber rename is unavailable")
+    raise FixtureTransferError("release promotion rename failed")
+
+
+def plan_transfer(
+    verified: VerifiedManifest,
+    policy: DatasetPolicy,
+    source: Path,
+    destination: str,
+    state_directory: Path,
+) -> TransferPlan:
+    """Build a private NUL-delimited rsync list from verified exact bytes."""
+
+    _validate_verified_manifest(verified)
+    if verified.manifest.dataset != policy.dataset_id:
+        raise FixtureTransferError("transfer dataset does not match policy")
+    if destination != policy.destination:
+        raise FixtureTransferError("transfer destination does not match policy")
+    verify_manifest(verified.manifest, policy, source)
+    state_fd, _ = _open_private_directory(state_directory, "transfer state directory")
+    os.close(state_fd)
+    files_from = state_directory / f"{verified.sha256}.files-from0"
+    file_list = b"".join(
+        item.path.encode("utf-8") + b"\0" for item in verified.manifest.files
+    )
+    _write_private(files_from, file_list)
+    return TransferPlan(
+        dataset=policy.dataset_id,
+        source=source,
+        destination=destination,
+        manifest_sha256=verified.sha256,
+        files_from=files_from,
+        file_count=verified.manifest.file_count,
+        total_bytes=verified.manifest.total_bytes,
+    )
+
+
+def render_transfer_summary(
+    plan: TransferPlan,
+    *,
+    source_alias: str,
+    destination_alias: str,
+    retained_releases: int,
+) -> str:
+    """Render aggregate-only dry-run output."""
+
+    for alias in (source_alias, destination_alias):
+        if not _DATASET_ID.fullmatch(alias):
+            raise FixtureTransferError("transfer alias is invalid")
+    if not _nonnegative_integer(retained_releases):
+        raise FixtureTransferError("retained release count is invalid")
+    return (
+        f"dataset: {plan.dataset}\n"
+        f"source: {source_alias}\n"
+        f"destination: {destination_alias}\n"
+        f"files: {plan.file_count}\n"
+        f"bytes: {plan.total_bytes}\n"
+        f"release: {plan.manifest_sha256}\n"
+        f"retained releases: {retained_releases}\n"
+        "deletions: 0\n"
+    )
+
+
+def new_transfer_id() -> str:
+    return secrets.token_hex(16)
+
+
+def create_staging(dataset_root: Path, transfer_id: str) -> Path:
+    """Create one exclusive private incoming directory."""
+
+    if not re.fullmatch(r"[0-9a-f]{32}", transfer_id):
+        raise FixtureTransferError("transfer id is invalid")
+    root_fd, _ = _open_private_directory(dataset_root, "dataset root")
+    incoming_fd: int | None = None
+    try:
+        incoming_fd, _ = _open_private_child_directory(
+            root_fd,
+            "incoming",
+            "incoming directory",
+        )
+        try:
+            os.mkdir(transfer_id, 0o700, dir_fd=incoming_fd)
+        except FileExistsError:
+            raise FixtureTransferError("staging exists") from None
+        os.fsync(incoming_fd)
+    except FixtureTransferError:
+        raise
+    except OSError:
+        raise FixtureTransferError("staging could not be created safely") from None
+    finally:
+        if incoming_fd is not None:
+            os.close(incoming_fd)
+        os.close(root_fd)
+    return dataset_root / "incoming" / transfer_id
+
+
+def _resolved_staging(
+    staging: Path,
+    policy: DatasetPolicy,
+    *,
+    receipt_expected: bool,
+) -> StagingLayout:
+    dataset_root = Path(policy.destination)
+    transfer_id = staging.name
+    expected_staging = dataset_root / "incoming" / transfer_id
+    if staging != expected_staging:
+        raise FixtureTransferError("staging target root is invalid")
+    if not re.fullmatch(r"[0-9a-f]{32}", transfer_id):
+        raise FixtureTransferError("staging transfer id is invalid")
+
+    root_fd, _ = _open_private_directory(dataset_root, "dataset root")
+    incoming_fd: int | None = None
+    staging_fd: int | None = None
+    data_fd: int | None = None
+    try:
+        incoming_fd, _ = _open_private_child_directory(
+            root_fd,
+            "incoming",
+            "incoming directory",
+        )
+        staging_fd, _ = _open_private_child_directory(
+            incoming_fd,
+            transfer_id,
+            "staging directory",
+        )
+        with os.scandir(staging_fd) as iterator:
+            entries = {entry.name for entry in iterator}
+        expected = {"data", "manifest.json", "manifest.minisig"}
+        if receipt_expected:
+            expected.add("receipt.json")
+        if entries != expected:
+            raise FixtureTransferError("staging layout is invalid")
+        data_fd, _ = _open_private_child_directory(
+            staging_fd,
+            "data",
+            "staging data directory",
+        )
+        return StagingLayout(
+            dataset_root=dataset_root,
+            staging=expected_staging,
+            transfer_id=transfer_id,
+            root_fd=root_fd,
+            incoming_fd=incoming_fd,
+            staging_fd=staging_fd,
+            data_fd=data_fd,
+        )
+    except BaseException as exc:
+        for descriptor in (data_fd, staging_fd, incoming_fd, root_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+        if isinstance(exc, OSError):
+            raise FixtureTransferError("staging layout is unavailable") from None
+        raise
+
+
+def _receipt_json(receipt: Receipt) -> bytes:
+    return (
+        json.dumps(
+            asdict(receipt),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def receive(
+    staging: Path,
+    manifest_path: Path,
+    signature_path: Path,
+    public_key: Path,
+    policy: DatasetPolicy,
+    *,
+    target_id: str,
+    verified_at: datetime,
+) -> Receipt:
+    """Verify a complete staging tree and write an aggregate-only receipt."""
+
+    layout = _resolved_staging(
+        staging,
+        policy,
+        receipt_expected=False,
+    )
+    manifest_fd: int | None = None
+    signature_fd: int | None = None
+    try:
+        if manifest_path != layout.staging / "manifest.json":
+            raise FixtureTransferError("staging manifest location is invalid")
+        if signature_path != layout.staging / "manifest.minisig":
+            raise FixtureTransferError("staging signature location is invalid")
+        if not _DATASET_ID.fullmatch(target_id):
+            raise FixtureTransferError("target id is invalid")
+
+        manifest_fd, manifest_before, anchored_manifest = _open_held_transfer_file_at(
+            layout.staging_fd,
+            "manifest.json",
+            label="staging manifest",
+            max_bytes=_MAX_MANIFEST_BYTES,
+        )
+        signature_fd, signature_before, anchored_signature = (
+            _open_held_transfer_file_at(
+                layout.staging_fd,
+                "manifest.minisig",
+                label="staging signature",
+                max_bytes=_MAX_SIGNATURE_BYTES,
+            )
+        )
+        verified = verify_signature(
+            manifest_path,
+            signature_path,
+            public_key,
+        )
+        _validate_verified_manifest(verified)
+        if verified.signature_sha256 is None:
+            raise FixtureTransferError("verified signature digest is missing")
+        if anchored_manifest != verified.canonical_bytes:
+            raise FixtureTransferError("staging manifest changed after verification")
+        if hashlib.sha256(anchored_signature).hexdigest() != verified.signature_sha256:
+            raise FixtureTransferError("staging signature changed after verification")
+        if verified.manifest.dataset != policy.dataset_id:
+            raise FixtureTransferError("staging dataset does not match policy")
+        verify_manifest(
+            verified.manifest,
+            policy,
+            layout.staging / "data",
+            _anchored_root_fd=layout.data_fd,
+        )
+        _require_linked_regular(
+            manifest_fd,
+            manifest_before,
+            layout.staging_fd,
+            "manifest.json",
+            "staging manifest",
+        )
+        _require_linked_regular(
+            signature_fd,
+            signature_before,
+            layout.staging_fd,
+            "manifest.minisig",
+            "staging signature",
+        )
+
+        receipt = Receipt(
+            schema_version=1,
+            dataset=policy.dataset_id,
+            manifest_sha256=verified.sha256,
+            file_count=verified.manifest.file_count,
+            total_bytes=verified.manifest.total_bytes,
+            verified_at=_format_created_at(verified_at),
+            target_id=target_id,
+            status="verified",
+        )
+        _require_linked_directory(
+            layout.staging_fd,
+            layout.incoming_fd,
+            layout.transfer_id,
+            "staging directory",
+        )
+        _write_private_at(
+            layout.staging_fd,
+            "receipt.json",
+            _receipt_json(receipt),
+            "receipt",
+        )
+        return receipt
+    finally:
+        if signature_fd is not None:
+            os.close(signature_fd)
+        if manifest_fd is not None:
+            os.close(manifest_fd)
+        layout.close()
+
+
+def _reject_receipt_duplicate_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise FixtureTransferError("duplicate key in receipt JSON")
+        result[key] = value
+    return result
+
+
+def _receipt_from_bytes(raw: bytes) -> Receipt:
+    try:
+        body = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_receipt_duplicate_keys,
+        )
+    except FixtureTransferError:
+        raise
+    except (UnicodeError, json.JSONDecodeError):
+        raise FixtureTransferError("receipt JSON is invalid") from None
+    expected = {
+        "schema_version",
+        "dataset",
+        "manifest_sha256",
+        "file_count",
+        "total_bytes",
+        "verified_at",
+        "target_id",
+        "status",
+    }
+    if not isinstance(body, dict) or set(body) != expected:
+        raise FixtureTransferError("receipt fields are invalid")
+    if (
+        body["schema_version"] != 1
+        or not isinstance(body["dataset"], str)
+        or not _DATASET_ID.fullmatch(body["dataset"])
+        or not isinstance(body["manifest_sha256"], str)
+        or not _SHA256.fullmatch(body["manifest_sha256"])
+        or not _nonnegative_integer(body["file_count"])
+        or not _nonnegative_integer(body["total_bytes"])
+        or not isinstance(body["verified_at"], str)
+        or not _CREATED_AT.fullmatch(body["verified_at"])
+        or not isinstance(body["target_id"], str)
+        or not _DATASET_ID.fullmatch(body["target_id"])
+        or body["status"] != "verified"
+    ):
+        raise FixtureTransferError("receipt values are invalid")
+    try:
+        datetime.strptime(body["verified_at"], "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise FixtureTransferError("receipt values are invalid") from None
+    receipt = Receipt(**body)
+    if raw != _receipt_json(receipt):
+        raise FixtureTransferError("receipt JSON is not canonical")
+    return receipt
+
+
+def _load_receipt(path: Path) -> Receipt:
+    raw = _read_checked_regular(
+        path,
+        error_type=FixtureTransferError,
+        label="receipt",
+        allowed_modes=frozenset({0o600}),
+        max_bytes=64 * 1024,
+    )
+    return _receipt_from_bytes(raw)
+
+
+def _switch_current(root_fd: int, manifest_sha: str) -> None:
+    temporary = f".current-{secrets.token_hex(16)}"
+    try:
+        try:
+            current = os.stat("current", dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and not stat.S_ISLNK(current.st_mode):
+            raise FixtureTransferError("current release pointer is unsafe")
+        os.symlink(f"releases/{manifest_sha}", temporary, dir_fd=root_fd)
+        os.replace(temporary, "current", src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        os.fsync(root_fd)
+    except FixtureTransferError:
+        raise
+    except OSError:
+        try:
+            os.unlink(temporary, dir_fd=root_fd)
+        except OSError:
+            pass
+        raise FixtureTransferError("current release pointer update failed") from None
+
+
+def _verify_release(
+    release: Path,
+    manifest_sha: str,
+    policy: DatasetPolicy,
+    public_key: Path,
+    *,
+    root_fd: int,
+    releases_fd: int,
+) -> None:
+    owned_releases_fd = os.dup(releases_fd)
+    release_fd: int | None = None
+    data_fd: int | None = None
+    manifest_fd: int | None = None
+    signature_fd: int | None = None
+    receipt_fd: int | None = None
+    try:
+        release_fd, _ = _open_private_child_directory(
+            owned_releases_fd,
+            release.name,
+            "existing release",
+        )
+        with os.scandir(release_fd) as iterator:
+            entries = {entry.name for entry in iterator}
+        if entries != {
+            "data",
+            "manifest.json",
+            "manifest.minisig",
+            "receipt.json",
+        }:
+            raise FixtureTransferError("existing release differs")
+        data_fd, _ = _open_private_child_directory(
+            release_fd,
+            "data",
+            "existing release data",
+        )
+        manifest_path = release / "manifest.json"
+        signature_path = release / "manifest.minisig"
+        manifest_fd, manifest_before, actual_manifest = _open_held_transfer_file_at(
+            release_fd,
+            "manifest.json",
+            label="existing release manifest",
+            max_bytes=_MAX_MANIFEST_BYTES,
+        )
+        signature_fd, signature_before, actual_signature = _open_held_transfer_file_at(
+            release_fd,
+            "manifest.minisig",
+            label="existing release signature",
+            max_bytes=_MAX_SIGNATURE_BYTES,
+        )
+        receipt_fd, receipt_before, receipt_bytes = _open_held_transfer_file_at(
+            release_fd,
+            "receipt.json",
+            label="receipt",
+            max_bytes=64 * 1024,
+        )
+        verified = verify_signature(manifest_path, signature_path, public_key)
+        _validate_verified_manifest(verified)
+        if verified.signature_sha256 is None:
+            raise FixtureTransferError("existing release differs")
+        receipt = _receipt_from_bytes(receipt_bytes)
+        if (
+            actual_manifest != verified.canonical_bytes
+            or hashlib.sha256(actual_signature).hexdigest() != verified.signature_sha256
+            or verified.sha256 != manifest_sha
+            or verified.manifest.dataset != policy.dataset_id
+            or receipt.manifest_sha256 != manifest_sha
+            or receipt.dataset != policy.dataset_id
+            or receipt.file_count != verified.manifest.file_count
+            or receipt.total_bytes != verified.manifest.total_bytes
+        ):
+            raise FixtureTransferError("existing release differs")
+        verify_manifest(
+            verified.manifest,
+            policy,
+            release / "data",
+            _anchored_root_fd=data_fd,
+        )
+        _require_linked_regular(
+            manifest_fd,
+            manifest_before,
+            release_fd,
+            "manifest.json",
+            "existing release manifest",
+        )
+        _require_linked_regular(
+            signature_fd,
+            signature_before,
+            release_fd,
+            "manifest.minisig",
+            "existing release signature",
+        )
+        _require_linked_regular(
+            receipt_fd,
+            receipt_before,
+            release_fd,
+            "receipt.json",
+            "receipt",
+        )
+        _require_linked_directory(
+            data_fd,
+            release_fd,
+            "data",
+            "existing release data",
+        )
+        _require_linked_directory(
+            release_fd,
+            owned_releases_fd,
+            release.name,
+            "existing release",
+        )
+        _require_linked_directory(
+            owned_releases_fd,
+            root_fd,
+            "releases",
+            "releases directory",
+        )
+        _require_configured_directory(Path(policy.destination), root_fd, "dataset root")
+    finally:
+        if receipt_fd is not None:
+            os.close(receipt_fd)
+        if signature_fd is not None:
+            os.close(signature_fd)
+        if manifest_fd is not None:
+            os.close(manifest_fd)
+        if data_fd is not None:
+            os.close(data_fd)
+        if release_fd is not None:
+            os.close(release_fd)
+        os.close(owned_releases_fd)
+
+
+def _promote_with_process_lock(
+    dataset_root: Path,
+    staging: Path,
+    manifest_sha: str,
+    policy: DatasetPolicy,
+    public_key: Path,
+) -> Path:
+    """Promote verified staging under a process-safe lock and atomically swap current."""
+
+    if not _SHA256.fullmatch(manifest_sha):
+        raise FixtureTransferError("release id is invalid")
+    if str(dataset_root) != policy.destination:
+        raise FixtureTransferError("promotion target root does not match policy")
+    root_fd, _ = _open_private_directory(dataset_root, "dataset root")
+    lock_fd: int | None = None
+    layout: StagingLayout | None = None
+    releases_fd: int | None = None
+    manifest_fd: int | None = None
+    signature_fd: int | None = None
+    receipt_fd: int | None = None
+    try:
+        lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            lock_flags |= os.O_NOFOLLOW
+        for attempt in range(16):
+            try:
+                lock_fd = os.open(
+                    ".promote.lock",
+                    lock_flags,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+                break
+            except OSError as exc:
+                if exc.errno in {errno.EINTR, errno.ENOENT} and attempt < 15:
+                    continue
+                raise FixtureTransferError("promotion lock open failed") from None
+        if lock_fd is None:
+            raise FixtureTransferError("promotion lock open failed")
+        try:
+            os.fchmod(lock_fd, 0o600)
+            lock_metadata = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(lock_metadata.st_mode)
+                or lock_metadata.st_uid != os.getuid()
+                or lock_metadata.st_nlink != 1
+                or _mode_bits(lock_metadata) != 0o600
+            ):
+                raise FixtureTransferError("promotion lock is unsafe")
+        except FixtureTransferError:
+            raise
+        except OSError as exc:
+            raise FixtureTransferError(
+                f"promotion lock validation failed (errno {exc.errno})"
+            ) from None
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise FixtureTransferError(
+                f"promotion lock acquisition failed (errno {exc.errno})"
+            ) from None
+
+        layout = _resolved_staging(staging, policy, receipt_expected=True)
+        if _directory_identity(os.fstat(root_fd)) != _directory_identity(
+            os.fstat(layout.root_fd)
+        ):
+            raise FixtureTransferError("dataset root changed")
+        manifest_path = layout.staging / "manifest.json"
+        signature_path = layout.staging / "manifest.minisig"
+        manifest_fd, manifest_before, actual_manifest = _open_held_transfer_file_at(
+            layout.staging_fd,
+            "manifest.json",
+            label="staging manifest",
+            max_bytes=_MAX_MANIFEST_BYTES,
+        )
+        signature_fd, signature_before, actual_signature = _open_held_transfer_file_at(
+            layout.staging_fd,
+            "manifest.minisig",
+            label="staging signature",
+            max_bytes=_MAX_SIGNATURE_BYTES,
+        )
+        receipt_fd, receipt_before, receipt_bytes = _open_held_transfer_file_at(
+            layout.staging_fd,
+            "receipt.json",
+            label="receipt",
+            max_bytes=64 * 1024,
+        )
+        receipt = _receipt_from_bytes(receipt_bytes)
+        verified = verify_signature(
+            manifest_path,
+            signature_path,
+            public_key,
+        )
+        _validate_verified_manifest(verified)
+        if verified.signature_sha256 is None:
+            raise FixtureTransferError("verified signature digest is missing")
+        if (
+            actual_manifest != verified.canonical_bytes
+            or hashlib.sha256(actual_signature).hexdigest() != verified.signature_sha256
+            or verified.sha256 != manifest_sha
+            or receipt.manifest_sha256 != manifest_sha
+            or receipt.dataset != policy.dataset_id
+            or receipt.file_count != verified.manifest.file_count
+            or receipt.total_bytes != verified.manifest.total_bytes
+        ):
+            raise FixtureTransferError("release id does not match verified staging")
+        verify_manifest(
+            verified.manifest,
+            policy,
+            layout.staging / "data",
+            _anchored_root_fd=layout.data_fd,
+        )
+        _require_linked_regular(
+            manifest_fd,
+            manifest_before,
+            layout.staging_fd,
+            "manifest.json",
+            "staging manifest",
+        )
+        _require_linked_regular(
+            signature_fd,
+            signature_before,
+            layout.staging_fd,
+            "manifest.minisig",
+            "staging signature",
+        )
+        _require_linked_regular(
+            receipt_fd,
+            receipt_before,
+            layout.staging_fd,
+            "receipt.json",
+            "receipt",
+        )
+        _require_linked_directory(
+            layout.staging_fd,
+            layout.incoming_fd,
+            layout.transfer_id,
+            "staging directory",
+        )
+
+        releases_fd, _ = _open_private_child_directory(
+            root_fd,
+            "releases",
+            "releases directory",
+        )
+        release = dataset_root / "releases" / manifest_sha
+        try:
+            os.stat(manifest_sha, dir_fd=releases_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                _rename_noreplace(
+                    layout.incoming_fd,
+                    layout.transfer_id,
+                    releases_fd,
+                    manifest_sha,
+                )
+                promoted = os.stat(
+                    manifest_sha,
+                    dir_fd=releases_fd,
+                    follow_symlinks=False,
+                )
+                if _directory_identity(promoted) != _directory_identity(
+                    os.fstat(layout.staging_fd)
+                ):
+                    raise FixtureTransferError("staging directory changed")
+                os.fsync(releases_fd)
+                os.fsync(layout.incoming_fd)
+            except FixtureTransferError:
+                raise
+            except OSError:
+                raise FixtureTransferError("release promotion rename failed") from None
+        except OSError:
+            raise FixtureTransferError(
+                "release path is unavailable or unsafe"
+            ) from None
+        else:
+            try:
+                _verify_release(
+                    release,
+                    manifest_sha,
+                    policy,
+                    public_key,
+                    root_fd=root_fd,
+                    releases_fd=releases_fd,
+                )
+            except (
+                FixtureManifestError,
+                FixturePolicyError,
+                FixtureSignatureError,
+                FixtureTransferError,
+                OSError,
+            ):
+                raise FixtureTransferError("existing release differs") from None
+        try:
+            _verify_release(
+                release,
+                manifest_sha,
+                policy,
+                public_key,
+                root_fd=root_fd,
+                releases_fd=releases_fd,
+            )
+        except (
+            FixtureManifestError,
+            FixturePolicyError,
+            FixtureSignatureError,
+            FixtureTransferError,
+            OSError,
+        ):
+            raise FixtureTransferError("promoted release failed verification") from None
+        _require_configured_directory(dataset_root, root_fd, "dataset root")
+        _require_linked_directory(
+            releases_fd,
+            root_fd,
+            "releases",
+            "releases directory",
+        )
+        _switch_current(root_fd, manifest_sha)
+        return release
+    except FixtureTransferError:
+        raise
+    except OSError:
+        raise FixtureTransferError("release promotion failed safely") from None
+    finally:
+        if receipt_fd is not None:
+            os.close(receipt_fd)
+        if signature_fd is not None:
+            os.close(signature_fd)
+        if manifest_fd is not None:
+            os.close(manifest_fd)
+        if releases_fd is not None:
+            os.close(releases_fd)
+        if layout is not None:
+            layout.close()
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(root_fd)
+
+
+def promote(
+    dataset_root: Path,
+    staging: Path,
+    manifest_sha: str,
+    policy: DatasetPolicy,
+    public_key: Path,
+) -> Path:
+    """Serialize threads, then use the filesystem lock to serialize processes."""
+
+    lock_key = os.path.abspath(dataset_root)
+    with _PROMOTION_THREAD_LOCKS_GUARD:
+        thread_lock = _PROMOTION_THREAD_LOCKS.setdefault(
+            lock_key,
+            threading.Lock(),
+        )
+    with thread_lock:
+        return _promote_with_process_lock(
+            dataset_root,
+            staging,
+            manifest_sha,
+            policy,
+            public_key,
+        )
+
+
 def _die(message: str) -> NoReturn:
     sys.stderr.write(f"fixturectl: {message}\n")
     raise SystemExit(2)
@@ -1256,7 +2369,13 @@ def main(argv: list[str] | None = None) -> int:
                 os.close(root_fd)
         else:
             verify_manifest(load_manifest(args.manifest), dataset_policy, args.root)
-    except (FixturePolicyError, FixtureManifestError, FixtureSignatureError, OSError):
+    except (
+        FixturePolicyError,
+        FixtureManifestError,
+        FixtureSignatureError,
+        FixtureTransferError,
+        OSError,
+    ):
         _die("validation failed")
     return 0
 
