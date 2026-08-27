@@ -14,11 +14,14 @@ from datetime import UTC, datetime
 import errno
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -55,6 +58,45 @@ _PROMOTION_THREAD_LOCKS_GUARD = threading.Lock()
 _PROMOTION_THREAD_LOCKS: dict[str, threading.Lock] = {}
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 0x00000004
+_SSH_DESTINATION = re.compile(
+    r"^(?:[a-z_][a-z0-9_-]{0,31}@)?[a-z0-9](?:[a-z0-9.-]{0,252}[a-z0-9])?$"
+)
+_TRANSFER_CONFIG_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source_alias",
+        "state_directory",
+        "ssh_executable",
+        "rsync_executable",
+        "rsync_version",
+        "targets",
+    }
+)
+_TRANSFER_TARGET_FIELDS = frozenset(
+    {
+        "ssh_destination",
+        "target_id",
+        "remote_fixturectl",
+    }
+)
+_RECEIVER_CONFIG_FIELDS = frozenset(
+    {
+        "schema_version",
+        "protocol_version",
+        "target_id",
+        "policy",
+        "public_key",
+        "fixturectl_executable",
+        "rsync_executable",
+        "rsync_version",
+    }
+)
+_RECEIVER_CONFIG_PATH = Path("/etc/fixturectl/receiver.json")
+_RECEIVER_PROTOCOL_VERSION = 1
+_PINNED_RSYNC_VERSION = "3.5.0"
+_PINNED_RSYNC_PROTOCOL = 32
+_RSYNC_DATA_SERVER_OPTIONS = "-logDtpRe.LsfxCIvu"
+_RSYNC_METADATA_SERVER_OPTIONS = "-logDtpre.iLsfxCIvu"
 
 
 class FixturePolicyError(ValueError):
@@ -71,6 +113,10 @@ class FixtureSignatureError(ValueError):
 
 class FixtureTransferError(ValueError):
     """A transfer or release operation violated the fixture safety contract."""
+
+
+class FixtureTransferApplyError(FixtureTransferError):
+    """An applied transfer failed after remote staging was created."""
 
 
 @dataclass(frozen=True)
@@ -124,6 +170,46 @@ class TransferPlan:
     files_from: Path
     file_count: int
     total_bytes: int
+
+
+@dataclass(frozen=True)
+class TransferTarget:
+    alias: str
+    ssh_destination: str
+    target_id: str
+    remote_fixturectl: str
+
+
+@dataclass(frozen=True)
+class ReceiverConfig:
+    schema_version: int
+    protocol_version: int
+    target_id: str
+    policy: Path
+    public_key: Path
+    fixturectl_executable: str
+    rsync_executable: str
+    rsync_version: str
+
+
+@dataclass(frozen=True)
+class TransferConfig:
+    schema_version: int
+    source_alias: str
+    state_directory: Path
+    ssh_executable: str
+    rsync_executable: str
+    rsync_version: str
+    targets: dict[str, TransferTarget]
+
+
+@dataclass(frozen=True)
+class TransferResult:
+    plan: TransferPlan
+    summary: str
+    applied: bool
+    transfer_id: str | None
+    receipt_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -1308,6 +1394,159 @@ def _validate_verified_manifest(verified: VerifiedManifest) -> None:
         raise FixtureTransferError("verified manifest digest is inconsistent")
 
 
+def _reject_transfer_config_duplicate_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise FixtureTransferError("duplicate key in transfer config")
+        result[key] = value
+    return result
+
+
+def _safe_remote_absolute_path(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith("/"):
+        return False
+    path = PurePosixPath(value)
+    return (
+        str(path) == value
+        and path.is_absolute()
+        and len(path.parts) > 1
+        and all(_safe_component(part) for part in path.parts[1:])
+    )
+
+
+def _tailnet_ssh_destination(value: object) -> bool:
+    if not isinstance(value, str) or not _SSH_DESTINATION.fullmatch(value):
+        return False
+    host = value.rsplit("@", 1)[-1]
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address in ipaddress.ip_network(
+        "100.64.0.0/10"
+    ) or address in ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def load_transfer_config(path: Path) -> TransferConfig:
+    raw = _read_checked_regular(
+        path,
+        error_type=FixtureTransferError,
+        label="transfer config",
+        allowed_modes=frozenset({0o600}),
+        max_bytes=64 * 1024,
+    )
+    try:
+        body = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_transfer_config_duplicate_keys,
+        )
+    except FixtureTransferError:
+        raise
+    except (UnicodeError, json.JSONDecodeError):
+        raise FixtureTransferError("transfer config JSON is invalid") from None
+    if not isinstance(body, dict) or set(body) != _TRANSFER_CONFIG_FIELDS:
+        raise FixtureTransferError("transfer config fields are invalid")
+    if (
+        body["schema_version"] != 1
+        or not isinstance(body["source_alias"], str)
+        or not _DATASET_ID.fullmatch(body["source_alias"])
+        or not isinstance(body["state_directory"], str)
+        or not Path(body["state_directory"]).is_absolute()
+        or not _safe_remote_absolute_path(body["ssh_executable"])
+        or not _safe_remote_absolute_path(body["rsync_executable"])
+        or body["rsync_version"] != _PINNED_RSYNC_VERSION
+        or not isinstance(body["targets"], dict)
+        or not body["targets"]
+        or len(body["targets"]) > 32
+    ):
+        raise FixtureTransferError("transfer config values are invalid")
+
+    targets: dict[str, TransferTarget] = {}
+    for alias, value in body["targets"].items():
+        if (
+            not isinstance(alias, str)
+            or not _DATASET_ID.fullmatch(alias)
+            or not isinstance(value, dict)
+            or set(value) != _TRANSFER_TARGET_FIELDS
+        ):
+            raise FixtureTransferError("transfer target fields are invalid")
+        if (
+            not _tailnet_ssh_destination(value["ssh_destination"])
+            or not isinstance(value["target_id"], str)
+            or not _DATASET_ID.fullmatch(value["target_id"])
+            or not _safe_remote_absolute_path(value["remote_fixturectl"])
+        ):
+            raise FixtureTransferError("transfer target values are invalid")
+        targets[alias] = TransferTarget(
+            alias=alias,
+            ssh_destination=value["ssh_destination"],
+            target_id=value["target_id"],
+            remote_fixturectl=value["remote_fixturectl"],
+        )
+
+    state_directory = Path(body["state_directory"])
+    state_fd, _ = _open_private_directory(
+        state_directory,
+        "transfer state directory",
+    )
+    os.close(state_fd)
+    return TransferConfig(
+        schema_version=1,
+        source_alias=body["source_alias"],
+        state_directory=state_directory,
+        ssh_executable=body["ssh_executable"],
+        rsync_executable=body["rsync_executable"],
+        rsync_version=body["rsync_version"],
+        targets=targets,
+    )
+
+
+def load_receiver_config(path: Path = _RECEIVER_CONFIG_PATH) -> ReceiverConfig:
+    raw = _read_checked_regular(
+        path,
+        error_type=FixtureTransferError,
+        label="receiver config",
+        allowed_modes=frozenset({0o600}),
+        max_bytes=64 * 1024,
+    )
+    try:
+        body = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_transfer_config_duplicate_keys,
+        )
+    except FixtureTransferError:
+        raise
+    except (UnicodeError, json.JSONDecodeError):
+        raise FixtureTransferError("receiver config JSON is invalid") from None
+    if not isinstance(body, dict) or set(body) != _RECEIVER_CONFIG_FIELDS:
+        raise FixtureTransferError("receiver config fields are invalid")
+    if (
+        body["schema_version"] != 1
+        or body["protocol_version"] != _RECEIVER_PROTOCOL_VERSION
+        or not isinstance(body["target_id"], str)
+        or not _DATASET_ID.fullmatch(body["target_id"])
+        or not _safe_remote_absolute_path(body["policy"])
+        or not _safe_remote_absolute_path(body["public_key"])
+        or not _safe_remote_absolute_path(body["fixturectl_executable"])
+        or not _safe_remote_absolute_path(body["rsync_executable"])
+        or body["rsync_version"] != _PINNED_RSYNC_VERSION
+    ):
+        raise FixtureTransferError("receiver config values are invalid")
+    return ReceiverConfig(
+        schema_version=1,
+        protocol_version=_RECEIVER_PROTOCOL_VERSION,
+        target_id=body["target_id"],
+        policy=Path(body["policy"]),
+        public_key=Path(body["public_key"]),
+        fixturectl_executable=body["fixturectl_executable"],
+        rsync_executable=body["rsync_executable"],
+        rsync_version=body["rsync_version"],
+    )
+
+
 def _open_private_directory(path: Path, label: str) -> tuple[int, os.stat_result]:
     descriptor: int | None = None
     try:
@@ -1583,7 +1822,21 @@ def plan_transfer(
     file_list = b"".join(
         item.path.encode("utf-8") + b"\0" for item in verified.manifest.files
     )
-    _write_private(files_from, file_list)
+    try:
+        _write_private(files_from, file_list)
+    except FixtureManifestError:
+        try:
+            existing = _read_checked_regular(
+                files_from,
+                error_type=FixtureTransferError,
+                label="transfer file list",
+                allowed_modes=frozenset({0o600}),
+                max_bytes=_MAX_MANIFEST_BYTES,
+            )
+        except FixtureTransferError:
+            raise FixtureTransferError("transfer file list is unsafe") from None
+        if existing != file_list:
+            raise FixtureTransferError("transfer file list differs") from None
     return TransferPlan(
         dataset=policy.dataset_id,
         source=source,
@@ -1623,6 +1876,570 @@ def render_transfer_summary(
 
 def new_transfer_id() -> str:
     return secrets.token_hex(16)
+
+
+def _ensure_private_state_leaf(
+    root: Path,
+    dataset: str,
+    manifest_sha: str,
+) -> Path:
+    if not _DATASET_ID.fullmatch(dataset) or not _SHA256.fullmatch(manifest_sha):
+        raise FixtureTransferError("transfer state identity is invalid")
+    root_fd, _ = _open_private_directory(root, "transfer state directory")
+    dataset_fd: int | None = None
+    release_fd: int | None = None
+    try:
+        try:
+            os.mkdir(dataset, 0o700, dir_fd=root_fd)
+            os.fsync(root_fd)
+        except FileExistsError:
+            pass
+        dataset_fd, _ = _open_private_child_directory(
+            root_fd,
+            dataset,
+            "dataset state directory",
+        )
+        try:
+            os.mkdir(manifest_sha, 0o700, dir_fd=dataset_fd)
+            os.fsync(dataset_fd)
+        except FileExistsError:
+            pass
+        release_fd, _ = _open_private_child_directory(
+            dataset_fd,
+            manifest_sha,
+            "release state directory",
+        )
+    except FixtureTransferError:
+        raise
+    except OSError:
+        raise FixtureTransferError("transfer state could not be prepared") from None
+    finally:
+        if release_fd is not None:
+            os.close(release_fd)
+        if dataset_fd is not None:
+            os.close(dataset_fd)
+        os.close(root_fd)
+    return root / dataset / manifest_sha
+
+
+def _verify_pinned_rsync(executable: str, expected_version: str) -> None:
+    output = _run_transfer_process(
+        [executable, "--version"],
+        capture=True,
+        timeout=10,
+    )
+    match = re.search(
+        rb"^rsync\s+version\s+([0-9]+\.[0-9]+\.[0-9]+)\s+"
+        rb"protocol version\s+([0-9]+)$",
+        output,
+        re.MULTILINE,
+    )
+    if (
+        match is None
+        or match.group(1).decode("ascii") != expected_version
+        or int(match.group(2)) != _PINNED_RSYNC_PROTOCOL
+    ):
+        raise FixtureTransferError("rsync does not match pinned protocol")
+
+
+def _ssh_command(
+    ssh: str,
+    target: TransferTarget,
+    *remote_arguments: str,
+) -> list[str]:
+    for argument in remote_arguments:
+        if not re.fullmatch(r"[A-Za-z0-9_./=-]+", argument):
+            raise FixtureTransferError("remote command argument is invalid")
+    return [
+        ssh,
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "--",
+        target.ssh_destination,
+        target.remote_fixturectl,
+        *remote_arguments,
+    ]
+
+
+def _run_transfer_process(
+    arguments: list[str],
+    *,
+    capture: bool = False,
+    timeout: int = 120,
+) -> bytes:
+    try:
+        completed = subprocess.run(
+            arguments,
+            check=True,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise FixtureTransferError("transfer step failed safely") from None
+    output = completed.stdout or b""
+    if len(output) > 64 * 1024:
+        raise FixtureTransferError("transfer response exceeded safe limit")
+    return output
+
+
+def _write_local_receipt(path: Path, receipt: Receipt) -> None:
+    body = _receipt_json(receipt)
+    try:
+        _write_private(path, body)
+    except FixtureManifestError:
+        try:
+            existing = _read_checked_regular(
+                path,
+                error_type=FixtureTransferError,
+                label="local receipt",
+                allowed_modes=frozenset({0o600}),
+                max_bytes=64 * 1024,
+            )
+        except FixtureTransferError:
+            raise FixtureTransferError("local receipt is unsafe") from None
+        if existing != body:
+            raise FixtureTransferError("local receipt differs") from None
+
+
+def _verify_preflight_response(
+    raw: bytes,
+    *,
+    dataset: str,
+    target: TransferTarget,
+) -> None:
+    try:
+        body = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_transfer_config_duplicate_keys,
+        )
+    except (FixtureTransferError, UnicodeError, json.JSONDecodeError):
+        raise FixtureTransferError("receiver preflight response is invalid") from None
+    if (
+        not isinstance(body, dict)
+        or set(body) != {"dataset", "protocol_version", "status", "target_id"}
+        or body["dataset"] != dataset
+        or body["protocol_version"] != _RECEIVER_PROTOCOL_VERSION
+        or body["status"] != "ready"
+        or body["target_id"] != target.target_id
+    ):
+        raise FixtureTransferError("receiver identity does not match approved target")
+
+
+def _run_quarantined_step(
+    arguments: list[str],
+    *,
+    dataset: str,
+    transfer_id: str,
+    remediation: str,
+    capture: bool = False,
+    timeout: int = 120,
+) -> bytes:
+    try:
+        return _run_transfer_process(
+            arguments,
+            capture=capture,
+            timeout=timeout,
+        )
+    except FixtureTransferError:
+        raise FixtureTransferApplyError(
+            f"transfer_id={transfer_id} status=quarantined; remediation: {remediation}"
+        ) from None
+
+
+def _recovery_command(
+    *,
+    config_path: Path,
+    dataset: str,
+    target_alias: str,
+    transfer_id: str,
+    manifest_sha: str,
+) -> str:
+    return shlex.join(
+        [
+            "fixturectl",
+            "transfer-status",
+            "--dataset",
+            dataset,
+            "--target",
+            target_alias,
+            "--config",
+            str(config_path),
+            "--transfer-id",
+            transfer_id,
+            "--manifest-sha",
+            manifest_sha,
+        ]
+    )
+
+
+def _confirmation_pending_error(transfer_id: str, remediation: str) -> NoReturn:
+    raise FixtureTransferApplyError(
+        f"transfer_id={transfer_id} status=confirmation-pending; "
+        f"remediation: {remediation}"
+    )
+
+
+def _transfer_status_from_bytes(
+    raw: bytes,
+    *,
+    dataset: str,
+    transfer_id: str,
+) -> str:
+    try:
+        body = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_transfer_config_duplicate_keys,
+        )
+    except (FixtureTransferError, UnicodeError, json.JSONDecodeError):
+        raise FixtureTransferError("receiver status response is invalid") from None
+    if (
+        not isinstance(body, dict)
+        or set(body) != {"dataset", "status", "transfer_id"}
+        or body["dataset"] != dataset
+        or body["transfer_id"] != transfer_id
+        or body["status"] not in {"not-found", "quarantined", "unsafe"}
+    ):
+        raise FixtureTransferError("receiver status response is invalid")
+    return body["status"]
+
+
+def run_transfer_status(
+    *,
+    config_path: Path,
+    dataset: str,
+    target_alias: str,
+    transfer_id: str,
+    manifest_sha: str,
+) -> tuple[str, Path | None]:
+    """Reconcile one interrupted apply without reading or transferring source data."""
+
+    if not _DATASET_ID.fullmatch(dataset):
+        raise FixtureTransferError("status dataset is invalid")
+    if not re.fullmatch(r"[0-9a-f]{32}", transfer_id):
+        raise FixtureTransferError("status transfer id is invalid")
+    if not _SHA256.fullmatch(manifest_sha):
+        raise FixtureTransferError("status release id is invalid")
+    config = load_transfer_config(config_path)
+    try:
+        target = config.targets[target_alias]
+    except KeyError:
+        raise FixtureTransferError("status target is not approved") from None
+    status_output = _run_transfer_process(
+        _ssh_command(
+            config.ssh_executable,
+            target,
+            "receive",
+            "status",
+            "--dataset",
+            dataset,
+            "--transfer-id",
+            transfer_id,
+        ),
+        capture=True,
+    )
+    status = _transfer_status_from_bytes(
+        status_output,
+        dataset=dataset,
+        transfer_id=transfer_id,
+    )
+    if status != "not-found":
+        return status, None
+
+    receipt_output = _run_transfer_process(
+        _ssh_command(
+            config.ssh_executable,
+            target,
+            "receipt",
+            "print",
+            "--dataset",
+            dataset,
+            "--manifest-sha",
+            manifest_sha,
+        ),
+        capture=True,
+    )
+    receipt = _receipt_from_bytes(receipt_output)
+    if (
+        receipt.dataset != dataset
+        or receipt.manifest_sha256 != manifest_sha
+        or receipt.target_id != target.target_id
+        or receipt.status != "verified"
+    ):
+        raise FixtureTransferError("remote receipt does not match recovery request")
+    state_leaf = _ensure_private_state_leaf(
+        config.state_directory,
+        dataset,
+        manifest_sha,
+    )
+    receipt_path = state_leaf / "receipt.json"
+    _write_local_receipt(receipt_path, receipt)
+    return "verified", receipt_path
+
+
+def _require_state_outside_source(state: Path, source: Path) -> None:
+    source_fd, _ = _open_dataset_root(source)
+    state_fd, _ = _open_private_directory(state, "transfer state directory")
+    try:
+        if _directory_is_within(state_fd, source_fd):
+            raise FixtureTransferError("transfer state must be outside source")
+    except FixtureManifestError:
+        raise FixtureTransferError("transfer state containment is invalid") from None
+    finally:
+        os.close(state_fd)
+        os.close(source_fd)
+
+
+def run_transfer(
+    *,
+    config_path: Path,
+    policy: DatasetPolicy,
+    dataset: str,
+    target_alias: str,
+    source: Path,
+    manifest_path: Path,
+    signature_path: Path,
+    public_key: Path,
+    apply: bool,
+    retained_releases: int,
+    verified_at: datetime,
+) -> TransferResult:
+    """Plan by default; explicitly apply one-way transfer to an approved target."""
+
+    if dataset != policy.dataset_id:
+        raise FixtureTransferError("transfer dataset does not match policy")
+    if manifest_path.name != "manifest.json":
+        raise FixtureTransferError("manifest must use canonical name")
+    if signature_path.name != "manifest.minisig":
+        raise FixtureTransferError("signature must use canonical name")
+    config = load_transfer_config(config_path)
+    try:
+        target = config.targets[target_alias]
+    except KeyError:
+        raise FixtureTransferError("transfer target is not approved") from None
+    _require_state_outside_source(config.state_directory, source)
+    verified = verify_signature(manifest_path, signature_path, public_key)
+    _validate_verified_manifest(verified)
+    if verified.signature_sha256 is None:
+        raise FixtureTransferError("verified signature digest is missing")
+    if verified.manifest.dataset != dataset:
+        raise FixtureTransferError("signed manifest dataset is invalid")
+
+    state_leaf = _ensure_private_state_leaf(
+        config.state_directory,
+        dataset,
+        verified.sha256,
+    )
+    plan = plan_transfer(
+        verified,
+        policy,
+        source,
+        policy.destination,
+        state_leaf,
+    )
+    summary = render_transfer_summary(
+        plan,
+        source_alias=config.source_alias,
+        destination_alias=target.alias,
+        retained_releases=retained_releases,
+    )
+    if not apply:
+        return TransferResult(
+            plan=plan,
+            summary=summary,
+            applied=False,
+            transfer_id=None,
+            receipt_path=None,
+        )
+
+    ssh = config.ssh_executable
+    rsync = config.rsync_executable
+    _verify_pinned_rsync(rsync, config.rsync_version)
+    transfer_id = new_transfer_id()
+    remote_staging = f"{policy.destination}/incoming/{transfer_id}"
+    remote_data = f"{remote_staging}/data/"
+    remote_root = f"{target.ssh_destination}:{remote_staging}/"
+    rsync_rsh = shlex.join(
+        [
+            ssh,
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+        ]
+    )
+
+    preflight_output = _run_transfer_process(
+        _ssh_command(
+            ssh,
+            target,
+            "receive",
+            "preflight",
+            "--dataset",
+            dataset,
+            "--required-bytes",
+            str(plan.total_bytes),
+        ),
+        capture=True,
+    )
+    _verify_preflight_response(
+        preflight_output,
+        dataset=dataset,
+        target=target,
+    )
+    remediation = _recovery_command(
+        config_path=config_path,
+        dataset=dataset,
+        target_alias=target_alias,
+        transfer_id=transfer_id,
+        manifest_sha=verified.sha256,
+    )
+    _run_quarantined_step(
+        _ssh_command(
+            ssh,
+            target,
+            "receive",
+            "create-staging",
+            "--dataset",
+            dataset,
+            "--transfer-id",
+            transfer_id,
+        ),
+        dataset=dataset,
+        transfer_id=transfer_id,
+        remediation=remediation,
+    )
+    data_rsync_path = shlex.join(
+        [
+            target.remote_fixturectl,
+            "ssh-dispatch-rsync",
+            "--dataset",
+            dataset,
+            "--transfer-id",
+            transfer_id,
+            "--kind",
+            "data",
+        ]
+    )
+    metadata_rsync_path = shlex.join(
+        [
+            target.remote_fixturectl,
+            "ssh-dispatch-rsync",
+            "--dataset",
+            dataset,
+            "--transfer-id",
+            transfer_id,
+            "--kind",
+            "metadata",
+        ]
+    )
+    _run_quarantined_step(
+        [
+            rsync,
+            "--archive",
+            "--from0",
+            f"--files-from={plan.files_from}",
+            "--partial",
+            f"--partial-dir=.fixturectl-partial-{transfer_id}",
+            "--chmod=D700,F600",
+            f"--rsh={rsync_rsh}",
+            f"--rsync-path={data_rsync_path}",
+            "--",
+            f"{source}{os.sep}",
+            f"{target.ssh_destination}:{remote_data}",
+        ],
+        dataset=dataset,
+        transfer_id=transfer_id,
+        remediation=remediation,
+        timeout=14_400,
+    )
+    _run_quarantined_step(
+        [
+            rsync,
+            "--archive",
+            "--chmod=F600",
+            f"--rsh={rsync_rsh}",
+            f"--rsync-path={metadata_rsync_path}",
+            "--",
+            str(manifest_path),
+            str(signature_path),
+            remote_root,
+        ],
+        dataset=dataset,
+        transfer_id=transfer_id,
+        remediation=remediation,
+        timeout=600,
+    )
+    _run_quarantined_step(
+        _ssh_command(
+            ssh,
+            target,
+            "receive",
+            "verify",
+            "--dataset",
+            dataset,
+            "--transfer-id",
+            transfer_id,
+        ),
+        dataset=dataset,
+        transfer_id=transfer_id,
+        remediation=remediation,
+    )
+    try:
+        _run_transfer_process(
+            _ssh_command(
+                ssh,
+                target,
+                "receive",
+                "promote",
+                "--dataset",
+                dataset,
+                "--transfer-id",
+                transfer_id,
+                "--manifest-sha",
+                verified.sha256,
+            )
+        )
+        receipt_output = _run_transfer_process(
+            _ssh_command(
+                ssh,
+                target,
+                "receipt",
+                "print",
+                "--dataset",
+                dataset,
+                "--manifest-sha",
+                verified.sha256,
+            ),
+            capture=True,
+        )
+        receipt = _receipt_from_bytes(receipt_output)
+        if (
+            receipt.dataset != dataset
+            or receipt.manifest_sha256 != verified.sha256
+            or receipt.file_count != verified.manifest.file_count
+            or receipt.total_bytes != verified.manifest.total_bytes
+            or receipt.target_id != target.target_id
+            or receipt.status != "verified"
+        ):
+            raise FixtureTransferError("remote receipt does not match local manifest")
+        receipt_path = state_leaf / "receipt.json"
+        _write_local_receipt(receipt_path, receipt)
+    except FixtureTransferError:
+        _confirmation_pending_error(transfer_id, remediation)
+    return TransferResult(
+        plan=plan,
+        summary=summary,
+        applied=True,
+        transfer_id=transfer_id,
+        receipt_path=receipt_path,
+    )
 
 
 def create_staging(dataset_root: Path, transfer_id: str) -> Path:
@@ -2321,6 +3138,208 @@ def promote(
         )
 
 
+def _create_staging_data(dataset_root: Path, transfer_id: str) -> Path:
+    staging = create_staging(dataset_root, transfer_id)
+    staging_fd, _ = _open_private_directory(staging, "staging directory")
+    try:
+        os.mkdir("data", 0o700, dir_fd=staging_fd)
+        os.fsync(staging_fd)
+    except OSError:
+        raise FixtureTransferError("staging data could not be created safely") from None
+    finally:
+        os.close(staging_fd)
+    return staging
+
+
+def _receiver_preflight(
+    policy: DatasetPolicy,
+    *,
+    required_bytes: int,
+) -> None:
+    if not _nonnegative_integer(required_bytes):
+        raise FixtureTransferError("required byte count is invalid")
+    root = Path(policy.destination)
+    root_fd, _ = _open_private_directory(root, "dataset root")
+    incoming_fd: int | None = None
+    releases_fd: int | None = None
+    try:
+        incoming_fd, _ = _open_private_child_directory(
+            root_fd,
+            "incoming",
+            "incoming directory",
+        )
+        releases_fd, _ = _open_private_child_directory(
+            root_fd,
+            "releases",
+            "releases directory",
+        )
+        if shutil.disk_usage(root).free < required_bytes:
+            raise FixtureTransferError("target capacity is insufficient")
+    finally:
+        if releases_fd is not None:
+            os.close(releases_fd)
+        if incoming_fd is not None:
+            os.close(incoming_fd)
+        os.close(root_fd)
+
+
+def _receiver_status(policy: DatasetPolicy, transfer_id: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{32}", transfer_id):
+        raise FixtureTransferError("transfer id is invalid")
+    root_fd, _ = _open_private_directory(Path(policy.destination), "dataset root")
+    incoming_fd: int | None = None
+    try:
+        incoming_fd, _ = _open_private_child_directory(
+            root_fd,
+            "incoming",
+            "incoming directory",
+        )
+        try:
+            metadata = os.stat(
+                transfer_id,
+                dir_fd=incoming_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return "not-found"
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or _mode_bits(metadata) != 0o700
+        ):
+            return "unsafe"
+        return "quarantined"
+    finally:
+        if incoming_fd is not None:
+            os.close(incoming_fd)
+        os.close(root_fd)
+
+
+def _validate_rsync_upload_command(
+    receiver: ReceiverConfig,
+    policy: DatasetPolicy,
+    *,
+    dataset: str,
+    transfer_id: str,
+    kind: str,
+    server_arguments: list[str],
+) -> list[str]:
+    """Validate the only rsync server commands the forced SSH identity may run."""
+
+    if dataset != policy.dataset_id or not _DATASET_ID.fullmatch(dataset):
+        raise FixtureTransferError("rsync dataset is invalid")
+    if not re.fullmatch(r"[0-9a-f]{32}", transfer_id):
+        raise FixtureTransferError("rsync transfer id is invalid")
+    if kind not in {"data", "metadata"}:
+        raise FixtureTransferError("rsync upload kind is invalid")
+    if not server_arguments or server_arguments[0] != "--server":
+        raise FixtureTransferError("rsync server mode is invalid")
+    partial = f"--partial-dir=.fixturectl-partial-{transfer_id}"
+    if kind == "data":
+        expected_arguments = [
+            "--server",
+            _RSYNC_DATA_SERVER_OPTIONS,
+            "--partial-dir",
+            partial.removeprefix("--partial-dir="),
+            ".",
+            f"{policy.destination}/incoming/{transfer_id}/data/",
+        ]
+    else:
+        expected_arguments = [
+            "--server",
+            _RSYNC_METADATA_SERVER_OPTIONS,
+            ".",
+            f"{policy.destination}/incoming/{transfer_id}/",
+        ]
+    if server_arguments != expected_arguments:
+        raise FixtureTransferError("rsync argv does not match pinned upload protocol")
+    return [receiver.rsync_executable, *server_arguments]
+
+
+def _dispatch_ssh_original_command(
+    receiver: ReceiverConfig,
+    original_command: str,
+) -> int:
+    try:
+        tokens = shlex.split(original_command, posix=True)
+    except ValueError:
+        raise FixtureTransferError("SSH command is invalid") from None
+    if len(tokens) < 2 or tokens[0] != receiver.fixturectl_executable:
+        raise FixtureTransferError("SSH command executable is not authorized")
+    if tokens[1] in {"receive", "receipt"}:
+        return main(tokens[1:])
+    if tokens[1] != "ssh-dispatch-rsync" or len(tokens) < 11:
+        raise FixtureTransferError("SSH command is not authorized")
+    prefix = tokens[2:8]
+    if (
+        len(prefix) != 6
+        or prefix[0] != "--dataset"
+        or prefix[2] != "--transfer-id"
+        or prefix[4] != "--kind"
+    ):
+        raise FixtureTransferError("rsync dispatcher prefix is invalid")
+    dataset, transfer_id, kind = prefix[1], prefix[3], prefix[5]
+    policy_set = load_policy(receiver.policy)
+    try:
+        policy = policy_set.datasets[dataset]
+    except KeyError:
+        raise FixtureTransferError("rsync dataset is not authorized") from None
+    executable_arguments = _validate_rsync_upload_command(
+        receiver,
+        policy,
+        dataset=dataset,
+        transfer_id=transfer_id,
+        kind=kind,
+        server_arguments=tokens[8:],
+    )
+    _verify_pinned_rsync(receiver.rsync_executable, receiver.rsync_version)
+    os.execv(receiver.rsync_executable, executable_arguments)
+    raise FixtureTransferError("rsync dispatcher returned unexpectedly")
+
+
+def _read_release_receipt(policy: DatasetPolicy, manifest_sha: str) -> Receipt:
+    if not _SHA256.fullmatch(manifest_sha):
+        raise FixtureTransferError("release id is invalid")
+    root_fd, _ = _open_private_directory(Path(policy.destination), "dataset root")
+    releases_fd: int | None = None
+    release_fd: int | None = None
+    receipt_fd: int | None = None
+    try:
+        releases_fd, _ = _open_private_child_directory(
+            root_fd,
+            "releases",
+            "releases directory",
+        )
+        release_fd, _ = _open_private_child_directory(
+            releases_fd,
+            manifest_sha,
+            "release directory",
+        )
+        receipt_fd, _, raw = _open_held_transfer_file_at(
+            release_fd,
+            "receipt.json",
+            label="receipt",
+            max_bytes=64 * 1024,
+        )
+        return _receipt_from_bytes(raw)
+    finally:
+        if receipt_fd is not None:
+            os.close(receipt_fd)
+        if release_fd is not None:
+            os.close(release_fd)
+        if releases_fd is not None:
+            os.close(releases_fd)
+        os.close(root_fd)
+
+
+def _write_redacted_mapping(value: dict[str, Any]) -> None:
+    sys.stdout.write(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    )
+
+
 def _die(message: str) -> NoReturn:
     sys.stderr.write(f"fixturectl: {message}\n")
     raise SystemExit(2)
@@ -2328,7 +3347,7 @@ def _die(message: str) -> NoReturn:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fixturectl")
-    parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument("--policy", type=Path)
     subcommands = parser.add_subparsers(dest="command", required=True)
     manifest = subcommands.add_parser("manifest")
     manifest_commands = manifest.add_subparsers(dest="manifest_command", required=True)
@@ -2340,18 +3359,101 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--dataset", required=True)
     verify.add_argument("--root", type=Path, required=True)
     verify.add_argument("--manifest", type=Path, required=True)
+
+    transfer = subcommands.add_parser("transfer")
+    transfer.add_argument("--dataset", required=True)
+    transfer.add_argument("--target", required=True)
+    transfer.add_argument("--config", type=Path, required=True)
+    transfer.add_argument("--source", type=Path, required=True)
+    transfer.add_argument("--manifest", type=Path, required=True)
+    transfer.add_argument("--signature", type=Path, required=True)
+    transfer.add_argument("--public-key", type=Path, required=True)
+    transfer.add_argument("--retained-releases", type=int, default=0)
+    transfer_mode = transfer.add_mutually_exclusive_group()
+    transfer_mode.add_argument("--apply", action="store_true")
+    transfer_mode.add_argument("--dry-run", action="store_false", dest="apply")
+    transfer.set_defaults(apply=False)
+
+    transfer_status = subcommands.add_parser("transfer-status")
+    transfer_status.add_argument("--dataset", required=True)
+    transfer_status.add_argument("--target", required=True)
+    transfer_status.add_argument("--config", type=Path, required=True)
+    transfer_status.add_argument("--transfer-id", required=True)
+    transfer_status.add_argument("--manifest-sha", required=True)
+
+    receiver = subcommands.add_parser("receive")
+    receiver_commands = receiver.add_subparsers(
+        dest="receive_command",
+        required=True,
+    )
+    preflight = receiver_commands.add_parser("preflight")
+    preflight.add_argument("--dataset", required=True)
+    preflight.add_argument("--required-bytes", type=int, required=True)
+    create_staging_parser = receiver_commands.add_parser("create-staging")
+    create_staging_parser.add_argument("--dataset", required=True)
+    create_staging_parser.add_argument("--transfer-id", required=True)
+    receive_verify = receiver_commands.add_parser("verify")
+    receive_verify.add_argument("--dataset", required=True)
+    receive_verify.add_argument("--transfer-id", required=True)
+    receive_promote = receiver_commands.add_parser("promote")
+    receive_promote.add_argument("--dataset", required=True)
+    receive_promote.add_argument("--transfer-id", required=True)
+    receive_promote.add_argument("--manifest-sha", required=True)
+    receive_status = receiver_commands.add_parser("status")
+    receive_status.add_argument("--dataset", required=True)
+    receive_status.add_argument("--transfer-id", required=True)
+
+    receipt = subcommands.add_parser("receipt")
+    receipt_commands = receipt.add_subparsers(dest="receipt_command", required=True)
+    receipt_print = receipt_commands.add_parser("print")
+    receipt_print.add_argument("--dataset", required=True)
+    receipt_print.add_argument("--manifest-sha", required=True)
+    subcommands.add_parser("ssh-dispatch")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        policy = load_policy(args.policy)
+        if args.command == "ssh-dispatch":
+            receiver = load_receiver_config()
+            original = os.environ.get("SSH_ORIGINAL_COMMAND")
+            if original is None:
+                raise FixtureTransferError("SSH original command is unavailable")
+            return _dispatch_ssh_original_command(receiver, original)
+        if args.command == "transfer-status":
+            status, _ = run_transfer_status(
+                config_path=args.config,
+                dataset=args.dataset,
+                target_alias=args.target,
+                transfer_id=args.transfer_id,
+                manifest_sha=args.manifest_sha,
+            )
+            _write_redacted_mapping(
+                {
+                    "dataset": args.dataset,
+                    "status": status,
+                    "target": args.target,
+                    "transfer_id": args.transfer_id,
+                }
+            )
+            return 0
+        receiver: ReceiverConfig | None = None
+        if args.command in {"receive", "receipt"}:
+            if args.policy is not None:
+                raise FixtureTransferError("receiver policy is server-owned")
+            receiver = load_receiver_config()
+            policy_path = receiver.policy
+        else:
+            if args.policy is None:
+                raise FixturePolicyError("policy is required")
+            policy_path = args.policy
+        policy = load_policy(policy_path)
         try:
             dataset_policy = policy.datasets[args.dataset]
         except KeyError as exc:
             raise FixturePolicyError("dataset id is not authorized") from exc
-        if args.manifest_command == "create":
+        if args.command == "manifest" and args.manifest_command == "create":
             root_fd, _ = _open_dataset_root(args.root)
             try:
                 manifest = _build_manifest(
@@ -2367,8 +3469,102 @@ def main(argv: list[str] | None = None) -> int:
                 )
             finally:
                 os.close(root_fd)
-        else:
+        elif args.command == "manifest":
             verify_manifest(load_manifest(args.manifest), dataset_policy, args.root)
+        elif args.command == "transfer":
+            result = run_transfer(
+                config_path=args.config,
+                policy=dataset_policy,
+                dataset=args.dataset,
+                target_alias=args.target,
+                source=args.source,
+                manifest_path=args.manifest,
+                signature_path=args.signature,
+                public_key=args.public_key,
+                apply=args.apply,
+                retained_releases=args.retained_releases,
+                verified_at=datetime.now(UTC),
+            )
+            sys.stdout.write(result.summary)
+            if result.applied:
+                _write_redacted_mapping(
+                    {
+                        "dataset": args.dataset,
+                        "status": "applied",
+                        "transfer_id": result.transfer_id,
+                    }
+                )
+        elif args.command == "receive" and args.receive_command == "preflight":
+            assert receiver is not None
+            _verify_pinned_rsync(
+                receiver.rsync_executable,
+                receiver.rsync_version,
+            )
+            _receiver_preflight(
+                dataset_policy,
+                required_bytes=args.required_bytes,
+            )
+            _write_redacted_mapping(
+                {
+                    "dataset": args.dataset,
+                    "protocol_version": receiver.protocol_version,
+                    "status": "ready",
+                    "target_id": receiver.target_id,
+                }
+            )
+        elif args.command == "receive" and args.receive_command == "create-staging":
+            _create_staging_data(Path(dataset_policy.destination), args.transfer_id)
+            _write_redacted_mapping(
+                {
+                    "dataset": args.dataset,
+                    "status": "staging-created",
+                    "transfer_id": args.transfer_id,
+                }
+            )
+        elif args.command == "receive" and args.receive_command == "verify":
+            assert receiver is not None
+            staging = Path(dataset_policy.destination) / "incoming" / args.transfer_id
+            receipt = receive(
+                staging,
+                staging / "manifest.json",
+                staging / "manifest.minisig",
+                receiver.public_key,
+                dataset_policy,
+                target_id=receiver.target_id,
+                verified_at=datetime.now(UTC),
+            )
+            sys.stdout.write(_receipt_json(receipt).decode("utf-8"))
+        elif args.command == "receive" and args.receive_command == "promote":
+            assert receiver is not None
+            staging = Path(dataset_policy.destination) / "incoming" / args.transfer_id
+            release = promote(
+                Path(dataset_policy.destination),
+                staging,
+                args.manifest_sha,
+                dataset_policy,
+                receiver.public_key,
+            )
+            _write_redacted_mapping(
+                {
+                    "dataset": args.dataset,
+                    "release": release.name,
+                    "status": "promoted",
+                }
+            )
+        elif args.command == "receive":
+            status = _receiver_status(dataset_policy, args.transfer_id)
+            _write_redacted_mapping(
+                {
+                    "dataset": args.dataset,
+                    "status": status,
+                    "transfer_id": args.transfer_id,
+                }
+            )
+        else:
+            receipt = _read_release_receipt(dataset_policy, args.manifest_sha)
+            sys.stdout.write(_receipt_json(receipt).decode("utf-8"))
+    except FixtureTransferApplyError as exc:
+        _die(str(exc))
     except (
         FixturePolicyError,
         FixtureManifestError,
