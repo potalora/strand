@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import io
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +56,20 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertNotIn("/Users/", POLICY_PATH.read_text(encoding="utf-8"))
 
+    def test_policy_validate_cli_reports_only_aggregate_status(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "stdout", stdout):
+            result = fixturectl.main(
+                ["--policy", str(POLICY_PATH), "policy", "validate"]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"dataset_count": 2, "status": "valid"},
+        )
+        self.assertNotIn("medtimeline", stdout.getvalue())
+
     def test_duplicate_json_key_is_rejected(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -72,6 +88,20 @@ class PolicyTests(unittest.TestCase):
 
         with self.assertRaisesRegex(fixturectl.FixturePolicyError, "policy fields"):
             fixturectl.load_policy(self._write_policy(body))
+
+    def test_policy_requires_a_real_non_writable_file(self) -> None:
+        body = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        path = self._write_policy(body)
+        path.chmod(0o666)
+
+        with self.assertRaisesRegex(fixturectl.FixturePolicyError, "mode"):
+            fixturectl.load_policy(path)
+
+        path.chmod(0o600)
+        link = path.with_name("policy-link.json")
+        link.symlink_to(path)
+        with self.assertRaisesRegex(fixturectl.FixturePolicyError, "regular file"):
+            fixturectl.load_policy(link)
 
     def test_dataset_key_and_identifier_must_be_safe(self) -> None:
         body = {

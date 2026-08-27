@@ -62,13 +62,20 @@ class ReleaseTests(unittest.TestCase):
         self.dataset_root = base / "target" / "synthetic"
         (self.dataset_root / "incoming").mkdir(parents=True)
         (self.dataset_root / "releases").mkdir()
+        (self.dataset_root / ".reservations").mkdir()
         for directory in (
+            self.dataset_root.parent,
             self.dataset_root,
             self.dataset_root / "incoming",
             self.dataset_root / "releases",
+            self.dataset_root / ".reservations",
         ):
             directory.chmod(0o700)
         self.policy = synthetic_policy(destination=str(self.dataset_root))
+        self.policy_set = fixturectl.Policy(
+            schema_version=1,
+            datasets={"synthetic": self.policy},
+        )
         manifest = fixturectl.build_manifest(self.policy, self.source, FIXED_TIME)
         canonical = fixturectl.canonical_json(manifest)
         self.signature_bytes = b"synthetic signature\n"
@@ -85,6 +92,19 @@ class ReleaseTests(unittest.TestCase):
         self.public_key.chmod(0o644)
 
     def _stage(self, transfer_id: str) -> tuple[Path, Path, Path]:
+        with mock.patch.object(
+            fixturectl.shutil,
+            "disk_usage",
+            return_value=mock.Mock(free=10**12),
+        ):
+            fixturectl.reserve_capacity(
+                self.policy_set,
+                self.policy,
+                transfer_id=transfer_id,
+                manifest_sha=self.verified.sha256,
+                required_bytes=self.verified.manifest.total_bytes,
+                reserved_bytes=1_000,
+            )
         staging = fixturectl.create_staging(self.dataset_root, transfer_id)
         shutil.copytree(self.source, staging / "data", copy_function=shutil.copyfile)
         for directory in (staging / "data", staging / "data/raw"):
@@ -163,6 +183,121 @@ class ReleaseTests(unittest.TestCase):
         rendered = receipt_path.read_text(encoding="utf-8")
         self.assertNotIn("record.json", rendered)
         self.assertNotIn(str(self.source), rendered)
+
+    def test_release_receipt_recovery_reverifies_signed_data_and_aggregates(
+        self,
+    ) -> None:
+        staging, _ = self._receive("1" * 32)
+        release = self._promote(staging, self.verified.sha256)
+        receipt_path = release / "receipt.json"
+        body = json.loads(receipt_path.read_text(encoding="utf-8"))
+        body["total_bytes"] += 1
+        receipt_path.write_bytes(
+            json.dumps(body, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+        )
+        receipt_path.chmod(0o600)
+
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            self.assertRaisesRegex(
+                fixturectl.FixtureTransferError,
+                "existing release differs",
+            ),
+        ):
+            fixturectl._read_release_receipt(
+                self.policy,
+                self.verified.sha256,
+                self.public_key,
+                target_id="synthetic-target",
+            )
+
+    def test_release_receipt_recovery_refuses_wrong_target_and_changed_data(
+        self,
+    ) -> None:
+        staging, _ = self._receive("2" * 32)
+        release = self._promote(staging, self.verified.sha256)
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            self.assertRaisesRegex(
+                fixturectl.FixtureTransferError,
+                "release receipt identity is invalid",
+            ),
+        ):
+            fixturectl._read_release_receipt(
+                self.policy,
+                self.verified.sha256,
+                self.public_key,
+                target_id="different-target",
+            )
+
+        changed = release / "data" / "raw" / "record.json"
+        changed.write_text("changed\n", encoding="utf-8")
+        changed.chmod(0o600)
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            self.assertRaises(fixturectl.FixtureManifestError),
+        ):
+            fixturectl._read_release_receipt(
+                self.policy,
+                self.verified.sha256,
+                self.public_key,
+                target_id="synthetic-target",
+            )
+
+    def test_release_receipt_recovery_refuses_release_link_swap(self) -> None:
+        staging, _ = self._receive("3" * 32)
+        release = self._promote(staging, self.verified.sha256)
+        detached = release.with_name(f"{release.name}-detached")
+        real_verify_manifest = fixturectl.verify_manifest
+
+        def swap_release(*args: object, **kwargs: object) -> None:
+            release.rename(detached)
+            shutil.copytree(detached, release)
+            for directory in (release, release / "data", release / "data" / "raw"):
+                directory.chmod(0o700)
+            for file in (release / "data" / "raw").iterdir():
+                file.chmod(0o600)
+            for file in (
+                release / "manifest.json",
+                release / "manifest.minisig",
+                release / "receipt.json",
+            ):
+                file.chmod(0o600)
+            real_verify_manifest(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            mock.patch.object(
+                fixturectl,
+                "verify_manifest",
+                side_effect=swap_release,
+            ),
+            self.assertRaises(
+                (fixturectl.FixtureTransferError, fixturectl.FixturePolicyError)
+            ),
+        ):
+            fixturectl._read_release_receipt(
+                self.policy,
+                self.verified.sha256,
+                self.public_key,
+                target_id="synthetic-target",
+            )
 
     def test_receive_refuses_interrupted_changed_extra_and_bad_signature(self) -> None:
         for mutation in ("missing", "changed", "extra"):
@@ -407,6 +542,98 @@ class ReleaseTests(unittest.TestCase):
         self.assertTrue(current.is_symlink())
         self.assertEqual(os.readlink(current), f"releases/{self.verified.sha256}")
 
+    def test_offline_release_verifier_requires_the_exact_receipt_identity(
+        self,
+    ) -> None:
+        staging, _ = self._receive("0" * 31 + "6")
+        release = self._promote(staging, self.verified.sha256)
+        with mock.patch.object(
+            fixturectl,
+            "verify_signature",
+            return_value=self.verified,
+        ):
+            receipt = fixturectl.verify_offline_release(
+                self.dataset_root,
+                self.verified.sha256,
+                self.policy,
+                self.public_key,
+                target_id="synthetic-target",
+            )
+        self.assertEqual(receipt.file_count, self.verified.manifest.file_count)
+        self.assertEqual(receipt.total_bytes, self.verified.manifest.total_bytes)
+
+        receipt_path = release / "receipt.json"
+        body = json.loads(receipt_path.read_text(encoding="utf-8"))
+        body["target_id"] = "wrong-target"
+        receipt_path.write_text(
+            json.dumps(body, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            self.assertRaisesRegex(
+                fixturectl.FixtureTransferError,
+                "receipt identity",
+            ),
+        ):
+            fixturectl.verify_offline_release(
+                self.dataset_root,
+                self.verified.sha256,
+                self.policy,
+                self.public_key,
+                target_id="synthetic-target",
+            )
+
+    def test_offline_verifier_returns_the_held_aggregate_verified_receipt(
+        self,
+    ) -> None:
+        staging, _ = self._receive("0" * 31 + "7")
+        release = self._promote(staging, self.verified.sha256)
+        receipt_path = release / "receipt.json"
+        real_verify_release = fixturectl._verify_release
+
+        def verify_then_replace_receipt(
+            *args: object, **kwargs: object
+        ) -> fixturectl.Receipt:
+            receipt = real_verify_release(*args, **kwargs)
+            body = json.loads(receipt_path.read_text(encoding="utf-8"))
+            body["file_count"] += 1
+            receipt_path.write_text(
+                json.dumps(body, separators=(",", ":"), sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            receipt_path.chmod(0o600)
+            return receipt
+
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            mock.patch.object(
+                fixturectl,
+                "_verify_release",
+                side_effect=verify_then_replace_receipt,
+            ),
+        ):
+            receipt = fixturectl.verify_offline_release(
+                self.dataset_root,
+                self.verified.sha256,
+                self.policy,
+                self.public_key,
+                target_id="synthetic-target",
+            )
+        self.assertEqual(receipt.file_count, self.verified.manifest.file_count)
+        self.assertNotEqual(
+            receipt.file_count,
+            json.loads(receipt_path.read_text(encoding="utf-8"))["file_count"],
+        )
+
     def test_promotion_refuses_release_name_mismatch_and_different_existing(
         self,
     ) -> None:
@@ -464,9 +691,297 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(releases), 2)
         self.assertEqual(releases[0], releases[1])
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual(list((self.dataset_root / ".reservations").iterdir()), [])
         self.assertEqual(
             os.readlink(self.dataset_root / "current"),
             f"releases/{self.verified.sha256}",
+        )
+
+    def test_status_reconciles_crash_after_release_rename(self) -> None:
+        transfer_id = "6" * 32
+        staging, _ = self._receive(transfer_id)
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            mock.patch.object(
+                fixturectl,
+                "_release_capacity_reservation_from_held_root",
+                side_effect=fixturectl.FixtureTransferError("simulated crash"),
+            ),
+            self.assertRaisesRegex(fixturectl.FixtureTransferError, "simulated crash"),
+        ):
+            fixturectl.promote(
+                self.dataset_root,
+                staging,
+                self.verified.sha256,
+                self.policy,
+                self.public_key,
+            )
+
+        reservation = self.dataset_root / ".reservations" / f"{transfer_id}.json"
+        self.assertTrue(reservation.is_file())
+        self.assertFalse(staging.exists())
+        with mock.patch.object(
+            fixturectl,
+            "verify_signature",
+            return_value=self.verified,
+        ):
+            status = fixturectl._receiver_status(
+                self.policy,
+                transfer_id,
+                self.public_key,
+            )
+
+        self.assertEqual(status, "not-found")
+        self.assertFalse(reservation.exists())
+        self.assertEqual(
+            os.readlink(self.dataset_root / "current"),
+            f"releases/{self.verified.sha256}",
+        )
+
+    def test_status_refuses_dataset_root_swap_during_reconciliation(self) -> None:
+        transfer_id = "0" * 31 + "1"
+        staging, _ = self._receive(transfer_id)
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            mock.patch.object(
+                fixturectl,
+                "_release_capacity_reservation_from_held_root",
+                side_effect=fixturectl.FixtureTransferError("simulated crash"),
+            ),
+            self.assertRaises(fixturectl.FixtureTransferError),
+        ):
+            fixturectl.promote(
+                self.dataset_root,
+                staging,
+                self.verified.sha256,
+                self.policy,
+                self.public_key,
+            )
+
+        detached = self.dataset_root.with_name("synthetic-detached")
+        real_verify_release = fixturectl._verify_release
+
+        def verify_then_swap(*args: object, **kwargs: object) -> None:
+            real_verify_release(*args, **kwargs)
+            self.dataset_root.rename(detached)
+            self.dataset_root.mkdir(mode=0o700)
+            for name in ("incoming", "releases", ".reservations"):
+                (self.dataset_root / name).mkdir(mode=0o700)
+            marker = self.dataset_root / "replacement-marker"
+            marker.write_text("untouched\n", encoding="utf-8")
+            marker.chmod(0o600)
+
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            mock.patch.object(
+                fixturectl,
+                "_verify_release",
+                side_effect=verify_then_swap,
+            ),
+            self.assertRaisesRegex(fixturectl.FixtureTransferError, "dataset root"),
+        ):
+            fixturectl._receiver_status(
+                self.policy,
+                transfer_id,
+                self.public_key,
+            )
+
+        self.assertEqual(
+            (self.dataset_root / "replacement-marker").read_text(encoding="utf-8"),
+            "untouched\n",
+        )
+        self.assertTrue((detached / ".reservations" / f"{transfer_id}.json").is_file())
+
+    def test_status_preserves_identity_from_reservation_read_to_reconcile(
+        self,
+    ) -> None:
+        transfer_id = "0" * 31 + "5"
+        staging, _ = self._receive(transfer_id)
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            mock.patch.object(
+                fixturectl,
+                "_release_capacity_reservation_from_held_root",
+                side_effect=fixturectl.FixtureTransferError("simulated crash"),
+            ),
+            self.assertRaises(fixturectl.FixtureTransferError),
+        ):
+            fixturectl.promote(
+                self.dataset_root,
+                staging,
+                self.verified.sha256,
+                self.policy,
+                self.public_key,
+            )
+
+        detached = self.dataset_root.with_name("synthetic-status-detached")
+        real_reconcile = fixturectl._reconcile_orphaned_capacity_reservation
+
+        def swap_before_reconcile(
+            policy: fixturectl.DatasetPolicy,
+            reservation: fixturectl.CapacityReservation,
+            public_key: Path,
+            anchored_root_fd: int,
+        ) -> bool:
+            self.dataset_root.rename(detached)
+            shutil.copytree(
+                detached,
+                self.dataset_root,
+                symlinks=True,
+                copy_function=shutil.copy2,
+            )
+            return real_reconcile(
+                policy,
+                reservation,
+                public_key,
+                anchored_root_fd,
+            )
+
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            mock.patch.object(
+                fixturectl,
+                "_reconcile_orphaned_capacity_reservation",
+                side_effect=swap_before_reconcile,
+            ),
+            self.assertRaisesRegex(fixturectl.FixtureTransferError, "dataset root"),
+        ):
+            fixturectl._receiver_status(
+                self.policy,
+                transfer_id,
+                self.public_key,
+            )
+
+        for root in (detached, self.dataset_root):
+            self.assertTrue((root / ".reservations" / f"{transfer_id}.json").is_file())
+
+    def test_duplicate_cleanup_refuses_staging_entry_swap(self) -> None:
+        first, _ = self._receive("0" * 31 + "2")
+        self._promote(first, self.verified.sha256)
+        transfer_id = "0" * 31 + "3"
+        duplicate, _ = self._receive(transfer_id)
+        real_rename = fixturectl._rename_noreplace
+
+        def swap_before_detach(
+            source_fd: int,
+            source: str,
+            destination_fd: int,
+            destination: str,
+        ) -> None:
+            held = ".attacker-held-staging"
+            real_rename(source_fd, source, source_fd, held)
+            os.mkdir(source, 0o700, dir_fd=source_fd)
+            real_rename(source_fd, source, destination_fd, destination)
+
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            mock.patch.object(
+                fixturectl,
+                "_rename_noreplace",
+                side_effect=swap_before_detach,
+            ),
+            self.assertRaisesRegex(
+                fixturectl.FixtureTransferError,
+                "detached staging identity",
+            ),
+        ):
+            fixturectl.promote(
+                self.dataset_root,
+                duplicate,
+                self.verified.sha256,
+                self.policy,
+                self.public_key,
+            )
+
+        incoming = self.dataset_root / "incoming"
+        self.assertTrue((incoming / ".attacker-held-staging").is_dir())
+        self.assertEqual(
+            len(list(incoming.glob(".fixturectl-discard-*"))),
+            1,
+        )
+        self.assertTrue(
+            (self.dataset_root / ".reservations" / f"{transfer_id}.json").is_file()
+        )
+
+    def test_promotion_refuses_dataset_root_swap_before_reservation_release(
+        self,
+    ) -> None:
+        transfer_id = "0" * 31 + "4"
+        staging, _ = self._receive(transfer_id)
+        detached = self.dataset_root.with_name("synthetic-promoted-detached")
+        real_release = fixturectl._release_capacity_reservation_from_held_root
+
+        def swap_then_release(
+            policy: fixturectl.DatasetPolicy,
+            reservation: fixturectl.CapacityReservation,
+            dataset_fd: int,
+        ) -> None:
+            self.dataset_root.rename(detached)
+            self.dataset_root.mkdir(mode=0o700)
+            for name in ("incoming", "releases", ".reservations"):
+                (self.dataset_root / name).mkdir(mode=0o700)
+            replacement = (
+                self.dataset_root / ".reservations" / f"{reservation.transfer_id}.json"
+            )
+            source = detached / ".reservations" / f"{reservation.transfer_id}.json"
+            replacement.write_bytes(source.read_bytes())
+            replacement.chmod(0o600)
+            real_release(policy, reservation, dataset_fd)
+
+        with (
+            mock.patch.object(
+                fixturectl,
+                "verify_signature",
+                return_value=self.verified,
+            ),
+            mock.patch.object(
+                fixturectl,
+                "_release_capacity_reservation_from_held_root",
+                side_effect=swap_then_release,
+            ),
+            self.assertRaisesRegex(fixturectl.FixtureTransferError, "dataset root"),
+        ):
+            fixturectl.promote(
+                self.dataset_root,
+                staging,
+                self.verified.sha256,
+                self.policy,
+                self.public_key,
+            )
+
+        self.assertTrue(
+            (self.dataset_root / ".reservations" / f"{transfer_id}.json").is_file()
+        )
+        self.assertTrue((detached / ".reservations" / f"{transfer_id}.json").is_file())
+        self.assertTrue((detached / "releases" / self.verified.sha256).is_dir())
+        self.assertFalse(
+            (self.dataset_root / "releases" / self.verified.sha256).exists()
         )
 
     def test_two_process_promotions_use_the_filesystem_lock(self) -> None:

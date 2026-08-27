@@ -8,6 +8,7 @@ contains a source-root path or file contents.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import ctypes
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -53,6 +54,20 @@ _READ_SIZE = 1024 * 1024
 _MAX_MANIFEST_BYTES = 32 * 1024 * 1024
 _MAX_SIGNATURE_BYTES = 64 * 1024
 _MAX_KEY_BYTES = 1024 * 1024
+_CAPACITY_TRANSFER_OVERHEAD_BYTES = (
+    _MAX_MANIFEST_BYTES + _MAX_SIGNATURE_BYTES + (128 * 1024)
+)
+_CAPACITY_PAYLOAD_MULTIPLIER = 2
+_CAPACITY_LOCK_NAME = ".fixturectl-capacity.lock"
+_RESERVATION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "dataset",
+        "transfer_id",
+        "manifest_sha256",
+        "required_bytes",
+    }
+)
 _PUBLIC_KEY_MODES = frozenset({0o400, 0o440, 0o444, 0o600, 0o640, 0o644})
 _PROMOTION_THREAD_LOCKS_GUARD = threading.Lock()
 _PROMOTION_THREAD_LOCKS: dict[str, threading.Lock] = {}
@@ -89,6 +104,7 @@ _RECEIVER_CONFIG_FIELDS = frozenset(
         "fixturectl_executable",
         "rsync_executable",
         "rsync_version",
+        "reserved_bytes",
     }
 )
 _RECEIVER_CONFIG_PATH = Path("/etc/fixturectl/receiver.json")
@@ -190,6 +206,7 @@ class ReceiverConfig:
     fixturectl_executable: str
     rsync_executable: str
     rsync_version: str
+    reserved_bytes: int
 
 
 @dataclass(frozen=True)
@@ -225,6 +242,15 @@ class Receipt:
 
 
 @dataclass(frozen=True)
+class CapacityReservation:
+    schema_version: int
+    dataset: str
+    transfer_id: str
+    manifest_sha256: str
+    required_bytes: int
+
+
+@dataclass(frozen=True)
 class StagingLayout:
     dataset_root: Path
     staging: Path
@@ -255,8 +281,15 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _read_strict_json(path: Path) -> Any:
     try:
-        with path.open("r", encoding="utf-8") as stream:
-            return json.load(stream, object_pairs_hook=_reject_duplicate_keys)
+        raw = _read_checked_regular(
+            path,
+            error_type=FixturePolicyError,
+            label="policy file",
+            allowed_modes=_PUBLIC_KEY_MODES,
+            allowed_owner_uids=frozenset({0, os.getuid()}),
+            max_bytes=_MAX_MANIFEST_BYTES,
+        )
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except FixturePolicyError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -763,19 +796,22 @@ def _open_checked_regular(
     path: Path,
     *,
     error_type: (
-        type[FixtureManifestError]
+        type[FixturePolicyError]
+        | type[FixtureManifestError]
         | type[FixtureSignatureError]
         | type[FixtureTransferError]
     ),
     label: str,
     allowed_modes: frozenset[int] | None,
+    allowed_owner_uids: frozenset[int] | None = None,
     max_bytes: int,
 ) -> tuple[int, os.stat_result]:
     try:
         metadata = path.lstat()
         if not stat.S_ISREG(metadata.st_mode):
             raise error_type(f"{label} must be a regular file")
-        if metadata.st_uid != os.getuid():
+        owners = allowed_owner_uids or frozenset({os.getuid()})
+        if metadata.st_uid not in owners:
             raise error_type(f"{label} owner is invalid")
         if allowed_modes is not None and _mode_bits(metadata) not in allowed_modes:
             raise error_type(f"{label} mode is invalid")
@@ -804,7 +840,8 @@ def _read_checked_descriptor(
     before: os.stat_result,
     *,
     error_type: (
-        type[FixtureManifestError]
+        type[FixturePolicyError]
+        | type[FixtureManifestError]
         | type[FixtureSignatureError]
         | type[FixtureTransferError]
     ),
@@ -835,12 +872,14 @@ def _read_checked_regular(
     path: Path,
     *,
     error_type: (
-        type[FixtureManifestError]
+        type[FixturePolicyError]
+        | type[FixtureManifestError]
         | type[FixtureSignatureError]
         | type[FixtureTransferError]
     ),
     label: str,
     allowed_modes: frozenset[int] | None,
+    allowed_owner_uids: frozenset[int] | None = None,
     max_bytes: int,
 ) -> bytes:
     descriptor, before = _open_checked_regular(
@@ -848,6 +887,7 @@ def _read_checked_regular(
         error_type=error_type,
         label=label,
         allowed_modes=allowed_modes,
+        allowed_owner_uids=allowed_owner_uids,
         max_bytes=max_bytes,
     )
     try:
@@ -1198,6 +1238,7 @@ def verify_signature(
             error_type=FixtureSignatureError,
             label="public key",
             allowed_modes=_PUBLIC_KEY_MODES,
+            allowed_owner_uids=frozenset({0, os.getuid()}),
             max_bytes=_MAX_KEY_BYTES,
         )
         public_key_bytes = _read_checked_descriptor(
@@ -1509,7 +1550,8 @@ def load_receiver_config(path: Path = _RECEIVER_CONFIG_PATH) -> ReceiverConfig:
         path,
         error_type=FixtureTransferError,
         label="receiver config",
-        allowed_modes=frozenset({0o600}),
+        allowed_modes=frozenset({0o444, 0o600}),
+        allowed_owner_uids=frozenset({0, os.getuid()}),
         max_bytes=64 * 1024,
     )
     try:
@@ -1533,6 +1575,7 @@ def load_receiver_config(path: Path = _RECEIVER_CONFIG_PATH) -> ReceiverConfig:
         or not _safe_remote_absolute_path(body["fixturectl_executable"])
         or not _safe_remote_absolute_path(body["rsync_executable"])
         or body["rsync_version"] != _PINNED_RSYNC_VERSION
+        or not _nonnegative_integer(body["reserved_bytes"])
     ):
         raise FixtureTransferError("receiver config values are invalid")
     return ReceiverConfig(
@@ -1544,6 +1587,7 @@ def load_receiver_config(path: Path = _RECEIVER_CONFIG_PATH) -> ReceiverConfig:
         fixturectl_executable=body["fixturectl_executable"],
         rsync_executable=body["rsync_executable"],
         rsync_version=body["rsync_version"],
+        reserved_bytes=body["reserved_bytes"],
     )
 
 
@@ -2025,7 +2069,7 @@ def _verify_preflight_response(
         or set(body) != {"dataset", "protocol_version", "status", "target_id"}
         or body["dataset"] != dataset
         or body["protocol_version"] != _RECEIVER_PROTOCOL_VERSION
-        or body["status"] != "ready"
+        or body["status"] != "reserved"
         or body["target_id"] != target.target_id
     ):
         raise FixtureTransferError("receiver identity does not match approved target")
@@ -2103,7 +2147,7 @@ def _transfer_status_from_bytes(
         or set(body) != {"dataset", "status", "transfer_id"}
         or body["dataset"] != dataset
         or body["transfer_id"] != transfer_id
-        or body["status"] not in {"not-found", "quarantined", "unsafe"}
+        or body["status"] not in {"not-found", "reserved", "quarantined", "unsafe"}
     ):
         raise FixtureTransferError("receiver status response is invalid")
     return body["status"]
@@ -2208,6 +2252,7 @@ def run_transfer(
     apply: bool,
     retained_releases: int,
     verified_at: datetime,
+    resume_transfer_id: str | None = None,
 ) -> TransferResult:
     """Plan by default; explicitly apply one-way transfer to an approved target."""
 
@@ -2260,7 +2305,11 @@ def run_transfer(
     ssh = config.ssh_executable
     rsync = config.rsync_executable
     _verify_pinned_rsync(rsync, config.rsync_version)
-    transfer_id = new_transfer_id()
+    if resume_transfer_id is not None and not re.fullmatch(
+        r"[0-9a-f]{32}", resume_transfer_id
+    ):
+        raise FixtureTransferError("resume transfer id is invalid")
+    transfer_id = resume_transfer_id or new_transfer_id()
     remote_staging = f"{policy.destination}/incoming/{transfer_id}"
     remote_data = f"{remote_staging}/data/"
     remote_root = f"{target.ssh_destination}:{remote_staging}/"
@@ -2274,25 +2323,6 @@ def run_transfer(
             "StrictHostKeyChecking=yes",
         ]
     )
-
-    preflight_output = _run_transfer_process(
-        _ssh_command(
-            ssh,
-            target,
-            "receive",
-            "preflight",
-            "--dataset",
-            dataset,
-            "--required-bytes",
-            str(plan.total_bytes),
-        ),
-        capture=True,
-    )
-    _verify_preflight_response(
-        preflight_output,
-        dataset=dataset,
-        target=target,
-    )
     remediation = _recovery_command(
         config_path=config_path,
         dataset=dataset,
@@ -2300,6 +2330,39 @@ def run_transfer(
         transfer_id=transfer_id,
         manifest_sha=verified.sha256,
     )
+    reservation_retry = (
+        f"rerun the same fixturectl transfer command with "
+        f"--resume-transfer-id {transfer_id}; then run {remediation} if needed"
+    )
+
+    try:
+        preflight_output = _run_transfer_process(
+            _ssh_command(
+                ssh,
+                target,
+                "receive",
+                "preflight",
+                "--dataset",
+                dataset,
+                "--required-bytes",
+                str(plan.total_bytes),
+                "--transfer-id",
+                transfer_id,
+                "--manifest-sha",
+                verified.sha256,
+            ),
+            capture=True,
+        )
+        _verify_preflight_response(
+            preflight_output,
+            dataset=dataset,
+            target=target,
+        )
+    except FixtureTransferError:
+        raise FixtureTransferApplyError(
+            f"transfer_id={transfer_id} status=reservation-pending; "
+            f"remediation: {reservation_retry}"
+        ) from None
     _run_quarantined_step(
         _ssh_command(
             ssh,
@@ -2310,6 +2373,10 @@ def run_transfer(
             dataset,
             "--transfer-id",
             transfer_id,
+            "--manifest-sha",
+            verified.sha256,
+            "--required-bytes",
+            str(plan.total_bytes),
         ),
         dataset=dataset,
         transfer_id=transfer_id,
@@ -2440,6 +2507,473 @@ def run_transfer(
         transfer_id=transfer_id,
         receipt_path=receipt_path,
     )
+
+
+def _reservation_json(reservation: CapacityReservation) -> bytes:
+    return (
+        json.dumps(
+            asdict(reservation),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _reservation_from_bytes(raw: bytes) -> CapacityReservation:
+    try:
+        body = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_transfer_config_duplicate_keys,
+        )
+    except FixtureTransferError:
+        raise
+    except (UnicodeError, json.JSONDecodeError):
+        raise FixtureTransferError("capacity reservation is invalid") from None
+    if not isinstance(body, dict) or set(body) != _RESERVATION_FIELDS:
+        raise FixtureTransferError("capacity reservation fields are invalid")
+    if (
+        body["schema_version"] != 1
+        or not isinstance(body["dataset"], str)
+        or not _DATASET_ID.fullmatch(body["dataset"])
+        or not isinstance(body["transfer_id"], str)
+        or not re.fullmatch(r"[0-9a-f]{32}", body["transfer_id"])
+        or not isinstance(body["manifest_sha256"], str)
+        or not _SHA256.fullmatch(body["manifest_sha256"])
+        or not _nonnegative_integer(body["required_bytes"])
+    ):
+        raise FixtureTransferError("capacity reservation values are invalid")
+    reservation = CapacityReservation(**body)
+    if raw != _reservation_json(reservation):
+        raise FixtureTransferError("capacity reservation is not canonical")
+    return reservation
+
+
+def _capacity_root(policy: Policy) -> Path:
+    if not policy.datasets:
+        raise FixtureTransferError("capacity policy is empty")
+    roots = {Path(item.destination).parent for item in policy.datasets.values()}
+    if len(roots) != 1:
+        raise FixtureTransferError("capacity roots do not share a filesystem root")
+    root = roots.pop()
+    for dataset_id, item in policy.datasets.items():
+        if Path(item.destination) != root / dataset_id:
+            raise FixtureTransferError("capacity dataset root is invalid")
+    return root
+
+
+@contextmanager
+def _capacity_lock_at(root_fd: int) -> Any:
+    lock_fd: int | None = None
+    try:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        lock_fd = os.open(_CAPACITY_LOCK_NAME, flags, 0o600, dir_fd=root_fd)
+        os.fchmod(lock_fd, 0o600)
+        metadata = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or _mode_bits(metadata) != 0o600
+        ):
+            raise FixtureTransferError("capacity reservation lock is unsafe")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield root_fd
+    except FixtureTransferError:
+        raise
+    except OSError:
+        raise FixtureTransferError("capacity reservation lock failed safely") from None
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+
+
+@contextmanager
+def _capacity_lock(policy: Policy) -> Any:
+    root = _capacity_root(policy)
+    root_fd, _ = _open_private_directory(root, "fixture capacity root")
+    try:
+        with _capacity_lock_at(root_fd):
+            yield root_fd
+    finally:
+        os.close(root_fd)
+
+
+def _read_reservation_at(
+    reservations_fd: int,
+    *,
+    dataset: DatasetPolicy,
+    transfer_id: str,
+) -> CapacityReservation:
+    name = f"{transfer_id}.json"
+    descriptor: int | None = None
+    try:
+        descriptor, before, raw = _open_held_transfer_file_at(
+            reservations_fd,
+            name,
+            label="capacity reservation",
+            max_bytes=64 * 1024,
+        )
+        reservation = _reservation_from_bytes(raw)
+        if (
+            reservation.dataset != dataset.dataset_id
+            or reservation.transfer_id != transfer_id
+            or reservation.required_bytes > dataset.max_total_bytes
+        ):
+            raise FixtureTransferError("capacity reservation does not match policy")
+        _require_linked_regular(
+            descriptor,
+            before,
+            reservations_fd,
+            name,
+            "capacity reservation",
+        )
+        return reservation
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _scan_capacity_state(
+    policy: Policy,
+    root_fd: int,
+) -> dict[tuple[str, str], CapacityReservation]:
+    active: dict[tuple[str, str], CapacityReservation] = {}
+    capacity_device = os.fstat(root_fd).st_dev
+    for dataset_id in sorted(policy.datasets):
+        dataset = policy.datasets[dataset_id]
+        dataset_fd: int | None = None
+        incoming_fd: int | None = None
+        releases_fd: int | None = None
+        reservations_fd: int | None = None
+        try:
+            dataset_fd, dataset_metadata = _open_private_child_directory(
+                root_fd,
+                dataset_id,
+                "capacity dataset root",
+            )
+            incoming_fd, incoming_metadata = _open_private_child_directory(
+                dataset_fd,
+                "incoming",
+                "incoming directory",
+            )
+            releases_fd, releases_metadata = _open_private_child_directory(
+                dataset_fd,
+                "releases",
+                "releases directory",
+            )
+            reservations_fd, reservations_metadata = _open_private_child_directory(
+                dataset_fd,
+                ".reservations",
+                "capacity reservations directory",
+            )
+            if any(
+                metadata.st_dev != capacity_device
+                for metadata in (
+                    dataset_metadata,
+                    incoming_metadata,
+                    releases_metadata,
+                    reservations_metadata,
+                )
+            ):
+                raise FixtureTransferError("capacity filesystem boundary is invalid")
+            with os.scandir(reservations_fd) as iterator:
+                reservation_names = sorted(entry.name for entry in iterator)
+            for name in reservation_names:
+                match = re.fullmatch(r"([0-9a-f]{32})\.json", name)
+                if match is None:
+                    raise FixtureTransferError("capacity reservation name is invalid")
+                transfer_id = match.group(1)
+                reservation = _read_reservation_at(
+                    reservations_fd,
+                    dataset=dataset,
+                    transfer_id=transfer_id,
+                )
+                key = (dataset_id, transfer_id)
+                if key in active:
+                    raise FixtureTransferError("capacity reservation is duplicated")
+                active[key] = reservation
+
+            with os.scandir(incoming_fd) as iterator:
+                incoming_names = sorted(entry.name for entry in iterator)
+            for transfer_id in incoming_names:
+                if not re.fullmatch(r"[0-9a-f]{32}", transfer_id):
+                    raise FixtureTransferError(
+                        "capacity reservation is missing for staging"
+                    )
+                metadata = os.stat(
+                    transfer_id,
+                    dir_fd=incoming_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or stat.S_ISLNK(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                    or _mode_bits(metadata) != 0o700
+                    or (dataset_id, transfer_id) not in active
+                ):
+                    raise FixtureTransferError(
+                        "capacity reservation is missing for staging"
+                    )
+        finally:
+            if reservations_fd is not None:
+                os.close(reservations_fd)
+            if releases_fd is not None:
+                os.close(releases_fd)
+            if incoming_fd is not None:
+                os.close(incoming_fd)
+            if dataset_fd is not None:
+                os.close(dataset_fd)
+    return active
+
+
+def reserve_capacity(
+    policy: Policy,
+    dataset: DatasetPolicy,
+    *,
+    transfer_id: str,
+    manifest_sha: str,
+    required_bytes: int,
+    reserved_bytes: int,
+) -> CapacityReservation:
+    """Atomically reserve target capacity across all configured datasets."""
+
+    if (
+        policy.datasets.get(dataset.dataset_id) != dataset
+        or not re.fullmatch(r"[0-9a-f]{32}", transfer_id)
+        or not _SHA256.fullmatch(manifest_sha)
+        or not _nonnegative_integer(required_bytes)
+        or required_bytes > dataset.max_total_bytes
+        or not _nonnegative_integer(reserved_bytes)
+    ):
+        raise FixtureTransferError("capacity reservation request is invalid")
+    reservation = CapacityReservation(
+        schema_version=1,
+        dataset=dataset.dataset_id,
+        transfer_id=transfer_id,
+        manifest_sha256=manifest_sha,
+        required_bytes=required_bytes,
+    )
+    with _capacity_lock(policy) as root_fd:
+        active = _scan_capacity_state(policy, root_fd)
+        existing = active.get((dataset.dataset_id, transfer_id))
+        if existing is not None:
+            if existing == reservation:
+                return existing
+            raise FixtureTransferError(
+                "capacity reservation already exists and differs"
+            )
+        active_bytes = sum(
+            (_CAPACITY_PAYLOAD_MULTIPLIER * item.required_bytes)
+            + _CAPACITY_TRANSFER_OVERHEAD_BYTES
+            for item in active.values()
+        )
+        required_free = (
+            reserved_bytes
+            + active_bytes
+            + (_CAPACITY_PAYLOAD_MULTIPLIER * required_bytes)
+            + _CAPACITY_TRANSFER_OVERHEAD_BYTES
+        )
+        if shutil.disk_usage(_capacity_root(policy)).free < required_free:
+            raise FixtureTransferError("target capacity is insufficient")
+
+        dataset_fd, _ = _open_private_child_directory(
+            root_fd,
+            dataset.dataset_id,
+            "capacity dataset root",
+        )
+        reservations_fd: int | None = None
+        try:
+            reservations_fd, _ = _open_private_child_directory(
+                dataset_fd,
+                ".reservations",
+                "capacity reservations directory",
+            )
+            _write_private_at(
+                reservations_fd,
+                f"{transfer_id}.json",
+                _reservation_json(reservation),
+                "capacity reservation",
+            )
+        finally:
+            if reservations_fd is not None:
+                os.close(reservations_fd)
+            os.close(dataset_fd)
+    return reservation
+
+
+def create_reserved_staging(
+    policy: Policy,
+    dataset: DatasetPolicy,
+    *,
+    transfer_id: str,
+    manifest_sha: str,
+    required_bytes: int,
+) -> Path:
+    """Create staging only for the exact capacity reservation."""
+
+    with _capacity_lock(policy) as root_fd:
+        active = _scan_capacity_state(policy, root_fd)
+        reservation = active.get((dataset.dataset_id, transfer_id))
+        if (
+            reservation is None
+            or reservation.manifest_sha256 != manifest_sha
+            or reservation.required_bytes != required_bytes
+        ):
+            raise FixtureTransferError("capacity reservation does not match staging")
+        return _create_staging_data(Path(dataset.destination), transfer_id)
+
+
+def _require_capacity_reservation(
+    dataset: DatasetPolicy,
+    *,
+    transfer_id: str,
+    manifest_sha: str,
+    required_bytes: int,
+) -> CapacityReservation:
+    root_fd, _ = _open_private_directory(Path(dataset.destination), "dataset root")
+    reservations_fd: int | None = None
+    try:
+        reservations_fd, _ = _open_private_child_directory(
+            root_fd,
+            ".reservations",
+            "capacity reservations directory",
+        )
+        reservation = _read_reservation_at(
+            reservations_fd,
+            dataset=dataset,
+            transfer_id=transfer_id,
+        )
+        if (
+            reservation.manifest_sha256 != manifest_sha
+            or reservation.required_bytes != required_bytes
+        ):
+            raise FixtureTransferError("capacity reservation does not match payload")
+        return reservation
+    finally:
+        if reservations_fd is not None:
+            os.close(reservations_fd)
+        os.close(root_fd)
+
+
+def _release_capacity_reservation(
+    dataset: DatasetPolicy,
+    reservation: CapacityReservation,
+) -> None:
+    one_dataset_policy = Policy(
+        schema_version=1, datasets={dataset.dataset_id: dataset}
+    )
+    with _capacity_lock(one_dataset_policy) as root_fd:
+        dataset_fd, _ = _open_private_child_directory(
+            root_fd,
+            dataset.dataset_id,
+            "capacity dataset root",
+        )
+        reservations_fd: int | None = None
+        try:
+            _unlink_capacity_reservation_at(dataset, reservation, dataset_fd)
+        finally:
+            if reservations_fd is not None:
+                os.close(reservations_fd)
+            os.close(dataset_fd)
+
+
+def _release_capacity_reservation_from_held_root(
+    dataset: DatasetPolicy,
+    reservation: CapacityReservation,
+    dataset_fd: int,
+) -> None:
+    capacity_root_fd: int | None = None
+    try:
+        capacity_root_fd = os.open(
+            "..",
+            _read_flags(directory=True),
+            dir_fd=dataset_fd,
+        )
+        capacity_root = os.fstat(capacity_root_fd)
+        if (
+            not stat.S_ISDIR(capacity_root.st_mode)
+            or capacity_root.st_uid != os.getuid()
+            or _mode_bits(capacity_root) != 0o700
+        ):
+            raise FixtureTransferError("fixture capacity root is unsafe")
+        with _capacity_lock_at(capacity_root_fd):
+            _require_linked_directory(
+                dataset_fd,
+                capacity_root_fd,
+                dataset.dataset_id,
+                "dataset root",
+            )
+            _require_configured_directory(
+                Path(dataset.destination),
+                dataset_fd,
+                "dataset root",
+            )
+            _unlink_capacity_reservation_at(dataset, reservation, dataset_fd)
+    except FixtureTransferError:
+        raise
+    except OSError:
+        raise FixtureTransferError(
+            "capacity reservation release failed safely"
+        ) from None
+    finally:
+        if capacity_root_fd is not None:
+            os.close(capacity_root_fd)
+
+
+def _unlink_capacity_reservation_at(
+    dataset: DatasetPolicy,
+    reservation: CapacityReservation,
+    dataset_fd: int,
+) -> None:
+    reservations_fd: int | None = None
+    descriptor: int | None = None
+    try:
+        reservations_fd, _ = _open_private_child_directory(
+            dataset_fd,
+            ".reservations",
+            "capacity reservations directory",
+        )
+        exact = _read_reservation_at(
+            reservations_fd,
+            dataset=dataset,
+            transfer_id=reservation.transfer_id,
+        )
+        if exact != reservation:
+            raise FixtureTransferError("capacity reservation changed")
+        descriptor, before, _ = _open_held_transfer_file_at(
+            reservations_fd,
+            f"{reservation.transfer_id}.json",
+            label="capacity reservation",
+            max_bytes=64 * 1024,
+        )
+        _require_linked_regular(
+            descriptor,
+            before,
+            reservations_fd,
+            f"{reservation.transfer_id}.json",
+            "capacity reservation",
+        )
+        os.unlink(f"{reservation.transfer_id}.json", dir_fd=reservations_fd)
+        os.fsync(reservations_fd)
+    except FixtureTransferError:
+        raise
+    except OSError:
+        raise FixtureTransferError(
+            "capacity reservation release failed safely"
+        ) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if reservations_fd is not None:
+            os.close(reservations_fd)
 
 
 def create_staging(dataset_root: Path, transfer_id: str) -> Path:
@@ -2597,6 +3131,12 @@ def receive(
             raise FixtureTransferError("staging signature changed after verification")
         if verified.manifest.dataset != policy.dataset_id:
             raise FixtureTransferError("staging dataset does not match policy")
+        _require_capacity_reservation(
+            policy,
+            transfer_id=layout.transfer_id,
+            manifest_sha=verified.sha256,
+            required_bytes=verified.manifest.total_bytes,
+        )
         verify_manifest(
             verified.manifest,
             policy,
@@ -2748,7 +3288,8 @@ def _verify_release(
     *,
     root_fd: int,
     releases_fd: int,
-) -> None:
+    configured_root_required: bool = True,
+) -> Receipt:
     owned_releases_fd = os.dup(releases_fd)
     release_fd: int | None = None
     data_fd: int | None = None
@@ -2856,7 +3397,13 @@ def _verify_release(
             "releases",
             "releases directory",
         )
-        _require_configured_directory(Path(policy.destination), root_fd, "dataset root")
+        if configured_root_required:
+            _require_configured_directory(
+                Path(policy.destination),
+                root_fd,
+                "dataset root",
+            )
+        return receipt
     finally:
         if receipt_fd is not None:
             os.close(receipt_fd)
@@ -2869,6 +3416,95 @@ def _verify_release(
         if release_fd is not None:
             os.close(release_fd)
         os.close(owned_releases_fd)
+
+
+def verify_offline_release(
+    dataset_root: Path,
+    manifest_sha: str,
+    policy: DatasetPolicy,
+    public_key: Path,
+    *,
+    target_id: str,
+) -> Receipt:
+    """Verify a restored immutable release and its canonical aggregate receipt."""
+
+    if not _SHA256.fullmatch(manifest_sha):
+        raise FixtureTransferError("offline release id is invalid")
+    if not _DATASET_ID.fullmatch(target_id):
+        raise FixtureTransferError("offline target id is invalid")
+    root_fd, _ = _open_private_directory(dataset_root, "offline dataset root")
+    releases_fd: int | None = None
+    try:
+        releases_fd, _ = _open_private_child_directory(
+            root_fd,
+            "releases",
+            "offline releases directory",
+        )
+        release = dataset_root / "releases" / manifest_sha
+        receipt = _verify_release(
+            release,
+            manifest_sha,
+            policy,
+            public_key,
+            root_fd=root_fd,
+            releases_fd=releases_fd,
+            configured_root_required=False,
+        )
+        if (
+            receipt.target_id != target_id
+            or receipt.dataset != policy.dataset_id
+            or receipt.manifest_sha256 != manifest_sha
+        ):
+            raise FixtureTransferError("offline receipt identity is invalid")
+        return receipt
+    finally:
+        if releases_fd is not None:
+            os.close(releases_fd)
+        os.close(root_fd)
+
+
+def _remove_verified_duplicate_staging(layout: StagingLayout) -> None:
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        raise FixtureTransferError("safe duplicate staging cleanup is unavailable")
+    _require_linked_directory(
+        layout.staging_fd,
+        layout.incoming_fd,
+        layout.transfer_id,
+        "staging directory",
+    )
+    trash_name = f".fixturectl-discard-{secrets.token_hex(16)}"
+    try:
+        _rename_noreplace(
+            layout.incoming_fd,
+            layout.transfer_id,
+            layout.incoming_fd,
+            trash_name,
+        )
+        detached = os.stat(
+            trash_name,
+            dir_fd=layout.incoming_fd,
+            follow_symlinks=False,
+        )
+        if _directory_identity(detached) != _directory_identity(
+            os.fstat(layout.staging_fd)
+        ):
+            raise FixtureTransferError("detached staging identity changed")
+        shutil.rmtree(trash_name, dir_fd=layout.incoming_fd)
+        try:
+            os.stat(
+                trash_name,
+                dir_fd=layout.incoming_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise FixtureTransferError("duplicate staging cleanup is incomplete")
+        os.fsync(layout.incoming_fd)
+    except FixtureTransferError:
+        raise
+    except OSError:
+        raise FixtureTransferError("duplicate staging cleanup failed safely") from None
 
 
 def _promote_with_process_lock(
@@ -2891,6 +3527,8 @@ def _promote_with_process_lock(
     manifest_fd: int | None = None
     signature_fd: int | None = None
     receipt_fd: int | None = None
+    promoted_new_release = False
+    reservation: CapacityReservation | None = None
     try:
         lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
@@ -2977,6 +3615,12 @@ def _promote_with_process_lock(
             or receipt.total_bytes != verified.manifest.total_bytes
         ):
             raise FixtureTransferError("release id does not match verified staging")
+        reservation = _require_capacity_reservation(
+            policy,
+            transfer_id=layout.transfer_id,
+            manifest_sha=verified.sha256,
+            required_bytes=verified.manifest.total_bytes,
+        )
         verify_manifest(
             verified.manifest,
             policy,
@@ -3038,6 +3682,7 @@ def _promote_with_process_lock(
                     raise FixtureTransferError("staging directory changed")
                 os.fsync(releases_fd)
                 os.fsync(layout.incoming_fd)
+                promoted_new_release = True
             except FixtureTransferError:
                 raise
             except OSError:
@@ -3089,6 +3734,14 @@ def _promote_with_process_lock(
             "releases directory",
         )
         _switch_current(root_fd, manifest_sha)
+        if not promoted_new_release:
+            _remove_verified_duplicate_staging(layout)
+        assert reservation is not None
+        _release_capacity_reservation_from_held_root(
+            policy,
+            reservation,
+            root_fd,
+        )
         return release
     except FixtureTransferError:
         raise
@@ -3155,6 +3808,7 @@ def _receiver_preflight(
     policy: DatasetPolicy,
     *,
     required_bytes: int,
+    reserved_bytes: int,
 ) -> None:
     if not _nonnegative_integer(required_bytes):
         raise FixtureTransferError("required byte count is invalid")
@@ -3173,7 +3827,7 @@ def _receiver_preflight(
             "releases",
             "releases directory",
         )
-        if shutil.disk_usage(root).free < required_bytes:
+        if shutil.disk_usage(root).free < required_bytes + reserved_bytes:
             raise FixtureTransferError("target capacity is insufficient")
     finally:
         if releases_fd is not None:
@@ -3183,17 +3837,225 @@ def _receiver_preflight(
         os.close(root_fd)
 
 
-def _receiver_status(policy: DatasetPolicy, transfer_id: str) -> str:
+def _reconcile_orphaned_capacity_reservation(
+    policy: DatasetPolicy,
+    reservation: CapacityReservation,
+    public_key: Path,
+    anchored_root_fd: int,
+) -> bool:
+    """Finish an interrupted verified promotion with no remaining staging tree."""
+
+    lock_key = os.path.abspath(policy.destination)
+    with _PROMOTION_THREAD_LOCKS_GUARD:
+        thread_lock = _PROMOTION_THREAD_LOCKS.setdefault(lock_key, threading.Lock())
+    with thread_lock:
+        root_fd = os.dup(anchored_root_fd)
+        lock_fd: int | None = None
+        incoming_fd: int | None = None
+        releases_fd: int | None = None
+        release_fd: int | None = None
+        receipt_fd: int | None = None
+        capacity_root_fd: int | None = None
+        try:
+            root_metadata = os.fstat(root_fd)
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or root_metadata.st_uid != os.getuid()
+                or _mode_bits(root_metadata) != 0o700
+            ):
+                raise FixtureTransferError("dataset root is unsafe")
+            _require_configured_directory(
+                Path(policy.destination),
+                root_fd,
+                "dataset root",
+            )
+            lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                lock_flags |= os.O_NOFOLLOW
+            lock_fd = os.open(".promote.lock", lock_flags, 0o600, dir_fd=root_fd)
+            os.fchmod(lock_fd, 0o600)
+            lock_metadata = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(lock_metadata.st_mode)
+                or lock_metadata.st_uid != os.getuid()
+                or lock_metadata.st_nlink != 1
+                or _mode_bits(lock_metadata) != 0o600
+            ):
+                raise FixtureTransferError("promotion reconciliation lock is unsafe")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+            incoming_fd, _ = _open_private_child_directory(
+                root_fd,
+                "incoming",
+                "incoming directory",
+            )
+            try:
+                os.stat(
+                    reservation.transfer_id,
+                    dir_fd=incoming_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                return False
+
+            releases_fd, _ = _open_private_child_directory(
+                root_fd,
+                "releases",
+                "releases directory",
+            )
+            try:
+                os.stat(
+                    reservation.manifest_sha256,
+                    dir_fd=releases_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            _verify_release(
+                Path(policy.destination) / "releases" / reservation.manifest_sha256,
+                reservation.manifest_sha256,
+                policy,
+                public_key,
+                root_fd=root_fd,
+                releases_fd=releases_fd,
+            )
+            release_fd, _ = _open_private_child_directory(
+                releases_fd,
+                reservation.manifest_sha256,
+                "release directory",
+            )
+            receipt_fd, receipt_before, receipt_raw = _open_held_transfer_file_at(
+                release_fd,
+                "receipt.json",
+                label="receipt",
+                max_bytes=64 * 1024,
+            )
+            receipt = _receipt_from_bytes(receipt_raw)
+            if (
+                receipt.manifest_sha256 != reservation.manifest_sha256
+                or receipt.total_bytes != reservation.required_bytes
+            ):
+                raise FixtureTransferError(
+                    "capacity reservation does not match verified release"
+                )
+            _require_linked_regular(
+                receipt_fd,
+                receipt_before,
+                release_fd,
+                "receipt.json",
+                "receipt",
+            )
+            _require_linked_directory(
+                release_fd,
+                releases_fd,
+                reservation.manifest_sha256,
+                "release directory",
+            )
+            _require_linked_directory(
+                releases_fd,
+                root_fd,
+                "releases",
+                "releases directory",
+            )
+            _require_configured_directory(
+                Path(policy.destination),
+                root_fd,
+                "dataset root",
+            )
+            _switch_current(root_fd, reservation.manifest_sha256)
+            capacity_root_fd = os.open(
+                "..", _read_flags(directory=True), dir_fd=root_fd
+            )
+            capacity_root = os.fstat(capacity_root_fd)
+            if (
+                not stat.S_ISDIR(capacity_root.st_mode)
+                or capacity_root.st_uid != os.getuid()
+                or _mode_bits(capacity_root) != 0o700
+            ):
+                raise FixtureTransferError("fixture capacity root is unsafe")
+            with _capacity_lock_at(capacity_root_fd):
+                _require_linked_directory(
+                    root_fd,
+                    capacity_root_fd,
+                    policy.dataset_id,
+                    "dataset root",
+                )
+                _require_configured_directory(
+                    Path(policy.destination),
+                    root_fd,
+                    "dataset root",
+                )
+                _unlink_capacity_reservation_at(policy, reservation, root_fd)
+            return True
+        except FixtureTransferError:
+            raise
+        except OSError:
+            raise FixtureTransferError(
+                "promotion reconciliation failed safely"
+            ) from None
+        finally:
+            if capacity_root_fd is not None:
+                os.close(capacity_root_fd)
+            if receipt_fd is not None:
+                os.close(receipt_fd)
+            if release_fd is not None:
+                os.close(release_fd)
+            if releases_fd is not None:
+                os.close(releases_fd)
+            if incoming_fd is not None:
+                os.close(incoming_fd)
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+            os.close(root_fd)
+
+
+def _receiver_status(
+    policy: DatasetPolicy,
+    transfer_id: str,
+    public_key: Path,
+) -> str:
     if not re.fullmatch(r"[0-9a-f]{32}", transfer_id):
         raise FixtureTransferError("transfer id is invalid")
     root_fd, _ = _open_private_directory(Path(policy.destination), "dataset root")
     incoming_fd: int | None = None
+    reservations_fd: int | None = None
     try:
         incoming_fd, _ = _open_private_child_directory(
             root_fd,
             "incoming",
             "incoming directory",
         )
+        reservations_fd, _ = _open_private_child_directory(
+            root_fd,
+            ".reservations",
+            "capacity reservations directory",
+        )
+        reservation_name = f"{transfer_id}.json"
+        try:
+            os.stat(
+                reservation_name,
+                dir_fd=reservations_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            reservation_exists = False
+        except OSError:
+            return "unsafe"
+        else:
+            try:
+                _read_reservation_at(
+                    reservations_fd,
+                    dataset=policy,
+                    transfer_id=transfer_id,
+                )
+            except FixtureTransferError:
+                return "unsafe"
+            reservation_exists = True
         try:
             metadata = os.stat(
                 transfer_id,
@@ -3201,16 +4063,33 @@ def _receiver_status(policy: DatasetPolicy, transfer_id: str) -> str:
                 follow_symlinks=False,
             )
         except FileNotFoundError:
-            return "not-found"
+            if not reservation_exists:
+                return "not-found"
+            reservation = _read_reservation_at(
+                reservations_fd,
+                dataset=policy,
+                transfer_id=transfer_id,
+            )
+            if _reconcile_orphaned_capacity_reservation(
+                policy,
+                reservation,
+                public_key,
+                root_fd,
+            ):
+                return "not-found"
+            return "reserved"
         if (
             not stat.S_ISDIR(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
             or metadata.st_uid != os.getuid()
             or _mode_bits(metadata) != 0o700
+            or not reservation_exists
         ):
             return "unsafe"
         return "quarantined"
     finally:
+        if reservations_fd is not None:
+            os.close(reservations_fd)
         if incoming_fd is not None:
             os.close(incoming_fd)
         os.close(root_fd)
@@ -3298,36 +4177,37 @@ def _dispatch_ssh_original_command(
     raise FixtureTransferError("rsync dispatcher returned unexpectedly")
 
 
-def _read_release_receipt(policy: DatasetPolicy, manifest_sha: str) -> Receipt:
+def _read_release_receipt(
+    policy: DatasetPolicy,
+    manifest_sha: str,
+    public_key: Path,
+    *,
+    target_id: str,
+) -> Receipt:
     if not _SHA256.fullmatch(manifest_sha):
         raise FixtureTransferError("release id is invalid")
+    if not _DATASET_ID.fullmatch(target_id):
+        raise FixtureTransferError("receipt target id is invalid")
     root_fd, _ = _open_private_directory(Path(policy.destination), "dataset root")
     releases_fd: int | None = None
-    release_fd: int | None = None
-    receipt_fd: int | None = None
     try:
         releases_fd, _ = _open_private_child_directory(
             root_fd,
             "releases",
             "releases directory",
         )
-        release_fd, _ = _open_private_child_directory(
-            releases_fd,
+        receipt = _verify_release(
+            Path(policy.destination) / "releases" / manifest_sha,
             manifest_sha,
-            "release directory",
+            policy,
+            public_key,
+            root_fd=root_fd,
+            releases_fd=releases_fd,
         )
-        receipt_fd, _, raw = _open_held_transfer_file_at(
-            release_fd,
-            "receipt.json",
-            label="receipt",
-            max_bytes=64 * 1024,
-        )
-        return _receipt_from_bytes(raw)
+        if receipt.target_id != target_id:
+            raise FixtureTransferError("release receipt identity is invalid")
+        return receipt
     finally:
-        if receipt_fd is not None:
-            os.close(receipt_fd)
-        if release_fd is not None:
-            os.close(release_fd)
         if releases_fd is not None:
             os.close(releases_fd)
         os.close(root_fd)
@@ -3360,6 +4240,25 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--root", type=Path, required=True)
     verify.add_argument("--manifest", type=Path, required=True)
 
+    policy_command = subcommands.add_parser("policy")
+    policy_commands = policy_command.add_subparsers(
+        dest="policy_command",
+        required=True,
+    )
+    policy_commands.add_parser("validate")
+
+    release_command = subcommands.add_parser("release")
+    release_commands = release_command.add_subparsers(
+        dest="release_command",
+        required=True,
+    )
+    release_verify = release_commands.add_parser("verify")
+    release_verify.add_argument("--dataset", required=True)
+    release_verify.add_argument("--root", type=Path, required=True)
+    release_verify.add_argument("--manifest-sha", required=True)
+    release_verify.add_argument("--public-key", type=Path, required=True)
+    release_verify.add_argument("--target-id", required=True)
+
     transfer = subcommands.add_parser("transfer")
     transfer.add_argument("--dataset", required=True)
     transfer.add_argument("--target", required=True)
@@ -3369,6 +4268,7 @@ def _parser() -> argparse.ArgumentParser:
     transfer.add_argument("--signature", type=Path, required=True)
     transfer.add_argument("--public-key", type=Path, required=True)
     transfer.add_argument("--retained-releases", type=int, default=0)
+    transfer.add_argument("--resume-transfer-id")
     transfer_mode = transfer.add_mutually_exclusive_group()
     transfer_mode.add_argument("--apply", action="store_true")
     transfer_mode.add_argument("--dry-run", action="store_false", dest="apply")
@@ -3389,9 +4289,13 @@ def _parser() -> argparse.ArgumentParser:
     preflight = receiver_commands.add_parser("preflight")
     preflight.add_argument("--dataset", required=True)
     preflight.add_argument("--required-bytes", type=int, required=True)
+    preflight.add_argument("--transfer-id", required=True)
+    preflight.add_argument("--manifest-sha", required=True)
     create_staging_parser = receiver_commands.add_parser("create-staging")
     create_staging_parser.add_argument("--dataset", required=True)
     create_staging_parser.add_argument("--transfer-id", required=True)
+    create_staging_parser.add_argument("--manifest-sha", required=True)
+    create_staging_parser.add_argument("--required-bytes", type=int, required=True)
     receive_verify = receiver_commands.add_parser("verify")
     receive_verify.add_argument("--dataset", required=True)
     receive_verify.add_argument("--transfer-id", required=True)
@@ -3449,6 +4353,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise FixturePolicyError("policy is required")
             policy_path = args.policy
         policy = load_policy(policy_path)
+        if args.command == "policy":
+            _write_redacted_mapping(
+                {
+                    "dataset_count": len(policy.datasets),
+                    "status": "valid",
+                }
+            )
+            return 0
         try:
             dataset_policy = policy.datasets[args.dataset]
         except KeyError as exc:
@@ -3471,6 +4383,22 @@ def main(argv: list[str] | None = None) -> int:
                 os.close(root_fd)
         elif args.command == "manifest":
             verify_manifest(load_manifest(args.manifest), dataset_policy, args.root)
+        elif args.command == "release":
+            receipt = verify_offline_release(
+                args.root,
+                args.manifest_sha,
+                dataset_policy,
+                args.public_key,
+                target_id=args.target_id,
+            )
+            _write_redacted_mapping(
+                {
+                    "dataset": receipt.dataset,
+                    "manifest_sha256": receipt.manifest_sha256,
+                    "status": "verified",
+                    "target_id": receipt.target_id,
+                }
+            )
         elif args.command == "transfer":
             result = run_transfer(
                 config_path=args.config,
@@ -3484,6 +4412,7 @@ def main(argv: list[str] | None = None) -> int:
                 apply=args.apply,
                 retained_releases=args.retained_releases,
                 verified_at=datetime.now(UTC),
+                resume_transfer_id=args.resume_transfer_id,
             )
             sys.stdout.write(result.summary)
             if result.applied:
@@ -3500,20 +4429,30 @@ def main(argv: list[str] | None = None) -> int:
                 receiver.rsync_executable,
                 receiver.rsync_version,
             )
-            _receiver_preflight(
+            reserve_capacity(
+                policy,
                 dataset_policy,
+                transfer_id=args.transfer_id,
+                manifest_sha=args.manifest_sha,
                 required_bytes=args.required_bytes,
+                reserved_bytes=receiver.reserved_bytes,
             )
             _write_redacted_mapping(
                 {
                     "dataset": args.dataset,
                     "protocol_version": receiver.protocol_version,
-                    "status": "ready",
+                    "status": "reserved",
                     "target_id": receiver.target_id,
                 }
             )
         elif args.command == "receive" and args.receive_command == "create-staging":
-            _create_staging_data(Path(dataset_policy.destination), args.transfer_id)
+            create_reserved_staging(
+                policy,
+                dataset_policy,
+                transfer_id=args.transfer_id,
+                manifest_sha=args.manifest_sha,
+                required_bytes=args.required_bytes,
+            )
             _write_redacted_mapping(
                 {
                     "dataset": args.dataset,
@@ -3552,7 +4491,12 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
         elif args.command == "receive":
-            status = _receiver_status(dataset_policy, args.transfer_id)
+            assert receiver is not None
+            status = _receiver_status(
+                dataset_policy,
+                args.transfer_id,
+                receiver.public_key,
+            )
             _write_redacted_mapping(
                 {
                     "dataset": args.dataset,
@@ -3561,7 +4505,13 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
         else:
-            receipt = _read_release_receipt(dataset_policy, args.manifest_sha)
+            assert receiver is not None
+            receipt = _read_release_receipt(
+                dataset_policy,
+                args.manifest_sha,
+                receiver.public_key,
+                target_id=receiver.target_id,
+            )
             sys.stdout.write(_receipt_json(receipt).decode("utf-8"))
     except FixtureTransferApplyError as exc:
         _die(str(exc))

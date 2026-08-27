@@ -33,6 +33,11 @@ parent and state directory mode `0700`.
 }
 ```
 
+Admission holds the configured static reserve plus twice each active payload and
+fixed metadata overhead. The two-times payload bound covers rsync's retained
+partial basis plus a full resumed temporary file; exact retries reuse the same
+reservation instead of spending capacity twice.
+
 The SSH destination must contain a literal Tailscale address, not DNS or an
 arbitrary command. The local target ID is checked against the receiver's signed
 preflight identity. SSH runs with batch mode and strict host-key checking.
@@ -104,18 +109,22 @@ not `--protect-args`/`--secluded-args`: secluded arguments hide server options
 from forced-command inspection and are therefore incompatible with this
 receiver boundary.
 
-Ansible owns `/etc/fixturectl/receiver.json` mode `0600`, for example:
+Ansible installs the receiver config, policy, and signing public key as
+root-owned mode `0444` trust anchors. The receiver identity can read but cannot
+rewrite them. A current-user-owned receiver config may be mode `0600` in an
+isolated development test. For example:
 
 ```json
 {
   "schema_version": 1,
   "protocol_version": 1,
   "target_id": "authorized-test-vps",
-  "policy": "/etc/fixturectl/policy.json",
-  "public_key": "/etc/fixturectl/fixture-signing.pub",
+  "policy": "/etc/private-fixture-target/policy.json",
+  "public_key": "/etc/private-fixture-target/fixture-signing.pub",
   "fixturectl_executable": "/usr/local/libexec/fixturectl",
-  "rsync_executable": "/usr/bin/rsync",
-  "rsync_version": "3.5.0"
+  "rsync_executable": "/usr/local/libexec/fixture-rsync",
+  "rsync_version": "3.5.0",
+  "reserved_bytes": 21474836480
 }
 ```
 

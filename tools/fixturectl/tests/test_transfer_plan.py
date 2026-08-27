@@ -207,7 +207,12 @@ class TransferCommandTests(unittest.TestCase):
         )
         self.config.chmod(0o600)
 
-    def _run(self, *, apply: bool) -> fixturectl.TransferResult:
+    def _run(
+        self,
+        *,
+        apply: bool,
+        resume_transfer_id: str | None = None,
+    ) -> fixturectl.TransferResult:
         with mock.patch.object(
             fixturectl,
             "verify_signature",
@@ -225,6 +230,7 @@ class TransferCommandTests(unittest.TestCase):
                 apply=apply,
                 retained_releases=3,
                 verified_at=FIXED_TIME,
+                resume_transfer_id=resume_transfer_id,
             )
 
     def _install_fake_binaries(self, receipt: fixturectl.Receipt) -> Path:
@@ -260,7 +266,7 @@ class TransferCommandTests(unittest.TestCase):
             {
                 "dataset": "synthetic",
                 "protocol_version": 1,
-                "status": "ready",
+                "status": "reserved",
                 "target_id": "authorized-test-vps",
             },
             separators=(",", ":"),
@@ -462,7 +468,7 @@ class TransferCommandTests(unittest.TestCase):
             {
                 "dataset": "synthetic",
                 "protocol_version": 1,
-                "status": "ready",
+                "status": "reserved",
                 "target_id": "authorized-test-vps",
             }
         ).encode()
@@ -523,12 +529,106 @@ class TransferCommandTests(unittest.TestCase):
             timeout=10,
         )
 
+    def test_lost_preflight_response_reports_recoverable_reservation(self) -> None:
+        transfer_id = "9" * 32
+        remote_root = self.base / "remote-private-fixtures"
+        remote_dataset_root = remote_root / "synthetic"
+        for relative in ("", "incoming", "releases", ".reservations"):
+            path = remote_dataset_root / relative
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(0o700)
+        remote_root.chmod(0o700)
+        remote_dataset = synthetic_policy(destination=str(remote_dataset_root))
+        remote_policy = fixturectl.Policy(
+            schema_version=1,
+            datasets={"synthetic": remote_dataset},
+        )
+        preflight_attempts = 0
+        receipt = fixturectl.Receipt(
+            schema_version=1,
+            dataset="synthetic",
+            manifest_sha256=self.verified.sha256,
+            file_count=self.verified.manifest.file_count,
+            total_bytes=self.verified.manifest.total_bytes,
+            verified_at="2026-08-27T00:00:00Z",
+            target_id="authorized-test-vps",
+            status="verified",
+        )
+
+        def response(arguments: list[str], **kwargs: object) -> bytes:
+            nonlocal preflight_attempts
+            del kwargs
+            if "--version" in arguments:
+                return b"rsync  version 3.5.0  protocol version 32\n"
+            if "preflight" in arguments:
+                with mock.patch.object(
+                    fixturectl.shutil,
+                    "disk_usage",
+                    return_value=mock.Mock(free=10**12),
+                ):
+                    fixturectl.reserve_capacity(
+                        remote_policy,
+                        remote_dataset,
+                        transfer_id=transfer_id,
+                        manifest_sha=self.verified.sha256,
+                        required_bytes=self.verified.manifest.total_bytes,
+                        reserved_bytes=1_000,
+                    )
+                preflight_attempts += 1
+                if preflight_attempts == 1:
+                    raise fixturectl.FixtureTransferError("response lost")
+                return json.dumps(
+                    {
+                        "dataset": "synthetic",
+                        "protocol_version": 1,
+                        "status": "reserved",
+                        "target_id": "authorized-test-vps",
+                    }
+                ).encode()
+            if "receipt" in arguments:
+                return fixturectl._receipt_json(receipt)
+            return b""
+
+        with (
+            mock.patch.object(
+                fixturectl,
+                "_run_transfer_process",
+                side_effect=response,
+            ),
+            mock.patch.object(fixturectl, "new_transfer_id", return_value=transfer_id),
+            self.assertRaises(fixturectl.FixtureTransferApplyError) as raised,
+        ):
+            self._run(apply=True)
+
+        rendered = str(raised.exception)
+        self.assertIn(f"transfer_id={transfer_id}", rendered)
+        self.assertIn("status=reservation-pending", rendered)
+        self.assertIn(f"--transfer-id {transfer_id}", rendered)
+        self.assertIn(f"--manifest-sha {self.verified.sha256}", rendered)
+
+        with mock.patch.object(
+            fixturectl,
+            "_run_transfer_process",
+            side_effect=response,
+        ):
+            resumed = self._run(
+                apply=True,
+                resume_transfer_id=transfer_id,
+            )
+        self.assertTrue(resumed.applied)
+        self.assertEqual(resumed.transfer_id, transfer_id)
+        self.assertEqual(preflight_attempts, 2)
+        self.assertEqual(
+            len(list((remote_dataset_root / ".reservations").glob("*.json"))),
+            1,
+        )
+
     def test_post_staging_failure_reports_quarantine_recovery(self) -> None:
         preflight = json.dumps(
             {
                 "dataset": "synthetic",
                 "protocol_version": 1,
-                "status": "ready",
+                "status": "reserved",
                 "target_id": "authorized-test-vps",
             }
         ).encode()
@@ -598,7 +698,7 @@ class TransferCommandTests(unittest.TestCase):
                             {
                                 "dataset": "synthetic",
                                 "protocol_version": 1,
-                                "status": "ready",
+                                "status": "reserved",
                                 "target_id": "authorized-test-vps",
                             }
                         ).encode()
@@ -798,10 +898,13 @@ class TransferCommandTests(unittest.TestCase):
         target_root = self.base / "receiver" / "synthetic"
         (target_root / "incoming").mkdir(parents=True)
         (target_root / "releases").mkdir()
+        (target_root / ".reservations").mkdir()
         for directory in (
+            target_root.parent,
             target_root,
             target_root / "incoming",
             target_root / "releases",
+            target_root / ".reservations",
         ):
             directory.chmod(0o700)
         receiver_policy = synthetic_policy(destination=str(target_root))
@@ -820,8 +923,22 @@ class TransferCommandTests(unittest.TestCase):
             fixturectl_executable="/usr/local/libexec/fixturectl",
             rsync_executable="/usr/bin/rsync",
             rsync_version="3.5.0",
+            reserved_bytes=20 * 1024 * 1024 * 1024,
         )
         transfer_id = "f" * 32
+        with mock.patch.object(
+            fixturectl.shutil,
+            "disk_usage",
+            return_value=mock.Mock(free=10**12),
+        ):
+            fixturectl.reserve_capacity(
+                policy_set,
+                receiver_policy,
+                transfer_id=transfer_id,
+                manifest_sha=self.verified.sha256,
+                required_bytes=10,
+                reserved_bytes=receiver_config.reserved_bytes,
+            )
         stdout = io.StringIO()
         with (
             mock.patch.object(
@@ -840,6 +957,10 @@ class TransferCommandTests(unittest.TestCase):
                     "synthetic",
                     "--transfer-id",
                     transfer_id,
+                    "--manifest-sha",
+                    self.verified.sha256,
+                    "--required-bytes",
+                    "10",
                 ]
             )
         staging = target_root / "incoming" / transfer_id
@@ -909,6 +1030,7 @@ class ReceiverAuthorizationTests(unittest.TestCase):
             fixturectl_executable="/usr/local/libexec/fixturectl",
             rsync_executable="/usr/bin/rsync",
             rsync_version="3.5.0",
+            reserved_bytes=20 * 1024 * 1024 * 1024,
         )
         self.transfer_id = "d" * 32
 
@@ -925,6 +1047,7 @@ class ReceiverAuthorizationTests(unittest.TestCase):
                     "fixturectl_executable": "/usr/local/libexec/fixturectl",
                     "rsync_executable": "/usr/bin/rsync",
                     "rsync_version": "3.5.0",
+                    "reserved_bytes": 20 * 1024 * 1024 * 1024,
                 }
             ),
             encoding="utf-8",
@@ -933,9 +1056,36 @@ class ReceiverAuthorizationTests(unittest.TestCase):
         loaded = fixturectl.load_receiver_config(config)
         self.assertEqual(loaded, self.receiver)
 
+        config.chmod(0o444)
+        self.assertEqual(fixturectl.load_receiver_config(config), self.receiver)
+
         config.chmod(0o644)
         with self.assertRaisesRegex(fixturectl.FixtureTransferError, "config mode"):
             fixturectl.load_receiver_config(config)
+
+    def test_preflight_preserves_configured_free_space_reserve(self) -> None:
+        root = self.base / "receiver-root"
+        (root / "incoming").mkdir(parents=True)
+        (root / "releases").mkdir()
+        for directory in (root, root / "incoming", root / "releases"):
+            directory.chmod(0o700)
+        policy = synthetic_policy(destination=str(root))
+        with (
+            mock.patch.object(
+                fixturectl.shutil,
+                "disk_usage",
+                return_value=mock.Mock(free=499),
+            ),
+            self.assertRaisesRegex(
+                fixturectl.FixtureTransferError,
+                "capacity",
+            ),
+        ):
+            fixturectl._receiver_preflight(
+                policy,
+                required_bytes=100,
+                reserved_bytes=400,
+            )
 
     def test_rsync_dispatcher_accepts_only_exact_upload_destination(self) -> None:
         destination = f"{self.policy.destination}/incoming/{self.transfer_id}/data/"
